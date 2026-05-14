@@ -6,15 +6,15 @@ description = "Bevy 0.19 + Solari raytracing + DLSS Ray Reconstruction — found
 license = "MIT"
 
 [dependencies]
-# bevy_solari       = realtime raytraced lighting (experimental).
-# bluenoise_texture = ships the blue-noise KTX2 Solari samples from.
-# free_camera       = the prebuilt fly-camera from bevy_camera_controller (off by default).
+# free_camera = the prebuilt fly-camera from bevy_camera_controller (off by default).
 # The `dlss` feature is forwarded from this crate's own `[features]` below.
 bevy = { version = "=0.19.0-rc.1", features = [
-    "bevy_solari",
-    "bluenoise_texture",
     "free_camera",
 ] }
+# bytemuck = #[repr(C)] <-> &[u8] for the GPU-mirror structs (render/gpu_types.rs).
+# Pinned to the version Bevy 0.19-rc.1 re-exports so the `Pod`/`Zeroable` traits
+# match across the crate boundary.
+bytemuck = { version = "=1.25.0", features = ["derive"] }
 
 [features]
 default = ["dlss"]

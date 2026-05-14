@@ -1,44 +1,60 @@
-//! bevy-naadf — Bevy 0.19 + Solari raytracing + DLSS Ray Reconstruction.
+//! bevy-naadf — Bevy 0.19 port of the NAADF voxel renderer.
 //!
-//! Foundation for porting the NAADF voxel renderer (`/mnt/archive4/DEV/NAADF`,
-//! a C#/MonoGame engine) to Rust/Bevy. This proof of concept stands up a generic
-//! Solari scene denoised by DLSS Ray Reconstruction, so the toolchain — DLSS SDK
-//! build, Vulkan ray tracing, the Bevy 0.19 API — is proven before the port.
+//! Port of NAADF (`/mnt/archive4/DEV/NAADF`, a C#/MonoGame engine — "Nested
+//! Axis-Aligned Distance Fields", Ulschmid et al., CGF 2026) to Rust/Bevy.
 //!
-//! Run with `--pathtracer` to use Solari's reference pathtracer (ground truth)
-//! instead of the realtime lighting system.
+//! Phase A is the smallest runnable slice: a `PositionSplit` camera + a
+//! hard-coded voxel test grid + the AADF three-layer cell structure + CPU-side
+//! AADF construction + DDA-with-AADF traversal + an albedo first-hit WGSL
+//! render. No Solari, no TAA, no world generator, no file I/O.
 
+mod aadf;
 mod camera;
 mod hud;
-mod scene;
+mod render;
+mod voxel;
+mod world;
 
 use bevy::{
     camera_controller::free_camera::FreeCameraPlugin,
     diagnostic::FrameTimeDiagnosticsPlugin,
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
-    solari::{pathtracer::PathtracingPlugin, prelude::SolariPlugins},
 };
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::anti_alias::dlss::DlssProjectId;
 
-/// Command-line options, parsed once and stored as a resource.
+/// Which hard-coded Phase-A test grid `voxel::grid::setup_test_grid` builds (D2).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum GridPreset {
+    /// The default scene: ground slab + axis-aligned boxes + a sphere + one
+    /// emissive box.
+    #[default]
+    Default,
+}
+
+/// Command-line options, parsed once and stored as a resource (`03-design.md` §4.1).
 #[derive(Resource, Clone, Copy)]
 pub struct AppArgs {
-    /// Use Solari's reference pathtracer instead of realtime lighting.
-    pub pathtracer: bool,
+    /// Which hard-coded test grid to build (D2).
+    pub grid_preset: GridPreset,
+    /// Long-term TAA. Wired but always `false` in Phase A (D4) — Phase A-2
+    /// turns it on.
+    pub taa: bool,
 }
 
 fn main() {
     let args = AppArgs {
-        pathtracer: std::env::args().any(|a| a == "--pathtracer"),
+        grid_preset: GridPreset::default(),
+        taa: false,
     };
 
     let mut app = App::new();
 
     // `DlssProjectId` must be inserted before `DefaultPlugins` so the render
-    // sub-app sees it during DLSS initialisation. Generate your own UUID per
+    // sub-app sees it during DLSS initialisation. DLSS plumbing stays available
+    // (Phase-B-relevant) but is dormant in Phase A. Generate your own UUID per
     // project — do not reuse this one in a shipping app.
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     app.insert_resource(DlssProjectId(bevy::asset::uuid::uuid!(
@@ -47,23 +63,30 @@ fn main() {
 
     app.insert_resource(args).add_plugins((
         DefaultPlugins,
-        SolariPlugins,
         FreeCameraPlugin,
         FrameTimeDiagnosticsPlugin::default(),
         RenderDiagnosticsPlugin,
     ));
 
-    // The pathtracer is opt-in: its render node is only registered when asked
-    // for, and `camera::setup_camera` then spawns a `Pathtracer` camera.
-    if args.pathtracer {
-        app.add_plugins(PathtracingPlugin);
-    }
-
     app.add_systems(
         Startup,
-        (scene::setup_scene, camera::setup_camera, hud::setup_hud),
+        (
+            voxel::grid::setup_test_grid,
+            camera::setup_camera,
+            hud::setup_hud,
+        ),
     )
-    .add_systems(Update, (camera::toggle_dlss, hud::update_hud));
+    .add_systems(
+        Update,
+        (
+            // `FreeCameraPlugin` drives the `Transform` in `RunFixedMainLoop`
+            // (ordered before `Update`), so by the time `sync_position_split`
+            // runs here the `Transform` is already current for this frame.
+            camera::sync_position_split,
+            camera::toggle_dlss,
+            hud::update_hud,
+        ),
+    );
 
     app.run();
 }

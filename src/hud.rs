@@ -8,8 +8,6 @@ use bevy::{
     prelude::*,
 };
 
-use crate::AppArgs;
-
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::anti_alias::dlss::{Dlss, DlssRayReconstructionFeature, DlssRayReconstructionSupported};
 
@@ -39,7 +37,6 @@ pub fn setup_hud(mut commands: Commands) {
 pub fn update_hud(
     mut text: Single<&mut Text, With<HudText>>,
     diagnostics: Res<DiagnosticsStore>,
-    args: Res<AppArgs>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr_supported: Option<
         Res<DlssRayReconstructionSupported>,
     >,
@@ -58,27 +55,18 @@ pub fn update_hud(
         let _ = writeln!(s, "FPS: {fps:.0}");
     }
 
-    let _ = writeln!(
-        s,
-        "Renderer: {}",
-        if args.pathtracer {
-            "Solari pathtracer (reference)"
-        } else {
-            "Solari realtime lighting"
-        }
-    );
+    let _ = writeln!(s, "Renderer: NAADF (Phase A — albedo first-hit)");
 
-    // DLSS Ray Reconstruction status line.
+    // DLSS Ray Reconstruction status line. Dormant in Phase A — the NAADF
+    // render path is not wired to DLSS yet.
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     {
-        if args.pathtracer {
-            let _ = writeln!(s, "DLSS-RR: n/a in pathtracer mode");
-        } else if dlss_rr_supported.is_none() {
+        if dlss_rr_supported.is_none() {
             let _ = writeln!(s, "DLSS-RR: unsupported on this GPU/driver");
         } else if dlss_cameras.is_empty() {
-            let _ = writeln!(s, "DLSS-RR: OFF — raw Solari output   [D] toggle");
+            let _ = writeln!(s, "DLSS-RR: OFF (dormant in Phase A)   [D] toggle");
         } else {
-            let _ = writeln!(s, "DLSS-RR: ON  — denoised + upscaled  [D] toggle");
+            let _ = writeln!(s, "DLSS-RR: ON  (dormant in Phase A)   [D] toggle");
         }
     }
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
@@ -86,17 +74,17 @@ pub fn update_hud(
         let _ = writeln!(s, "DLSS-RR: not compiled in (no `dlss` feature)");
     }
 
-    // Per-pass GPU timings (populated once RenderDiagnosticsPlugin has data).
-    write_timing(s, &diagnostics, "direct lighting", "render/solari_lighting/direct_lighting/elapsed_gpu");
-    write_timing(s, &diagnostics, "diffuse indirect", "render/solari_lighting/diffuse_indirect_lighting/elapsed_gpu");
-    write_timing(s, &diagnostics, "specular indirect", "render/solari_lighting/specular_indirect_lighting/elapsed_gpu");
-    write_timing(s, &diagnostics, "world cache", "render/solari_lighting/world_cache/elapsed_gpu");
-    write_timing(s, &diagnostics, "DLSS-RR", "render/dlss_ray_reconstruction/elapsed_gpu");
+    // Per-pass GPU timings. The NAADF render-node timing paths are wired in
+    // Batch 2 (design §8 step 12) — nothing populates these lines yet.
 
     let _ = write!(s, "\nWASD / Shift / mouse: fly camera");
 }
 
 /// Append one `label  N.NN ms` line if the diagnostic at `path` has a value.
+///
+/// Unused until Batch 2 step 12 re-points the HUD at the NAADF render-node
+/// timing paths (design §1.1 keeps this helper unchanged).
+#[allow(dead_code)]
 fn write_timing(s: &mut String, diagnostics: &DiagnosticsStore, label: &str, path: &'static str) {
     if let Some(ms) = diagnostics
         .get(&DiagnosticPath::new(path))

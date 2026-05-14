@@ -47,7 +47,7 @@ B (GI) → C (GPU construction/editing)**. One gated phase at a time.
 - [x] Step 5 — Context files written (`README.md`, `01-context.md`)
 - [x] `research` phase → `02-research.md` (whole paper + in-scope C# tree, phase-tagged, ~36 KB)
 - [x] `design` phase (**Phase A**) → `03-design.md` (~33 KB; 12-step Phase-A impl sequence)
-- [ ] `impl` phase (**Phase A**) → `04-impl.md`
+- [~] `impl` phase (**Phase A**) → `04-impl.md` — Batch 1 (steps 1–6) done 2026-05-14, 32 tests pass; Batch 2 (steps 7–12) pending
 - [ ] `review` phase (**Phase A**) → `05-review.md`
 - [ ] Phase A-2 (TAA): design → impl → review
 - [ ] Phase B (GI): design → impl → review
