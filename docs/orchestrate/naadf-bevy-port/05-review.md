@@ -523,3 +523,307 @@ translation-invariance, and rotation-rigidity — exactly the properties whose
 absence produced the reported "distributed around a point / barely responds to
 rotation / non-euclidean on move" symptom.
 
+---
+
+## review findings + fix — Phase A out-of-volume concentric-lines artifact (2026-05-14)
+
+Combined diagnose-and-fix for the second Phase-A rendering bug found at the
+review gate, reported verbatim: *"i noticed if camera is outside of render
+area, below plane, etc - entire screen covers in these ugly concentric lines"*.
+Inside the voxel volume the scene renders coherently (the perspective fix
+above already landed); only an **outside-the-volume** camera triggers the
+concentric-ring interference pattern.
+
+**Verdict up front: fixed.** Single root cause: the Bevy port uploads the wrong
+values for the ray-AABB clip box (`world_meta.bounding_box_min/max`). NAADF
+stores these as a `float3` world extent **inset by 0.1 voxel on every side**;
+the port stored an *integer-inclusive* box (`min=0`, `max=sizeInVoxels-1`). The
+fix replicates NAADF's values exactly — a **faithful replication**, not a
+divergence. The §4 secondary issues were not touched (in particular the
+`rayAABB` f32-precision faithful-port note is untouched — this fix corrects the
+*box values*, not the f32 reconstruction).
+
+---
+
+### 1. Root cause — `world_meta.bounding_box_min/max` are the wrong values; NAADF insets the ray-AABB by 0.1 voxel. (confidence: very high)
+
+**NAADF side — the reference:**
+
+- `World/Data/WorldData.cs:477-478` — `setEffect` uploads the ray-AABB bounds:
+  ```csharp
+  effect.Parameters["boundingBoxMin"].SetValue(new Vector3(+0.1f));
+  effect.Parameters["boundingBoxMax"].SetValue(sizeInVoxels.ToVector3() - new Vector3(0.1f));
+  ```
+  i.e. `boundingBoxMin = (0.1, 0.1, 0.1)` and `boundingBoxMax = sizeInVoxels - 0.1`
+  (for the port's 64×32×64 grid: `(63.9, 31.9, 63.9)`). `sizeInVoxels` is the
+  **full** voxel extent (64/32/64), and NAADF insets the box by **0.1 voxel**
+  on every side.
+- `Content/shaders/render/rayTracing.fxh:29` — these are declared `float3
+  boundingBoxMin, boundingBoxMax;` — **floats**, not integers.
+- `renderFirstHit.fx:42` feeds them to `rayAABB(camPosInt + camPosFrac, rayDir,
+  boundingBoxMin, boundingBoxMax, ...)`; `rayTracing.fxh:98` uses
+  `boundingBoxMax` as the `shootRay` DDA loop-exit (`any((float3)curCell >=
+  boundingBoxMax)`). `WorldData.cs:399` independently confirms the same intent
+  in NAADF's CPU `RayTraversal` reference: `new BoundingBox(new Vector3(0.1f),
+  sizeInVoxels.ToVector3() - new Vector3(0.1f))`.
+
+**Bevy port side — the bug:**
+
+- `src/voxel/grid.rs:60-63` builds `WorldData.bounding_box` as an inclusive
+  *integer* AABB: `IAabb3 { min: IVec3::ZERO, max: IVec3::new(size-1, ...) }` —
+  for the 64×32×64 grid that is `min=(0,0,0)`, `max=(63,31,63)`.
+- `src/render/extract.rs:90` copies it verbatim; `src/render/prepare.rs:184-186`
+  (pre-fix) wrote `bounding_box_min = extracted.bounding_box.min` /
+  `bounding_box_max = extracted.bounding_box.max` straight into
+  `GpuWorldMeta`, whose fields were typed `IVec3` (`gpu_types.rs:125,129`) and
+  declared `vec3<i32>` in WGSL (`world_data.wgsl:34-36`).
+- So the GPU got `bbox_min = (0,0,0)`, `bbox_max = (63,31,63)` — **no 0.1
+  inset, and `max` one voxel short of NAADF's `sizeInVoxels - 0.1`**.
+
+**Why it produces the symptom (and only when the camera is outside the volume):**
+
+When the camera is *inside* the volume, `rayAABB` returns
+`dist_min_max.x = max(0, t_near) = 0` (`ray_tracing.wgsl:73`) — the ray origin
+is already inside, the entry-point advance in `naadf_first_hit.wgsl:84` is a
+no-op, and `floor()` of the origin is whatever the camera frac is (well away
+from integer planes in general). Coherent.
+
+When the camera is *outside* (below the plane, beside the grid, …), every
+primary ray that still hits the AABB enters **exactly on a box face**.
+`naadf_first_hit.wgsl:84-86` then does
+`cur_pos = cam_pos + ray_dir * dist_min_max.x` and `floor`-splits it to seed
+the DDA. With the port's box, that face is the **integer plane** `y = 0.0`
+(or `x = 0`, `x = 63`, …) — so the entry point lands at `y ≈ 0.0 ± epsilon`,
+sitting exactly on the `floor()` knife-edge. Tiny per-pixel f32 error in
+`dist_min_max.x` (the `(rec - origin) * 1/dir` slab math, computed from the
+f32-reconstructed `cam_pos_world`) flips `floor(entry.y)` between `-1` and `0`
+**per pixel**, as a smooth function of ray angle. Pixels that land in cell
+`-1` immediately hit the `any(cur_cell < bounding_box_min)` break in
+`shoot_ray` (no hit → background); pixels in cell `0` trace normally → hit the
+ground. That ray-angle-modulated alternation across the whole viewport *is* the
+"ugly concentric lines" interference pattern. NAADF's `+0.1` inset pushes the
+entry point cleanly to `y = 0.1`, so `floor()` is a rock-stable `0` for the
+whole screen.
+
+**Observed numbers** — a standalone CPU reproduction of the exact
+`ray_tracing.wgsl::ray_aabb` + the `naadf_first_hit.wgsl:84` entry-point
+advance, for a camera below the plane at `cam_pos_world = (30.3, -40.7, 30.6)`,
+sweeping a 40-pixel scanline of ray directions aimed up into the volume:
+
+```
+PORT bbox  (min=(0,0,0),   max=(63,31,63)):    entry-point cellY flips across the scanline = 12
+NAADF bbox (min=(0.1,..),  max=(63.9,31.9,..)): entry-point cellY flips across the scanline =  0
+```
+
+With the port box the entry point reads `entryY = 0.0000000` / `-0.0000038` /
+`+0.0000038` pixel-to-pixel — `floor()` oscillates `0 / -1 / 0`. With NAADF's
+inset box the entry point reads a stable `entryY ≈ 0.0999985` — `floor()` is a
+constant `0`. 12 flips per 40 pixels is exactly a regular interference fringe.
+
+**Ruled out (with evidence):**
+
+- *Negative / nonsensical entry distance not clamped* — **not the bug.**
+  `ray_aabb` already does `t_near = max(0.0, t_near)` (`ray_tracing.wgsl:73`,
+  faithful to `rayTracing.fxh:64`), so `dist_min_max.x` fed to the entry
+  advance is always ≥ 0. NAADF clamps it identically. No missing clamp.
+- *Full-miss case (ray never enters the AABB) not handled* — **not the bug.**
+  `ray_aabb` correctly returns `hit = false` when `t_far < 0` (volume behind
+  the camera) or `t_near > t_far` (ray misses). `naadf_first_hit.wgsl:81`
+  guards the whole trace with `if (volume.hit)`, so on a miss it skips
+  `shoot_ray` entirely, leaves `distance_ray = -1`, `norm_tangs.x =
+  HIT_NOTHING`, `light = vec3(0)`, and writes a clean background G-buffer +
+  black `shaded_color`. This is exactly what NAADF's `calcFirstHit`
+  (`renderFirstHit.fx:57`) does — the `if (isVolumeHit)` guard. The full-miss
+  path was already correct; the artifact comes from rays that *do* hit, just
+  with the entry point on a knife-edge.
+- *`cur_pos_frac += ray_dir * volume.dist_min_max.x` advancing by a negative
+  distance* — **not the bug**, same reason: `dist_min_max.x ≥ 0` always.
+- *int+frac precision when the camera is far outside the small grid* — **not
+  the bug.** The int+frac split keeps `shoot_ray` precise regardless of how far
+  the origin is; the failure is the `floor()` knife-edge at the *entry plane*,
+  not large-magnitude precision loss.
+
+---
+
+### 2. The fix — replicate NAADF's `WorldData.cs:477-478` exactly (5 files)
+
+The ray-AABB box is `world_meta.bounding_box_min/max`, read by both
+`naadf_first_hit.wgsl` (`ray_aabb`) and `ray_tracing.wgsl` (`shoot_ray`'s
+loop-exit). The fix changes those values to NAADF's and re-types the field
+from integer to `float3` to match `rayTracing.fxh`.
+
+**File 1 — `src/render/prepare.rs` (`prepare_world_gpu`) — the value fix.**
+
+Before (lines 181-188):
+```rust
+let world_meta_data = GpuWorldMeta {
+    size_in_chunks: size,
+    _pad0: 0,
+    bounding_box_min: extracted.bounding_box.min,
+    _pad1: 0,
+    bounding_box_max: extracted.bounding_box.max,
+    _pad2: 0,
+};
+```
+After:
+```rust
+// Faithful to WorldData.setEffect (WorldData.cs:477-478): the world extent
+// inset by 0.1 voxel on every side. extracted.bounding_box is the inclusive
+// integer voxel AABB { min: 0, max: sizeInVoxels - 1 }, so
+// sizeInVoxels = bounding_box.max + 1.
+let size_in_voxels = (extracted.bounding_box.max + IVec3::ONE).as_vec3();
+let world_meta_data = GpuWorldMeta {
+    size_in_chunks: size,
+    _pad0: 0,
+    bounding_box_min: extracted.bounding_box.min.as_vec3() + Vec3::splat(0.1),
+    _pad1: 0,
+    bounding_box_max: size_in_voxels - Vec3::splat(0.1),
+    _pad2: 0,
+};
+```
+(`IVec3` / `Vec3` already in scope via `bevy::prelude::*` + `bevy::math::Vec3`.)
+
+**File 2 — `src/render/gpu_types.rs` (`GpuWorldMeta`) — the type fix.**
+`bounding_box_min` / `bounding_box_max` changed from `IVec3` to `Vec3`
+(NAADF's `rayTracing.fxh:29` declares them `float3`). Struct size is unchanged
+— still `UVec3 + pad + Vec3 + pad + Vec3 + pad` = 48 bytes, so the existing
+`const _: () = assert!(size_of::<GpuWorldMeta>() == 48)` still holds. Doc
+comments updated to cite `WorldData.cs:477-478`.
+
+**File 3 — `src/assets/shaders/world_data.wgsl` (`GpuWorldMeta`) — the WGSL type fix.**
+`bounding_box_min` / `bounding_box_max` changed from `vec3<i32>` to `vec3<f32>`
+to match. No layout change (a `vec3<i32>` and a `vec3<f32>` occupy the same
+16-byte slot). Comments updated.
+
+**File 4 — `src/assets/shaders/naadf_first_hit.wgsl` — drop the now-wrong casts.**
+Before (lines 64-65):
+```wgsl
+let bbox_min = vec3<f32>(world_meta.bounding_box_min);
+let bbox_max = vec3<f32>(world_meta.bounding_box_max);
+```
+After:
+```wgsl
+let bbox_min = world_meta.bounding_box_min;
+let bbox_max = world_meta.bounding_box_max;
+```
+(The fields are now `vec3<f32>` — the integer→float cast is gone.)
+
+**File 5 — `src/assets/shaders/ray_tracing.wgsl` — drop one cast, fix one.**
+- Line 120: `let bbox_max = vec3<f32>(world_meta.bounding_box_max);` →
+  `let bbox_max = world_meta.bounding_box_max;` (the field is now `vec3<f32>`;
+  the cast is gone). This also *corrects* a pre-fix side effect: the old
+  `bbox_max = (63,31,63)` made the `shoot_ray` loop-exit
+  `any(vec3<f32>(cur_cell) >= bbox_max)` break on `cell 63` (`63 >= 63`),
+  clipping the entire last voxel layer; NAADF's `63.9` keeps `cell 63`
+  reachable (`63.0 >= 63.9` is false) — matching NAADF exactly.
+- Line 143: the negative-cell loop-exit was
+  `if (any(cur_cell < world_meta.bounding_box_min))` with both sides
+  `vec3<i32>`. `bounding_box_min` is now the `float3` `0.1`-inset value, so a
+  naive `vec3<f32>(cur_cell) < bounding_box_min` would compare against `0.1`
+  and **wrongly break on the valid edge cell 0** (`0.0 < 0.1` is true). This
+  explicit signed-cell break (a Batch-2 port deviation — NAADF has no min-side
+  test, it leans on `uint3` wraparound) must test the *integer world floor*,
+  so the fix compares against `floor(world_meta.bounding_box_min)` —
+  `floor(0.1) = 0.0`: `cell 0` → `0.0 < 0.0` false (kept), `cell -1` →
+  `-1.0 < 0.0` true (break). Final form:
+  `if (any(vec3<f32>(cur_cell) < floor(world_meta.bounding_box_min)))`.
+
+> **Note on the `bounding_box_min` loop-exit (resolved, not a design
+> decision).** NAADF's `shootRay` has *no* min-side bounds test — it leans on
+> the `uint3` cast of a negative cell wrapping to a huge value, which then
+> trips `>= boundingBoxMax`. The Batch-2 port added an explicit
+> `any(cur_cell < bounding_box_min)` break because WGSL keeps the cell signed
+> (logged as Batch-2 deviation #4). That explicit break must test against the
+> *integer* world floor (`0`), not the `0.1`-inset `rayAABB` min — a cell
+> index of `0` is a valid edge cell. The fix therefore compares against
+> `floor(world_meta.bounding_box_min)` (= `0.0` for NAADF's `0.1` min), so the
+> explicit break still fires only for genuinely-negative cells and cell 0 is
+> kept. This keeps both the explicit-break deviation *and* the new float
+> `bounding_box_min` correct; it is a mechanical consequence of the type
+> change, not a new design choice.
+
+---
+
+### 3. Faithful replication vs. divergence
+
+This is a **faithful replication of NAADF behaviour**, not a divergence. NAADF
+*does* guard this case — `WorldData.cs:477-478` deliberately insets the
+ray-AABB by 0.1 voxel, and `WorldData.cs:399` repeats the same inset in the CPU
+reference path. The port simply uploaded the wrong values (an integer-inclusive
+`size-1` box with no inset) where NAADF uploads a `float3` `0.1`-inset box. The
+fix makes the port's `world_meta` bit-for-bit match what NAADF's `setEffect`
+sends. No Phase-A-specific addition, no deliberate divergence — the one small
+mechanical knock-on (the explicit signed-cell `bounding_box_min` break, itself
+a previously-logged Batch-2 deviation, now tests `floor()` of the float min)
+keeps that pre-existing deviation correct under the type change.
+
+---
+
+### 4. Build + test
+
+- `cargo build` — succeeds, only the 13 pre-existing dead-code warnings, **none
+  new**.
+- `cargo test --bin bevy-naadf` — **39 passed**, 0 failed (all pre-existing
+  tests still green; the `GpuWorldMeta` size assertion still holds at 48 bytes).
+
+---
+
+### 5. Smoke-run / instrumentation verification — and revert
+
+Temporary instrumentation: an `info!` in `prepare_world_gpu` logging the
+uploaded `world_meta` bbox values. `cargo run` (timeout-capped ~35 s, windowed
+GPU app on the RTX 5080 / Vulkan — the framebuffer cannot be captured, so the
+verification vehicle is the uploaded numbers + the CPU repro in §1):
+
+```
+NAADF test grid (Default): 32 chunks, 1536 blocks, 2144 voxel-u32s (64x32x64 voxels)
+TEMP world_meta: bbox_min=Vec3(0.1, 0.1, 0.1) bbox_max=Vec3(63.9, 31.9, 63.9) (size_in_voxels=Vec3(64.0, 32.0, 64.0))
+```
+
+The GPU now receives **exactly** NAADF's `WorldData.cs:477-478` values:
+`boundingBoxMin = (0.1, 0.1, 0.1)`, `boundingBoxMax = sizeInVoxels - 0.1 =
+(63.9, 31.9, 63.9)`. The app ran the full two-pass render graph (first-hit
+compute → final blit) with **no WGSL compile errors, no pipeline-validation
+errors, no panics**, exiting clean on the timeout. The §1 CPU reproduction
+already proved that with these exact values the out-of-volume entry-point
+`floor()` is stable (0 flips vs. 12 flips for the old box) — the shader reads
+precisely these values, so the concentric-line fringing is eliminated. (The
+definitive visual confirmation — flying the camera below the plane and seeing
+a clean background instead of rings — is the user's at the review gate; this
+environment cannot capture the framebuffer.)
+
+Instrumentation reverted: the `info!` line was removed and `cargo build`
+re-confirmed clean afterwards. `git status --short` (source files only):
+```
+ M src/assets/shaders/naadf_first_hit.wgsl
+ M src/assets/shaders/ray_tracing.wgsl
+ M src/assets/shaders/world_data.wgsl
+ M src/render/gpu_types.rs
+ M src/render/prepare.rs
+```
+Exactly the five intended fix files — no instrumentation residue, no stray
+files. (`05-review.md` shows modified as this deliverable.)
+
+> **Noted in passing, NOT fixed (not in scope):** `prepare_world_gpu` is
+> meant to be build-once but the instrumentation showed it re-running every
+> frame — its `existing.is_some() && !extracted.dirty` early-out is not
+> tripping (something keeps `extracted.dirty` set, or `extract_world` re-sets
+> it). This is a pre-existing perf inefficiency, not a §4 secondary issue and
+> not related to this bug — the *uploaded values* are correct either way.
+> Flagged for a future cleanup, not touched here.
+
+---
+
+### 6. Verdict
+
+**fixed.** Single root cause — the port uploaded an integer-inclusive,
+no-inset ray-AABB box where NAADF uploads a `float3` `0.1`-voxel-inset box
+(`WorldData.cs:477-478`) — corrected across the 5 files in the value/type
+chain. Faithful replication of NAADF, not a divergence. `cargo build` clean,
+39/39 tests pass, smoke-run clean with the correct `(0.1…)/(63.9…)` values
+confirmed uploaded; the CPU reproduction proves the out-of-volume entry-point
+`floor()` knife-edge — the concentric-lines mechanism — is eliminated.
+Instrumentation reverted; only the 5 intended fix files modified. The §4
+secondary issues (including the explicitly-faithful `rayAABB` f32-precision
+note) were not touched.
+

@@ -21,7 +21,8 @@ render), no editor GUI / persistence / importers.
 | `02-research.md` | `research` group | structured map of NAADF C# subsystems + AADF GI algorithm → Rust/Bevy porting reference |
 | `03-design.md` | `design` group | crate/module layout, ECS decomposition, render-graph plan, subsystem→Bevy mapping |
 | `04-impl.md` | `impl` group | phased porting work log |
-| `05-review.md` | `review` group | verification against source behaviour + the paper |
+| `05-review.md` | `review` group | Phase-A verification + the two review-gate fixes |
+| `06-design-a2.md` | `design` group | Phase A-2 (TAA) architecture design |
 | `design-exploration-qa.md` | orchestrator | methodology/capability/VRAM Q&A reference (lineage, PBR texturing, dynamic entities, microvoxels, LOD, TAA-history VRAM lever) — read before scoping features it covers; holds one binding decision (§6) |
 
 ## Agent groups
@@ -49,8 +50,8 @@ B (GI) → C (GPU construction/editing)**. One gated phase at a time.
 - [x] `research` phase → `02-research.md` (whole paper + in-scope C# tree, phase-tagged, ~36 KB)
 - [x] `design` phase (**Phase A**) → `03-design.md` (~33 KB; 12-step Phase-A impl sequence)
 - [x] `impl` phase (**Phase A**) → `04-impl.md` — Batch 1 (steps 1–6) + Batch 2 (steps 7–12) done 2026-05-14; 39 tests pass, builds + smoke-runs clean
-- [~] `review` phase (**Phase A**) → `05-review.md` — perspective/camera regression **diagnosed + fixed + verified** (3 compounding convention bugs; user re-test confirmed coherent). New review-gate finding: concentric-line artifacts when the camera is outside the render volume / below the ground plane — fix dispatch pending → then user re-test.
-- [ ] Phase A-2 (TAA): design → impl → review
+- [x] `review` phase (**Phase A**) → `05-review.md` — **Phase A review gate PASSED**. Two regressions found, fixed, and user-confirmed: (1) camera→ray perspective (3 compounding MonoGame↔wgpu convention bugs), (2) out-of-volume concentric-line artifacts (wrong AABB clip-box values — NAADF insets by 0.1 voxel as `float3`). 39 tests pass; builds + runs coherent inside and outside the volume.
+- [~] Phase A-2 (TAA) — context written (`01-context.md` §2c: 16-sample history per `design-exploration-qa.md` §6; 0.25-spp target constraint); **`design` in progress** → `06-design-a2.md`; then impl → review
 - [ ] Phase B (GI): design → impl → review
 - [ ] Phase C (GPU construction/editing): design → impl → review
 

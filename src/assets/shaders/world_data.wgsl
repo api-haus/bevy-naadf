@@ -30,10 +30,13 @@
 struct GpuWorldMeta {
     // World size in chunks.
     size_in_chunks: vec3<u32>,
-    // Geometry AABB minimum, in voxels (inclusive).
-    bounding_box_min: vec3<i32>,
-    // Geometry AABB maximum, in voxels (inclusive).
-    bounding_box_max: vec3<i32>,
+    // Geometry AABB minimum, in voxels — NAADF's `boundingBoxMin` (the
+    // 0.1-voxel-inset world minimum, `WorldData.cs:477`). `float3`, not
+    // integer, faithful to `rayTracing.fxh`'s `float3 boundingBoxMin`.
+    bounding_box_min: vec3<f32>,
+    // Geometry AABB maximum, in voxels — NAADF's `boundingBoxMax`
+    // (`sizeInVoxels - 0.1`, `WorldData.cs:478`).
+    bounding_box_max: vec3<f32>,
 }
 
 // --- @group(0) — world data (read-only in the render passes) ----------------

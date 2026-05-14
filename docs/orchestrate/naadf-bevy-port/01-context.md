@@ -93,6 +93,78 @@ construction. Phase order: **A → A-2 (TAA) → B (GI) → C (GPU construction/
 
 ---
 
+## 2c. Phase A-2 (TAA) working context
+
+Phase A is complete and has passed its review gate (two regressions found + fixed +
+user-confirmed — see `05-review.md` and the README checklist). **Phase A-2 ports NAADF's
+long-term-memory TAA.** This section is the canonical Phase-A-2 context — the A-2 `design`
+agent reads it first.
+
+### Binding decision (from `design-exploration-qa.md` §6, 2026-05-14)
+
+> **TAA stays NAADF's own long-term-memory TAA** — not Bevy Solari, not a DLSS replacement.
+> The VRAM lever is the **sample-count knob NAADF already exposes: run a 16-sample history**
+> (~501 MB @1440p) instead of 32-sample (~973 MB) — a ~470 MB saving, pipeline fully intact,
+> modest quality cost. **The `taaSamples` ring is 16-deep, not 32-deep.**
+
+- The **camera-history ring stays at NAADF's depth** (128-deep ring of camera matrices /
+  positions / jitters — `02-research.md` divergence #5). The §6 lever is specifically the
+  *sample* ring (32→16); the camera-matrix ring is tiny in VRAM — leave it as NAADF has it.
+- **DLSS / DLSS-RR is UNDER REVIEW, not decided** — only as a possible upscaler/denoiser
+  *pairing over* NAADF (would need G-buffer extensions NAADF doesn't materialise), explicitly
+  NOT a replacement renderer and NOT touching the 16-sample decision. Phase A-2 does **not**
+  depend on DLSS; the `dlss` / `force_disable_dlss` Cargo plumbing stays dormant. DLSS
+  evaluation is a separate later thread — do not design for it in A-2.
+
+### 0.25 spp — the GI sampling target (user directive, 2026-05-14)
+
+NAADF's headline 2× GI speedup comes from running GI at an **adaptive ~0.25 spp**, and that
+adaptive rate is *driven by the TAA's per-pixel accumulated sample count*
+(`design-exploration-qa.md` §6). The GI sampler itself is **Phase B** — 0.25 spp is not
+exercised in A-2 — but it is a **binding constraint on the Phase-A-2 TAA design**: the ported
+TAA MUST preserve and expose the per-pixel accumulated **sample-count** signal, not just the
+accumulated colour. If A-2 strips the sample-count tracking, Phase B forfeits the adaptive
+0.25-spp sampling and the 2× speedup. **Record 0.25 spp as the GI sampling target; design the
+A-2 TAA to feed it.**
+
+### Phase A-2 scope (research-doc §4.1 + the Phase-A seam)
+
+Port research-doc **§4.1** — the long-term-memory TAA (paper lines ~238–265 in
+`docs/research/ulschmid-2026-naadf-voxel-gi.md`; full porting detail in `02-research.md`
+§1.2.2, pipeline placement in §1.2.1):
+- The **16-deep** `taaSamples` ring (64-bit/sample) + the **128-deep** camera-history ring.
+- `renderTaaSampleReverse` reprojection + the accumulation logic + colour-compression
+  (`commonColorCompression.fxh` / `commonTaa.fxh`). Port the **albedo** version's TAA
+  (`Content/shaders/render/versions/albedo/renderTaaSampleReverse.fx`) — Phase A is the albedo
+  path.
+- A new TAA render-graph node slotting **between** `naadf_first_hit` and `naadf_final_blit`
+  (NAADF places TAA unusually early — `02-research.md` §1.2.1).
+- **Replace Phase A's `shaded_color` blit-source stand-in** (`03-design.md` §5.3) with the real
+  `taaSampleAccum` buffer: `naadf_first_hit` writes TAA samples, the TAA node accumulates,
+  `naadf_final_blit` reads `taaSampleAccum`. The Phase-A blit was deliberately built to the
+  `taaSampleAccum` element format, so this is a designed-in drop-in swap.
+
+### Phase A-2 must also fix (carried from `05-review.md` §4 secondary issues)
+
+- **`frame_count` / `rand_counter` misuse** (`src/render/prepare.rs`, ~lines 268-269):
+  currently set from `time.elapsed()` (millis / `elapsed_secs*1000`). NAADF's `frameCount` is an
+  integer frame *counter* and `randCounter` indexes `randValues[]`
+  (`WorldRenderAlbedo.cs:94-95`). TAA reprojection needs a **real monotonic frame counter** — A-2
+  fixes this properly.
+- `05-review.md` §4 also flags a pre-existing `prepare_world_gpu`-runs-every-frame inefficiency
+  and the zeroed `GpuRenderParams.bbox` fields — those are **NOT** Phase-A-2 scope unless they
+  actively block TAA; leave them for a later cleanup pass.
+
+### Phase A-2 deliverable / done-bar
+
+Phase A's albedo first-hit render, now with the ported **16-frame** long-term TAA: temporally
+stable (jitter-AA'd, no per-frame shimmer), the real `taaSampleAccum` in place, and the
+per-pixel sample-count signal exposed and ready for Phase B's adaptive 0.25-spp sampler. Build +
+the existing test suite green; user interactive re-test confirms temporal stability (the A-2
+review gate).
+
+---
+
 ## 3. Reuse audit summary
 
 Full audit: `docs/orchestrate/naadf-bevy-port/00-reuse-audit.md`. Condensed verdict:

@@ -61,8 +61,10 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // `rayAABB(camPosInt + camPosFrac, rayDir, boundingBoxMin, boundingBoxMax, ...)`
     // — clip the ray to the world volume. The bounding box comes from
     // `world_meta` (`@group(0)`), not `params` — `03-design.md` prepare note.
-    let bbox_min = vec3<f32>(world_meta.bounding_box_min);
-    let bbox_max = vec3<f32>(world_meta.bounding_box_max);
+    // `bounding_box_min/max` are NAADF's `float3 boundingBoxMin/Max` — the
+    // 0.1-voxel-inset world extent (`WorldData.cs:477-478`).
+    let bbox_min = world_meta.bounding_box_min;
+    let bbox_max = world_meta.bounding_box_max;
     let cam_pos_world = vec3<f32>(cam_pos_int) + cam_pos_frac;
     let volume = ray_aabb(cam_pos_world, ray_dir, bbox_min, bbox_max);
 

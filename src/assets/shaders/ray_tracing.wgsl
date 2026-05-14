@@ -117,7 +117,9 @@ fn shoot_ray(
     (*ray_result).hit_type = 0u;
     (*ray_result).voxel_pos = vec3<i32>(0, 0, 0);
 
-    let bbox_max = vec3<f32>(world_meta.bounding_box_max);
+    // NAADF's `boundingBoxMax` — already a `float3` (the 0.1-inset world
+    // extent, `WorldData.cs:478`).
+    let bbox_max = world_meta.bounding_box_max;
 
     var step_count: i32 = 0;
     var cur_pos = start_pos;
@@ -139,8 +141,13 @@ fn shoot_ray(
         }
         // Negative cells are outside the world too — the C# relies on the
         // `uint3` cast wrapping huge, which then trips the `>= boundingBoxMax`
-        // test; in WGSL with signed cells we test explicitly.
-        if (any(cur_cell < world_meta.bounding_box_min)) {
+        // test; in WGSL with signed cells we test explicitly. `bounding_box_min`
+        // is now NAADF's `float3 boundingBoxMin` — the 0.1-voxel-INSET world
+        // minimum (`WorldData.cs:477`), so it is `0.1`, not `0`. This explicit
+        // signed-cell break must test the integer world FLOOR (cell index 0 is
+        // a valid edge cell — `0 < 0.1` would wrongly break it), so compare
+        // against `floor(bounding_box_min)`.
+        if (any(vec3<f32>(cur_cell) < floor(world_meta.bounding_box_min))) {
             break;
         }
 

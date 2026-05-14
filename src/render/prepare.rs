@@ -178,12 +178,22 @@ pub fn prepare_world_gpu(
     voxel_types.upload_all(&voxel_types_data, &render_device, &render_queue);
 
     // --- world_meta uniform -------------------------------------------------
+    // The ray-AABB bounds NAADF's `rayAABB` / `shootRay` clip to. Faithful to
+    // `WorldData.setEffect` (`WorldData.cs:477-478`): the world extent inset by
+    // 0.1 voxel on every side — `boundingBoxMin = (0.1,0.1,0.1)`,
+    // `boundingBoxMax = sizeInVoxels - (0.1,0.1,0.1)`. `extracted.bounding_box`
+    // is the inclusive integer voxel AABB `{ min: 0, max: sizeInVoxels - 1 }`,
+    // so `sizeInVoxels = bounding_box.max + 1`. The 0.1 inset keeps the ray
+    // entry point off the integer voxel planes — without it, an out-of-volume
+    // camera's entry point lands exactly on a voxel boundary and `floor()`
+    // flips per-pixel with f32 noise (the concentric-lines artifact).
+    let size_in_voxels = (extracted.bounding_box.max + IVec3::ONE).as_vec3();
     let world_meta_data = GpuWorldMeta {
         size_in_chunks: size,
         _pad0: 0,
-        bounding_box_min: extracted.bounding_box.min,
+        bounding_box_min: extracted.bounding_box.min.as_vec3() + Vec3::splat(0.1),
         _pad1: 0,
-        bounding_box_max: extracted.bounding_box.max,
+        bounding_box_max: size_in_voxels - Vec3::splat(0.1),
         _pad2: 0,
     };
     let world_meta = render_device.create_buffer(&BufferDescriptor {

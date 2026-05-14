@@ -114,6 +114,16 @@ pub const FLAG_IS_TAA: u32 = 1 << 2;
 ///
 /// Mirrors `rayTracing.fxh`'s `groupSizeX/Y/Z` + `boundingBoxMin/Max` globals
 /// (`03-design.md` §2.6 — the small `WorldMeta` uniform in `@group(0)`).
+///
+/// `bounding_box_min/max` are `float3` (not integers) — faithful to NAADF's
+/// `rayTracing.fxh` (`float3 boundingBoxMin, boundingBoxMax;`). NAADF's
+/// `WorldData.setEffect` (`WorldData.cs:477-478`) writes them as the world
+/// extent **inset by 0.1 voxel** on every side — `boundingBoxMin = (0.1,0.1,0.1)`,
+/// `boundingBoxMax = sizeInVoxels - (0.1,0.1,0.1)`. That inset keeps the
+/// ray-AABB entry point off the integer voxel planes so `floor()` of the
+/// entry point is unambiguous; an integer-inclusive box (`min..=size-1`)
+/// instead puts the entry point exactly on a voxel boundary and `floor()`
+/// flips with f32 noise — the out-of-volume concentric-lines artifact.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuWorldMeta {
@@ -121,12 +131,14 @@ pub struct GpuWorldMeta {
     pub size_in_chunks: UVec3,
     /// Padding to a 16-byte boundary.
     pub _pad0: u32,
-    /// Geometry AABB minimum, in voxels.
-    pub bounding_box_min: IVec3,
+    /// Geometry AABB minimum, in voxels — NAADF's `boundingBoxMin` (the
+    /// 0.1-voxel-inset world minimum, `WorldData.cs:477`).
+    pub bounding_box_min: Vec3,
     /// Padding to a 16-byte boundary.
     pub _pad1: u32,
-    /// Geometry AABB maximum, in voxels.
-    pub bounding_box_max: IVec3,
+    /// Geometry AABB maximum, in voxels — NAADF's `boundingBoxMax`
+    /// (`sizeInVoxels - 0.1`, `WorldData.cs:478`).
+    pub bounding_box_max: Vec3,
     /// Padding to a 16-byte stride.
     pub _pad2: u32,
 }
