@@ -38,14 +38,20 @@ render), no editor GUI / persistence / importers.
 
 ## Phase checklist
 
+Phase order (canonical defs in `01-context.md` §2 "Phasing decision"): **A → A-2 (TAA) →
+B (GI) → C (GPU construction/editing)**. One gated phase at a time.
+
 - [x] Step 2 — Re-implementation audit → `00-reuse-audit.md`
-- [x] Step 4 — Architectural Q&A (4 questions answered 2026-05-14)
-- [x] Design-phase Q&A (4 questions answered 2026-05-14 — D1–D4 in `01-context.md` §2b)
+- [x] Step 4 — Architectural Q&A → Q1–Q4 (`01-context.md` §2)
+- [x] Design-phase Q&A → D1–D5 + 4-phase restructure (`01-context.md` §2b)
 - [x] Step 5 — Context files written (`README.md`, `01-context.md`)
-- [x] `research` phase → `02-research.md` (done 2026-05-14, ~36 KB)
-- [ ] `design` phase → `03-design.md`
-- [ ] `impl` phase → `04-impl.md`
-- [ ] `review` phase → `05-review.md`
+- [x] `research` phase → `02-research.md` (whole paper + in-scope C# tree, phase-tagged, ~36 KB)
+- [x] `design` phase (**Phase A**) → `03-design.md` (~33 KB; 12-step Phase-A impl sequence)
+- [ ] `impl` phase (**Phase A**) → `04-impl.md`
+- [ ] `review` phase (**Phase A**) → `05-review.md`
+- [ ] Phase A-2 (TAA): design → impl → review
+- [ ] Phase B (GI): design → impl → review
+- [ ] Phase C (GPU construction/editing): design → impl → review
 
 ## Pacing
 

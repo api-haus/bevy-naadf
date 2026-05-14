@@ -34,27 +34,42 @@ These four decisions are binding. Cite them, do not relitigate them.
 | Q3 | Source of truth for the AADF data structure? | **Re-derive from the paper** | Primary source = `docs/research/ulschmid-2026-naadf-voxel-gi.md`. Cross-check correctness details against `Libraries/VoxelsCore/*.cs`. Produce idiomatic Rust, not a line-by-line C# transliteration. |
 | Q4 | Where does new Rust code live? | **Single crate, modules** | One binary crate. New modules under `src/` (e.g. `src/voxel/`, `src/aadf/`, `src/world/`, `src/render/`). **No Cargo workspace.** |
 
-### Phasing decision (refined in chat after the Q&A, 2026-05-14)
+### Phasing decision (refined in chat 2026-05-14 — restructured to FOUR gated phases)
 
-The user observed that NAADF's two contributions are separable and confirmed a two-phase port.
-This maps onto NAADF's own renderer version-split (`World/Render/Versions/WorldRender{Albedo,
-Base,PathTracer}`), so the seam is natural, not contrived.
+NAADF's contributions are separable, and the port is split into **four sequential, gated
+phases**. The split maps onto NAADF's own renderer version-split (`World/Render/Versions/
+WorldRender{Albedo,Base,PathTracer}`) plus its construction/runtime split, so the seams are
+natural. **A phase's `design`/`impl` does not begin until the prior phase is reviewed and
+confirmed runnable.**
 
 - **Phase A — NAADF substrate + albedo (do this first).** Port the three-layer cell hierarchy
-  (chunk / block / voxel, 4³ each), AADF construction (hashing + flood-fill invalidation), and
-  DDA traversal with AADF empty-space skipping. Render path = primary-ray first-hit producing
-  albedo + normal only, **no bounce lighting** — maps to NAADF's `WorldRenderAlbedo` version.
-  Source surface: research-doc **Section 3** + `Libraries/VoxelsCore` + `World/{Data,Generator}`.
-  Deliverable: a voxel scene the user can fly through with correct geometry, flat-lit.
-- **Phase B — GI pipeline (only after Phase A is reviewed + confirmed runnable).** Port
-  research-doc **Section 4**: long-term-memory TAA (32 frames @ 64 bit/sample), compressed
-  ReSTIR GI, sparse bilateral denoiser. Built on Phase A's traversal. Maps to `WorldRender{Base,
-  PathTracer}` + the bulk of `Content/shaders/render/**`.
+  (chunk / block / voxel, 4³ each), CPU-side AADF construction, and DDA traversal with AADF
+  empty-space skipping. Render path = primary-ray first-hit producing albedo + normal only,
+  **no bounce lighting, no TAA** — maps to NAADF's `WorldRenderAlbedo` version. Source surface:
+  research-doc **Section 3** + `Libraries/VoxelsCore` + `World/Data` (data structures only).
+  Deliverable: a voxel scene the user can fly through with correct geometry, flat-lit. Fully
+  designed in implementable detail in `03-design.md`.
+- **Phase A-2 — long-term-memory TAA.** Port research-doc **§4.1**: the 32-frame / 64-bit
+  long-term TAA — `renderTaaSampleReverse` reprojection, the 32-deep `taaSamples` ring, the
+  128-deep camera-history ring, accumulation. The TAA node slots between first-hit and the
+  final blit; it replaces Phase A's `shaded_color` blit-source stand-in (`03-design.md` §5.3)
+  with the real `taaSampleAccum` buffer. Built on Phase A. Sequenced **before** Phase B.
+- **Phase B — GI pipeline (minus TAA).** Port research-doc **§4.2–4.3**: compressed ReSTIR GI
+  (lit/unlit separation, 8×8 screen-space regions, 12-iteration spatial pass), the sparse
+  bilateral denoiser, the 4-plane-bounce first-hit, atmosphere precompute. Maps to
+  `WorldRender{Base,PathTracer}` + the bulk of `Content/shaders/render/**`. Built on Phase A-2.
+- **Phase C — GPU world construction & editing.** Port the GPU hashing construction
+  (`chunkCalc.fx` = paper Algorithm 1), the background chunk-AADF queue (`boundsCalc.fx` /
+  `WorldBoundHandler`), and flood-fill edit invalidation (`ChangeHandler` / `worldChange.fx`).
+  This is a **speed-up / scalability + editability track, NOT a rendering foundation** — the
+  CPU construction path in Phase A produces bit-identical buffers and the traversal shader is
+  agnostic to who built them. Needed only for large GPU-generated or editable worlds. Last.
 
-**The `research` phase maps the whole paper + whole in-scope C# tree in one pass**, but tags
-every subsystem / shader / data type as **Phase A** or **Phase B** so `design` and `impl` can
-act on the split. `design` and `impl` are explicitly **Phase-A-first**: Phase B work does not
-begin until Phase A is reviewed.
+**The `research` phase already mapped the whole paper + whole in-scope C# tree in one pass**,
+tagging subsystems / shaders / data types Phase A vs. Phase B. That tagging **predates the
+4-phase restructure** — read `02-research.md`'s "Phase B" tags as "Phase A-2 + Phase B", and
+its construction shaders (`chunkCalc.fx`, `boundsCalc.fx`, `worldChange.fx`, `mapCopy.fx`) as
+**Phase C**. `design` and `impl` proceed **one gated phase at a time**.
 
 ---
 
@@ -65,14 +80,16 @@ that change the design brief. These are binding alongside Q1–Q4.
 
 | # | Question | User's choice | Consequence |
 |---|---|---|---|
-| D1 | Camera precision — `PositionSplit` is pervasive; every render shader uses `camPosInt`+`camPosFrac` | **Port `PositionSplit` faithfully** | Implement NAADF's int+frac camera (`pos_int: IVec3` + `pos_frac: Vec3`) and thread both through every WGSL render pass; G-buffer plane reconstruction / TAA / GI reprojection all in int+frac space. User note: *"port with its own camera-relative rendering, then explore this problemspace later"* — faithful NAADF camera-relative rendering now; alternatives (origin rebasing, plain f32) explicitly deferred. |
+| D1 | Camera precision — `PositionSplit` is pervasive; every render shader uses `camPosInt`+`camPosFrac` | **Port `PositionSplit` faithfully** | Implement NAADF's int+frac camera (`pos_int: IVec3` + `pos_frac: Vec3`) and thread both through every WGSL render pass; G-buffer plane reconstruction / TAA / GI reprojection all in int+frac space. User note: *"port with its own camera-relative rendering, then explore this problemspace later"* — faithful NAADF camera-relative rendering now; alternatives (origin rebasing, plain f32) explicitly deferred. **Deferred-exploration reference:** `big_space` (https://github.com/aevyrie/big_space) solves large-world precision at the entity-transform level — a candidate if/when volume-renders are added later. Large-world precision is its own future problemspace; the shader-level mitigation (the ported `PositionSplit`) is kept regardless, since stripping it risks more issues than it solves for the demo-app port. |
 | D2 | Phase-A content path — importers are out of scope (Q1) but Phase A needs voxels on screen | **Hard-coded test grid** | Phase A builds a voxel grid procedurally in Rust (primitives / simple shapes). NO `.vox` reader, NO `WorldGenerator` port in Phase A — the generator is deferred. Smallest content path. |
 | D3 | Bevy Solari — currently wired into the scaffold | **Strip entirely** | Remove `bevy_solari` from `Cargo.toml`; delete `SolariPlugins` from `src/main.rs`; delete the Solari camera components (`SolariLighting`/`Pathtracer`, `CameraMainTextureUsages` STORAGE_BINDING, `Msaa::Off` if Solari-only) from `src/camera.rs`. No reference renderer kept. **This resolves the "open tension" noted in §3 below — strip, do not keep dormant.** |
-| D4 | Long-term 32-frame TAA — Phase A or Phase B? | **Phase B, don't pre-design** | Phase A ships with TAA off; layouts are NOT pre-designed for it. Phase B adds TAA and accepts whatever refactor it then needs. Smallest possible Phase A. |
+| D4 | Long-term 32-frame TAA — Phase A or Phase B? | **Its own gated phase: Phase A-2 (between A and B)** | Originally answered "Phase B, don't pre-design"; then refined — TAA is pulled out into its own gated phase **Phase A-2**, sequenced **after Phase A, before Phase B**. Phase A itself ships with **no TAA** and keeps the design's `shaded_color` blit-source stand-in (`03-design.md` §5.3); Phase A-2 swaps that stand-in for the real `taaSampleAccum` + accumulation. Phase B is then the GI pipeline *minus* TAA. |
+| D5 | Is GPU world construction a rendering foundation or a speed-up? | **Speed-up → its own gated phase: Phase C (last)** | GPU Algorithm 1 (`chunkCalc.fx`), the background AADF queue (`boundsCalc.fx`), and flood-fill invalidation (`worldChange.fx`) are a scalability/editability track, **not** required for rendering — the CPU construction path (`03-design.md` §6) produces bit-identical buffers and the traversal shader is producer-agnostic. Postponed to **Phase C**, after Phase B. |
 
 **Net effect — Phase A is the smallest runnable slice:** `PositionSplit` camera + hard-coded
-voxel test grid + AADF data structure + DDA-with-AADF traversal + albedo first-hit WGSL render.
-No Solari, no TAA, no world generator, no file I/O.
+voxel test grid + AADF data structure + CPU-side AADF construction + DDA-with-AADF traversal +
+albedo first-hit WGSL render. No Solari, no TAA, no world generator, no file I/O, no GPU
+construction. Phase order: **A → A-2 (TAA) → B (GI) → C (GPU construction/editing)**.
 
 ---
 
@@ -188,8 +205,9 @@ approximate, from the reuse audit's breadth-first skim — verify with Read.
 - **Do not port NAADF's C# `*Handler` orchestration architecture verbatim** (`WorldHandler`,
   `ChangeHandler`, `BlockHashingHandler`, etc.). Map it onto Bevy ECS systems/resources +
   `Assets<T>` + custom render-graph nodes.
-- **Do not start Phase B (GI) design or implementation until Phase A is reviewed and confirmed
-  runnable.** `design` and `impl` are Phase-A-first.
+- **Do not start a later phase's design or implementation until the prior phase is reviewed and
+  confirmed runnable.** Phase order is strictly **A → A-2 (TAA) → B (GI) → C (GPU
+  construction/editing)**; `design` and `impl` proceed one gated phase at a time.
 - **Do not resolve the "strip vs. keep dormant Solari" tension before the `design` phase** —
   it is the design phase's call; flag it, don't pre-empt it.
 - General `/delegate` rule: each agent reads this file + its group file first, and **Writes its
