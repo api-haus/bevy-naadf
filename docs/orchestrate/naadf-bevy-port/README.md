@@ -3,6 +3,7 @@
 **Topic slug:** `naadf-bevy-port`
 **Started:** 2026-05-14
 **Mode:** `/delegate` — orchestrator scopes/briefs/synthesizes; all work is dispatched to sub-agents.
+**To resume:** read [`RESUME.md`](RESUME.md) — current state + the next dispatch. Continue with `/delegate continue naadf-bevy-port`.
 
 ## Goal (one line)
 
@@ -16,6 +17,7 @@ render), no editor GUI / persistence / importers.
 | file | owner group | purpose |
 |---|---|---|
 | `README.md` | orchestrator | this index + phase checklist |
+| `RESUME.md` | orchestrator | resume pointer — current state + the next dispatch; read first to continue |
 | `00-reuse-audit.md` | `delegate-auditor` | what already exists in `bevy-naadf` vs. what is greenfield (DONE) |
 | `01-context.md` | orchestrator | canonical context bundle — every agent reads this first |
 | `02-research.md` | `research` group | structured map of NAADF C# subsystems + AADF GI algorithm → Rust/Bevy porting reference |
