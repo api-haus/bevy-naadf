@@ -4,7 +4,18 @@ Implements the batched sequence from `09-design-b.md` §11. The orchestrator
 dispatches + reviews batch-by-batch. This log grows one batch section at a time.
 
 Worktree: `/mnt/archive4/DEV/bevy-naadf/.claude/worktrees/phase-b-gi`, branch
-`feat/phase-b-gi`. Test command: `cargo test --bin bevy-naadf`.
+`feat/phase-b-gi`. Test command: `cargo test` (the `src/lib.rs` extraction moved
+the unit tests into the lib suite — the old `cargo test --bin bevy-naadf` now
+finds 0 tests).
+
+**Verification step for Batches 4–6 onward:** `cargo build` + `cargo test` +
+**`cargo run --bin e2e_render`** (the bounded windowed e2e render-test harness —
+`e2e-render-test.md`, implemented 2026-05-14). The e2e run replaces the
+open-ended live smoke-run: it boots the real windowed app, renders a fixed frame
+budget, reads the framebuffer back, and runs the per-batch region gates + the
+`PipelineCache` error scan + the node-dispatch check in one self-terminating
+shot — run it **once**, read the exit code, do not loop. Each batch adds its gate
+in `src/e2e/gates.rs` (`e2e-render-test.md` §6.4 / Implementation log).
 
 ---
 

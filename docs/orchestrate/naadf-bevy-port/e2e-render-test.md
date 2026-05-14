@@ -833,3 +833,143 @@ replaces the live smoke-run as the *agent's* gate; the agent runs it once, not i
   Layer-B reasoning and with Batch 1 bug #3 manifesting as a hard `DeviceLost` abort). If the
   runner ever swallowed panics, Layer B's panic-propagation signal would weaken — but Layer A
   (the pipeline scan) is unaffected and remains load-bearing.
+
+---
+
+## Implementation log (2026-05-14)
+
+Implements the §11 10-step plan. Worktree
+`/mnt/archive4/DEV/bevy-naadf/.claude/worktrees/phase-b-gi`, branch
+`feat/phase-b-gi`. Result: `cargo build` clean, `cargo test` 44 pass (unchanged),
+`cargo run --bin e2e_render` exits 0 with B1–B3 gates green.
+
+### Files created / changed
+
+**Created:**
+
+| file | what it does |
+|---|---|
+| `src/lib.rs` | The shared library surface. Re-exports the existing modules (`aadf`, `camera`, `hud`, `render`, `voxel`, `world`) + the new `e2e` module, hoists `AppArgs` / `GiSettings` / `GridPreset` out of `main.rs`, and carries `pub fn build_app(cfg: AppConfig) -> App` — the single app-wiring path both binaries share. Adds `AppConfig` + `WindowConfig` (the four deliberate e2e deltas) with `AppConfig::windowed()` / `AppConfig::e2e()`, and `pub fn run_e2e_render() -> AppExit` delegating to `e2e::run_e2e_render`. |
+| `src/bin/e2e_render.rs` | The whole binary: `fn main() -> AppExit { bevy_naadf::run_e2e_render() }`. |
+| `src/e2e/mod.rs` | The harness module root. Frame-budget consts (`E2E_WIDTH/HEIGHT = 256`, `E2E_RENDER_FRAMES = 8`, `E2E_DRAIN_FRAMES = 8`), `add_e2e_systems` (inserts `WinitSettings` `Continuous`-both-modes, the e2e resources, the fixed-pose camera spawn, the `Update` driver, and — into the `RenderApp` — the render-world `PipelineCache` scan system), `setup_e2e_camera` (the production camera component set minus `FreeCamera`, at the fixed pose), and `run_e2e_render` (builds `AppConfig::e2e()`, runs it; the driver does every check inside the app). |
+| `src/e2e/driver.rs` | The bounded-frame state machine: `E2ePhase` (`Run/Shoot/Drain/Assert/Done`), `E2eState`, `E2eOutcome`, and the `e2e_driver` `Update` system. At `ASSERT` it runs `run_assertions` — degenerate-frame floor + per-batch region gate + node-dispatch check + `PipelineCache` scan — folds *all* failures into one message, and writes `AppExit::Success`/`AppExit::error()`. |
+| `src/e2e/readback.rs` | `E2eScreenshot(Option<Image>)` resource, the `stash_screenshot` observer (`On<ScreenshotCaptured>` → stash the `Image`), and `shoot_primary_window` (spawns `Screenshot::primary_window()` + the observer). |
+| `src/e2e/framebuffer.rs` | `Framebuffer` (format-normalised RGBA `u8` grid) + `Rect` (fractional-coord rects keyed off the actual readback size). `from_image` branches on `texture_descriptor.format` (R7). Helpers: `region_mean`, `pixel`, `luminance`, `region_luminance`, `fraction_brighter_than`, `is_near`, `mean_pixel_delta` (the B6 temporal metric), `stability_hash`, `check_not_degenerate` (the §7 floor). |
+| `src/e2e/checks.rs` | `PipelineScanResult` (the cross-world `Arc<Mutex>` channel), `scan_pipeline_errors_render_system` (the render-world `PipelineCache` `Err`-state scan — the load-bearing §3.1 check), `pipeline_scan_result` (the main-world read), and `assert_nodes_dispatched` (the §8 node-dispatch check against the main-world `DiagnosticsStore`). |
+| `src/e2e/gates.rs` | Everything camera-pose-coupled in one place (R5): `e2e_camera_transform` (the fixed pose), `CURRENT_BATCH = 3`, the three gate rects (`emissive_rect` / `solid_block_rect` / `sky_rect`, fractional coords), `assert_batch_2` / `assert_batch_3`, `expected_spans` / `batch_gate` / `batch_needs_second_frame` dispatch tables, and `hash_baseline`. |
+
+**Changed:**
+
+| file | change |
+|---|---|
+| `src/main.rs` | Reduced to a thin shim: `fn main() -> AppExit { build_app(AppConfig::windowed()).run() }`. All wiring moved to `src/lib.rs`. |
+| `Cargo.toml` | Added explicit `[lib] name = "bevy_naadf"`, `[[bin]] bevy-naadf`, `[[bin]] e2e_render` (the e2e bin is also cargo-auto-discovered; listed for clarity). |
+
+### How the `src/lib.rs` extraction was done
+
+`main.rs`'s `mod` declarations + `AppArgs`/`GiSettings`/`GridPreset` definitions +
+the `App::new()…add_plugins…add_systems` body moved verbatim into `src/lib.rs`,
+re-homed under `pub fn build_app(cfg: AppConfig) -> App`. The wiring is
+parameterised by `AppConfig` along exactly the four §2.2 deltas: `add_hud`,
+`add_free_camera`, `synchronous_pipeline_compilation` (threaded into a
+`DefaultPlugins.set(RenderPlugin { … })`), `window` (threaded into a
+`DefaultPlugins.set(WindowPlugin { … })`), and `add_e2e_systems` (calls
+`e2e::add_e2e_systems`). The production path is `AppConfig::windowed()` — HUD on,
+free camera on, async compile, default window — so `cargo run` is behaviour-identical
+to before (verified: 44 tests still pass, build clean). The crate is now a library
++ two thin binaries; the existing `#[cfg(test)]` unit tests now live in the lib
+suite — `cargo test` runs them (the old `cargo test --bin bevy-naadf` would now
+find 0 tests; the verification command is `cargo test`).
+
+### How the five flagged open items were resolved
+
+- **R2 — screenshot-readback latency.** The driver's `DRAIN` phase polls
+  `E2eScreenshot` for up to `E2E_DRAIN_FRAMES = 8` extra frames (the design
+  suggested 4; bumped to 8 for extra slack — it is pure margin, not cost) before
+  declaring "no framebuffer produced". In practice the capture arrives within
+  ~1–2 drain frames. Generous bound, no false failure.
+- **R3 — frame budget sized for lazy pipeline creation.** `E2E_RENDER_FRAMES = 8`
+  render frames precede the `SHOOT`. With `synchronous_pipeline_compilation: true`
+  every pipeline a node queues resolves to `Ok`/`Err` the same frame, so 8 frames
+  is comfortably past the ~3-frame resource-build latency — *and* the `PipelineCache`
+  scan additionally fails on any still-`Queued`/`Creating` pipeline, so an
+  under-budget run is caught loudly rather than passing blind. `GiSettings::default()`
+  has every GI bool `true`, so the default e2e scene exercises every conditional
+  Phase-B node. Confirmed: the run reports "every pipeline created cleanly".
+- **R4 — device-error capture stays best-effort.** No Layer-B machinery was added
+  beyond what the design specifies: a panic in `app.update()` (DeviceLost / failed
+  submit) propagates through the winit runner and aborts the process non-zero, and
+  the degenerate-frame floor catches a mis-fed-but-compiled pipeline as a content
+  failure. The load-bearing catch is the `PipelineCache` `Err`-state scan (Layer A).
+- **R5 — assertion rects coupled to the fixed camera pose.** Everything pose-coupled
+  lives in `src/e2e/gates.rs`: the pose is a single named const `e2e_camera_transform`,
+  the three rects are fractional-coord helpers right below it, and the module header
+  documents that the rects are derived from that pose. The rects were derived from
+  an actual `save_to_disk` PNG dump (the dev-time aid, since reverted) — *not*
+  guessed. The production `setup_camera` pose framed empty space at the e2e
+  256×256 1:1-aspect window, so a **test-specific pose** was chosen (the design
+  explicitly allows this — §4.2 / Assumptions). Verified-by-dump region luminances:
+  emissive ~188, solid-geometry ~3, sky ~39 — well-separated, generous gate margins.
+- **R7 — readback branches on the platform surface format.** `Framebuffer::from_image`
+  matches on `image.texture_descriptor.format`: `Rgba8Unorm`/`Rgba8UnormSrgb` →
+  no swap, `Bgra8Unorm`/`Bgra8UnormSrgb` → swap R↔B to normalise to RGBA, any
+  other format → a hard `Err` ("add a branch for this format") rather than a
+  silent channel-swap. On the dev box (RTX 5080 / Vulkan) the surface is a Bgra8
+  format and the swap path is exercised — the gates pass, confirming the
+  normalisation is correct.
+- **R8 — `Continuous` update mode.** `add_e2e_systems` inserts
+  `WinitSettings { focused_mode: Continuous, unfocused_mode: Continuous }` so the
+  app ticks every frame regardless of focus — the bounded frame loop advances and
+  the run self-terminates even if the e2e window never gains focus.
+
+### Invocation, results
+
+- **Command:** `cargo run --bin e2e_render` (from the worktree root).
+- **`cargo build`:** clean (pre-existing dead-code warnings only).
+- **`cargo test`:** 44 passed (was 44 — the lib extraction is a pure refactor; no
+  test added or removed). Note: tests now run in the lib suite, so the command is
+  `cargo test`, not `cargo test --bin bevy-naadf`.
+- **`cargo run --bin e2e_render`:** exits **0**. A 256×256 window opens for under
+  a second and closes itself; stdout: `e2e_render: PASS (batch 3) — 8 render
+  frames, framebuffer read back & non-degenerate, per-batch region gate green,
+  every pipeline created cleanly, every expected render-graph node dispatched.`
+
+### Live batch gates (B1–B3) + how a future batch adds its gate
+
+`CURRENT_BATCH = 3`. The `ASSERT` step runs, unconditionally every run: the
+degenerate-frame floor, the node-dispatch check (`EXPECTED_SPANS` for B1–B3 =
+`naadf_atmosphere`, `naadf_first_hit`, `naadf_ray_queue`, `naadf_global_illum`,
+`naadf_final_blit`), and the `PipelineCache` error scan. Plus the highest batch's
+region gate:
+
+- **B1** — no visible-change gate of its own (the atmosphere precompute writes a
+  buffer the blit does not read); covered by the floor + pipeline scan + dispatch
+  check.
+- **B2** — `assert_batch_2`: emissive-block region near-white (luminance > 120),
+  non-emissive solid-block region near-black (luminance < 90), sky region in the
+  [10, 230] mid-band and brighter than the un-lit solid block.
+- **B3** — `assert_batch_3`: re-runs the B2 region gate (Batch 3 leaves the image
+  unchanged — it only writes GI buffers the blit does not read) + asserts the
+  stability hash equals the B3 baseline *once one is blessed* (`hash_baseline(3)`
+  is currently `None` — see "remaining issue").
+
+**A future batch (B4/B5/B6) adds its gate with a small, obvious edit in
+`src/e2e/gates.rs`:** (1) write `assert_batch_N(&GateState) -> Result<(), String>`,
+(2) add its arm to `batch_gate` and its row to `expected_spans` (B4 adds the
+`naadf_sample_refine*` spans, B5 the denoiser span, B6 the TAA-node spans), (3)
+bump `CURRENT_BATCH`, (4) if the batch intentionally changes the image (B5's GI
+bounce, B6's TAA) re-bless its `hash_baseline` entry. The window-boot, driver,
+readback, pipeline scan, and node-dispatch check are batch-agnostic and untouched.
+
+### Remaining issue (one)
+
+The §6.1 **stability-hash baseline is not yet blessed** (`hash_baseline` returns
+`None` for every batch). The harness landed *alongside* Batch 3, and the readback
+is only bit-identical run-to-run *on the same binary* — a committed hash literal
+would just be re-derived on each dev box. The first real baseline should be
+blessed by **Batch 4** (the first "no visible change" batch to land after the
+harness): capture the Batch-3 readback `stability_hash` and pin it as
+`hash_baseline(4)`. Until then the B3/B4 "image unchanged" guard rests on the
+re-run B2 region gate, which still catches gross regressions. This is a
+deliberate deferral, not a defect — the region gates are the primary check; the
+hash is the optional tripwire (§6.1).

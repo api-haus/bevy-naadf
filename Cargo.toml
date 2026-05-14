@@ -5,6 +5,24 @@ edition = "2021"
 description = "Bevy 0.19 + Solari raytracing + DLSS Ray Reconstruction — foundation for the NAADF port"
 license = "MIT"
 
+# The crate is a library (`src/lib.rs` — the shared `build_app` app-wiring path)
+# plus two thin binaries over it: `bevy-naadf` (the production app, `src/main.rs`)
+# and `e2e_render` (the bounded windowed render-test harness, `src/bin/e2e_render.rs`
+# — auto-discovered, listed explicitly for clarity). All the unit tests live in
+# the library; `cargo test` runs them. See `docs/orchestrate/naadf-bevy-port/
+# e2e-render-test.md` §9.
+[lib]
+name = "bevy_naadf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bevy-naadf"
+path = "src/main.rs"
+
+[[bin]]
+name = "e2e_render"
+path = "src/bin/e2e_render.rs"
+
 [dependencies]
 # free_camera = the prebuilt fly-camera from bevy_camera_controller (off by default).
 # The `dlss` feature is forwarded from this crate's own `[features]` below.
