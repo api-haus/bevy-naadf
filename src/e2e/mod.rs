@@ -57,6 +57,19 @@ pub const E2E_HEIGHT: u32 = 256;
 /// `Queued` at the scan, the fix is bumping this const, not a redesign.
 pub const E2E_RENDER_FRAMES: u32 = 8;
 
+/// The fixed directory every run writes its readback screenshot PNG(s) into
+/// (`e2e-render-test.md` Implementation log — 2026-05-14 screenshot-to-disk
+/// addition). Relative to the worktree root (`cargo run` cwd); `target/` is
+/// already gitignored and persists across runs. The directory is created on
+/// demand. An orchestrator/agent can `Read` the PNGs here for visual analysis.
+pub const E2E_SCREENSHOT_DIR: &str = "target/e2e-screenshots";
+
+/// The stable filename of the final asserted readback frame inside
+/// [`E2E_SCREENSHOT_DIR`] — overwritten every run, so the path is fixed and
+/// documented. The harness reads back exactly one frame (the final asserted
+/// frame), so this single file is the whole screenshot output.
+pub const E2E_SCREENSHOT_LATEST: &str = "e2e_latest.png";
+
 /// Max extra frames the driver waits in the `DRAIN` phase for the async
 /// `Screenshot` capture to deliver (`e2e-render-test.md` §5.2, R2).
 ///

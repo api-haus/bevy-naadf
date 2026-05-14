@@ -973,3 +973,119 @@ harness): capture the Batch-3 readback `stability_hash` and pin it as
 re-run B2 region gate, which still catches gross regressions. This is a
 deliberate deferral, not a defect — the region gates are the primary check; the
 hash is the optional tripwire (§6.1).
+
+---
+
+## Implementation log — addendum (2026-05-14): luminance liveness gate + persistent screenshot-to-disk
+
+Two capabilities added to the existing harness, on top of the 10-step build
+above. `cargo build` clean, `cargo test` **44 pass** (unchanged), `cargo run
+--bin e2e_render` exits **0** with all gates green.
+
+### 1. Global luminance liveness gate — "the scene isn't mostly dead"
+
+A new **global** frame check (not a per-batch region gate), run in the driver's
+`ASSERT` step alongside the degenerate-frame floor: assert that a large fraction
+of the frame is **not pitch black**.
+
+- **Measured first.** Computed the *actual* whole-frame non-black fraction of
+  the current Batch-3 readback at the fixed e2e camera pose, with the "not pitch
+  black" epsilon `NON_BLACK_EPS = 2.0` (Rec.709 luminance, channels 0..255 — a
+  small "the pixel received *some* light" floor, well below the sky tint, the
+  emissive block, and any GI-lit surface; only literal clear-black and fully
+  unlit pre-GI geometry fall at or below it). **Result: 43.4% non-black.** The
+  saved PNG confirms why — the atmosphere-tinted sky fills the upper frame, the
+  white emissive block sits at centre, and the **lower ~half is pitch-black
+  pre-GI voxel geometry** (correct for Batch 3: `10-impl-b.md` Batch 2 — "pre-GI
+  a non-emissive diffuse block should be near-black"; GI bounce that lights it
+  does not land until Batch 5).
+- **50% does NOT hold at B3** (43.4% < 50%) — so per the task brief's option
+  (b), the gate is **batch-aware**, not a single hard 50% wired red:
+  - **Batch 5 onward (`GI_LIT_BATCH = 5`): hard gate at 50%**
+    (`MIN_NON_BLACK_FRACTION_GI = 0.50`) — the user's verbatim "at least 50%"
+    target. `10-impl-b.md` Batch 5 is "GI bounce becomes visible"; once
+    `globalIllum`'s bounce light reaches the screen the lower-frame geometry is
+    no longer pitch black and 50%+ of the frame is lit. The B5 impl agent
+    re-runs the e2e harness and confirms (or, if the measured GI-lit fraction
+    lands just under 50%, nudges `MIN_NON_BLACK_FRACTION_GI` to just below the
+    measured value — a real check, same rule as the brief).
+  - **Batch 1–4: floor at 25%** (`MIN_NON_BLACK_FRACTION_PRE_GI = 0.25`) — the
+    scene is *correctly* mostly dark before GI, so demanding 50% would be a
+    false failure. 25% is comfortably below the measured 43.4%, so it is a real
+    "the sky and the emissive block are rendering, the screen isn't dead"
+    liveness check (it would trip if the sky/blit node silently early-returned
+    and dropped the frame to near-black) — not a rubber stamp.
+- **Reasoning for (b) over (a).** Lowering a single hard threshold to ~40% (so
+  B3 passes) would make the gate weaker for *every future batch* including the
+  GI-lit ones where 50%+ genuinely holds — it would stop encoding the user's
+  intent. The batch-aware split keeps the user's 50% target as the real gate for
+  the state it describes (GI-lit) and uses an honest, measurement-grounded floor
+  for the pre-GI state. It also matches the harness's existing batch-aware
+  pattern (`batch_gate` / `expected_spans` / `CURRENT_BATCH`).
+- **Wiring.** `Framebuffer::non_black_fraction(eps)` + `Framebuffer::
+  check_luminance_alive(batch)` in `src/e2e/framebuffer.rs` (the `NON_BLACK_EPS`
+  / `MIN_NON_BLACK_FRACTION_GI` / `MIN_NON_BLACK_FRACTION_PRE_GI` /
+  `GI_LIT_BATCH` consts + the `min_non_black_fraction(batch)` selector live
+  there too). Called from `run_assertions` in `src/e2e/driver.rs` as folded
+  check (3) — its failure joins the other gate failures in the single combined
+  `AppExit::error()` message. The measured fraction + the active threshold are
+  printed to stdout every run (`e2e_render: luminance gate (batch 3) — 43.4% of
+  the frame is non-black (luminance > 2); threshold 25%`), so the value is
+  visible run-to-run and easy to re-tune.
+
+### 2. Persistent screenshot-to-disk
+
+Every `cargo run --bin e2e_render` now saves the readback frame to disk as a
+PNG, **unconditionally**, before the gates run (so the PNG is on disk for visual
+analysis whether or not the gates pass).
+
+- **Path (fixed + documented):** `target/e2e-screenshots/e2e_latest.png`
+  (`E2E_SCREENSHOT_DIR` / `E2E_SCREENSHOT_LATEST` consts in `src/e2e/mod.rs`).
+  `target/` is already gitignored and persists across runs; the
+  `e2e-screenshots/` subdir is created on demand (`std::fs::create_dir_all`).
+- **What is written:** exactly one file, `e2e_latest.png`, overwritten each run.
+  The harness reads back exactly **one** frame — the final asserted frame (the
+  `SHOOT`→`DRAIN`→`ASSERT` single-capture flow; `batch_needs_second_frame` is
+  still `false` for B1–B5, and even the B6 two-shot temporal gate asserts on the
+  *final* frame) — so a single stable filename *is* the whole screenshot output.
+  No per-frame `frame_NNN.png` series is written (there is only one readback).
+  The saved path is printed to stdout each run (`e2e_render: screenshot saved to
+  target/e2e-screenshots/e2e_latest.png`) so it is discoverable.
+- **Format conversion (design R7 honoured):** the PNG is a standard 8-bit sRGB
+  **RGB** PNG that renders correctly when an agent `Read`s it. `Framebuffer::
+  save_png` encodes from the `Framebuffer`'s **already-normalised RGBA bytes** —
+  `Framebuffer::from_image` is the single R7 normalisation point: it branches on
+  `Image.texture_descriptor.format` and on the dev box (RTX 5080 / Vulkan, a
+  `Bgra8*` surface) swaps R↔B to land on RGBA. `save_png` then drops the alpha
+  channel (on this render path alpha carries the blit weight, not coverage —
+  exactly why Bevy's own `save_to_disk` `to_rgb8()`s) and writes RGB8 via the
+  `image` crate (added to `Cargo.toml` pinned `=0.25.10` — the exact version
+  Bevy 0.19-rc.1 already pulls in transitively, so no second copy of the crate;
+  `default-features = false`, only the `png` codec). Verified: the saved PNG
+  reads back correctly — sky band at the top, white emissive block at centre,
+  dark pre-GI geometry below, no channel swap.
+
+### Verification
+
+- `cargo build` — clean (pre-existing dead-code warnings only).
+- `cargo test` — **44 passed** (unchanged; the new code is exercised by the e2e
+  binary, not a unit test — it needs a real GPU readback).
+- `cargo run --bin e2e_render` — exits **0**. The 256×256 window opens for under
+  a second and closes itself; stdout: the screenshot-saved line, the
+  luminance-gate line (`batch 3 — 43.4% non-black; threshold 25%`), then
+  `e2e_render: PASS (batch 3) — …`. `target/e2e-screenshots/e2e_latest.png` is
+  written every run.
+- No TEMP debug instrumentation was added — the luminance-gate stdout line is a
+  permanent, intended part of the gate (every harness check prints its result).
+
+### Note for future batch agents (B4–B6)
+
+- The luminance gate is **automatic and batch-aware** — no per-batch edit is
+  needed for it to keep working. When **Batch 5** lands (GI bounce visible),
+  `GI_LIT_BATCH = 5` flips the threshold to the 50% hard gate; the B5 agent
+  re-runs `cargo run --bin e2e_render` and confirms the GI-lit frame clears 50%
+  (if it lands just under, nudge `MIN_NON_BLACK_FRACTION_GI` to just below the
+  measured value — a real check, not a rubber stamp).
+- The screenshot save is also batch-agnostic — `target/e2e-screenshots/
+  e2e_latest.png` is written every run regardless of batch. Agents debugging a
+  B4/B5/B6 render regression can `Read` it directly for a visual diff.

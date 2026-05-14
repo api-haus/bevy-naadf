@@ -19,11 +19,13 @@
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
 
+use std::path::Path;
+
 use super::checks::{assert_nodes_dispatched, pipeline_scan_result, PipelineScanResult};
 use super::framebuffer::Framebuffer;
 use super::gates::{batch_gate, expected_spans, GateState, CURRENT_BATCH};
 use super::readback::{shoot_primary_window, E2eScreenshot};
-use super::{E2E_DRAIN_FRAMES, E2E_RENDER_FRAMES};
+use super::{E2E_DRAIN_FRAMES, E2E_RENDER_FRAMES, E2E_SCREENSHOT_DIR, E2E_SCREENSHOT_LATEST};
 
 /// The driver's state-machine phase.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -140,24 +142,36 @@ pub fn e2e_driver(
     }
 }
 
-/// Run **all three checks** at the `ASSERT` step and fold them into one
-/// `Result` (`e2e-render-test.md` §6.5 — every check runs inside the app
-/// because the winit runner consumes the `App`, so there is no post-`run()`
-/// inspection point):
+/// Run **every check** at the `ASSERT` step and fold them into one `Result`
+/// (`e2e-render-test.md` §6.5 — every check runs inside the app because the
+/// winit runner consumes the `App`, so there is no post-`run()` inspection
+/// point):
 ///
-/// 1. **Degenerate-frame floor** (§7) — the readback must not be a stuck clear
+/// 1. **Screenshot-to-disk** — the readback `Framebuffer` is written to
+///    `target/e2e-screenshots/e2e_latest.png` *unconditionally*, every run,
+///    before the gates, so an orchestrator/agent can `Read` it for visual
+///    analysis regardless of pass/fail (`e2e-render-test.md` Implementation log
+///    — 2026-05-14). The saved path is printed to stdout. A save *failure* is
+///    itself a folded gate failure.
+/// 2. **Degenerate-frame floor** (§7) — the readback must not be a stuck clear
 ///    colour / contrast-less frame. Runs first so a uniformly-black frame gives
 ///    a clear message rather than a confusing region-mean assertion.
-/// 2. **Per-batch region gate** (§6.2) — `batch_gate` for `CURRENT_BATCH`;
+/// 3. **Global luminance liveness gate** — a large fraction of the frame must
+///    not be pitch black (`Framebuffer::check_luminance_alive` — 2026-05-14): a
+///    global "the scene isn't mostly dead" check alongside the floor.
+///    Batch-aware — the user's "at least 50%" target is a hard gate from the
+///    GI-lit batch (B5) on; the pre-GI batches use a lower real-liveness floor
+///    (the scene is correctly mostly dark before GI bounce).
+/// 4. **Per-batch region gate** (§6.2) — `batch_gate` for `CURRENT_BATCH`;
 ///    older batches' gates are kept as called helpers so an earlier-gate
 ///    regression still trips.
-/// 3. **Node-dispatch check** (§8) — every expected render-graph span has a
+/// 5. **Node-dispatch check** (§8) — every expected render-graph span has a
 ///    recorded `DiagnosticsStore` measurement (`DiagnosticsStore` is
 ///    main-world).
-/// 4. **`PipelineCache` error scan** (§3.1) — the load-bearing check, read from
+/// 6. **`PipelineCache` error scan** (§3.1) — the load-bearing check, read from
 ///    the shared cross-world channel the render-world scan system fills.
 ///
-/// All four are collected so a single run reports *every* failure, not just the
+/// All are collected so a single run reports *every* failure, not just the
 /// first — that is the whole point of the harness (`e2e-render-test.md` §1).
 fn run_assertions(
     screenshot: &mut E2eScreenshot,
@@ -166,13 +180,32 @@ fn run_assertions(
 ) -> Result<(), String> {
     let mut failures: Vec<String> = Vec::new();
 
-    // --- The framebuffer-dependent checks (1 + 2).
+    // --- The framebuffer-dependent checks (1 + 2 + 3 + 4).
     match screenshot.0.as_ref() {
         Some(image) => match Framebuffer::from_image(image) {
             Ok(fb) => {
+                // (1) Persist the readback to a fixed, documented path — every
+                // run, before the gates, so the PNG is on disk for visual
+                // analysis whether or not the gates pass.
+                let path = Path::new(E2E_SCREENSHOT_DIR).join(E2E_SCREENSHOT_LATEST);
+                match fb.save_png(&path) {
+                    Ok(()) => println!(
+                        "e2e_render: screenshot saved to {}",
+                        path.display()
+                    ),
+                    Err(msg) => failures.push(format!("screenshot save:\n  {msg}")),
+                }
+                // (2) Degenerate-frame floor.
                 if let Err(msg) = fb.check_not_degenerate() {
                     failures.push(format!("degenerate-frame floor:\n  {msg}"));
                 }
+                // (3) Global luminance liveness gate — a large fraction of the
+                // frame must not be pitch black. Batch-aware threshold: 50%
+                // from the GI-lit batch on, a lower real-liveness floor before.
+                if let Err(msg) = fb.check_luminance_alive(CURRENT_BATCH) {
+                    failures.push(format!("luminance liveness gate:\n  {msg}"));
+                }
+                // (4) Per-batch region gate.
                 let state = GateState {
                     fb: &fb,
                     fb_next: None,

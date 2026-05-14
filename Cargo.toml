@@ -33,6 +33,11 @@ bevy = { version = "=0.19.0-rc.1", features = [
 # Pinned to the version Bevy 0.19-rc.1 re-exports so the `Pod`/`Zeroable` traits
 # match across the crate boundary.
 bytemuck = { version = "=1.25.0", features = ["derive"] }
+# image = PNG encoding for the e2e harness's persistent screenshot-to-disk
+# (`src/e2e/framebuffer.rs` `Framebuffer::save_png`). Pinned to the exact version
+# Bevy 0.19-rc.1 already pulls in transitively (so there is no second copy of the
+# crate); only the `png` codec is enabled.
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 
 [features]
 default = ["dlss"]

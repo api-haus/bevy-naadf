@@ -10,6 +10,7 @@
 //! RGBA.
 
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 
 use bevy::image::Image;
 use bevy::render::render_resource::TextureFormat;
@@ -37,6 +38,59 @@ impl Rect {
         let x1 = ((fx1 * w) as u32).max(x0 + 1).min(fb.width());
         let y1 = ((fy1 * h) as u32).max(y0 + 1).min(fb.height());
         Self { x0, y0, x1, y1 }
+    }
+}
+
+/// The "not pitch black" luminance floor (channels `0.0..=255.0`) for the
+/// global liveness gate ([`Framebuffer::check_luminance_alive`]). A pixel whose
+/// Rec.709 luminance is at or below this is treated as pitch black. Kept small —
+/// it is a "the pixel received *some* light" floor, not a brightness threshold:
+/// the atmosphere-tinted sky, the emissive block, and any GI-lit geometry all
+/// sit comfortably above it; only the literal clear-colour-black background and
+/// fully-unlit pre-GI geometry fall at or below it.
+pub const NON_BLACK_EPS: f32 = 2.0;
+
+/// The minimum non-black fraction for the **GI-lit** batches (Batch 5 onward) —
+/// the user's "at least 50%" target (`e2e-render-test.md` Implementation log —
+/// 2026-05-14 luminance-gate addition).
+///
+/// The user asked for "most of the pixels are not pitch black … at least 50%, i
+/// guess". That target describes the *GI-lit* scene: once `globalIllum`'s bounce
+/// light reaches the screen (Batch 5 — `10-impl-b.md`: "GI bounce becomes
+/// visible", the pre-GI-black geometry "measurably brighter"), the lower-frame
+/// voxel geometry is no longer pitch black and 50%+ of the frame is lit. So 50%
+/// is a **hard gate from Batch 5 on**.
+pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.50;
+
+/// The minimum non-black fraction for the **pre-GI** batches (Batch 1–4).
+///
+/// Before GI bounce lands, the scene is *correctly* mostly dark: only the
+/// atmosphere-tinted sky and the emissive block are lit; the non-emissive voxel
+/// geometry filling the lower frame is pitch black by design (`10-impl-b.md`
+/// Batch 2: "pre-GI a non-emissive diffuse block should be near-black").
+/// Demanding 50% here would be a false failure. The measured Batch-3 non-black
+/// fraction at the fixed e2e pose is **43.4%** (the sky band + the emissive
+/// block + the lit ground edges); this floor is set to **0.25** — comfortably
+/// below the measured 43.4% so it is a real "the screen isn't dead, the sky and
+/// the emissive block are rendering" liveness check, not a rubber stamp, while
+/// still catching the failure where the blit/sky node silently produced almost
+/// nothing. When Batch 5 lands, [`MIN_NON_BLACK_FRACTION_GI`] takes over.
+pub const MIN_NON_BLACK_FRACTION_PRE_GI: f32 = 0.25;
+
+/// The batch at which the GI bounce lights the scene and the full
+/// [`MIN_NON_BLACK_FRACTION_GI`] (50%) liveness threshold becomes a hard gate
+/// (`10-impl-b.md` Batch 5 — "GI bounce becomes visible"). Below it the gate
+/// uses [`MIN_NON_BLACK_FRACTION_PRE_GI`].
+pub const GI_LIT_BATCH: u32 = 5;
+
+/// The non-black-fraction threshold for `batch` — [`MIN_NON_BLACK_FRACTION_GI`]
+/// (0.50) from [`GI_LIT_BATCH`] on, [`MIN_NON_BLACK_FRACTION_PRE_GI`] (0.25)
+/// before it. See [`Framebuffer::check_luminance_alive`].
+pub fn min_non_black_fraction(batch: u32) -> f32 {
+    if batch >= GI_LIT_BATCH {
+        MIN_NON_BLACK_FRACTION_GI
+    } else {
+        MIN_NON_BLACK_FRACTION_PRE_GI
     }
 }
 
@@ -179,6 +233,60 @@ impl Framebuffer {
         }
     }
 
+    /// Fraction (`0.0..=1.0`) of the *whole* framebuffer whose pixels are **not
+    /// pitch black** — luminance strictly above `eps` (`0.0..=255.0`).
+    ///
+    /// Backs the global "the scene isn't mostly dead" liveness gate
+    /// (`e2e-render-test.md` §6 / Implementation log): a frame where almost
+    /// every pixel is pitch black means the render graph delivered essentially
+    /// nothing. `eps` is a small "not pitch black" floor — anything above it
+    /// counts as lit (sky, geometry, the emissive block).
+    pub fn non_black_fraction(&self, eps: f32) -> f32 {
+        if self.data.is_empty() {
+            return 0.0;
+        }
+        let mut lit = 0u64;
+        for p in &self.data {
+            let lum = Self::luminance([p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]);
+            if lum > eps {
+                lit += 1;
+            }
+        }
+        lit as f32 / self.data.len() as f32
+    }
+
+    /// Write the framebuffer to `path` as a standard 8-bit sRGB **RGB** PNG.
+    ///
+    /// The bytes are already format-normalised to RGBA channel order by
+    /// [`Framebuffer::from_image`] (R7 — the platform surface format, commonly
+    /// `Bgra8*` on Vulkan/Linux, is decoded there), so this is a straight
+    /// encode. The alpha channel is dropped: on this render path it carries the
+    /// blit weight, not coverage — mirroring Bevy's own `save_to_disk`, which
+    /// `to_rgb8()`s for exactly that reason — so an RGB PNG renders correctly
+    /// when an agent `Read`s it.
+    pub fn save_png(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+        }
+        let mut rgb = Vec::with_capacity(self.data.len() * 3);
+        for px in &self.data {
+            rgb.push(px[0]);
+            rgb.push(px[1]);
+            rgb.push(px[2]);
+        }
+        let buf: image::RgbImage = image::ImageBuffer::from_raw(self.width, self.height, rgb)
+            .ok_or_else(|| {
+                format!(
+                    "RGB buffer size mismatch for {}x{} framebuffer",
+                    self.width, self.height
+                )
+            })?;
+        buf.save_with_format(path, image::ImageFormat::Png)
+            .map_err(|e| format!("could not write PNG to {}: {e}", path.display()))
+    }
+
     /// Whether every channel of `a` is within `tol` of `b` (channels in
     /// `0.0..=255.0`).
     pub fn is_near(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {
@@ -254,5 +362,46 @@ impl Framebuffer {
             "framebuffer has no contrast (has_dark={has_dark}, has_bright={has_bright}) — \
              expected both dark geometry and a brighter sky"
         ))
+    }
+
+    /// The global "the scene isn't mostly dead" liveness gate
+    /// (`e2e-render-test.md` Implementation log — 2026-05-14): assert that a
+    /// large fraction of the frame is **not pitch black** (luminance above
+    /// [`NON_BLACK_EPS`]).
+    ///
+    /// The threshold is **batch-aware** ([`min_non_black_fraction`]): the user's
+    /// "at least 50%" target describes the GI-lit scene, so 50% is a hard gate
+    /// from [`GI_LIT_BATCH`] on; before GI bounce lands the scene is *correctly*
+    /// mostly dark (only sky + the emissive block are lit) and the floor is the
+    /// lower [`MIN_NON_BLACK_FRACTION_PRE_GI`] — still a real liveness check, not
+    /// a rubber stamp.
+    ///
+    /// This is a global frame check, run alongside the degenerate-frame floor.
+    /// Where [`check_not_degenerate`](Self::check_not_degenerate) only catches a
+    /// *uniformly* dead frame, this catches the weaker failure where the render
+    /// graph produced *something* but most of the screen is still black — a sky
+    /// node that silently early-returned, a blit reading the wrong buffer, a
+    /// camera framing nothing. Always prints the measured fraction to stdout so
+    /// it is visible run-to-run and easy to re-tune.
+    pub fn check_luminance_alive(&self, batch: u32) -> Result<(), String> {
+        let frac = self.non_black_fraction(NON_BLACK_EPS);
+        let threshold = min_non_black_fraction(batch);
+        println!(
+            "e2e_render: luminance gate (batch {batch}) — {:.1}% of the frame is non-black \
+             (luminance > {NON_BLACK_EPS}); threshold {:.0}%",
+            frac * 100.0,
+            threshold * 100.0
+        );
+        if frac < threshold {
+            return Err(format!(
+                "only {:.1}% of the frame is non-black (luminance > {NON_BLACK_EPS}), \
+                 expected >= {:.0}% for batch {batch} — most of the screen is pitch black, \
+                 the render graph produced almost no light (a sky/blit node likely silently \
+                 early-returned, or the camera frames nothing)",
+                frac * 100.0,
+                threshold * 100.0
+            ));
+        }
+        Ok(())
     }
 }
