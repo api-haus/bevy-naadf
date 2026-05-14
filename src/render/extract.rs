@@ -17,6 +17,7 @@ use bevy::prelude::*;
 use bevy::render::Extract;
 
 use crate::camera::PositionSplit;
+use crate::render::taa::{rotation_only_view_proj, CameraHistory, CAMERA_HISTORY_DEPTH};
 use crate::voxel::VoxelType;
 use crate::world::data::{IAabb3, VoxelTypes, WorldData};
 
@@ -57,6 +58,13 @@ pub struct ExtractedCameraData {
     /// unprojected vector as a pure direction. The ray *origin* is supplied
     /// separately via [`PositionSplit`].
     pub inv_view_proj: Mat4,
+    /// Rotation-only (translation-free) `clip_from_view` — the *non-inverted*
+    /// matrix `inv_view_proj` is the inverse of (mirrors NAADF's
+    /// `camera.viewProjTransform`, `Camera.cs:201`). The Phase-A-2 TAA reproject
+    /// pass needs this (C# `camMatrix`) to project a reprojected virtual pos
+    /// into the current screen; stored directly to avoid a redundant inverse
+    /// (`06-design-a2.md` §9.2).
+    pub view_proj: Mat4,
     /// Render-target size in pixels, taken from the camera viewport.
     pub viewport_size: UVec2,
     /// `true` once a real camera has been seen at least once.
@@ -108,14 +116,13 @@ pub fn extract_camera(
     let Some((camera, global_transform, position_split)) = cameras.iter().next() else {
         return;
     };
-    let clip_from_view = camera.clip_from_view();
     // NAADF builds invCamMatrix from a view matrix at the ORIGIN
     // (Camera.cs:199 — CreateLookAt(Vector3::ZERO, camDir, Up)): rotation only,
     // no camera translation. getRayDir then treats the unprojected vector as a
-    // pure direction. Mirror that — use the rotation-only part of
-    // world_from_view, so no translation column reaches the inverse.
-    let world_from_view_rot = Mat4::from_quat(global_transform.rotation());
-    let clip_from_view_rot = clip_from_view * world_from_view_rot.inverse();
+    // pure direction. `rotation_only_view_proj` is the shared helper that
+    // builds that translation-free view-proj — the single place the formula
+    // lives, also called by `update_camera_history` (`06-design-a2.md` §9.3).
+    let clip_from_view_rot = rotation_only_view_proj(camera, global_transform.rotation());
     let inv_view_proj = clip_from_view_rot.inverse();
 
     let viewport_size = camera
@@ -125,6 +132,68 @@ pub fn extract_camera(
 
     extracted.position_split = *position_split;
     extracted.inv_view_proj = inv_view_proj;
+    extracted.view_proj = clip_from_view_rot;
     extracted.viewport_size = viewport_size;
+    extracted.valid = true;
+}
+
+/// Render-world mirror of the 128-deep camera-history ring + the frame counter
+/// (`06-design-a2.md` §9.1, §9.3). Rebuilt every frame by
+/// [`extract_camera_history`] from the main-world [`CameraHistory`].
+///
+/// `render::taa::prepare_taa` consumes this to build the `GpuCameraHistorySlot`
+/// array + `GpuTaaParams`, and `prepare_frame_gpu` reads `frame_count` /
+/// `taa_index` / `current_jitter` for `GpuRenderParams`.
+#[derive(Resource)]
+pub struct ExtractedCameraHistory {
+    /// Per-frame camera `PositionSplit` (C# `oldCamPositions[128]`).
+    pub positions: [PositionSplit; CAMERA_HISTORY_DEPTH],
+    /// Per-frame translation-free view-proj matrix (C# `taaSampleCamTransform[128]`).
+    pub view_proj: [Mat4; CAMERA_HISTORY_DEPTH],
+    /// Per-frame Halton jitter (C# `taaSampleJitter[128]`).
+    pub jitter: [Vec2; CAMERA_HISTORY_DEPTH],
+    /// Monotonic frame counter (C# `frameCount`).
+    pub frame_count: u32,
+    /// `taaIndex` for the slot written this frame — computed once per frame in
+    /// `update_camera_history` (`06-design-a2.md` §9.3).
+    pub taa_index: u32,
+    /// This frame's Halton jitter (= `jitter[taa_index]`).
+    pub current_jitter: Vec2,
+    /// `true` once the history has been extracted at least once.
+    pub valid: bool,
+}
+
+impl Default for ExtractedCameraHistory {
+    fn default() -> Self {
+        Self {
+            positions: [PositionSplit::default(); CAMERA_HISTORY_DEPTH],
+            view_proj: [Mat4::IDENTITY; CAMERA_HISTORY_DEPTH],
+            jitter: [Vec2::ZERO; CAMERA_HISTORY_DEPTH],
+            frame_count: 0,
+            taa_index: (CAMERA_HISTORY_DEPTH as u32) - 1,
+            current_jitter: Vec2::ZERO,
+            valid: false,
+        }
+    }
+}
+
+/// `ExtractSchedule` system: mirror the main-world [`CameraHistory`] into the
+/// render-world [`ExtractedCameraHistory`] (`06-design-a2.md` §9.1).
+///
+/// Runs every frame — the camera-history ring changes every frame. The rings
+/// are fixed-size 128-element arrays, so this is a cheap fixed-cost copy.
+pub fn extract_camera_history(
+    mut extracted: ResMut<ExtractedCameraHistory>,
+    history: Extract<Option<Res<CameraHistory>>>,
+) {
+    let Some(history) = &*history else {
+        return;
+    };
+    extracted.positions = history.positions;
+    extracted.view_proj = history.view_proj;
+    extracted.jitter = history.jitter;
+    extracted.frame_count = history.frame_count;
+    extracted.taa_index = history.taa_index;
+    extracted.current_jitter = history.current_jitter;
     extracted.valid = true;
 }

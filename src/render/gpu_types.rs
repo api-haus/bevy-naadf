@@ -15,6 +15,10 @@
 //! WGSL counterpart declarations live in `assets/shaders/world_data.wgsl`
 //! (`GpuWorldMeta`, `GpuVoxelType`) and `assets/shaders/render_pipeline_common.wgsl`
 //! (`GpuCamera`, `GpuRenderParams`) — keep the field order / padding in sync.
+//!
+//! Phase A-2 adds `GpuTaaParams` + `GpuCameraHistorySlot` (the TAA reproject
+//! pass's uniform + the 128-deep camera-history ring slot, `06-design-a2.md`
+//! §4.2–4.3); their WGSL counterparts live in `assets/shaders/taa.wgsl`.
 
 use bevy::math::{IVec3, Mat4, UVec3, Vec2, Vec3};
 use bytemuck::{Pod, Zeroable};
@@ -143,6 +147,81 @@ pub struct GpuWorldMeta {
     pub _pad2: u32,
 }
 
+/// TAA reproject-pass uniform — the dedicated scalar uniform for the
+/// `taa.wgsl` reproject pass (`06-design-a2.md` §4.2).
+///
+/// Mirrors `renderTaaSampleReverse.fx:10-21`'s scalar uniforms. It overlaps
+/// `GpuRenderParams` but is not identical (it adds `camMatrix` / `sampleAge` /
+/// the camera-relative position), so it is its own uniform rather than a
+/// widening of `GpuRenderParams`.
+///
+/// Layout: `mat4 (64) + mat4 (64) + (ivec3+pad) (16) + (vec3+pad) (16) +
+/// 4×u32 (16) + 4×u32 (16)` = 192 bytes, 16-byte aligned throughout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GpuTaaParams {
+    /// Rotation-only inverse view-proj (C# `invCamMatrix`) — for `get_ray_dir`.
+    /// The same matrix Phase A puts in `GpuCamera.inv_view_proj`.
+    pub inv_view_proj: Mat4,
+    /// Translation-free view-proj of the CURRENT frame (C# `camMatrix`) —
+    /// projects a reprojected virtual pos into the current screen for the
+    /// 1-pixel reject test.
+    pub view_proj: Mat4,
+    /// Current camera integer position (C# `camPosInt`) — base for the
+    /// camera-relative reprojection space.
+    pub cam_pos_int: IVec3,
+    /// Padding to a 16-byte boundary.
+    pub _pad0: u32,
+    /// Current camera fractional position (C# `camPosFrac`).
+    pub cam_pos_frac: Vec3,
+    /// Padding to a 16-byte boundary.
+    pub _pad1: u32,
+    /// Render-target width in pixels.
+    pub screen_width: u32,
+    /// Render-target height in pixels.
+    pub screen_height: u32,
+    /// Monotonic frame counter (C# `frameCount`).
+    pub frame_count: u32,
+    /// `taaIndex = CAMERA_HISTORY_DEPTH - (frame_count % CAMERA_HISTORY_DEPTH) - 1`.
+    pub taa_index: u32,
+    /// How many past frames to walk (C# `sampleAge` / `taaSampleMaxAge`).
+    /// Clamped to `[1, TAA_SAMPLE_RING_DEPTH]` in A-2 (`06-design-a2.md` §7.1).
+    pub sample_age: u32,
+    /// Padding to a 16-byte stride.
+    pub _pad2: u32,
+    /// Padding to a 16-byte stride.
+    pub _pad3: u32,
+    /// Padding to a 16-byte stride.
+    pub _pad4: u32,
+}
+
+/// One slot of the 128-deep camera-history ring, GPU side
+/// (`06-design-a2.md` §4.3).
+///
+/// The reproject shader indexes `camRotOld[128]`,
+/// `taaOldCamPosFromCurCamInt[128]`, `taaJitterOld[128]` — this struct packs
+/// all three per-slot. Bound as a read-only storage buffer
+/// (`array<GpuCameraHistorySlot, 128>`); created once, rewritten every frame.
+///
+/// Layout: `mat4 (64) + (vec3+pad) (16) + (vec2+vec2pad) (16)` = 96 bytes/slot,
+/// 16-byte aligned.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GpuCameraHistorySlot {
+    /// Past frame's translation-free view-proj (C# `camRotOld[i]`).
+    pub view_proj: Mat4,
+    /// Past frame's camera pos, relative to the CURRENT camera int position
+    /// (C# `taaOldCamPosFromCurCamInt[i] = (oldCamPositions[i] - camPos).toVector3()`).
+    /// Recomputed every frame in `prepare_taa`.
+    pub cam_pos_from_cur_int: Vec3,
+    /// Padding to a 16-byte boundary.
+    pub _pad0: u32,
+    /// Past frame's Halton jitter (C# `taaJitterOld[i]`).
+    pub jitter: Vec2,
+    /// Padding to a 16-byte stride.
+    pub _pad1: Vec2,
+}
+
 /// GPU material entry — the 128-bit (`UVec4`) form of a [`VoxelType`], mirroring
 /// the C# `VoxelType.compressForRender()` (`03-design.md` §2.4):
 ///
@@ -226,6 +305,9 @@ const _: () = assert!(std::mem::size_of::<GpuCamera>() == 64 + 32);
 const _: () = assert!(std::mem::size_of::<GpuRenderParams>() == 16 * 7);
 const _: () = assert!(std::mem::size_of::<GpuWorldMeta>() == 48);
 const _: () = assert!(std::mem::size_of::<GpuVoxelType>() == 16);
+// Phase A-2 TAA structs (`06-design-a2.md` §4.2, §4.3).
+const _: () = assert!(std::mem::size_of::<GpuTaaParams>() == 192);
+const _: () = assert!(std::mem::size_of::<GpuCameraHistorySlot>() == 96);
 
 // Keep the material enums referenced so a future material-format change can't
 // silently drift this file out of step (also documents the intent).

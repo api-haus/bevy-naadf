@@ -5,14 +5,15 @@
 // setup, `rayAABB` volume test, `shootRay`, a simple sun + ambient term, and
 // the G-buffer / shaded-colour writes.
 //
-// Phase-A divergences from the HLSL (all per `03-design.md` §5.3 + D4):
-//   * `isTAA` is always 0 — the `taaSamples` ring write is omitted entirely
-//     (that buffer does not exist in Phase A).
-//   * The HLSL only writes `firstHitData` inside `if (isTAA)`; Phase A writes
+// Divergences from the HLSL (per `03-design.md` §5.3 + `06-design-a2.md`):
+//   * The `taaSamples` ring write (HLSL `if (isTAA)`) is still omitted in
+//     Phase A-2 Batch 1 — it is added in Batch 2 step 6.
+//   * The HLSL only writes `firstHitData` inside `if (isTAA)`; the port writes
 //     it unconditionally so the G-buffer plane 0 is always populated.
-//   * The HLSL's `taaSampleAccum` write is Phase A's `shaded_color` write —
-//     identical `vec2<u32>` element format (`03-design.md` §5.3), so the final
-//     blit stays a near-verbatim port of `renderFinal.fx`.
+//   * The HLSL's `taaSampleAccum` write is this pass's `taa_sample_accum`
+//     write — Phase A-2 renamed Phase A's `shaded_color` stand-in (the
+//     stand-in was deliberately built to the `taaSampleAccum` `vec2<u32>`
+//     element format, so the rename is logic-free — `06-design-a2.md` §5.1).
 //
 // `[numthreads(64,1,1)]` in the HLSL → `@workgroup_size(64,1,1)`.
 
@@ -32,8 +33,12 @@
 @group(1) @binding(1) var<uniform> params: GpuRenderParams;
 // The Phase-A G-buffer — one `vec4<u32>` per pixel (`03-design.md` §5.3).
 @group(1) @binding(2) var<storage, read_write> first_hit_data: array<vec4<u32>>;
-// The blit-source stand-in — one `vec2<u32>` per pixel, `taaSampleAccum` format.
-@group(1) @binding(3) var<storage, read_write> shaded_color: array<vec2<u32>>;
+// The real `taaSampleAccum` — one `vec2<u32>` per pixel (`06-design-a2.md`
+// §2.2, §5.1). Phase A-2 renamed Phase A's `shaded_color` stand-in to
+// `taa_sample_accum` and re-homed the buffer into `TaaGpu`; the element format
+// and the write site below are unchanged (the stand-in was deliberately built
+// to the `taaSampleAccum` format), so this is a pure rename.
+@group(1) @binding(3) var<storage, read_write> taa_sample_accum: array<vec2<u32>>;
 
 @compute @workgroup_size(64, 1, 1)
 fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -143,10 +148,12 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
     first_hit_data[pixel_index] =
         compress_first_hit_data(distance_ray, norm_tangs, voxel_type_raw, entity);
 
-    // --- shaded-colour write (HLSL `taaSampleAccum` write) -----------------
+    // --- taa_sample_accum write (HLSL `taaSampleAccum` write) --------------
     // `newColorComp.x = f16(1.0) | (f16(light.r) << 16)`
     // `newColorComp.y = f16(light.g) | (f16(light.b) << 16)`
-    // i.e. a `1.0` weight in the low half of `.x`, RGB as three f16s.
+    // i.e. a `1.0` weight in the low half of `.x`, RGB as three f16s. The
+    // `1.0` weight is the current frame's per-pixel sample count — the
+    // load-bearing 0.25-spp signal (`06-design-a2.md` §2.2, §3.2).
     var new_color = vec2<u32>(0u, 0u);
     new_color.x = pack2x16float(vec2<f32>(1.0, light.r));
     new_color.y = pack2x16float(vec2<f32>(light.g, light.b));
@@ -154,5 +161,5 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if ((params.flags & FLAG_SHOW_RAY_STEP) != 0u) {
         new_color.x = u32(ray_result.step_count);
     }
-    shaded_color[pixel_index] = new_color;
+    taa_sample_accum[pixel_index] = new_color;
 }

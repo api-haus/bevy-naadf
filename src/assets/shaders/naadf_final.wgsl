@@ -8,11 +8,13 @@
 // port uses a standard fullscreen triangle (`02-research.md` divergence #9) —
 // the vertex stage is Bevy's `FullscreenShader`, so this file is fragment-only.
 //
-// Phase-A blit source (`03-design.md` §5.3): the C# `MainPS` reads
-// `taaSampleAccum`; with TAA off (D4) there is no accum buffer, so Phase A
-// reads the `shaded_color` stand-in instead — identical `vec2<u32>` element
-// format, so the tonemap below is the C# `MainPS` unchanged. Phase A-2 swaps
-// `shaded_color` for the real `taaSampleAccum` with no shader change.
+// Blit source (`03-design.md` §5.3, `06-design-a2.md` §5.4): the C# `MainPS`
+// reads `taaSampleAccum`. Phase A used a `shaded_color` stand-in built to the
+// `taaSampleAccum` `vec2<u32>` element format; Phase A-2 renamed it to
+// `taa_sample_accum` and the buffer is now the real `taaSampleAccum` (owned by
+// `TaaGpu`, written by the first-hit pass — and, in Batch 2, accumulated by the
+// TAA reproject node). The tonemap below is the C# `MainPS` unchanged — the
+// element format never changed, so the swap is logic-free.
 //
 // `HDR` is off in Phase A (`03-design.md` §5.4) — the C# `#ifdef HDR` branches
 // are dropped.
@@ -20,10 +22,10 @@
 #import "shaders/render_pipeline_common.wgsl"::{GpuRenderParams, FLAG_SHOW_RAY_STEP}
 
 // --- the final-blit pass's own small bind group (`03-design.md` §2.6) -------
-// first_hit_data (unused in Phase A's blit but bound for layout stability),
-// shaded_color (the blit source), render_params (screen size + exposure).
+// first_hit_data (unused in the blit but bound for layout stability),
+// taa_sample_accum (the blit source), render_params (screen size + exposure).
 @group(0) @binding(0) var<storage, read> first_hit_data: array<vec4<u32>>;
-@group(0) @binding(1) var<storage, read> shaded_color: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> taa_sample_accum: array<vec2<u32>>;
 @group(0) @binding(2) var<uniform> params: GpuRenderParams;
 
 @fragment
@@ -33,7 +35,7 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel_index = u32(pixel_pos.x) + u32(pixel_pos.y) * params.screen_width;
 
     // `uint2 colSamples = taaSampleAccum[pixelIndex];`
-    let col_samples = shaded_color[pixel_index];
+    let col_samples = taa_sample_accum[pixel_index];
     // `float weight = f16tof32(colSamples.x & 0xFFFF);`
     let weight = unpack2x16float(col_samples.x).x;
     // RGB is `f16(.x>>16), f16(.y&0xFFFF), f16(.y>>16)` / max(1, weight).

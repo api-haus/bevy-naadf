@@ -18,6 +18,7 @@ pub mod gpu_types;
 pub mod graph;
 pub mod pipelines;
 pub mod prepare;
+pub mod taa;
 
 use bevy::core_pipeline::schedule::Core3d;
 use bevy::core_pipeline::tonemapping::tonemapping;
@@ -27,10 +28,14 @@ use bevy::render::{
     ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
 
-use extract::{extract_camera, extract_world, ExtractedCameraData, ExtractedWorld};
+use extract::{
+    extract_camera, extract_camera_history, extract_world, ExtractedCameraData,
+    ExtractedCameraHistory, ExtractedWorld,
+};
 use graph::{naadf_final_blit_node, naadf_first_hit_node};
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
+use taa::prepare_taa;
 
 /// Plugin: wires the Phase-A NAADF render path into the render sub-app.
 pub struct NaadfRenderPlugin;
@@ -44,16 +49,23 @@ impl Plugin for NaadfRenderPlugin {
         render_app
             .init_resource::<ExtractedWorld>()
             .init_resource::<ExtractedCameraData>()
+            .init_resource::<ExtractedCameraHistory>()
             // Pipelines + bind-group layouts — `FromWorld`, built once in
             // `RenderStartup` (after the render device exists).
             .init_gpu_resource::<NaadfPipelines>()
             // Extract: main world -> render world mirror.
-            .add_systems(ExtractSchedule, (extract_world, extract_camera))
+            .add_systems(
+                ExtractSchedule,
+                (extract_world, extract_camera, extract_camera_history),
+            )
             // Prepare: create + upload GPU resources, build bind groups,
-            // queue the per-target-format blit pipeline variant.
+            // queue the per-target-format blit pipeline variant. `prepare_taa`
+            // creates `TaaGpu` here in `PrepareResources` so it exists before
+            // `prepare_frame_gpu` (`PrepareBindGroups`) binds `taa_sample_accum`
+            // (`06-design-a2.md` §5.5, §9.4).
             .add_systems(
                 Render,
-                (prepare_world_gpu, prepare_blit_pipeline)
+                (prepare_world_gpu, prepare_taa, prepare_blit_pipeline)
                     .in_set(RenderSystems::PrepareResources),
             )
             .add_systems(

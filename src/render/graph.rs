@@ -2,10 +2,15 @@
 //! (`03-design.md` §5.1).
 //!
 //! Phase A is two passes: [`naadf_first_hit_node`] (a compute pass that
-//! raytraces the AADF world and writes `first_hit_data` + `shaded_color`)
+//! raytraces the AADF world and writes `first_hit_data` + `taa_sample_accum`)
 //! followed by [`naadf_final_blit_node`] (a fullscreen fragment pass that
-//! tonemaps `shaded_color` onto the view target). Both run in the `Core3d`
+//! tonemaps `taa_sample_accum` onto the view target). Both run in the `Core3d`
 //! `PostProcess` set, chained, before tonemapping (see `render::mod`).
+//!
+//! (Phase A-2 renamed the per-pixel accumulated-colour buffer from Phase A's
+//! `shaded_color` stand-in to the real `taa_sample_accum`, owned by `TaaGpu`;
+//! the node systems below are unchanged — they bind whatever
+//! `prepare_frame_gpu` put in the frame / blit bind groups.)
 //!
 //! In Bevy 0.19's render API a "render-graph node" is just a system in the
 //! `Core3d` schedule that records commands via [`RenderContext`] — there is
@@ -37,7 +42,7 @@ pub const FINAL_BLIT_SPAN: &str = "naadf_final_blit";
 /// Faithful port of the C# `WorldRenderAlbedo` first-hit dispatch: one compute
 /// pass running `naadf_first_hit.wgsl`'s `calc_first_hit` over
 /// `ceil(pixel_count / 64)` workgroups, binding `@group(0)` (world) +
-/// `@group(1)` (frame). Writes `first_hit_data` + `shaded_color`.
+/// `@group(1)` (frame). Writes `first_hit_data` + `taa_sample_accum`.
 ///
 /// Skips silently until the world + frame GPU resources exist and the compute
 /// pipeline has finished compiling.

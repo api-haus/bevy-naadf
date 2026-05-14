@@ -8,8 +8,11 @@
 //!   `world_meta` uniform, upload all of them, and build `bind_group_world`.
 //!   Build-once (D2): later frames are a no-op.
 //! - [`prepare_frame_gpu`] — every frame: `write_buffer` the `GpuCamera` +
-//!   `GpuRenderParams` uniforms, (re)create the `first_hit_data` + `shaded_color`
-//!   storage buffers on a viewport resize, and build `bind_group_frame`.
+//!   `GpuRenderParams` uniforms, (re)create the `first_hit_data` storage buffer
+//!   on a viewport resize, and build `bind_group_frame`. The per-pixel
+//!   accumulated-colour buffer (Phase A's `shaded_color` stand-in) moved into
+//!   `TaaGpu` as the real `taa_sample_accum` — `prepare_frame_gpu` reads
+//!   `TaaGpu` and binds it (`06-design-a2.md` §5.5, §9.4).
 //!
 //! The chunk layer is a CPU-built, upload-only 3D texture (`03-design.md`
 //! §2.5, §6.1) — the render pass only ever *reads* it, sidestepping wgpu's
@@ -27,9 +30,10 @@ use bevy::render::render_resource::{
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 
-use crate::render::extract::{ExtractedCameraData, ExtractedWorld};
+use crate::render::extract::{ExtractedCameraData, ExtractedCameraHistory, ExtractedWorld};
 use crate::render::gpu_types::{GpuCamera, GpuRenderParams, GpuVoxelType, GpuWorldMeta, FLAG_CHECK_SUN};
 use crate::render::pipelines::NaadfPipelines;
+use crate::render::taa::TaaGpu;
 use crate::world::buffer::{GrowableBuffer, GROWABLE_BUFFER_USAGES};
 
 /// The GPU side of the voxel world (`03-design.md` §4.4 — render-world
@@ -63,16 +67,15 @@ pub struct FrameGpu {
     pub render_params: Buffer,
     /// The Phase-A G-buffer — one `vec4<u32>` per pixel (`03-design.md` §5.3).
     pub first_hit_data: Buffer,
-    /// The blit-source stand-in — one `vec2<u32>` per pixel, the
-    /// `taaSampleAccum` element format (`03-design.md` §5.3). Phase A keeps
-    /// this in place of the real TAA accumulation buffer (D4).
-    pub shaded_color: Buffer,
     /// Pixel count the storage buffers are currently sized for.
     pub pixel_count: u32,
-    /// `@group(1)` bind group for the first-hit compute pass.
+    /// `@group(1)` bind group for the first-hit compute pass. Binds
+    /// `taa_sample_accum` (owned by `TaaGpu`) at slot 3 — Phase A-2 moved the
+    /// per-pixel accumulated-colour buffer out of `FrameGpu` (it used to be
+    /// the `shaded_color` stand-in — `06-design-a2.md` §9.4).
     pub bind_group: BindGroup,
-    /// The final-blit pass's own bind group (`first_hit_data`, `shaded_color`,
-    /// `render_params`).
+    /// The final-blit pass's own bind group (`first_hit_data`,
+    /// `taa_sample_accum`, `render_params`).
     pub blit_bind_group: BindGroup,
 }
 
@@ -231,25 +234,36 @@ pub fn prepare_world_gpu(
 }
 
 /// `RenderSystems::PrepareBindGroups` system: write the per-frame camera +
-/// render-params uniforms, (re)create the G-buffer storage buffers on a
+/// render-params uniforms, (re)create the `first_hit_data` storage buffer on a
 /// viewport resize, and build the frame bind groups.
 ///
 /// Runs in `PrepareBindGroups` (after `PrepareResources`) so the world bind
-/// group / pipelines are already created. Skips silently until both the
-/// camera has been extracted and `WorldGpu` exists.
+/// group / pipelines *and* `TaaGpu` are already created. Skips silently until
+/// the camera has been extracted and `TaaGpu` exists.
+///
+/// Phase A-2: the per-pixel accumulated-colour buffer (Phase A's `shaded_color`
+/// stand-in) moved into `TaaGpu` as the real `taa_sample_accum`; this system
+/// reads `TaaGpu` and binds `taa_gpu.taa_sample_accum` where it used to bind
+/// the local `shaded_color` (`06-design-a2.md` §5.5, §9.4).
 pub fn prepare_frame_gpu(
     mut commands: Commands,
     extracted_camera: Res<ExtractedCameraData>,
+    extracted_history: Res<ExtractedCameraHistory>,
     existing: Option<ResMut<FrameGpu>>,
+    taa_gpu: Option<Res<TaaGpu>>,
     pipelines: Res<NaadfPipelines>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    time: Res<Time>,
 ) {
     if !extracted_camera.valid {
         return;
     }
+    // `TaaGpu` (created in `PrepareResources` by `prepare_taa`) owns
+    // `taa_sample_accum` — wait for it before building the bind groups.
+    let Some(taa_gpu) = taa_gpu else {
+        return;
+    };
     let viewport = extracted_camera.viewport_size.max(UVec2::ONE);
     let pixel_count = viewport.x * viewport.y;
 
@@ -275,10 +289,24 @@ pub fn prepare_frame_gpu(
     let render_params = GpuRenderParams {
         screen_width: viewport.x,
         screen_height: viewport.y,
-        frame_count: time.elapsed().as_millis() as u32,
-        rand_counter: (time.elapsed_secs_f64() * 1000.0) as u32,
-        taa_index: 0,
-        // Phase A: no TAA (D4), no ray-step debug view; trace the sun shadow.
+        // The real monotonic frame counter (the carried `05-review.md` §4 fix —
+        // `06-design-a2.md` §9.1). `frame_count` / `taa_index` come from the
+        // extracted `CameraHistory`, computed once per frame in
+        // `update_camera_history` (`06-design-a2.md` §9.3 — `taa_index` is
+        // *stored*, not re-derived render-side, to avoid the off-by-one trap).
+        frame_count: extracted_history.frame_count,
+        // `rand_counter` = the frame counter (the monotonic per-frame RNG salt
+        // — `init_rand` uses it only as salt). Deliberate A-2 simplification:
+        // NAADF refills a `randValues[32]` table per frame and indexes it
+        // (`WorldRender.cs:82-86`); the load-bearing property is a
+        // per-frame-varying salt, which the counter already is — the table is
+        // not ported (`06-design-a2.md` §4.1, §13.3).
+        rand_counter: extracted_history.frame_count,
+        taa_index: extracted_history.taa_index,
+        // A-2 Batch 1: TAA logic is not wired yet (the TAA node + the first-hit
+        // ring write are Batch 2), so `FLAG_IS_TAA` stays clear here. When
+        // `AppArgs.taa` is off, `update_camera_history` keeps `current_jitter`
+        // zero, so `taa_jitter` below is zero — Phase A renders identically.
         flags: FLAG_CHECK_SUN,
         exposure: 1.5,
         _pad0: 0,
@@ -286,7 +314,10 @@ pub fn prepare_frame_gpu(
         _pad1: 0,
         sun_color: Vec3::new(1.0, 0.95, 0.85),
         _pad2: 0,
-        taa_jitter: Vec2::ZERO,
+        // This frame's Halton jitter — the same value `update_camera_history`
+        // wrote into `CameraHistory.jitter[taa_index]` (one value, computed
+        // once — `06-design-a2.md` §9.3). Zero unless `AppArgs.taa` is on.
+        taa_jitter: extracted_history.current_jitter,
         _pad3: Vec2::ZERO,
         bounding_box_min: Vec3::ZERO, // filled below from WorldGpu's meta? — see note
         _pad4: 0,
@@ -302,13 +333,15 @@ pub fn prepare_frame_gpu(
     // and the shader uses `world_meta` instead. Kept in the struct so the
     // uniform layout is stable for Phase A-2 / B.
 
-    // (re)create the storage buffers if the pixel count changed.
-    let (first_hit_data, shaded_color, needs_new_storage) = match &existing {
-        Some(frame) if frame.pixel_count == pixel_count => (
-            frame.first_hit_data.clone(),
-            frame.shaded_color.clone(),
-            false,
-        ),
+    // (re)create the `first_hit_data` storage buffer if the pixel count
+    // changed. `taa_sample_accum` (Phase A's `shaded_color`) now lives in
+    // `TaaGpu` and is (re)sized by `prepare_taa` on the same trigger — they
+    // read the same `extracted_camera.viewport_size`, so they stay coherent
+    // (`06-design-a2.md` §9.4).
+    let (first_hit_data, needs_new_storage) = match &existing {
+        Some(frame) if frame.pixel_count == pixel_count => {
+            (frame.first_hit_data.clone(), false)
+        }
         _ => {
             // first_hit_data: vec4<u32> per pixel (16 bytes).
             let first_hit_data = render_device.create_buffer(&BufferDescriptor {
@@ -317,14 +350,7 @@ pub fn prepare_frame_gpu(
                 usage: GROWABLE_BUFFER_USAGES,
                 mapped_at_creation: false,
             });
-            // shaded_color: vec2<u32> per pixel (8 bytes).
-            let shaded_color = render_device.create_buffer(&BufferDescriptor {
-                label: Some("naadf_shaded_color"),
-                size: (pixel_count as u64) * 8,
-                usage: GROWABLE_BUFFER_USAGES,
-                mapped_at_creation: false,
-            });
-            (first_hit_data, shaded_color, true)
+            (first_hit_data, true)
         }
     };
 
@@ -350,18 +376,23 @@ pub fn prepare_frame_gpu(
     render_queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&camera_data));
     render_queue.write_buffer(&render_params_buf, 0, bytemuck::bytes_of(&render_params));
 
-    // Zero the storage buffers when freshly (re)created so a black frame is
-    // shown until the first-hit pass fills them, rather than garbage.
+    // Zero `first_hit_data` when freshly (re)created so a clean frame is shown
+    // until the first-hit pass fills it, rather than garbage. (`taa_sample_accum`
+    // is zero-cleared by `prepare_taa` on its own (re)creation.)
     if needs_new_storage {
         let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("naadf_clear_gbuffer"),
         });
         encoder.clear_buffer(&first_hit_data, 0, None);
-        encoder.clear_buffer(&shaded_color, 0, None);
         render_queue.submit([encoder.finish()]);
     }
 
-    // Rebuild the bind groups when storage changed; otherwise reuse.
+    // Rebuild the bind groups when storage changed; otherwise reuse. Slot 3 of
+    // the frame group / slot 1 of the blit group bind `taa_gpu.taa_sample_accum`
+    // (the real `taaSampleAccum`, owned by `TaaGpu`) — Phase A bound the local
+    // `shaded_color` stand-in here (`06-design-a2.md` §5.1, §5.4). `TaaGpu`'s
+    // `taa_sample_accum` resizes on the same `pixel_count` trigger as
+    // `first_hit_data`, so `needs_new_storage` covers both.
     let (bind_group, blit_bind_group) = if needs_new_storage || existing.is_none() {
         let bind_group = render_device.create_bind_group(
             "naadf_frame_bind_group",
@@ -370,7 +401,7 @@ pub fn prepare_frame_gpu(
                 camera_buf.as_entire_buffer_binding(),
                 render_params_buf.as_entire_buffer_binding(),
                 first_hit_data.as_entire_buffer_binding(),
-                shaded_color.as_entire_buffer_binding(),
+                taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
             )),
         );
         let blit_bind_group = render_device.create_bind_group(
@@ -378,7 +409,7 @@ pub fn prepare_frame_gpu(
             &pipeline_cache.get_bind_group_layout(&pipelines.blit_layout),
             &BindGroupEntries::sequential((
                 first_hit_data.as_entire_buffer_binding(),
-                shaded_color.as_entire_buffer_binding(),
+                taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
                 render_params_buf.as_entire_buffer_binding(),
             )),
         );
@@ -392,7 +423,6 @@ pub fn prepare_frame_gpu(
         camera: camera_buf,
         render_params: render_params_buf,
         first_hit_data,
-        shaded_color,
         pixel_count,
         bind_group,
         blit_bind_group,

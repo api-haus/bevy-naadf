@@ -62,19 +62,24 @@ fn main() {
         "8f6b1d2e-3c4a-4f5b-9a7c-1e2d3f4a5b6c"
     )));
 
-    app.insert_resource(args).add_plugins((
-        // The NAADF WGSL render shaders live in `src/assets/shaders/`
-        // (`03-design.md` §1 module layout) — point the asset server there.
-        DefaultPlugins.set(AssetPlugin {
-            file_path: "src/assets".to_string(),
-            ..default()
-        }),
-        FreeCameraPlugin,
-        FrameTimeDiagnosticsPlugin::default(),
-        RenderDiagnosticsPlugin,
-        world::WorldPlugin,
-        render::NaadfRenderPlugin,
-    ));
+    app.insert_resource(args)
+        // The 128-deep camera-history ring + the monotonic frame counter
+        // (`06-design-a2.md` §2.3). Main-world resource, `Default`-seeded,
+        // updated each frame by `update_camera_history`.
+        .init_resource::<render::taa::CameraHistory>()
+        .add_plugins((
+            // The NAADF WGSL render shaders live in `src/assets/shaders/`
+            // (`03-design.md` §1 module layout) — point the asset server there.
+            DefaultPlugins.set(AssetPlugin {
+                file_path: "src/assets".to_string(),
+                ..default()
+            }),
+            FreeCameraPlugin,
+            FrameTimeDiagnosticsPlugin::default(),
+            RenderDiagnosticsPlugin,
+            world::WorldPlugin,
+            render::NaadfRenderPlugin,
+        ));
 
     app.add_systems(
         Startup,
@@ -91,6 +96,10 @@ fn main() {
             // (ordered before `Update`), so by the time `sync_position_split`
             // runs here the `Transform` is already current for this frame.
             camera::sync_position_split,
+            // The camera-history ring update must run *after*
+            // `sync_position_split` so the ring stores this frame's current
+            // camera state (`06-design-a2.md` §9.3).
+            render::taa::update_camera_history.after(camera::sync_position_split),
             camera::toggle_dlss,
             hud::update_hud,
         ),

@@ -13,11 +13,11 @@
 //!   (`texture_3d<u32>`), `blocks` / `voxels` / `voxel_types` (read-only
 //!   storage), `world_meta` (uniform).
 //! - `@group(1)` — frame data: `camera` + `render_params` uniforms,
-//!   `first_hit_data` + `shaded_color` read-write storage.
+//!   `first_hit_data` + `taa_sample_accum` read-write storage.
 //!
 //! The first-hit compute pass binds `@group(0)` + `@group(1)`. The final-blit
 //! fullscreen pass binds its own small layout (`first_hit_data` +
-//! `shaded_color` + `render_params`) — it does not need the world buffers
+//! `taa_sample_accum` + `render_params`) — it does not need the world buffers
 //! (`03-design.md` §5.4).
 //!
 //! ## Per-format blit pipeline
@@ -68,11 +68,17 @@ pub struct NaadfPipelines {
     /// `world_meta`.
     pub world_layout: BindGroupLayoutDescriptor,
     /// `@group(1)` — frame data: `camera`, `render_params`, `first_hit_data`,
-    /// `shaded_color`.
+    /// `taa_sample_accum`.
     pub frame_layout: BindGroupLayoutDescriptor,
     /// The final-blit pass's own small layout: `first_hit_data`,
-    /// `shaded_color`, `render_params`.
+    /// `taa_sample_accum`, `render_params`.
     pub blit_layout: BindGroupLayoutDescriptor,
+    /// `@group(2)` for the first-hit pass — the `taa_samples` 16-ring write
+    /// (`06-design-a2.md` §5.2). One read-write storage binding. The first-hit
+    /// pipeline's *layout* is not extended to use it until Phase A-2 Batch 2
+    /// step 6; this layout is created in Batch 1 step 5 so `TaaGpu` can build
+    /// its `taa_first_hit_bind_group` field (`06-design-a2.md` §9.4).
+    pub taa_layout: BindGroupLayoutDescriptor,
     /// Cached id of the `naadf_first_hit` compute pipeline.
     pub first_hit_pipeline: CachedComputePipelineId,
     /// Per-`TextureFormat` cache of the `naadf_final` fullscreen render
@@ -123,8 +129,10 @@ impl FromWorld for NaadfPipelines {
         );
 
         // --- @group(1): frame data ------------------------------------------
-        // camera + render_params uniforms; first_hit_data + shaded_color
-        // read-write storage arrays.
+        // camera + render_params uniforms; first_hit_data + taa_sample_accum
+        // read-write storage arrays. (`taa_sample_accum` is the Phase A-2
+        // rename of Phase A's `shaded_color` stand-in — same type / access,
+        // the buffer just moved into `TaaGpu` — `06-design-a2.md` §5.1.)
         let frame_layout = BindGroupLayoutDescriptor::new(
             "naadf_frame_bind_group_layout",
             &BindGroupLayoutEntries::sequential(
@@ -133,13 +141,13 @@ impl FromWorld for NaadfPipelines {
                     uniform_buffer_sized(false, Some(camera_size)),
                     uniform_buffer_sized(false, Some(params_size)),
                     storage_buffer_sized(false, None), // first_hit_data: array<vec4<u32>>, rw
-                    storage_buffer_sized(false, None), // shaded_color: array<vec2<u32>>, rw
+                    storage_buffer_sized(false, None), // taa_sample_accum: array<vec2<u32>>, rw
                 ),
             ),
         );
 
         // --- final-blit layout (fullscreen fragment pass) -------------------
-        // first_hit_data (read), shaded_color (read), render_params (uniform).
+        // first_hit_data (read), taa_sample_accum (read), render_params (uniform).
         let blit_layout = BindGroupLayoutDescriptor::new(
             "naadf_blit_bind_group_layout",
             &BindGroupLayoutEntries::sequential(
@@ -148,8 +156,23 @@ impl FromWorld for NaadfPipelines {
                     // The blit pass only reads these — `var<storage, read>` in
                     // `naadf_final.wgsl`.
                     storage_buffer_read_only_sized(false, None), // first_hit_data: array<vec4<u32>>
-                    storage_buffer_read_only_sized(false, None), // shaded_color: array<vec2<u32>>
+                    storage_buffer_read_only_sized(false, None), // taa_sample_accum: array<vec2<u32>>
                     uniform_buffer_sized(false, Some(params_size)),
+                ),
+            ),
+        );
+
+        // --- @group(2): the first-hit pass's TAA-sample-ring write ----------
+        // One read-write storage binding — `taa_samples: array<vec2<u32>>`
+        // (`06-design-a2.md` §5.2). Created here in Batch 1 so `TaaGpu` can
+        // build its `taa_first_hit_bind_group`; the first-hit pipeline does
+        // not bind this group until Batch 2 step 6.
+        let taa_layout = BindGroupLayoutDescriptor::new(
+            "naadf_taa_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    storage_buffer_sized(false, None), // taa_samples: array<vec2<u32>>, rw
                 ),
             ),
         );
@@ -179,6 +202,7 @@ impl FromWorld for NaadfPipelines {
             world_layout,
             frame_layout,
             blit_layout,
+            taa_layout,
             first_hit_pipeline,
             blit_pipelines: HashMap::default(),
             blit_vertex,
