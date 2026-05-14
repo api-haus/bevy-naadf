@@ -165,6 +165,99 @@ review gate).
 
 ---
 
+## 2d. Phase B (GI) working context
+
+Phase A and Phase A-2 are complete and review-gated (the albedo first-hit render + NAADF's
+16-frame long-term-memory TAA with the per-pixel sample-count signal exposed). **Phase B ports
+NAADF's real-time raytraced GI pipeline.** This section is the canonical Phase-B context — the
+B `design` agent reads it first. **Phase B is being done in a git worktree:**
+`/mnt/archive4/DEV/bevy-naadf/.claude/worktrees/phase-b-gi`, branch `feat/phase-b-gi`, branched
+from `main` at the Phase-A-2-close commit. All Phase-B file operations use absolute paths under
+that worktree.
+
+### Binding scope decision (user, 2026-05-14)
+
+> **Implement only the raytraced GI + TAA, fully — NAADF's `WorldRenderBase` version.**
+> - **Reference pathtracer (`WorldRenderPathTracer` / `pathTracer/**` shaders) — OUT of Phase B
+>   scope** (future work — do not port).
+> - **DLSS / DLSS-RR pairing — OUT of Phase B scope** (future work; the `dlss` /
+>   `force_disable_dlss` Cargo plumbing stays dormant — do not design for it).
+>
+> Phase B is the complete NAADF real-time GI pipeline and nothing else.
+
+### Phase B scope — research-doc §4.2–4.3 + NAADF's `WorldRenderBase`
+
+Port the full real-time GI pipeline (research-doc §4.2–4.3; digest in `02-research.md` §1.2.1
+pipeline overview / §1.2.3 compressed ReSTIR GI / §1.2.4 sparse bilateral denoiser / §1.2.5
+atmosphere; the `base/` shader inventory in `02-research.md` §5.4; maps to
+`Content/shaders/render/versions/base/**` + the Phase-B functions of the shared `.fxh` headers):
+
+- **4-plane-bounce first-hit** — the Phase-B variant of the first-hit pass
+  (`base/renderFirstHit.fx`). Phase A/A-2's `naadf_first_hit.wgsl` fills only G-buffer plane 0;
+  Phase B fills planes 1–3 (specular bounces) — needs the specular-path `getHitDataFromPlanes`
+  (a Phase-B function of `commonRenderPipeline.fxh`) and VNDF/GGX sampling (a Phase-B function
+  of `commonRayTracing.fxh`).
+- **`rayQueueCalc`** (`base/rayQueueCalc.fx`) — the adaptive sampler. **This is where 0.25 spp
+  is realised.** It reads the TAA per-pixel accumulated sample-count signal (Phase A-2 exposed
+  it in `taa_sample_accum.x`) to decide which pixels need GI rays this frame → the adaptive
+  ~0.25-spp rate, NAADF's headline 2× GI speedup. The "0.25 spp" the user flagged is *this
+  pass*, now actually exercised.
+- **Compressed ReSTIR GI** (`base/renderGlobalIllum.fx`) — lit/unlit sample separation, the
+  5-bit/channel colour compression (`commonColorCompression.fxh` — Phase-B-tagged in
+  `02-research.md` §5.1, in scope now), 8×8 screen-space regions, the 12-iteration spatial-
+  resampling pass with a *single* visibility check.
+- **`renderSampleRefine`** (`base/renderSampleRefine.fx`) — the `RefineBuckets`
+  brightness-leveling; uses the `COLOR_DIF_PROB` exponential-difference probability table
+  (`02-research.md` divergence #10).
+- **`renderSpatialResampling`** (`base/renderSpatialResampling.fx`) — the spatial resampling pass.
+- **Sparse bilateral denoiser** (`base/renderDenoiseSplit.fx`) — research-doc §4.3.
+- **Atmosphere precompute** — Phase A/A-2 used only the inline sun+ambient term; Phase B needs
+  the full `Atmosphere` model + `base/renderAtmosphere.fx` + the atmosphere `.fxh` headers
+  (`02-research.md` divergence #7).
+- **The Phase-B `renderFinal`** (`base/renderFinal.fx`) — the Phase-B variant of the final blit.
+
+### Pipeline shape (from `02-research.md` §1.2.1)
+
+The Phase-A-2 render graph is `naadf_first_hit → naadf_taa_reproject → naadf_final_blit`. Phase
+B expands it — the existing TAA node stays where it is (NAADF places TAA early, between
+first-hit and the GI passes):
+```
+[atmosphere precompute] [first_hit (4-plane G-buffer)] → [TAA reproject] → [rayQueueCalc]
+   → [globalIllum] → [sampleRefine] → [spatialResampling] → [denoiseSplit] → [final blit]
+```
+
+### What Phase B builds on (Phase A + A-2 — already in the tree)
+
+- The **AADF traversal `shoot_ray`** (`src/assets/shaders/ray_tracing.wgsl`) — reused unchanged
+  for GI secondary rays + visibility rays.
+- The **16-frame long-term TAA** + the **`taa_sample_accum` per-pixel sample-count signal**
+  (Phase A-2 — `06-design-a2.md`, verified in `08-review-a2.md`). `rayQueueCalc` consumes the
+  sample-count signal.
+- The **`PositionSplit` int+frac camera** (D1) + the **`M*v` glam matrix convention** (the
+  Phase-A perspective fix, `05-review.md`) — every new WGSL projection multiply in Phase B MUST
+  use `M*v` + the `w`-divide, NOT verbatim HLSL `mul(v,M)`. This bug class has bitten the port
+  twice; do not reintroduce it.
+- The render-world plumbing (`extract`/`prepare`/`pipelines`/`graph`/`gpu_types`), the
+  `GrowableBuffer`, the `TaaGpu` / `WorldGpu` / `FrameGpu` resources.
+
+### Forbidden / out of Phase B scope
+
+- The reference pathtracer (`WorldRenderPathTracer`, `pathTracer/**` shaders) — future work.
+- DLSS / DLSS-RR — future work; do not design for it, Cargo plumbing stays dormant.
+- Phase C (GPU world construction — `chunkCalc.fx` / `boundsCalc.fx` / `worldChange.fx` — and
+  editing) — separate later phase.
+- The `05-review.md` §4 non-A-2 secondary issues, unless one actively blocks the GI pipeline.
+
+### Phase B deliverable / done-bar
+
+The full NAADF real-time raytraced GI pipeline running on the Phase-A-2 base: 4-plane first-hit
+→ adaptive ~0.25-spp GI rays via `rayQueueCalc` → compressed ReSTIR GI + refine + spatial
+resampling → sparse bilateral denoiser → atmosphere → final. Build + the existing test suite
+green; user interactive re-test confirms GI is rendering (bounce lighting visible, temporally
+stable via the A-2 TAA, no obvious artifacts) — the Phase-B review gate.
+
+---
+
 ## 3. Reuse audit summary
 
 Full audit: `docs/orchestrate/naadf-bevy-port/00-reuse-audit.md`. Condensed verdict:

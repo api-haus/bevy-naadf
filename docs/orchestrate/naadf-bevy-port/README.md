@@ -25,7 +25,10 @@ render), no editor GUI / persistence / importers.
 | `06-design-a2.md` | `design` group | Phase A-2 (TAA) architecture design |
 | `07-impl-a2.md` | `impl` group | Phase A-2 (TAA) implementation log |
 | `08-review-a2.md` | `review` group | Phase A-2 (TAA) verification — faithful-port + 0.25-spp-readiness (sample-count signal) |
+| `09-design-b.md` | `design` group | Phase B (GI) architecture design |
 | `design-exploration-qa.md` | orchestrator | methodology/capability/VRAM Q&A reference (lineage, PBR texturing, dynamic entities, microvoxels, LOD, TAA-history VRAM lever) — read before scoping features it covers; holds one binding decision (§6) |
+
+**Phase B is being done in a git worktree:** `/mnt/archive4/DEV/bevy-naadf/.claude/worktrees/phase-b-gi` (branch `feat/phase-b-gi`, from `main` at the Phase-A-2-close commit). All Phase-B orchestrate files, briefs, and code use absolute paths under that worktree.
 
 ## Agent groups
 
@@ -54,7 +57,7 @@ B (GI) → C (GPU construction/editing)**. One gated phase at a time.
 - [x] `impl` phase (**Phase A**) → `04-impl.md` — Batch 1 (steps 1–6) + Batch 2 (steps 7–12) done 2026-05-14; 39 tests pass, builds + smoke-runs clean
 - [x] `review` phase (**Phase A**) → `05-review.md` — **Phase A review gate PASSED**. Two regressions found, fixed, and user-confirmed: (1) camera→ray perspective (3 compounding MonoGame↔wgpu convention bugs), (2) out-of-volume concentric-line artifacts (wrong AABB clip-box values — NAADF insets by 0.1 voxel as `float3`). 39 tests pass; builds + runs coherent inside and outside the volume.
 - [x] **Phase A-2 (TAA) — COMPLETE.** Context (`01-context.md` §2c) + design (`06-design-a2.md`) + impl (all 9 steps, `07-impl-a2.md`) + review (`08-review-a2.md`): 0.25-spp readiness READY, faithful HLSL→WGSL port + `M*v` matrix convention verified, leftover step-8 instrumentation reverted, 39 tests pass, smoke-runs clean. Deliverable: NAADF's 16-frame long-term-memory TAA, on by default; per-pixel sample-count signal exposed for Phase B.
-- [ ] Phase B (GI): design → impl → review
+- [~] Phase B (GI) — in worktree `feat/phase-b-gi`. Context written (`01-context.md` §2d): scope = NAADF's real-time `WorldRenderBase` GI pipeline only (compressed ReSTIR GI + sparse bilateral denoiser + 4-plane first-hit + `rayQueueCalc` adaptive 0.25-spp + atmosphere); reference pathtracer + DLSS-RR explicitly OUT (future). **`design` in progress** → `09-design-b.md`; then impl → review
 - [ ] Phase C (GPU construction/editing): design → impl → review
 
 ## Pacing
