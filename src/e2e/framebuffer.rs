@@ -54,18 +54,21 @@ pub const NON_BLACK_EPS: f32 = 2.0;
 ///
 /// The user asked for "most of the pixels are not pitch black … at least 50%, i
 /// guess" — 50% is the floor of that intent. That target describes the *GI-lit*
-/// scene: once `globalIllum`'s bounce light reaches the screen (Batch 5 —
-/// `10-impl-b.md`: "GI bounce becomes visible", the pre-GI-black geometry
-/// "measurably brighter"), the dark diffuse geometry is no longer pitch black.
+/// scene: once the GI bounce light reaches the screen (Batch 6 — see
+/// [`GI_LIT_BATCH`]; the B5-vs-B6 milestone settled the visible bounce to B6),
+/// the dark diffuse geometry is no longer pitch black.
 ///
 /// **Recalibrated (2026-05-14, e2e test-scene expansion):** the test scene was
 /// expanded with five emissive blocks + more geometry, and the pre-GI non-black
 /// fraction at the re-framed e2e pose rose to **69.1%** (was ~41%) — so once GI
 /// lights the dark diffuse geometry the GI-lit fraction is ≥ that. A 0.50 hard
 /// gate would no longer be a real check on the expanded scene. This is set to
-/// **0.60** — above the user's 50% floor, a real check on the GI-lit frame,
-/// with headroom for the Batch-5 agent to confirm against the actual measured
-/// GI-lit fraction and nudge it to just below the measured value (the
+/// **0.60** — above the user's 50% floor, a real check on the GI-lit frame.
+/// **Batch-5 confirmed it is not yet exercised:** the whole-frame non-black
+/// fraction stays bit-identical at 69.1% through B5 (the GI consumers run but
+/// their pre-B6 contribution is negligible), so [`GI_LIT_BATCH`] is `6` and the
+/// Batch-6 agent re-confirms this 0.60 hard gate against the actual measured
+/// GI-lit fraction and nudges it to just below the measured value (the
 /// `e2e-render-test.md` rule).
 pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.60;
 
@@ -75,7 +78,10 @@ pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.60;
 /// atmosphere-tinted sky and the emissive blocks are lit; the non-emissive
 /// diffuse voxel geometry is pitch black by design (`10-impl-b.md` Batch 2:
 /// "pre-GI a non-emissive diffuse block should be near-black"). Demanding the
-/// full GI-lit threshold here would be a false failure.
+/// full GI-lit threshold here would be a false failure. This floor covers
+/// **Batch 1-5** ([`GI_LIT_BATCH`] is `6` — the B5-vs-B6 milestone settled the
+/// visible bounce to Batch 6; B5's GI consumers run but their pre-B6
+/// contribution is negligible, so B5's frame is still pre-GI-like).
 ///
 /// **Recalibrated (2026-05-14, e2e test-scene expansion):** the expanded scene
 /// (five emissive blocks distributed through the volume + the atmosphere-tinted
@@ -89,14 +95,26 @@ pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.60;
 pub const MIN_NON_BLACK_FRACTION_PRE_GI: f32 = 0.50;
 
 /// The batch at which the GI bounce lights the scene and the full
-/// [`MIN_NON_BLACK_FRACTION_GI`] (50%) liveness threshold becomes a hard gate
-/// (`10-impl-b.md` Batch 5 — "GI bounce becomes visible"). Below it the gate
-/// uses [`MIN_NON_BLACK_FRACTION_PRE_GI`].
-pub const GI_LIT_BATCH: u32 = 5;
+/// [`MIN_NON_BLACK_FRACTION_GI`] liveness threshold becomes a hard gate. Below
+/// it the gate uses [`MIN_NON_BLACK_FRACTION_PRE_GI`].
+///
+/// **This is `6`, not `5`.** `09-design-b.md` §11 Batch 5 step 15 claimed the
+/// GI bounce becomes visible at end-of-B5, but the Batch-5 verification (see
+/// `10-impl-b.md` Batch-5 section + `gates::assert_batch_5`) settled the
+/// B5-vs-B6 question: the visible-bounce milestone genuinely moves to **Batch
+/// 6**. B5's GI consumers (`renderSpatialResampling` / `renderDenoiseSplit`)
+/// run and write `final_color`, but the 12-iteration reservoir loop reads the
+/// `renderSampleRefine` refine buffers, which are correct-but-empty until B6
+/// wires `taa_dist_min_max`; the spatial pass's independent sun sample
+/// contributes negligibly in the enclosed e2e test scene (the whole-frame
+/// non-black fraction stays bit-identical at 69.1% through B5). So B5 keeps the
+/// pre-GI floor — the honest regime — and B6 is the first batch the GI hard
+/// gate applies to.
+pub const GI_LIT_BATCH: u32 = 6;
 
 /// The non-black-fraction threshold for `batch` — [`MIN_NON_BLACK_FRACTION_GI`]
-/// (0.50) from [`GI_LIT_BATCH`] on, [`MIN_NON_BLACK_FRACTION_PRE_GI`] (0.25)
-/// before it. See [`Framebuffer::check_luminance_alive`].
+/// (0.60) from [`GI_LIT_BATCH`] (`6`) on, [`MIN_NON_BLACK_FRACTION_PRE_GI`]
+/// (0.50) before it. See [`Framebuffer::check_luminance_alive`].
 pub fn min_non_black_fraction(batch: u32) -> f32 {
     if batch >= GI_LIT_BATCH {
         MIN_NON_BLACK_FRACTION_GI

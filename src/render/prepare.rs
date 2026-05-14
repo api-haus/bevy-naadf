@@ -579,7 +579,10 @@ pub fn prepare_frame_gpu(
     // `renderGlobalIllum`). Batch 4 adds `sample_refine_bind_group` (`@group(0)`
     // shared by all 5 sample-refine passes — it mixes `GiGpu` + `FrameGpu`
     // (`first_hit_data`) + `TaaGpu` (`taa_dist_min_max` + `camera_history`),
-    // exactly the mixed pattern). Batches 5-6 add the rest.
+    // exactly the mixed pattern). Batch 5 adds `spatial_resampling_bind_group`
+    // (`@group(1)` of `renderSpatialResampling`) + `denoise_bind_group`
+    // (`@group(0)` shared by the two `renderDenoiseSplit` passes). Batch 6 adds
+    // the last (`calc_new_taa_sample_bind_group`).
     let gi_bind_groups_stale = match &existing_gi_bind_groups {
         Some(bg) => bg.pixel_count != pixel_count,
         None => true,
@@ -647,11 +650,51 @@ pub fn prepare_frame_gpu(
                 gi_gpu.invalid_dispatch.as_entire_buffer_binding(),
             )),
         );
+        // `spatial_resampling_bind_group` (`@group(1)` for `renderSpatialResampling`
+        // — `09-design-b.md` §8.3). 8 bindings, matching
+        // `pipelines.spatial_resampling_layout` order exactly. Mixes `GiGpu` +
+        // `FrameGpu` (`first_hit_data` / `first_hit_absorption` / `final_color`)
+        // + `TaaGpu` (`taa_sample_accum`). CROSS-BATCH (`09-design-b.md` §11
+        // Batch 5): `bucket_info` / `valid_samples_compressed` are
+        // correct-but-empty until Batch 6 wires `taa_dist_min_max` — the
+        // 12-tap reservoir loop yields nothing pre-B6, but the sun sample is
+        // independent, so direct-sun bounce light still lands in `final_color`.
+        let spatial_resampling_bind_group = render_device.create_bind_group(
+            "naadf_spatial_resampling_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.spatial_resampling_layout),
+            &BindGroupEntries::sequential((
+                gi_gpu.gi_params.as_entire_buffer_binding(),
+                first_hit_data.as_entire_buffer_binding(),
+                first_hit_absorption.as_entire_buffer_binding(),
+                gi_gpu.bucket_info.as_entire_buffer_binding(),
+                gi_gpu.valid_samples_compressed.as_entire_buffer_binding(),
+                taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
+                final_color.as_entire_buffer_binding(),
+                gi_gpu.denoise_preprocessed.as_entire_buffer_binding(),
+            )),
+        );
+        // `denoise_bind_group` (`@group(0)` shared by both `renderDenoiseSplit`
+        // passes — `09-design-b.md` §9.1). 5 bindings, matching
+        // `pipelines.denoise_layout` order exactly. Mixes `GiGpu` + `FrameGpu`
+        // (`first_hit_absorption` / `final_color`).
+        let denoise_bind_group = render_device.create_bind_group(
+            "naadf_denoise_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.denoise_layout),
+            &BindGroupEntries::sequential((
+                gi_gpu.gi_params.as_entire_buffer_binding(),
+                first_hit_absorption.as_entire_buffer_binding(),
+                gi_gpu.denoise_preprocessed.as_entire_buffer_binding(),
+                gi_gpu.denoise_preprocessed_horizontal.as_entire_buffer_binding(),
+                final_color.as_entire_buffer_binding(),
+            )),
+        );
         commands.insert_resource(GiBindGroups {
             ray_queue_bind_group,
             global_illum_bind_group,
             sample_refine_bind_group,
             sample_refine_dispatch_bind_group,
+            spatial_resampling_bind_group,
+            denoise_bind_group,
             pixel_count,
         });
     }

@@ -20,6 +20,7 @@ use bevy::render::render_resource::{ComputePassDescriptor, PipelineCache};
 use bevy::render::renderer::RenderContext;
 
 use crate::render::atmosphere::{AtmosphereGpu, ATMOSPHERE_TEX_SIZE, ATMOSPHERE_WORKGROUP_SIZE};
+use crate::render::extract::ExtractedGiConfig;
 use crate::render::gi::{GiBindGroups, GiGpu};
 use crate::render::pipelines::{NaadfPipelines, FIRST_HIT_WORKGROUP_SIZE};
 use crate::render::prepare::{FrameGpu, WorldGpu};
@@ -39,6 +40,13 @@ pub const GLOBAL_ILLUM_SPAN: &str = "naadf_global_illum";
 /// `rayQueueCalc` / `globalIllum` in NAADF's dispatch order), but they share
 /// one HUD line + one node-dispatch-check entry.
 pub const SAMPLE_REFINE_SPAN: &str = "naadf_sample_refine";
+/// Timing-span name for the spatial-resampling pass — surfaces in the HUD as
+/// `render/naadf_spatial_resampling/elapsed_gpu`.
+pub const SPATIAL_RESAMPLING_SPAN: &str = "naadf_spatial_resampling";
+/// Timing-span name shared by the two `renderDenoiseSplit` passes — surfaces in
+/// the HUD as `render/naadf_denoise/elapsed_gpu`. The horizontal + vertical
+/// passes are 2 dispatches in one node, so they share one span.
+pub const DENOISE_SPAN: &str = "naadf_denoise";
 
 /// `Core3d` system: the NAADF atmosphere precompute compute pass
 /// (`09-design-b.md` §4.3 / §9.2).
@@ -432,6 +440,134 @@ pub fn naadf_sample_refine_buckets_node(
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &gi_bind_groups.sample_refine_bind_group, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    time_span.end(render_context.command_encoder());
+}
+
+/// `Core3d` system: the NAADF `renderSpatialResampling` pass — compressed-ReSTIR
+/// GI Algorithm 2 (`09-design-b.md` §4.8 / §8.3).
+///
+/// Faithful port of the C# `WorldRenderBase` `spatialResamplingEffect` dispatch
+/// (`WorldRenderBase.cs:396-397`): one compute pass running
+/// `spatial_resampling.wgsl`'s `calc_spatial_resampling` over
+/// `ceil(pixel_count / 64)` workgroups. Per pixel: the 12-iteration neighbour-
+/// reservoir loop over the 8×8 bucket grid, the single 3-step mirror-following
+/// visibility ray, the sun sample, then the denoise-vs-final write split.
+///
+/// Binds `@group(0)` world (it traverses for the visibility + sun rays) +
+/// `@group(1)` `spatial_resampling_bind_group`.
+///
+/// Batch 5: this is the first GI consumer — it writes `final_color` (non-denoise
+/// path) or `denoise_preprocessed` (denoise path). With Batch-2's temporary
+/// `final_color` blit still in place, the GI bounce light it composites becomes
+/// VISIBLE. The 12-tap reservoir loop yields nothing until Batch 6 fills
+/// `taa_dist_min_max` (the refine buffers are correct-but-empty pre-B6), but the
+/// sun sample is independent — direct-sun bounce light lands at end-of-B5
+/// (`10-impl-b.md` Batch 4 "note for B5").
+pub fn naadf_spatial_resampling_node(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipelines: Res<NaadfPipelines>,
+    world_gpu: Option<Res<WorldGpu>>,
+    gi_gpu: Option<Res<GiGpu>>,
+    gi_bind_groups: Option<Res<GiBindGroups>>,
+) {
+    let (Some(world_gpu), Some(gi_gpu), Some(gi_bind_groups)) =
+        (world_gpu, gi_gpu, gi_bind_groups)
+    else {
+        return;
+    };
+    let Some(pipeline) =
+        pipeline_cache.get_compute_pipeline(pipelines.spatial_resampling_pipeline)
+    else {
+        return;
+    };
+
+    // `ceil(pixel_count / 64)` workgroups (`WorldRenderBase.cs:397`).
+    let workgroups = gi_gpu.pixel_count.div_ceil(FIRST_HIT_WORKGROUP_SIZE).max(1);
+
+    let diagnostics = render_context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    let encoder = render_context.command_encoder();
+    let time_span = diagnostics.time_span(encoder, SPATIAL_RESAMPLING_SPAN);
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("naadf_spatial_resampling_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &world_gpu.bind_group, &[]);
+        pass.set_bind_group(1, &gi_bind_groups.spatial_resampling_bind_group, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    time_span.end(render_context.command_encoder());
+}
+
+/// `Core3d` system: the NAADF `renderDenoiseSplit` sparse-bilateral denoiser
+/// (`09-design-b.md` §4.9 / §9.1).
+///
+/// Faithful port of the C# `WorldRenderBase` `denoiseEffect` dispatches
+/// (`WorldRenderBase.cs:412-416`): TWO dispatches in one node — the horizontal
+/// then the vertical separable sparse-bilateral pass, each over
+/// `ceil(pixel_count / 64)` workgroups. Both bind the single
+/// `denoise_bind_group` (`@group(0)`); the denoiser does not traverse the voxel
+/// world.
+///
+/// **Gated on `ExtractedGiConfig.is_denoise`** (`WorldRenderBase.cs:400`): when
+/// off, the node early-returns — `spatial_resampling` already wrote `final_color`
+/// directly in its non-denoise branch (`renderSpatialResampling.fx:391-398`).
+/// Mirrors A-2's `naadf_taa_reproject_node` gate on `ExtractedTaaConfig.enabled`.
+///
+/// Batch 5: with denoise on, `spatial_resampling` writes `denoise_preprocessed`
+/// and this node filters it into `final_color` — the GI bounce is denoised
+/// before the Batch-2 temporary `final_color` blit shows it.
+pub fn naadf_denoise_node(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipelines: Res<NaadfPipelines>,
+    gi_gpu: Option<Res<GiGpu>>,
+    gi_bind_groups: Option<Res<GiBindGroups>>,
+    extracted_gi: Option<Res<ExtractedGiConfig>>,
+) {
+    let (Some(gi_gpu), Some(gi_bind_groups)) = (gi_gpu, gi_bind_groups) else {
+        return;
+    };
+    // Gated on `is_denoise` — when off, `spatial_resampling` wrote `final_color`
+    // directly and there is nothing to filter (`WorldRenderBase.cs:400`).
+    let Some(extracted_gi) = extracted_gi else {
+        return;
+    };
+    if !extracted_gi.settings.is_denoise {
+        return;
+    }
+    let (Some(horizontal_pipeline), Some(vertical_pipeline)) = (
+        pipeline_cache.get_compute_pipeline(pipelines.denoise_horizontal_pipeline),
+        pipeline_cache.get_compute_pipeline(pipelines.denoise_vertical_pipeline),
+    ) else {
+        return;
+    };
+
+    // Each pass: `ceil(pixel_count / 64)` workgroups (`WorldRenderBase.cs:412-416`).
+    let workgroups = gi_gpu.pixel_count.div_ceil(FIRST_HIT_WORKGROUP_SIZE).max(1);
+
+    let diagnostics = render_context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    let encoder = render_context.command_encoder();
+    let time_span = diagnostics.time_span(encoder, DENOISE_SPAN);
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("naadf_denoise_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, &gi_bind_groups.denoise_bind_group, &[]);
+        // Pass 1: the horizontal sparse-bilateral pass.
+        pass.set_pipeline(horizontal_pipeline);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+        // Pass 2: the vertical pass — reads what the horizontal pass wrote;
+        // wgpu's automatic buffer barrier between the dispatches serialises
+        // `denoise_preprocessed_horizontal`.
+        pass.set_pipeline(vertical_pipeline);
         pass.dispatch_workgroups(workgroups, 1, 1);
     }
     time_span.end(render_context.command_encoder());

@@ -162,9 +162,9 @@ pub struct GiGpu {
 /// because they reference `GiGpu` + `FrameGpu` + `TaaGpu` buffers and must be
 /// built after all three resources exist (`09-design-b.md` §10.3).
 ///
-/// Batch 3 lands two of them, Batch 4 adds `sample_refine_bind_group`; the rest
-/// (`spatial_resampling_bind_group`, `denoise_bind_group`,
-/// `calc_new_taa_sample_bind_group`) arrive in Batches 5-6.
+/// Batch 3 lands two of them, Batch 4 adds `sample_refine_bind_group`, Batch 5
+/// adds `spatial_resampling_bind_group` + `denoise_bind_group`; the last
+/// (`calc_new_taa_sample_bind_group`) arrives in Batch 6.
 #[derive(Resource)]
 pub struct GiBindGroups {
     /// `@group(0)` for the `ray_queue_calc` passes (`09-design-b.md` §4.5):
@@ -193,6 +193,20 @@ pub struct GiBindGroups {
     /// sources by the two count passes, so they cannot be bound rw in the shared
     /// `@group(0)` (the count passes bind that group).
     pub sample_refine_dispatch_bind_group: BindGroup,
+    /// `@group(1)` for `naadf_spatial_resampling_node` (`09-design-b.md` §8.3):
+    /// `gi_params`, `first_hit_data` / `first_hit_absorption` / `bucket_info` /
+    /// `valid_samples_compressed` / `taa_sample_accum` (read), `final_color` /
+    /// `denoise_preprocessed` (rw). Mixes `GiGpu` + `FrameGpu`
+    /// (`first_hit_data` / `first_hit_absorption` / `final_color`) + `TaaGpu`
+    /// (`taa_sample_accum`), so built here in `prepare_frame_gpu`. The pass also
+    /// binds `@group(0)` world (it traverses).
+    pub spatial_resampling_bind_group: BindGroup,
+    /// `@group(0)` shared by the two `naadf_denoise_node` passes
+    /// (`09-design-b.md` §9.1): `gi_params`, `first_hit_absorption` /
+    /// `denoise_preprocessed` (read), `denoise_preprocessed_horizontal` /
+    /// `final_color` (rw). Mixes `GiGpu` + `FrameGpu` (`first_hit_absorption` /
+    /// `final_color`), so built here in `prepare_frame_gpu`.
+    pub denoise_bind_group: BindGroup,
     /// Pixel count these bind groups' buffers were sized for — the rebuild
     /// trigger (mirrors `FrameGpu.pixel_count`).
     pub pixel_count: u32,

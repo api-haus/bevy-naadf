@@ -44,10 +44,11 @@ use gi::prepare_gi;
 // `base/` TAA rewire is Batch 6); not imported here so the chain stays honest.
 use graph::{naadf_final_blit_node, naadf_first_hit_node};
 use graph_b::{
-    naadf_atmosphere_node, naadf_global_illum_node, naadf_ray_queue_node,
-    naadf_sample_refine_buckets_node, naadf_sample_refine_clear_node,
-    naadf_sample_refine_count_invalid_node, naadf_sample_refine_count_valid_node,
-    naadf_sample_refine_valid_history_node,
+    naadf_atmosphere_node, naadf_denoise_node, naadf_global_illum_node,
+    naadf_ray_queue_node, naadf_sample_refine_buckets_node,
+    naadf_sample_refine_clear_node, naadf_sample_refine_count_invalid_node,
+    naadf_sample_refine_count_valid_node, naadf_sample_refine_valid_history_node,
+    naadf_spatial_resampling_node,
 };
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
@@ -170,6 +171,20 @@ impl Plugin for NaadfRenderPlugin {
             //     sample-refine reprojection validity test rejects everything
             //     until then (correct-but-empty — `09-design-b.md` §11 Batch 4
             //     step 13).
+            //
+            // Phase B Batch 5 (`09-design-b.md` §11 Batch 5 / §4.2): the GI
+            // *consumers* land — `naadf_spatial_resampling_node` (Algorithm 2:
+            // the 12-iteration neighbour-reservoir loop + the single visibility
+            // ray + the sun sample) and `naadf_denoise_node` (the two separable
+            // sparse-bilateral passes, gated on `ExtractedGiConfig.is_denoise`),
+            // inserted AFTER `naadf_sample_refine_buckets_node`, BEFORE
+            // `naadf_final_blit_node`. Both write `final_color` — and Batch-2's
+            // temporary `final_color` blit is still in place, so the GI bounce
+            // light becomes VISIBLE at end-of-Batch-5. The full indirect
+            // reservoir-resampled bounce needs Batch 6's `taa_dist_min_max`
+            // (the refine buffers are correct-but-empty pre-B6), but the
+            // spatial pass's sun sample is independent — direct-sun bounce
+            // light on diffuse surfaces lands at end-of-B5.
             .add_systems(
                 Core3d,
                 (
@@ -182,6 +197,8 @@ impl Plugin for NaadfRenderPlugin {
                     naadf_sample_refine_count_valid_node,
                     naadf_sample_refine_count_invalid_node,
                     naadf_sample_refine_buckets_node,
+                    naadf_spatial_resampling_node,
+                    naadf_denoise_node,
                     naadf_final_blit_node,
                 )
                     .chain()

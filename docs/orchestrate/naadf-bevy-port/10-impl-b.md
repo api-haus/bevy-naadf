@@ -1145,3 +1145,274 @@ single-run all-errors property held), both fixed:
   `MIN_NON_BLACK_FRACTION_GI` to just below the measured value if it lands
   under, a real check not a rubber stamp). The current pre-GI frame is at
   69.1%, so there is headroom.
+
+---
+
+## Batch 5 — spatialResampling + denoiser (2026-05-14)
+
+`09-design-b.md` §11 Batch 5 (steps 15–16). Builds the GI *consumers* — the
+spatial-reuse stage of compressed ReSTIR GI (`renderSpatialResampling` —
+Algorithm 2) and NAADF's sparse separable bilateral denoiser
+(`renderDenoiseSplit`). These are the first passes that write `final_color` /
+`denoise_preprocessed`; the render-graph chain becomes `… →
+spatial_resampling → denoise → final_blit`. Ends ▶ runnable.
+
+### The B5-vs-B6 "GI visible" milestone finding — **the visible bounce requires Batch 6**
+
+The FIRST ACTION the brief required. `09-design-b.md` §11 Batch 5 step 15
+claims "GI bounce lighting is visible for the first time" at end-of-B5. The
+Batch-4 "note for B5" carry-forward flagged this as suspect ("B5's done-bar of
+'GI bounce becomes visible' therefore *also* depends on B6"). **The Batch-5
+verification settles it: the visible-bounce milestone genuinely moves to Batch
+6.** The §11 evidence + the reasoning:
+
+- **The reservoir path is empty until B6.** `renderSpatialResampling`'s
+  12-iteration neighbour loop reads `valid_samples_compressed` + `bucket_info`
+  — the `renderSampleRefine` refine buffers. Batch 4's "Cross-batch dependency"
+  section + `09-design-b.md` §11 Batch 4 step 13 establish those are
+  *correct-but-empty* until Batch 6: `renderSampleRefine`'s reprojection
+  validity test rejects every sample because `taa_dist_min_max` is the
+  zero-cleared buffer (`dist_min == dist_max == 0`), and `taa_dist_min_max` is
+  not written until Batch 6 wires the `base/` `ReprojectOld`. So in B5 every
+  bucket reads `bucket_valid_stored == 0` ⇒ the reservoir loop selects nothing
+  ⇒ the resampled-GI term is zero.
+- **The spatial pass's sun sample IS independent — and IS wired + dispatched —
+  but contributes negligibly in this scene.** `renderSpatialResampling.fx:321-339`'s
+  sun sample shoots a sun ray and adds `sunColor * weight` for a sun-facing
+  unshadowed surface; it does not touch the refine buffers. It is ported
+  faithfully and runs every frame. But in the enclosed e2e test scene at the
+  fixed pose, its contribution to `final_color` is negligible — the visible
+  diffuse geometry is largely sun-shadowed / sun-averted. **Hard evidence:** the
+  e2e whole-frame non-black fraction stays bit-identical at **69.1%** through
+  B5 (same as B2/B3/B4), and the screenshot is visually indistinguishable from
+  Batch 4 (the dark diffuse voxel structure stays near-black; the
+  `solid_block_rect` region measured luminance 4.1, vs. its pre-GI ~4).
+- **Conclusion.** B5's image is stable like B3/B4 — the GI consumers run, the
+  passes dispatch clean, `final_color` is written — but no visually significant
+  bounce lands until Batch 6 populates the reservoir buffers via
+  `taa_dist_min_max`. `09-design-b.md` step 15's "visible for the first time"
+  claim did not trace the full `taa_dist_min_max → renderSampleRefine →
+  valid_samples_compressed → renderSpatialResampling` dependency chain; the
+  Batch-4 agent did, and flagged it; this batch confirms it. **Not a
+  regression, not a bug — a pipeline-shape reality the design's step-15 prose
+  understated.** Per the brief: the harness batch-tracker was kept honest (NOT
+  flipped to a B5-visible regime the pipeline cannot yet satisfy; no faked
+  gate) — see "How the e2e harness batch-tracker was set".
+
+### Files created
+
+| file | what it is | NAADF provenance |
+|---|---|---|
+| `src/assets/shaders/spatial_resampling.wgsl` | compressed-ReSTIR GI Algorithm 2 — the spatial resampling pass. `calc_spatial_resampling` compute entry + `sample_neighbors` (the 12-iteration weighted-reservoir loop + the adaptive-radius 12-tap pre-pass + the single 3-step mirror-following visibility ray + the sun sample) + `get_sample_data` (the HLSL out-param decode → a struct return) + `get_brdf` + `get_target_function_new`. Binds `@group(0)` world (it traverses) + `@group(1)` the spatial-specific buffer set. | `base/renderSpatialResampling.fx` (406 lines — `calcSpatialResampling` + `sampleNeighbors` + `getSampleData` + `getBRDF` + `getTargetFunctionNew`) |
+| `src/assets/shaders/denoise_split.wgsl` | the sparse separable bilateral GI denoiser — `calc_denoise_horizontal` + `calc_denoise_vertical` as 2 compute entry points in one naga-oil module. Kernel 21 (`±10`), σ = 10, with the random sparse per-row/-column offset ("on average every 2nd pixel"); the bilateral weight folds a Gaussian falloff × a TAA-weight-difference term × a normal/material-state match term. Both passes share `@group(0)` = `denoise_bind_group`; the denoiser does not traverse the voxel world. | `base/renderDenoiseSplit.fx` (146 lines — `calcDenoiseHorizontal` + `calcDenoiseVertical`) |
+
+### Files changed
+
+| file | change |
+|---|---|
+| `src/render/pipelines.rs` | `NaadfPipelines` += `spatial_resampling_layout` (`@group(1)`, 8 bindings: `gi_params` uniform + `first_hit_data`/`first_hit_absorption`/`bucket_info`/`valid_samples_compressed`/`taa_sample_accum` RO + `final_color`/`denoise_preprocessed` RW) + `denoise_layout` (`@group(0)`, 5 bindings: `gi_params` uniform + `first_hit_absorption`/`denoise_preprocessed` RO + `denoise_preprocessed_horizontal`/`final_color` RW) + `spatial_resampling_pipeline` (layout `[world, spatial_resampling]` — it traverses) + `denoise_horizontal_pipeline` + `denoise_vertical_pipeline` (both bind only `denoise_layout`); new `SPATIAL_RESAMPLING_SHADER` / `DENOISE_SHADER` path consts. |
+| `src/render/gi.rs` | `GiBindGroups` += `spatial_resampling_bind_group` + `denoise_bind_group` (the doc comment's "Batches 5-6 add the rest" updated — Batch 5 lands these two, Batch 6 the last). |
+| `src/render/prepare.rs` | `prepare_frame_gpu` builds the two new mixed bind groups into `GiBindGroups` (alongside the Batch-3/4 groups, same `pixel_count` resize trigger). `spatial_resampling_bind_group` mixes `GiGpu` + `FrameGpu` (`first_hit_data` / `first_hit_absorption` / `final_color`) + `TaaGpu` (`taa_sample_accum`); `denoise_bind_group` mixes `GiGpu` + `FrameGpu` (`first_hit_absorption` / `final_color`). |
+| `src/render/graph_b.rs` | += `SPATIAL_RESAMPLING_SPAN` + `DENOISE_SPAN` (one combined HUD/dispatch-check span for the two `renderDenoiseSplit` passes — same one-span convention as `SAMPLE_REFINE_SPAN`) + the 2 node systems `naadf_spatial_resampling_node` (1 dispatch, `ceil(pixel_count/64)` workgroups, binds `@group(0)` world + `@group(1)` spatial) + `naadf_denoise_node` (2 dispatches — horizontal then vertical, each `ceil(pixel_count/64)` — **gated on `ExtractedGiConfig.is_denoise`**, mirroring A-2's `naadf_taa_reproject_node` gate on `ExtractedTaaConfig.enabled`). |
+| `src/render/mod.rs` | the 2 nodes imported + wired into the `Core3d` `.chain()` at their §4.2 positions: `naadf_spatial_resampling_node` + `naadf_denoise_node` inserted **after `naadf_sample_refine_buckets_node`, before `naadf_final_blit_node`** (they consume `valid_samples_compressed` / `bucket_info` and produce `final_color` / `denoise_preprocessed`). |
+| `src/e2e/gates.rs` | `CURRENT_BATCH` 4 → 5; `assert_batch_5` added (re-runs the B2 emissive/solid/sky region gate — see the milestone finding: B5's image is unchanged — plus the optional `hash_baseline(5)` tripwire, kept `None`); `expected_spans` / `batch_gate` gain their B5 arms (`expected_spans` adds `naadf_spatial_resampling` + `naadf_denoise`). `CURRENT_BATCH` / `hash_baseline` doc comments record the B5-vs-B6 finding. |
+| `src/e2e/framebuffer.rs` | **`GI_LIT_BATCH` 5 → 6** — the central honest-batch-tracker change (see "How the e2e harness batch-tracker was set"). The `MIN_NON_BLACK_FRACTION_GI` / `MIN_NON_BLACK_FRACTION_PRE_GI` / `min_non_black_fraction` / `GI_LIT_BATCH` doc comments updated to record that the visible-bounce milestone moved to Batch 6 and that B1-5 use the pre-GI floor. |
+
+### Mapping to NAADF source — `renderSpatialResampling.fx` + `renderDenoiseSplit.fx`
+
+- **`spatial_resampling.wgsl`** is a faithful function-by-function port of
+  `base/renderSpatialResampling.fx`:
+  - `calc_spatial_resampling` ← `calcSpatialResampling` (`:344-399`): `get_ray_dir`
+    using `gi_params.inv_view_proj` (the HLSL binds `invCamMatrix` — the inverse
+    view-proj — into `getRayDir`'s `camTransform`; the shared `get_ray_dir`
+    already takes an inverse view-proj. Note this is the *current-frame* inverse
+    view-proj, NOT `renderSampleRefine`'s per-frame-history inverse ring — a
+    different thing, §3.6). `get_hit_data_from_planes` (the shared full version,
+    entity params dropped). The `isDenoise` write split: denoise path writes the
+    TRANSPOSED `denoise_preprocessed[pixelPos.y + pixelPos.x * screenHeight]`
+    (the denoiser reads it column-major); non-denoise path composites
+    `final_color += absorption * color`.
+  - `sample_neighbors` ← `sampleNeighbors` (`:56-342`): the `isVaryingResmaplingRadius`
+    12-tap adaptive-radius pre-pass (`:81-148`), the 12-iteration reservoir loop
+    (`:153-263` — the normal-mask / distance / pdf-ratio / Jacobian gates + the
+    WRS update), the single 3-step mirror-following visibility ray (`:266-302` —
+    `shoot_ray` with `MAX_RAY_STEPS_VISIBILITY`), the resampled-colour resolve
+    (`:304-319`), and the independent sun sample (`:321-339` — `shoot_ray` with
+    `MAX_RAY_STEPS_SUN`).
+  - `get_sample_data` ← `getSampleData` (`:29-38`), HLSL out-params → a
+    `SampleData` struct return (the A-2 `decompressSample` pattern).
+  - `get_brdf` / `get_target_function_new` ← `getBRDF` / `getTargetFunctionNew`
+    (`:40-54`).
+- **`denoise_split.wgsl`** is a faithful port of `base/renderDenoiseSplit.fx`:
+  `calc_denoise_horizontal` ← `calcDenoiseHorizontal` (`:15-73` — the transposed
+  read index, the random sparse x-offset, the bilateral weight, the row-major
+  write into `denoise_preprocessed_horizontal`); `calc_denoise_vertical` ←
+  `calcDenoiseVertical` (`:75-132` — reads the horizontal scratch + the original
+  transposed colour, `lerp(colorOrig, color, 0.92)`, `*= absorption`, ADDS into
+  `final_color`). The transposed indexing is ported exactly (`:18,46,72,81-82,106`).
+- HLSL implicit-truncation class (the carry-forward): explicit `i32()` /
+  `u32()` casts on the `vec2<f32>(pixelPos) + xy` neighbour indices, the
+  `f32(bucketValidStored) * nextRand` random sample index, the screen-bucket
+  indices; explicit `vec3<f32>` constructors where the HLSL broadcasts a scalar
+  (`float3 weight = 2.0f * sunDirCosTheta`). Every HLSL `mul(v, M)` is the
+  column-vector `M * v`. The `Uint3` `denoisePreprocessed` /
+  `denoisePreprocessedHorizontal` are the `vec4<u32>`-padded buffers (`§3.3`) —
+  read `.xyz`, write `.w = 0`. Every `#ifdef ENTITIES` is omitted (the
+  `getHitDataFromPlanes` entity params are absent — the shared full version
+  already drops them).
+
+### Design ambiguities adjudicated
+
+1. **`is_denoise` — kept `true` (the `GiSettings` default), not toggled per
+   step.** `09-design-b.md` §11 Batch 5 step 15 says "temporarily set
+   `GiSettings.is_denoise = false`" to run the non-denoise spatial-resampling
+   path standalone, then step 16 restores it to `true`. This batch implements
+   *both* step 15 and step 16 (`spatial_resampling.wgsl` + `denoise_split.wgsl`
+   land together — the denoiser is small, 146 HLSL lines, and §12 / the §11
+   Batch sequencing rationale explicitly allow one batch for both), so the
+   end-of-batch state is `is_denoise = true` — already the `GiSettings::default()`
+   value (`gi.rs` Batch-3 defaults). No `GiSettings` / `main.rs` change. The
+   `is_denoise` flag is read by `spatial_resampling.wgsl` (the write split) +
+   gated by `naadf_denoise_node`; with the default `true` the denoise path runs
+   end-to-end. The step-15 "temporarily false" is a within-batch development
+   aid, not an end-state — followed §11's Batch 5 *whole* (steps 15+16).
+2. **`spatialResampling`'s `getRayDir` matrix — the current-frame inverse
+   view-proj, NOT the camera-history inverse ring.** `09-design-b.md` §3.6
+   distinguishes `renderGlobalIllum` / `renderTaaSampleReverse` (bind the
+   non-inverse rotation-only ring) from `renderSampleRefine` (binds the *inverse*
+   ring). `renderSpatialResampling.fx:17,351` binds `invCamMatrix` — the
+   *current-frame* inverse view-proj — into `getRayDir`; it does not index the
+   camera-history ring at all (`sampleNeighbors` reconstructs neighbour samples
+   from `valid_samples_compressed`'s packed positions, not via reprojection).
+   So `spatial_resampling.wgsl` passes `gi_params.inv_view_proj` to the shared
+   `get_ray_dir` — and binds no `camera_history`. Followed the HLSL.
+3. **`spatialVisibilityCount` — dropped (dead uniform).** `09-design-b.md` §8.3
+   notes the HLSL declares `spatialVisibilityCount` but `sampleNeighbors`
+   actually passes the `MAX_RAY_STEPS_VISIBILITY` const to `shootRay` at
+   `renderSpatialResampling.fx:274`. The §8.3 recommendation is "drop it — it is
+   a dead uniform". `GpuGiParams` (Batch 1, `gpu_types.rs` / `gi_params.wgsl`)
+   never declared a `spatial_visibility_count` field, so there was nothing to
+   drop — the WGSL uses `MAX_RAY_STEPS_VISIBILITY` (the `ray_tracing.wgsl`
+   const = 60) directly, faithful to the HLSL behaviour.
+
+### How the e2e harness batch-tracker was set — and why
+
+The brief required engaging the correct luminance regime per the B5-vs-B6
+finding, *honestly*. Two batch-tracker constants were touched:
+
+- **`CURRENT_BATCH` 4 → 5** (`gates.rs`) — B5 IS implemented, so the harness's
+  `ASSERT` step must run B5's region gate + check B5's render-graph spans. This
+  is the straightforward "a batch landed" bump.
+- **`GI_LIT_BATCH` 5 → 6** (`framebuffer.rs`) — **this is the honest-tracker
+  change.** `GI_LIT_BATCH` is the batch from which the harness applies the 0.60
+  hard luminance gate (`MIN_NON_BLACK_FRACTION_GI`) instead of the 0.50 pre-GI
+  floor. It was `5` on the design's assumption that the GI bounce becomes
+  visible at end-of-B5. The B5-vs-B6 finding shows it does not — B5's frame is
+  bit-identical to B4 (69.1% non-black, screenshot indistinguishable). Leaving
+  `GI_LIT_BATCH = 5` would make the harness apply the 0.60 hard gate to a frame
+  the B5 pipeline produces *for pre-GI reasons* — it would have *passed* (69.1%
+  ≥ 60%), but that would have been a gate the B5 pipeline-shape does not yet
+  *earn*: the brief explicitly forbids "flip[ping] it to a B5-visible regime
+  that the pipeline can't yet satisfy". Setting `GI_LIT_BATCH = 6` keeps B5 on
+  the pre-GI floor — the honest regime — and makes Batch 6 (which wires
+  `taa_dist_min_max` and lands the real visible bounce) the first batch the
+  0.60 hard gate applies to. The first e2e run (with `GI_LIT_BATCH` still 5 and
+  a too-optimistic `assert_batch_5` that expected the `solid_block_rect` to
+  brighten) FAILED on exactly that region check — confirming the finding — and
+  was corrected to the honest `GI_LIT_BATCH = 6` + the `assert_batch_2`-rerun
+  `assert_batch_5` (the same pattern `assert_batch_4` uses for an
+  "image-unchanged" batch). `MIN_NON_BLACK_FRACTION_GI` stays `0.60` — the
+  Batch-6 agent re-confirms it against the actual GI-lit fraction and nudges it
+  to just below the measured value (the `e2e-render-test.md` rule), now that B6
+  is the batch that actually exercises it.
+
+### Verification
+
+- `cargo build` — clean, no new warnings.
+- `cargo test` — **46 passed** (4 suites), unchanged from Batch 4. Batch 5
+  added no unit tests: `spatial_resampling.wgsl` / `denoise_split.wgsl` are
+  GPU-only working code (exercised by the e2e harness), and there is no new
+  CPU-side logic to unit-test (the bind-group / pipeline / node wiring is
+  covered by the e2e `PipelineCache` scan + node-dispatch check).
+- `cargo run --bin e2e_render` — exits **0**, all gates green: luminance gate
+  `batch 5 — 69.1% non-black; threshold 50%` (the pre-GI floor — `GI_LIT_BATCH
+  = 6`, the honest regime, since B5's frame is pre-GI-like), then `PASS (batch
+  5) — 8 render frames, framebuffer read back & non-degenerate, per-batch
+  region gate green, every pipeline created cleanly, every expected
+  render-graph node dispatched.` The 3 new pipelines (`spatial_resampling`,
+  `denoise_horizontal`, `denoise_vertical`) compiled cleanly — the
+  `PipelineCache::Err` scan would have surfaced any naga / WGSL / bind-group /
+  pipeline error in a single run — and the `naadf_spatial_resampling` +
+  `naadf_denoise` spans were both recorded (the node-dispatch check confirms
+  the two new nodes fired every frame). Used **2 of the 5** allotted `cargo run
+  --bin e2e_render` invocations (run 1 caught the too-optimistic
+  `assert_batch_5` — see "How the e2e harness batch-tracker was set" — run 2
+  green after the honest-regime correction).
+- **Visual assessment of `e2e_latest.png`:** the frame is **stable vs. Batch
+  2/3/4 — no visible change, exactly as the B5-vs-B6 finding predicts.** The
+  five emissive blocks render bright/coloured (warm-white centre, magenta
+  lower-left, green right; amber + cool-white higher/partly occluded), the
+  atmosphere-tinted sky band sits clean across the top with no streaks or
+  rings, and the dark diffuse voxel structure (towers, boxes, pillars, spheres)
+  fills the mid/lower frame near-black. Batch 5's `spatialResampling` +
+  `denoiseSplit` passes run and write `final_color` / `denoise_preprocessed`
+  every frame — the GI consumers are wired and dispatching — but their pre-B6
+  contribution is negligible (the reservoir loop reads the empty refine
+  buffers; the independent sun sample contributes nothing visible in this
+  enclosed scene/pose). The done-bar — "the GI consumer passes dispatch clean"
+  — is met; the visible bounce lands at Batch 6.
+- No TEMP debug instrumentation was added; no cross-frame buffer-readback
+  instrumentation was used (the finding was reasoned from the NAADF source's
+  `taa_dist_min_max → renderSampleRefine → valid_samples_compressed →
+  renderSpatialResampling` dependency chain + the bit-identical 69.1%
+  whole-frame fraction, not from buffer probes).
+
+### Notes for the next batch (B6 — the `base/` TAA rewire + renderFinal + integration)
+
+- **B6 lands the visible GI bounce.** This is the central B5-vs-B6 finding:
+  B6's step 17 wires the `base/` `ReprojectOld` to write `taa_dist_min_max`,
+  which un-blocks Batch 4's `renderSampleRefine` reprojection validity test ⇒
+  `valid_samples_compressed` + `bucket_info` populate ⇒ B5's
+  `renderSpatialResampling` 12-iteration reservoir loop finally yields output ⇒
+  the full indirect GI bounce composites into `final_color`. B6 is therefore
+  the batch where the e2e image *changes* — `GI_LIT_BATCH = 6` is set so the
+  0.60 hard luminance gate applies from B6, and `assert_batch_6` should be the
+  first region gate that asserts the previously-near-black diffuse geometry has
+  *brightened* (the positive "GI bounce is visible" check that
+  `assert_batch_5`'s first draft wrongly expected at B5). The B6 agent must
+  re-confirm `MIN_NON_BLACK_FRACTION_GI = 0.60` against the actual measured
+  GI-lit fraction and nudge it per the `e2e-render-test.md` rule.
+- **`spatial_resampling.wgsl` reads `taa_sample_accum` on the denoise path**
+  (`renderSpatialResampling.fx:371` — the `curTaaColor` term, packed into
+  `denoise_preprocessed.y` high half-word as the denoiser's TAA-weight signal).
+  `taa_sample_accum` is the zero-cleared `TaaGpu` buffer until B6's
+  `ReprojectOld` + `CalcNewTaaSample` write it — so pre-B6 the denoiser's
+  TAA-weight bilateral term degrades to a constant (every `cur_taa_weight` is
+  the same), which is harmless (the bilateral weight just loses one of its
+  three discriminators). B6 wiring `taa_sample_accum` makes the denoiser's
+  TAA-weight term real — another B6 quality improvement, like the
+  `taa_dist_min_max` one.
+- **The mixed-bind-group pattern is fully established.** `prepare_frame_gpu`
+  now builds all six `GiBindGroups` entries (`ray_queue` + `global_illum` +
+  `sample_refine` + `sample_refine_dispatch` + `spatial_resampling` +
+  `denoise`). B6 adds the last — `calc_new_taa_sample_bind_group` — the same
+  way (it mixes `TaaGpu` + `FrameGpu` + `WorldGpu`'s `voxel_types` — see
+  `09-design-b.md` §4.10 / §10.3, designer's-call build location is
+  `prepare_frame_gpu`).
+- **The temporary `final_color` blit is still in place** (Batch 2's seam). B6
+  step 19 reverts it: `naadf_final_blit_node` reads `taa_sample_accum` again
+  (correctly filled by `ReprojectOld` + `CalcNewTaaSample`), and
+  `FLAG_BLIT_FINAL_COLOR` is cleared. Until then, B5's GI consumers writing
+  `final_color` is exactly what makes the bounce *show* once B6 fills the
+  reservoir buffers — the seam is load-bearing for the B6 reveal, then reverted.
+- **`naadf_denoise_node` is gated on `ExtractedGiConfig.is_denoise`** (the A-2
+  `naadf_taa_reproject_node` gate pattern). With the `GiSettings` default
+  `is_denoise = true` it always dispatches; if B6 or a later toggle wants the
+  non-denoise path, `spatial_resampling.wgsl`'s non-denoise branch already
+  writes `final_color` directly (`renderSpatialResampling.fx:391-398`), so the
+  node early-returning is correct — no extra wiring needed.
+- **`DENOISE_SPAN` is one combined span for both `renderDenoiseSplit` passes**
+  (same one-span convention as `SAMPLE_REFINE_SPAN`). B6's HUD work (step 20)
+  adds the timing lines for the expensive nodes — `naadf_spatial_resampling` +
+  `naadf_denoise` are both in `expected_spans` and recorded; the HUD's
+  `write_timing` + `const`-checked path-pair pattern extends to them directly.

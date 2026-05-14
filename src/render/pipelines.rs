@@ -76,6 +76,14 @@ pub const GLOBAL_ILLUM_SHADER: &str = "shaders/naadf_global_illum.wgsl";
 /// (`09-design-b.md` §5.1, §5.7, §8.2) — the 5-pass sample-refine stage, port
 /// of `base/renderSampleRefine.fx`. One file, five entry points.
 pub const SAMPLE_REFINE_SHADER: &str = "shaders/sample_refine.wgsl";
+/// Asset path of the Phase-B `renderSpatialResampling` compute shader
+/// (`09-design-b.md` §5.1, §5.7, §8.3) — Algorithm 2, port of
+/// `base/renderSpatialResampling.fx`.
+pub const SPATIAL_RESAMPLING_SHADER: &str = "shaders/spatial_resampling.wgsl";
+/// Asset path of the Phase-B `renderDenoiseSplit` compute shader
+/// (`09-design-b.md` §5.1, §9.1) — the sparse separable bilateral GI denoiser,
+/// port of `base/renderDenoiseSplit.fx`. One file, two entry points.
+pub const DENOISE_SHADER: &str = "shaders/denoise_split.wgsl";
 
 /// Compute-shader workgroup size — `[numthreads(64,1,1)]` in the HLSL
 /// `albedo/renderFirstHit.fx` `calcFirstHit` (`03-design.md` §5.1). The Phase-B
@@ -158,6 +166,19 @@ pub struct NaadfPipelines {
     /// so they cannot sit in the shared `@group(0)` (the count passes bind that
     /// group). Only the `valid_history` pipeline's layout includes this group.
     pub sample_refine_dispatch_layout: BindGroupLayoutDescriptor,
+    /// `@group(1)` for the Phase-B `renderSpatialResampling` pass
+    /// (`09-design-b.md` §8.3). 8 bindings: `gi_params` (uniform),
+    /// `first_hit_data` / `first_hit_absorption` / `bucket_info` /
+    /// `valid_samples_compressed` / `taa_sample_accum` (read), `final_color` /
+    /// `denoise_preprocessed` (rw). `spatialResampling` also binds `@group(0)`
+    /// world — it traverses (visibility + sun rays).
+    pub spatial_resampling_layout: BindGroupLayoutDescriptor,
+    /// `@group(0)` for the Phase-B `renderDenoiseSplit` passes (`09-design-b.md`
+    /// §9.1). 5 bindings: `gi_params` (uniform), `first_hit_absorption` /
+    /// `denoise_preprocessed` (read), `denoise_preprocessed_horizontal` /
+    /// `final_color` (rw). Shared by the horizontal + vertical passes; the
+    /// denoiser does not traverse the voxel world.
+    pub denoise_layout: BindGroupLayoutDescriptor,
     /// Cached id of the `naadf_first_hit` compute pipeline.
     pub first_hit_pipeline: CachedComputePipelineId,
     /// Cached id of the `taa.wgsl` `reproject_old_samples` compute pipeline
@@ -196,6 +217,16 @@ pub struct NaadfPipelines {
     /// Cached id of `sample_refine.wgsl`'s `refine_buckets` — the
     /// `COLOR_DIF_PROB` brightness-leveling, writes `valid_samples_compressed`.
     pub sample_refine_buckets_pipeline: CachedComputePipelineId,
+    /// Cached id of `spatial_resampling.wgsl`'s `calc_spatial_resampling`
+    /// (`09-design-b.md` §4.8 / §8.3) — Algorithm 2: the 12-iteration neighbour-
+    /// reservoir loop + the single visibility ray + the sun sample.
+    pub spatial_resampling_pipeline: CachedComputePipelineId,
+    /// Cached id of `denoise_split.wgsl`'s `calc_denoise_horizontal`
+    /// (`09-design-b.md` §4.9 / §9.1) — the horizontal sparse-bilateral pass.
+    pub denoise_horizontal_pipeline: CachedComputePipelineId,
+    /// Cached id of `denoise_split.wgsl`'s `calc_denoise_vertical` — the
+    /// vertical sparse-bilateral pass; adds the denoised GI into `final_color`.
+    pub denoise_vertical_pipeline: CachedComputePipelineId,
     /// An entry-less bind group for `empty_layout` — `naadf_global_illum_node`
     /// must `set_bind_group(2, ...)` since the `globalIllum` pipeline layout
     /// has a placeholder at index 2 (`09-design-b.md` §8.1 — the shader skips
@@ -458,6 +489,51 @@ impl FromWorld for NaadfPipelines {
             ),
         );
 
+        // --- @group(1): the Phase-B `renderSpatialResampling` bind group ----
+        // 8 bindings (`09-design-b.md` §8.3). `gi_params` uniform;
+        // `first_hit_data` / `first_hit_absorption` / `bucket_info` /
+        // `valid_samples_compressed` / `taa_sample_accum` read-only storage;
+        // `final_color` / `denoise_preprocessed` read-write storage.
+        // `spatialResampling` also binds `@group(0)` world (it traverses for
+        // the visibility + sun rays).
+        let spatial_resampling_layout = BindGroupLayoutDescriptor::new(
+            "naadf_spatial_resampling_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(gi_params_size)),
+                    storage_buffer_read_only_sized(false, None), // first_hit_data
+                    storage_buffer_read_only_sized(false, None), // first_hit_absorption
+                    storage_buffer_read_only_sized(false, None), // bucket_info
+                    storage_buffer_read_only_sized(false, None), // valid_samples_compressed
+                    storage_buffer_read_only_sized(false, None), // taa_sample_accum
+                    storage_buffer_sized(false, None),           // final_color, rw
+                    storage_buffer_sized(false, None),           // denoise_preprocessed, rw
+                ),
+            ),
+        );
+
+        // --- @group(0): the Phase-B `renderDenoiseSplit` bind group ---------
+        // 5 bindings (`09-design-b.md` §9.1). One shared layout for both the
+        // horizontal + vertical passes. `gi_params` uniform;
+        // `first_hit_absorption` / `denoise_preprocessed` read-only storage;
+        // `denoise_preprocessed_horizontal` / `final_color` read-write storage.
+        // The denoiser does not traverse the voxel world — this is its only
+        // group.
+        let denoise_layout = BindGroupLayoutDescriptor::new(
+            "naadf_denoise_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(gi_params_size)),
+                    storage_buffer_read_only_sized(false, None), // first_hit_absorption
+                    storage_buffer_read_only_sized(false, None), // denoise_preprocessed
+                    storage_buffer_sized(false, None),           // denoise_preprocessed_horizontal, rw
+                    storage_buffer_sized(false, None),           // final_color, rw
+                ),
+            ),
+        );
+
         // --- compute pipeline (single, format-agnostic) ---------------------
         let first_hit_shader = asset_server.load(FIRST_HIT_SHADER);
         let first_hit_pipeline =
@@ -592,6 +668,43 @@ impl FromWorld for NaadfPipelines {
             "refine_buckets",
         );
 
+        // --- the Phase-B `renderSpatialResampling` pipeline (Batch 5) -------
+        // Layout `[world, spatial_resampling]` — the shader binds `@group(0)`
+        // world (it traverses for visibility + sun rays) + `@group(1)` the
+        // spatial-specific buffer set (`09-design-b.md` §8.3). One entry point;
+        // dispatched over `ceil(pixel_count / 64)` workgroups.
+        let spatial_resampling_shader = asset_server.load(SPATIAL_RESAMPLING_SHADER);
+        let spatial_resampling_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_spatial_resampling_pipeline".into()),
+                layout: vec![world_layout.clone(), spatial_resampling_layout.clone()],
+                shader: spatial_resampling_shader,
+                entry_point: Some(Cow::from("calc_spatial_resampling")),
+                ..default()
+            });
+
+        // --- the Phase-B `renderDenoiseSplit` pipelines (Batch 5) -----------
+        // One shader file, two entry points (`09-design-b.md` §9.1); both bind
+        // the single `denoise_layout` `@group(0)`. Each is `[numthreads(64,1,1)]`,
+        // dispatched over `ceil(pixel_count / 64)` workgroups.
+        let denoise_shader = asset_server.load(DENOISE_SHADER);
+        let denoise_horizontal_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_denoise_horizontal_pipeline".into()),
+                layout: vec![denoise_layout.clone()],
+                shader: denoise_shader.clone(),
+                entry_point: Some(Cow::from("calc_denoise_horizontal")),
+                ..default()
+            });
+        let denoise_vertical_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_denoise_vertical_pipeline".into()),
+                layout: vec![denoise_layout.clone()],
+                shader: denoise_shader,
+                entry_point: Some(Cow::from("calc_denoise_vertical")),
+                ..default()
+            });
+
         // The blit pipeline is queued lazily per target format — see
         // `prepare_blit_pipeline`. Capture the vertex state + fragment shader
         // handle so re-queuing is cheap.
@@ -620,6 +733,8 @@ impl FromWorld for NaadfPipelines {
             global_illum_layout,
             sample_refine_layout,
             sample_refine_dispatch_layout,
+            spatial_resampling_layout,
+            denoise_layout,
             first_hit_pipeline,
             taa_reproject_pipeline,
             atmosphere_pipeline,
@@ -631,6 +746,9 @@ impl FromWorld for NaadfPipelines {
             sample_refine_count_valid_pipeline,
             sample_refine_count_invalid_pipeline,
             sample_refine_buckets_pipeline,
+            spatial_resampling_pipeline,
+            denoise_horizontal_pipeline,
+            denoise_vertical_pipeline,
             empty_bind_group,
             blit_pipelines: HashMap::default(),
             blit_vertex,

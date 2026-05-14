@@ -50,9 +50,21 @@ pub fn e2e_camera_transform() -> Transform {
 
 /// The highest batch currently implemented — the `ASSERT` step runs this
 /// batch's region gate (older batches' gates are kept as called helpers so an
-/// earlier-gate regression still trips). Phase B Batches 1-4 exist
-/// (`10-impl-b.md`); bump this as B5/B6 land.
-pub const CURRENT_BATCH: u32 = 4;
+/// earlier-gate regression still trips). Phase B Batches 1-5 exist
+/// (`10-impl-b.md`); bump this as B6 lands.
+///
+/// **Batch 5 stays in the pre-GI luminance regime.** `09-design-b.md` §11
+/// Batch 5 step 15 claimed the GI bounce becomes visible at end-of-B5, but the
+/// Batch-5 verification (see `10-impl-b.md` Batch-5 section + [`assert_batch_5`])
+/// settled the B5-vs-B6 question: the visible-bounce milestone genuinely moves
+/// to **Batch 6**. The GI consumers (`renderSpatialResampling` /
+/// `renderDenoiseSplit`) run and write `final_color`, but the 12-iteration
+/// reservoir loop reads the `renderSampleRefine` refine buffers, which are
+/// correct-but-empty until Batch 6 wires `taa_dist_min_max`; the spatial pass's
+/// independent sun sample contributes negligibly in this enclosed test scene.
+/// So [`super::framebuffer::GI_LIT_BATCH`] is `6`, NOT `5` — B5 keeps the
+/// pre-GI floor, the honest regime (the image is stable like B3/B4).
+pub const CURRENT_BATCH: u32 = 5;
 
 // --- Gate rectangles -------------------------------------------------------
 //
@@ -108,9 +120,11 @@ fn sky_rect(fb: &Framebuffer) -> Rect {
 // --- Stability-hash baselines ----------------------------------------------
 //
 // The §6.1 tripwire: for batches that are *supposed* to leave the image
-// unchanged (B3, B4), assert the readback hash equals the prior batch's stored
-// hash. Re-blessed *only* by the batch that intentionally changes the image
-// (B2's first-hit+atmosphere, B5's GI bounce, B6's TAA).
+// unchanged (B3, B4, B5), assert the readback hash equals the prior batch's
+// stored hash. Re-blessed *only* by the batch that intentionally changes the
+// image (B2's first-hit+atmosphere, B6's GI bounce + TAA — see the B5-vs-B6
+// milestone note: B5's GI consumers run but their pre-B6 contribution is
+// negligible, so B5 is an "image unchanged" batch, not the GI-visible one).
 //
 // `None` means "no baseline asserted for this batch" — used while a baseline is
 // being blessed for the first time, or for batches that legitimately change the
@@ -130,6 +144,11 @@ fn sky_rect(fb: &Framebuffer) -> Rect {
 // primary "image unchanged" check and catches gross regressions; the hash
 // remains the optional tripwire it was always specified as (§6.1). This is the
 // deliberate-deferral path the harness doc itself allows.
+// Batch-5 note: same reasoning — `hash_baseline(5)` stays `None`. B5 IS an
+// "image unchanged" batch (the GI consumers' pre-B6 contribution is negligible
+// — the B5-vs-B6 milestone moved the visible bounce to B6), so `assert_batch_5`
+// re-runs the B2 region gate as the primary "image unchanged" check; the
+// per-binary/GPU non-portability of a committed hash literal is unchanged.
 fn hash_baseline(batch: u32) -> Option<u64> {
     match batch {
         _ => None,
@@ -255,6 +274,55 @@ fn assert_batch_4(state: &GateState) -> Result<(), String> {
     Ok(())
 }
 
+/// Batch 5 gate — Phase B Batch 5 (`renderSpatialResampling` + the sparse
+/// bilateral `renderDenoiseSplit`) builds the GI *consumers* — they write
+/// `final_color` / `denoise_preprocessed`, and the chain is
+/// `… → spatial_resampling → denoise → final_blit`. The done-bar is "the GI
+/// consumer passes dispatch clean"; the image is **unchanged from Batch 2-4**.
+///
+/// **The B5-vs-B6 "GI visible" milestone — settled in the Batch-5 impl log:**
+/// `09-design-b.md` §11 Batch 5 step 15 claims the GI bounce "is visible for the
+/// first time". The Batch-4 "note for B5" carry-forward flagged this as
+/// suspect, and the Batch-5 verification confirmed it: **the visible-bounce
+/// milestone genuinely moves to Batch 6.** Reasoning:
+/// - The 12-iteration neighbour-reservoir loop reads `valid_samples_compressed`
+///   / `bucket_info` — the `renderSampleRefine` refine buffers, which are
+///   *correct-but-empty* until Batch 6 wires `taa_dist_min_max` (Batch 4's
+///   reprojection validity test rejects every sample with `dist_min_max ==
+///   (0,0)`). So the reservoir path yields nothing pre-B6.
+/// - The spatial pass's **sun sample** (`renderSpatialResampling.fx:321-339`)
+///   *is* independent of the refine buffers and *is* wired + dispatched — but
+///   in this enclosed test scene at the fixed e2e pose its contribution to
+///   `final_color` is negligible (the visible diffuse geometry is largely
+///   sun-shadowed / sun-averted; the whole-frame non-black fraction stays
+///   bit-identical at 69.1%, and the screenshot is visually indistinguishable
+///   from Batch 4).
+/// So B5's image is stable like B3/B4 — the GI consumers run and write
+/// `final_color`, but no visually significant bounce lands until Batch 6
+/// populates the reservoir buffers. This gate is therefore the `assert_batch_2`
+/// region gate re-run (exactly as `assert_batch_4` does — the GI consumers must
+/// not have *broken* the first-hit / atmosphere image). `GI_LIT_BATCH` is `6`,
+/// so B5 still uses the pre-GI luminance floor — the honest regime. The
+/// `PipelineCache` error scan + the node-dispatch check (run unconditionally by
+/// the driver) cover the new B5 pipelines + the `naadf_spatial_resampling` /
+/// `naadf_denoise` spans.
+fn assert_batch_5(state: &GateState) -> Result<(), String> {
+    assert_batch_2(state)?;
+    if let Some(baseline) = hash_baseline(5) {
+        let actual = state.fb.stability_hash();
+        if actual != baseline {
+            return Err(format!(
+                "Batch 5: stability hash {actual:#018x} != baseline {baseline:#018x} — \
+                 Batch 5 must leave the image unchanged from Batch 2-4 (the GI \
+                 consumers write `final_color`, but their pre-B6 contribution is \
+                 negligible — the reservoir buffers are empty until Batch 6 wires \
+                 `taa_dist_min_max`). An unexpected image change is a regression."
+            ));
+        }
+    }
+    Ok(())
+}
+
 // --- Dispatch tables -------------------------------------------------------
 
 /// The expected render-graph spans for a given batch — the node-dispatch check
@@ -267,7 +335,8 @@ fn assert_batch_4(state: &GateState) -> Result<(), String> {
 /// Batch 4 adds `naadf_sample_refine` — the 5 `renderSampleRefine` passes are 5
 /// separate node systems but share ONE span (`graph_b.rs SAMPLE_REFINE_SPAN` —
 /// `09-design-b.md` §4.7 "one span recommended"), so one new row entry covers
-/// all five. B5 adds the denoiser span, B6 the TAA-node spans.
+/// all five. Batch 5 adds `naadf_spatial_resampling` + `naadf_denoise` (the two
+/// `renderDenoiseSplit` passes share one span). B6 adds the TAA-node spans.
 pub fn expected_spans(batch: u32) -> &'static [&'static str] {
     match batch {
         0..=3 => &[
@@ -278,12 +347,23 @@ pub fn expected_spans(batch: u32) -> &'static [&'static str] {
             "naadf_final_blit",
         ],
         // B4: + `naadf_sample_refine` (the 5 sample-refine passes' shared span).
+        4 => &[
+            "naadf_atmosphere",
+            "naadf_first_hit",
+            "naadf_ray_queue",
+            "naadf_global_illum",
+            "naadf_sample_refine",
+            "naadf_final_blit",
+        ],
+        // B5: + `naadf_spatial_resampling` + `naadf_denoise` (the GI consumers).
         _ => &[
             "naadf_atmosphere",
             "naadf_first_hit",
             "naadf_ray_queue",
             "naadf_global_illum",
             "naadf_sample_refine",
+            "naadf_spatial_resampling",
+            "naadf_denoise",
             "naadf_final_blit",
         ],
     }
@@ -309,7 +389,8 @@ pub fn batch_gate(batch: u32, state: &GateState) -> Result<(), String> {
         2 => assert_batch_2(state),
         3 => assert_batch_3(state),
         4 => assert_batch_4(state),
-        // B5+ : add `5 => assert_batch_5(state)`, etc.
-        _ => assert_batch_4(state),
+        5 => assert_batch_5(state),
+        // B6+ : add `6 => assert_batch_6(state)`, etc.
+        _ => assert_batch_5(state),
     }
 }
