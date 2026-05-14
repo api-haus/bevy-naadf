@@ -362,3 +362,184 @@ jitter plumbing, the `TaaGpu` buffers) plus the designed-in `shaded_color` →
 orchestrator/user consultation — the three deviations logged above are all
 small and local, made and logged per the brief's allowance. Scope stopped at
 step 5 — no Batch 2 (steps 6–9) work started.
+
+---
+
+## impl findings — Phase A-2 Batch 2 (steps 6–9) (2026-05-14)
+
+Batch 2 (steps 6–9 of `06-design-a2.md` §12) was implemented by a previous
+agent and committed as `8abd2ec` ("feat: implement Phase A-2 TAA reproject node
+and first-hit ring write"), but that agent was interrupted before writing this
+log. This section **reconstructs** what Batch 2 did from the committed code,
+records the **step-9 `hud.rs` TAA-timing line** added by this (the `review`)
+group — the one missing piece — and logs the build / test / smoke-run results.
+The verification of the Batch-2 TAA code against the design + the NAADF HLSL is
+in `08-review-a2.md` (the review deliverable); this section is the impl record.
+
+Test command (unchanged): `cargo test --bin bevy-naadf` (binary-only crate).
+
+---
+
+### Steps 6–8 — reconstructed from the committed code (`8abd2ec`)
+
+**Step 6 — first-hit `taa_samples` ring write.** `pipelines.rs`:
+`first_hit_pipeline`'s layout extended from `[world_layout, frame_layout]` to
+`[world_layout, frame_layout, taa_layout]` (`pipelines.rs:223-227`) — the
+`taa_layout` descriptor itself was already created in Batch 1 step 5.
+`naadf_first_hit.wgsl`: added the `@group(2) @binding(0) var<storage, read_write>
+taa_samples` binding (`:52`), imported `taa_compress_sample` +
+`TAA_SAMPLE_RING_DEPTH` from `taa_common.wgsl` (`:32`), and added the
+`if ((params.flags & FLAG_IS_TAA) != 0u)` ring-write block (`:170-187`) — a
+faithful port of `renderFirstHit.fx:109-117`'s `if (isTAA)` path:
+`specular_normals = 0u` hardcoded (plane-0-only, entity-free),
+`sample_dist = select(distance_ray, 65520.0, voxel_type_raw == 0u)`,
+`taa_compress_sample(...)` into ring slot `params.taa_index %
+TAA_SAMPLE_RING_DEPTH`. `graph.rs`: `naadf_first_hit_node` binds
+`@group(2) = taa_gpu.taa_first_hit_bind_group` (`graph.rs:203`).
+
+**Step 7 — the TAA reproject WGSL.** `src/assets/shaders/taa.wgsl` (NEW, 423
+lines): the port of `albedo/renderTaaSampleReverse.fx`'s `reprojectOldSamples`
+→ `reproject_old_samples`. Contains `get_hit_data_from_planes_a2` (the
+single-plane reduction of `getHitDataFromPlanes`), `get_screen_pos_projection` /
+`get_screen_index_projection` (ports of the `commonRenderPipeline.fxh` helpers,
+returning structs in place of HLSL `out` params), the 3×3 neighbourhood
+precompute, the reprojection loop, the accumulation into `taa_sample_accum`, and
+the `GpuTaaParams` + `GpuCameraHistorySlot` WGSL struct decls. Entity blocks
+omitted, the rough-specular branch left as a structural dead-code comment, the
+sample ring `% 16` (both sites), the camera-history ring `% 128`. Every matrix
+multiply is `M * v` + `w`-divide (the `05-review.md` perspective-fix convention).
+
+**Step 8 — the TAA node + pipeline + graph wiring.** `pipelines.rs`: added
+`taa_reproject_layout` (`pipelines.rs:200-212` — `taa_params` uniform +
+`camera_history` / `first_hit_data` / `taa_samples` read storage +
+`taa_sample_accum` rw storage), `taa_reproject_pipeline` (entry
+`reproject_old_samples`, `pipelines.rs:235-242`), `TAA_REPROJECT_SHADER` const.
+`extract.rs`: added `ExtractedTaaConfig` (mirrors `AppArgs.taa`) +
+`extract_taa_config`. `prepare.rs`: `prepare_frame_gpu` builds
+`taa_reproject_bind_group` (mixes `TaaGpu` + `FrameGpu.first_hit_data`,
+`prepare.rs:435-445`) and sets `FLAG_IS_TAA` when `extracted_taa.enabled`.
+`graph.rs`: `naadf_taa_reproject_node` (`graph.rs:226-284`) + the
+`TAA_REPROJECT_SPAN` const (`graph.rs:151`); the node gates its dispatch on
+`ExtractedTaaConfig.enabled` and early-returns when TAA is off (leaving
+`taa_sample_accum` bit-identical to Phase A). `mod.rs`: registered
+`ExtractedTaaConfig`, added `extract_taa_config` to `ExtractSchedule`, inserted
+`naadf_taa_reproject_node` into the `Core3d` `.chain()` between first-hit and
+final-blit. `main.rs`: `AppArgs.taa` default flipped `false` → `true` (the §9.5
+default flip — confirmed: `main.rs:51` reads `taa: true`).
+
+**Verification of steps 6–8 against the design + the NAADF HLSL:** see
+`08-review-a2.md` §1–§4 — verdict: the TAA logic is faithfully ported,
+0.25-spp-ready, and uses the correct matrix convention.
+
+---
+
+### Step 9 — the missing piece, added by the `review` group
+
+Batch 2's commit `8abd2ec` did **not** add the step-9 `hud.rs` TAA-node timing
+line (`06-design-a2.md` §11) — `hud.rs` was left exactly as Phase A had it. This
+group added it (the only implementation work in this group's scope; the
+`AppArgs.taa` default flip, also part of step 9, was already done in `8abd2ec`).
+
+**File edited:** `src/hud.rs`.
+
+- Imported `TAA_REPROJECT_SPAN` from `render::graph` (alongside the existing
+  `FIRST_HIT_SPAN` / `FINAL_BLIT_SPAN`).
+- Added the `const TAA_REPROJECT_GPU_PATH = "render/naadf_taa_reproject/elapsed_gpu"`
+  + `TAA_REPROJECT_CPU_PATH = "render/naadf_taa_reproject/elapsed_cpu"` path pair,
+  matching the Phase-A pattern for the other two render nodes.
+- Added the `const`-checked
+  `assert!(matches_span(TAA_REPROJECT_GPU_PATH, TAA_REPROJECT_SPAN));` line to the
+  compile-time path/span consistency block (`hud.rs:30-33`), so the HUD path
+  cannot drift from the `render::graph` span name.
+- Added a `write_timing(s, &diagnostics, "taa-reproject", TAA_REPROJECT_GPU_PATH,
+  TAA_REPROJECT_CPU_PATH)` call in the `"NAADF passes:"` block, **between**
+  `first-hit` and `final-blit` (matching the render order, per §11).
+- Updated the surrounding "two render nodes" comment to "three render nodes".
+
+`write_timing` itself is unchanged (it is generic). The optional cosmetic
+renderer-mode-string update (§11, "low priority") was **not** done — it is
+explicitly optional and out of this group's minimal scope.
+
+No deviations.
+
+---
+
+### Build + tests + smoke-run
+
+- **`cargo build`** — succeeds. 11 warnings, all the pre-existing dead-code
+  profile carried from `04-impl.md` / Batch 1 — none new from the `hud.rs` edit.
+- **`cargo test --bin bevy-naadf`** — **39 passed, 0 failed.** No regressions
+  (the `hud.rs` change is HUD-only; the `gpu_types` struct-size asserts are
+  compile-time and still hold).
+- **Smoke-run** — exactly **one** timeout-capped (~30 s) `cargo run`, after the
+  `hud.rs` edit, on the RTX 5080 / Vulkan. Result: **the app launches, no panic,
+  no WGSL compile error, no pipeline/bind-group validation error, clean exit
+  (code 0).** The `taa.wgsl` `reproject_old_samples` pipeline compiles (the early
+  one-frame "shader could not be loaded" line is the normal async asset-load
+  transient — the pipeline resolves to `Creating` then dispatches), and
+  `naadf_taa_reproject_node` dispatches every frame with `AppArgs.taa` on (the
+  default). The full three-node graph (first-hit → TAA reproject → final blit)
+  runs. **One observation from the smoke-run, NOT a launch failure:** the
+  leftover TEMP STEP-8 instrumentation committed in `8abd2ec` is still active —
+  the run logged `TAA_DEBUG[center]: ...` and `TAA_DEBUG reproject_node:
+  DISPATCHING` every frame. That instrumentation was never reverted before the
+  Batch-2 commit; it is logged as the **blocking issue** in `08-review-a2.md` §5
+  (with the full file:line revert list). It is incomplete-cleanup, not a launch
+  or logic failure — the app builds, launches, and exits clean — so it is a
+  review finding to be reverted as a separate scoped task, not an impl fix this
+  group makes (the brief scopes this group's impl work to the `hud.rs` line only
+  and forbids touching the Batch-2 TAA code).
+
+No verification loop was run — the TAA correctness check is the static analysis
+in `08-review-a2.md`; the app was run exactly once, only to confirm it still
+builds + launches + exits clean after the `hud.rs` edit.
+
+---
+
+## State at end of Phase A-2
+
+- **Batch 1 (steps 1–5)** — GPU types + the 64-bit sample format
+  (`taa_common.wgsl`), the `CameraHistory` ring + monotonic frame counter +
+  Halton jitter + shared camera helpers (`taa.rs`), the extract plumbing
+  (`ExtractedCameraData.view_proj`, `ExtractedCameraHistory`), the carried
+  `05-review.md` §4 `frame_count`/`rand_counter` fix, and the `TaaGpu` resource
+  + `prepare_taa` + the `shaded_color` → `taa_sample_accum` drop-in swap. Logged
+  in full above; committed `91c67e3`.
+- **Batch 2 (steps 6–8)** — the first-hit `taa_samples` ring write
+  (`naadf_first_hit.wgsl` `@group(2)` + the `FLAG_IS_TAA`-gated write), the TAA
+  reproject WGSL (`taa.wgsl` — port of `renderTaaSampleReverse.fx`), the TAA
+  node + `taa_reproject_pipeline` + `taa_reproject_layout` + graph wiring, and
+  the `AppArgs.taa` default flip to `true`. Committed `8abd2ec`. Verified
+  faithful + 0.25-spp-ready + correct matrix convention in `08-review-a2.md`.
+- **Step 9** — the `AppArgs.taa` default flip landed in `8abd2ec`; the `hud.rs`
+  TAA-node timing line was missing and was added by this group (above).
+- **Files:** Phase A-2 total — 3 new (`src/render/taa.rs`,
+  `src/assets/shaders/taa.wgsl`, `src/assets/shaders/taa_common.wgsl`),
+  ~10 modified (`src/main.rs`, `src/hud.rs`, `src/render/{extract,gpu_types,
+  graph,mod,pipelines,prepare,taa}.rs`,
+  `src/assets/shaders/{naadf_first_hit,naadf_final}.wgsl`).
+- **Build:** `cargo build` clean (11 pre-existing dead-code warnings, none new).
+- **Tests:** `cargo test --bin bevy-naadf` → **39 passed, 0 failed.**
+- **Smoke-run:** one run — launches on the RTX 5080 / Vulkan, the full
+  three-node render graph compiles and runs, no WGSL / pipeline / bind-group
+  validation errors, no panics, clean exit.
+- **Blocking issue (carried into the review gate):** the leftover TEMP STEP-8
+  instrumentation from `8abd2ec` was never reverted — it is still committed and
+  active across `taa.wgsl`, `graph.rs`, `mod.rs`, `taa.rs`. It corrupts one pixel
+  of `taa_sample_accum`, does a blocking per-frame GPU readback, and spams logs.
+  Full file:line evidence + the recommended revert are in `08-review-a2.md` §5.
+  **Phase A-2 should not close until this instrumentation is reverted** (a
+  mechanical, separately-scoped task — the TAA logic underneath is verified
+  correct).
+
+### Verdict
+
+**Phase A-2 implementation is complete; the step-9 `hud.rs` timing line is
+landed; build + 39 tests + the single smoke-run are green.** The Batch-2 TAA
+logic is verified faithful, 0.25-spp-ready, and correct on the matrix
+convention (`08-review-a2.md`). The one blocking issue — the un-reverted TEMP
+STEP-8 instrumentation committed in `8abd2ec` — is a separate, mechanical revert
+task flagged in `08-review-a2.md` §5; it is not a logic or design defect, and it
+was not fixed here because the brief scopes this group's impl work to the
+`hud.rs` line and forbids touching the Batch-2 TAA code. Once that revert lands,
+Phase A-2 is ready for the user interactive temporal-stability review gate.

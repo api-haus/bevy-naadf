@@ -11,17 +11,21 @@ use bevy::{
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::anti_alias::dlss::{Dlss, DlssRayReconstructionFeature, DlssRayReconstructionSupported};
 
-use crate::render::graph::{FINAL_BLIT_SPAN, FIRST_HIT_SPAN};
+use crate::render::graph::{FINAL_BLIT_SPAN, FIRST_HIT_SPAN, TAA_REPROJECT_SPAN};
 
 /// Diagnostic path of the first-hit pass's GPU time. `RenderDiagnosticsPlugin`
 /// names a `time_span(encoder, "<span>")` measurement
 /// `render/<span>/elapsed_gpu` (and `.../elapsed_cpu` as a CPU-side fallback).
 const FIRST_HIT_GPU_PATH: &str = "render/naadf_first_hit/elapsed_gpu";
+/// Diagnostic path of the Phase-A-2 TAA reproject pass's GPU time
+/// (`06-design-a2.md` §11).
+const TAA_REPROJECT_GPU_PATH: &str = "render/naadf_taa_reproject/elapsed_gpu";
 /// Diagnostic path of the final-blit pass's GPU time.
 const FINAL_BLIT_GPU_PATH: &str = "render/naadf_final_blit/elapsed_gpu";
 /// CPU-time fallback paths — used when the backend has no timestamp queries
 /// (`RenderDiagnosticsPlugin` records `elapsed_cpu` unconditionally).
 const FIRST_HIT_CPU_PATH: &str = "render/naadf_first_hit/elapsed_cpu";
+const TAA_REPROJECT_CPU_PATH: &str = "render/naadf_taa_reproject/elapsed_cpu";
 const FINAL_BLIT_CPU_PATH: &str = "render/naadf_final_blit/elapsed_cpu";
 
 // Compile-time check that the HUD's hard-coded paths stay in step with the
@@ -29,6 +33,7 @@ const FINAL_BLIT_CPU_PATH: &str = "render/naadf_final_blit/elapsed_cpu";
 // the path as `render/<span>/<field>`; assert the `<span>` part matches.
 const _: () = {
     assert!(matches_span(FIRST_HIT_GPU_PATH, FIRST_HIT_SPAN));
+    assert!(matches_span(TAA_REPROJECT_GPU_PATH, TAA_REPROJECT_SPAN));
     assert!(matches_span(FINAL_BLIT_GPU_PATH, FINAL_BLIT_SPAN));
 };
 
@@ -123,11 +128,13 @@ pub fn update_hud(
         let _ = writeln!(s, "DLSS-RR: not compiled in (no `dlss` feature)");
     }
 
-    // Per-pass NAADF render-node GPU timings. The two render nodes
+    // Per-pass NAADF render-node GPU timings. The three render nodes
     // (`render::graph`) wrap their work in a `time_span`, which
     // `RenderDiagnosticsPlugin` surfaces at `render/<span>/elapsed_gpu`. On a
     // backend with timestamp queries (Vulkan / DX12) the GPU path populates;
-    // elsewhere `write_timing` falls back to the CPU-side `elapsed_cpu`.
+    // elsewhere `write_timing` falls back to the CPU-side `elapsed_cpu`. The
+    // `taa-reproject` line sits between `first-hit` and `final-blit`, matching
+    // the render order (`06-design-a2.md` §11).
     let _ = writeln!(s, "NAADF passes:");
     write_timing(
         s,
@@ -135,6 +142,13 @@ pub fn update_hud(
         "first-hit",
         FIRST_HIT_GPU_PATH,
         FIRST_HIT_CPU_PATH,
+    );
+    write_timing(
+        s,
+        &diagnostics,
+        "taa-reproject",
+        TAA_REPROJECT_GPU_PATH,
+        TAA_REPROJECT_CPU_PATH,
     );
     write_timing(
         s,
