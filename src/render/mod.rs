@@ -33,8 +33,6 @@ use extract::{
     ExtractedCameraData, ExtractedCameraHistory, ExtractedTaaConfig, ExtractedWorld,
 };
 use graph::{naadf_final_blit_node, naadf_first_hit_node, naadf_taa_reproject_node};
-// TEMPORARY STEP-8 INSTRUMENTATION
-use graph::{taa_debug_copy_node, taa_debug_readback_system};
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
 use taa::prepare_taa;
@@ -93,15 +91,11 @@ impl Plugin for NaadfRenderPlugin {
                 (
                     naadf_first_hit_node,
                     naadf_taa_reproject_node,
-                    // TEMPORARY STEP-8 INSTRUMENTATION
-                    taa_debug_copy_node,
                     naadf_final_blit_node,
                 )
                     .chain()
                     .in_set(Core3dSystems::PostProcess)
                     .before(tonemapping),
-            )
-            // TEMPORARY STEP-8 INSTRUMENTATION — readback the accum buffer.
-            .add_systems(Render, taa_debug_readback_system.in_set(RenderSystems::Cleanup));
+            );
     }
 }

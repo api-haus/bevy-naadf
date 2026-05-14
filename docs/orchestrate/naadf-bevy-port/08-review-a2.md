@@ -423,3 +423,102 @@ mechanical to revert (§5.3) and is a separate scoped task, not part of this
 review group's implementation surface (which was the `hud.rs` timing line only,
 done — see `07-impl-a2.md`). Once §5 is reverted, Phase A-2 is verified: the
 TAA logic is correct, faithful, and Phase-B-ready.
+
+---
+
+## fix applied — Phase A-2 instrumentation revert (2026-05-14)
+
+The §5.3 revert was executed exactly — only the self-fenced `TEMP` / `TEMPORARY
+STEP-8` scaffolding was deleted; the TAA logic verified in §1–§4 was left
+untouched. Each of the 4 files was re-Read post-edit to confirm.
+
+### Files reverted
+
+**1. `src/assets/shaders/taa.wgsl`** — removed:
+- the `var dbg_valid / dbg_dist_pass / dbg_screen_pass` debug-counter
+  declarations (was `:301-304`, just above the reproject loop) + their `// TEMP
+  STEP-8 DEBUG counters` comment.
+- the three `dbg_* = dbg_* + 1.0` increments inside the reproject loop (after
+  the `!proj.valid`, distance-reject, and screen-reject `continue` guards).
+- the whole `if (pixel_index == params.screen_width * params.screen_height / 2u
+  + 7u)` debug-pixel block (was `:410-422`) that overwrote
+  `taa_sample_accum[pixel_index]` with raw integer counters, plus its `// TEMP
+  STEP-8 DEBUG` comment.
+- *Real logic intact:* the 3×3 neighbourhood precompute, `pos_virtual`, the
+  reproject loop body (history-index / `cur_taa_index` `% TAA_SAMPLE_RING_DEPTH`,
+  `get_screen_index_projection`, `taa_decompress_sample`, the distance reject,
+  the `M * v` 1-pixel screen reject, the hash reject, `color_sum + s.color`),
+  and Phase-3 accumulation (`pack2x16float(vec2(sample_weight + color_sum.a,
+  …))` → `taa_sample_accum[pixel_index]`) are byte-identical to §1–§2. The
+  function now ends cleanly at the real accumulation write.
+
+**2. `src/render/graph.rs`** — removed:
+- the `// === TEMPORARY STEP-8 INSTRUMENTATION ===` fenced `use` block
+  (`Buffer, BufferDescriptor, BufferUsages, MapMode, PollType`, `RenderDevice`)
+  + the `TaaDebugReadback` resource.
+- the `taa_debug_copy_node` function (the `Core3d` staging-buffer copy node).
+- the `taa_debug_readback_system` function (the blocking-`poll` map + `TAA_DEBUG`
+  `info!` log).
+- the `half_to_f32` helper.
+- inside `naadf_taa_reproject_node`: the `info!("TAA_DEBUG reproject_node:
+  missing …")` call — its `else` arm collapsed back to a plain `return;`; the
+  per-pipeline-state `match` that existed only to log
+  (`info!("TAA_DEBUG reproject pipeline …")`) — collapsed back to a plain
+  `else { return; }`; and `info!("TAA_DEBUG reproject_node: DISPATCHING")`.
+- *Real logic intact:* `naadf_first_hit_node`, `naadf_final_blit_node`, the
+  span-name consts, and `naadf_taa_reproject_node`'s actual dispatch (the
+  `taa_config.enabled` gate, the resource/pipeline guards, the workgroup count,
+  the `time_span`-wrapped compute pass binding `frame_gpu.taa_reproject_bind_group`)
+  are unchanged — verified against §4.
+
+**3. `src/render/mod.rs`** — removed:
+- the `// TEMPORARY STEP-8 INSTRUMENTATION` `use graph::{taa_debug_copy_node,
+  taa_debug_readback_system};`.
+- `taa_debug_copy_node` (and its `// TEMPORARY STEP-8 INSTRUMENTATION` comment)
+  from the `Core3d` `.chain()` — it is back to
+  `(naadf_first_hit_node, naadf_taa_reproject_node, naadf_final_blit_node)`.
+- the `.add_systems(Render, taa_debug_readback_system.in_set(
+  RenderSystems::Cleanup))` registration + its comment; the `Core3d` block now
+  terminates the `render_app` builder chain with `;`.
+- *Real logic intact:* all resource inits, the extract/prepare system
+  registrations, and the three-node `Core3d` chain ordering are unchanged.
+
+**4. `src/render/taa.rs`** — removed:
+- `| BufferUsages::COPY_SRC` from the `taa_sample_accum` `BufferDescriptor` in
+  `create_screen_buffers` — usage is back to `STORAGE | COPY_DST`.
+- the `// TEMPORARY STEP-8 INSTRUMENTATION: `| COPY_SRC` added …` comment.
+- *Real logic intact:* buffer sizing, `taa_samples` descriptor, the
+  `CameraHistory` ring, `prepare_taa`, and all helpers are unchanged.
+
+A post-revert `grep` over `src/` for `TAA_DEBUG|taa_debug|TaaDebugReadback|
+half_to_f32|STEP-8|dbg_valid|dbg_dist|dbg_screen` returned **zero** matches. (The
+one `COPY_SRC` hit in `src/world/buffer.rs:37` is an unrelated world buffer, not
+part of the §5 instrumentation — left untouched.)
+
+### Verification results
+
+- **`cargo build`:** succeeded — `Finished dev profile` in ~8 s. Only
+  pre-existing dead-code warnings (`MaterialLayer` / `GrowableBuffer` etc.); no
+  new warnings or errors from the revert.
+- **`cargo test --bin bevy-naadf`:** **39 passed** (1 suite) — all tests still
+  green.
+- **Smoke-run** (one timeout-capped `cargo run`, ~30 s): **clean launch** — the
+  app started on the NVIDIA RTX 5080 / Vulkan adapter, **no panic, no WGSL /
+  naga compile error, no pipeline or bind-group validation error, NO `TAA_DEBUG`
+  log spam** (the spam being gone is the positive signal the revert worked), and
+  **clean exit (code 0)** at the timeout. The grep over the run output for
+  `TAA_DEBUG|panic|error|wgsl|naga|validation|bind group|pipeline` matched
+  nothing but the benign `AdapterInfo` line.
+- **`git status --short`:** the 4 reverted source files
+  (`src/assets/shaders/taa.wgsl`, `src/render/graph.rs`, `src/render/mod.rs`,
+  `src/render/taa.rs`) modified, plus this `08-review-a2.md` deliverable —
+  nothing else.
+
+### Verdict
+
+**Phase A-2 instrumentation reverted — Phase A-2 closed.** The leftover TEMP
+STEP-8 scaffolding (§5) is fully removed: the debug-pixel buffer corruption is
+gone, the per-frame blocking GPU sync stall + `TAA_DEBUG` log spam are gone, the
+dead readback node + `COPY_SRC` usage flag are gone. The TAA logic verified
+correct, faithful, and Phase-B-ready in §1–§4 is intact. Build green, all 39
+tests green, smoke-run clean. Phase A-2 is closed.

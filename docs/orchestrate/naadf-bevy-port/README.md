@@ -53,7 +53,7 @@ B (GI) → C (GPU construction/editing)**. One gated phase at a time.
 - [x] `design` phase (**Phase A**) → `03-design.md` (~33 KB; 12-step Phase-A impl sequence)
 - [x] `impl` phase (**Phase A**) → `04-impl.md` — Batch 1 (steps 1–6) + Batch 2 (steps 7–12) done 2026-05-14; 39 tests pass, builds + smoke-runs clean
 - [x] `review` phase (**Phase A**) → `05-review.md` — **Phase A review gate PASSED**. Two regressions found, fixed, and user-confirmed: (1) camera→ray perspective (3 compounding MonoGame↔wgpu convention bugs), (2) out-of-volume concentric-line artifacts (wrong AABB clip-box values — NAADF insets by 0.1 voxel as `float3`). 39 tests pass; builds + runs coherent inside and outside the volume.
-- [~] Phase A-2 (TAA) — context + design + impl (all 9 steps, `07-impl-a2.md`) + **review done** (`08-review-a2.md`): **0.25-spp readiness READY**, faithful HLSL→WGSL port verified, matrix convention CORRECT (no perspective regression), 39 tests pass. **ONE blocking issue:** leftover TEMP step-8 instrumentation was committed in `8abd2ec` (corrupts 1 pixel + per-frame GPU sync stall + log spam). **Cleanup-revert dispatch pending** → then Phase A-2 closes.
+- [x] **Phase A-2 (TAA) — COMPLETE.** Context (`01-context.md` §2c) + design (`06-design-a2.md`) + impl (all 9 steps, `07-impl-a2.md`) + review (`08-review-a2.md`): 0.25-spp readiness READY, faithful HLSL→WGSL port + `M*v` matrix convention verified, leftover step-8 instrumentation reverted, 39 tests pass, smoke-runs clean. Deliverable: NAADF's 16-frame long-term-memory TAA, on by default; per-pixel sample-count signal exposed for Phase B.
 - [ ] Phase B (GI): design → impl → review
 - [ ] Phase C (GPU construction/editing): design → impl → review
 

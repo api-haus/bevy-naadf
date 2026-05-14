@@ -298,11 +298,6 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let pos_virtual = ray_dir * first_hit_dist;
     var color_sum = vec4<f32>(0.0, 0.0, 0.0, 0.0); // .rgb accumulated, .a = accepted count
 
-    // TEMP STEP-8 DEBUG counters
-    var dbg_valid = 0.0;
-    var dbg_dist_pass = 0.0;
-    var dbg_screen_pass = 0.0;
-
     for (var i = 1u; i < params.sample_age; i = i + 1u) {
         let cur_history_index = (params.taa_index + i) % 128u;
         // The §6 16-deep sample ring — the SECOND `% 32` in the HLSL (`:91`).
@@ -325,7 +320,6 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (!proj.valid) {
             continue;
         }
-        dbg_valid = dbg_valid + 1.0;
 
         // Fetch + decompress the past sample (slot-major ring index — the
         // SECOND `% 32` already applied to `cur_taa_index`).
@@ -347,7 +341,6 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
             || s.dist > dist_min_max.y * 2.0) {
             continue;
         }
-        dbg_dist_pass = dbg_dist_pass + 1.0;
 
         // 1-pixel screen-position reject — project the old virtual pos into
         // the CURRENT screen with `params.view_proj` (C# camMatrix). `M * v`
@@ -361,7 +354,6 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (dot(screen_pos_dif, screen_pos_dif) > 1.0) {
             continue;
         }
-        dbg_screen_pass = dbg_screen_pass + 1.0;
 
         // Rough-specular reweight (`renderTaaSampleReverse.fx:138-148`) — DEAD
         // in A-2: `s.extra_data` is always 0 in the albedo path
@@ -406,18 +398,4 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_color_comp.x = pack2x16float(vec2<f32>(sample_weight + color_sum.a, taa_color.r));
     new_color_comp.y = pack2x16float(vec2<f32>(taa_color.g, taa_color.b));
     taa_sample_accum[pixel_index] = new_color_comp;
-
-    // TEMP STEP-8 DEBUG: for the one debug pixel, overwrite with RAW INTEGER
-    // counters (no f16 packing) so the readback decode is unambiguous.
-    // .x = valid | (dist_pass << 8) | (screen_pass << 16) | (accepted << 24)
-    // .y = u32(color_sum.a) | (u32(first_hit_dist) << 16)
-    if (pixel_index == params.screen_width * params.screen_height / 2u + 7u) {
-        var dbg = vec2<u32>(0u, 0u);
-        dbg.x = (u32(dbg_valid) & 0xFFu)
-            | ((u32(dbg_dist_pass) & 0xFFu) << 8u)
-            | ((u32(dbg_screen_pass) & 0xFFu) << 16u)
-            | ((u32(color_sum.a) & 0xFFu) << 24u);
-        dbg.y = (u32(color_sum.a) & 0xFFFFu) | ((u32(first_hit_dist) & 0xFFFFu) << 16u);
-        taa_sample_accum[pixel_index] = dbg;
-    }
 }

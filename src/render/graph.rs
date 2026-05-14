@@ -34,115 +34,6 @@ use crate::render::pipelines::{NaadfPipelines, FIRST_HIT_WORKGROUP_SIZE};
 use crate::render::prepare::{FrameGpu, WorldGpu};
 use crate::render::taa::TaaGpu;
 
-// === TEMPORARY STEP-8 INSTRUMENTATION — reverted before return ==============
-use bevy::render::render_resource::{
-    Buffer, BufferDescriptor, BufferUsages, MapMode, PollType,
-};
-use bevy::render::renderer::RenderDevice;
-
-#[derive(Resource)]
-pub struct TaaDebugReadback {
-    pub staging: Buffer,
-}
-
-/// Temporary `Core3d` node: copy 8 bytes (`taa_sample_accum[center_pixel]`)
-/// into a mappable staging buffer, run after the reproject node.
-pub fn taa_debug_copy_node(
-    mut render_context: RenderContext,
-    frame_gpu: Option<Res<FrameGpu>>,
-    taa_gpu: Option<Res<TaaGpu>>,
-    render_device: Res<RenderDevice>,
-    existing: Option<Res<TaaDebugReadback>>,
-    mut commands: Commands,
-) {
-    let (Some(frame_gpu), Some(taa_gpu)) = (frame_gpu, taa_gpu) else {
-        return;
-    };
-    let staging = match &existing {
-        Some(r) => r.staging.clone(),
-        None => {
-            let s = render_device.create_buffer(&BufferDescriptor {
-                label: Some("taa_debug_staging"),
-                size: 8,
-                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            commands.insert_resource(TaaDebugReadback { staging: s.clone() });
-            s
-        }
-    };
-    // center pixel of a 1280x720-ish viewport — pick pixel_count/2 + 7 to land
-    // somewhere on the grid geometry.
-    let center = (frame_gpu.pixel_count / 2 + 7) as u64;
-    let encoder = render_context.command_encoder();
-    encoder.copy_buffer_to_buffer(&taa_gpu.taa_sample_accum, center * 8, &staging, 0, 8);
-}
-
-/// Temporary `Render`-schedule system: map the staging buffer, decode the
-/// accumulated weight + RGB, and log them. Proves the TAA accumulation evolves
-/// frame-to-frame.
-pub fn taa_debug_readback_system(
-    readback: Option<Res<TaaDebugReadback>>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(readback) = readback else {
-        return;
-    };
-    let slice = readback.staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(MapMode::Read, move |res| {
-        let _ = tx.send(res);
-    });
-    let _ = render_device.poll(PollType::wait_indefinitely());
-    if rx.recv().is_ok() {
-        let data = slice.get_mapped_range();
-        let x = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let y = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        // TEMP raw-integer-counter decode (matches taa.wgsl debug block):
-        // .x = valid | dist_pass<<8 | screen_pass<<16 | accepted<<24
-        // .y = u32(color_sum.a) | u32(first_hit_dist)<<16
-        let valid = x & 0xFF;
-        let dist_pass = (x >> 8) & 0xFF;
-        let screen_pass = (x >> 16) & 0xFF;
-        let accepted = (x >> 24) & 0xFF;
-        let accepted_full = y & 0xFFFF;
-        let first_hit_dist = y >> 16;
-        info!(
-            "TAA_DEBUG[center]: valid={valid} dist_pass={dist_pass} screen_pass={screen_pass} accepted={accepted} accepted_full={accepted_full} fhd={first_hit_dist} raw=({x:#010x},{y:#010x})"
-        );
-        let _ = half_to_f32(0);
-        drop(data);
-        readback.staging.unmap();
-    }
-}
-
-fn half_to_f32(h: u16) -> f32 {
-    let sign = ((h >> 15) & 1) as u32;
-    let exp = ((h >> 10) & 0x1F) as u32;
-    let mant = (h & 0x3FF) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign << 31
-        } else {
-            // subnormal
-            let mut e = -1i32;
-            let mut m = mant;
-            while (m & 0x400) == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            m &= 0x3FF;
-            (sign << 31) | (((e + 127 + 1 - 15) as u32) << 23) | (m << 13)
-        }
-    } else if exp == 0x1F {
-        (sign << 31) | (0xFF << 23) | (mant << 13)
-    } else {
-        (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
-    };
-    f32::from_bits(bits)
-}
-// === END TEMPORARY STEP-8 INSTRUMENTATION ===================================
-
 /// Timing-span name for the first-hit pass — surfaces in the HUD as
 /// `render/naadf_first_hit/elapsed_gpu`.
 pub const FIRST_HIT_SPAN: &str = "naadf_first_hit";
@@ -237,32 +128,14 @@ pub fn naadf_taa_reproject_node(
         return;
     }
     let (Some(taa_gpu), Some(frame_gpu)) = (taa_gpu, frame_gpu) else {
-        info!("TAA_DEBUG reproject_node: missing taa_gpu/frame_gpu");
         return;
     };
     let _ = taa_gpu; // the bind group (in `FrameGpu`) carries the TAA buffers.
     let Some(pipeline) =
         pipeline_cache.get_compute_pipeline(pipelines.taa_reproject_pipeline)
     else {
-        let st = pipeline_cache
-            .get_compute_pipeline_state(pipelines.taa_reproject_pipeline);
-        match st {
-            bevy::render::render_resource::CachedPipelineState::Err(e) => {
-                info!("TAA_DEBUG reproject pipeline ERR: {e}");
-            }
-            bevy::render::render_resource::CachedPipelineState::Queued => {
-                info!("TAA_DEBUG reproject pipeline: Queued");
-            }
-            bevy::render::render_resource::CachedPipelineState::Creating(_) => {
-                info!("TAA_DEBUG reproject pipeline: Creating");
-            }
-            bevy::render::render_resource::CachedPipelineState::Ok(_) => {
-                info!("TAA_DEBUG reproject pipeline: Ok-but-not-compute?!");
-            }
-        }
         return;
     };
-    info!("TAA_DEBUG reproject_node: DISPATCHING");
 
     let workgroups =
         frame_gpu.pixel_count.div_ceil(FIRST_HIT_WORKGROUP_SIZE).max(1);
