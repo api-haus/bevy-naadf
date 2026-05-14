@@ -51,7 +51,7 @@ B (GI) → C (GPU construction/editing)**. One gated phase at a time.
 - [x] `design` phase (**Phase A**) → `03-design.md` (~33 KB; 12-step Phase-A impl sequence)
 - [x] `impl` phase (**Phase A**) → `04-impl.md` — Batch 1 (steps 1–6) + Batch 2 (steps 7–12) done 2026-05-14; 39 tests pass, builds + smoke-runs clean
 - [x] `review` phase (**Phase A**) → `05-review.md` — **Phase A review gate PASSED**. Two regressions found, fixed, and user-confirmed: (1) camera→ray perspective (3 compounding MonoGame↔wgpu convention bugs), (2) out-of-volume concentric-line artifacts (wrong AABB clip-box values — NAADF insets by 0.1 voxel as `float3`). 39 tests pass; builds + runs coherent inside and outside the volume.
-- [~] Phase A-2 (TAA) — context written (`01-context.md` §2c: 16-sample history per `design-exploration-qa.md` §6; 0.25-spp target constraint); **`design` in progress** → `06-design-a2.md`; then impl → review
+- [~] Phase A-2 (TAA) — context (`01-context.md` §2c) + **design done** (`06-design-a2.md`, ~46 KB, 9-step impl sequence); **impl pending** → review
 - [ ] Phase B (GI): design → impl → review
 - [ ] Phase C (GPU construction/editing): design → impl → review
 
