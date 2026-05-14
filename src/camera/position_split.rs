@@ -13,8 +13,6 @@
 
 use bevy::prelude::*;
 
-use bevy::camera_controller::free_camera::FreeCamera;
-
 /// Camera-relative position as an integer voxel coordinate + a fractional
 /// offset kept in `[0,1)³` (D1, `03-design.md` §4.2).
 ///
@@ -92,15 +90,29 @@ impl core::ops::Sub for PositionSplit {
     }
 }
 
-/// `Update` system: derive the camera's [`PositionSplit`] from its
-/// `FreeCamera`-driven `Transform` each frame (`03-design.md` §4.2).
+/// `Update` system: derive the camera's [`PositionSplit`] from its `Transform`
+/// each frame (`03-design.md` §4.2).
 ///
-/// Runs after `FreeCameraPlugin`'s movement system has updated the `Transform`.
-/// Phase A uses Bevy's free-fly camera for *input*; this system converts the
-/// resulting `Transform.translation` into the int+frac split the render path
-/// consumes (D1).
+/// Runs after `FreeCameraPlugin`'s movement system has updated the `Transform`
+/// (when the free camera is present). Phase A uses Bevy's free-fly camera for
+/// *input*; this system converts the resulting `Transform.translation` into the
+/// int+frac split the render path consumes (D1).
+///
+/// The camera is matched by `With<PositionSplit>` — the marker of *the NAADF
+/// render camera* — NOT `With<FreeCamera>`. `FreeCamera` is an input concern
+/// (the fly-camera plugin); the `PositionSplit` sync is a render concern that
+/// must keep the int+frac position consistent with the `Transform` for *every*
+/// configuration of the render camera. The e2e harness spawns a render camera
+/// **without** `FreeCamera` (`e2e/mod.rs setup_e2e_camera`); a `With<FreeCamera>`
+/// filter made `Single` match nothing there, so the system was silently skipped
+/// and `PositionSplit` stayed pinned at its spawn value — harmless for the e2e
+/// harness's *static* pose, but it silently breaks the int+frac camera-relative
+/// rendering the instant such a camera moves (the ray origin desyncs from the
+/// `Transform` rotation, so `first_hit`'s DDA traversal misses geometry). This
+/// mirrors the identical `With<FreeCamera>` trap already fixed in
+/// [`crate::render::taa::update_camera_history`].
 pub fn sync_position_split(
-    mut camera: Single<(&Transform, &mut PositionSplit), With<FreeCamera>>,
+    mut camera: Single<(&Transform, &mut PositionSplit), With<PositionSplit>>,
 ) {
     let (transform, split) = &mut *camera;
     **split = PositionSplit::from_world(transform.translation);

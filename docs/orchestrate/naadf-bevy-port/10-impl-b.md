@@ -2138,3 +2138,158 @@ passes honestly (the region gate at the design-intent `MIN_GI_BOUNCE_LUMINANCE
 remaining work for Phase B is the **user interactive review gate**
 (`01-context.md` §2d done-bar — "bounce lighting visible, temporally stable,
 no obvious artifacts"), not further implementation.
+
+---
+
+## TAA shadow decay-to-black fix (2026-05-15)
+
+**Status: NOT resolved as scoped. The dispatch's premise — that the TAA decay
+reproduces in the e2e harness by running the static-camera budget longer — is
+DISPROVEN. The decay needs camera *motion*, which the e2e harness could not
+exercise because of a latent `sync_position_split` `With<FreeCamera>` filter
+bug. That bug is fixed (it is a genuine prerequisite for any camera-motion e2e
+coverage and is the same trap already fixed once in `update_camera_history`);
+the actual windowed-app TAA decay's root cause is NOT confirmed and was NOT
+patched — patching it speculatively would violate "diagnose before patching."
+The 8-run e2e cap was reached. This section is the full diagnosis for a
+follow-up dispatch.**
+
+### What was established (and how)
+
+**1. The static-camera e2e does NOT decay — at any budget.** `cargo run --bin
+e2e_render` at `E2E_RENDER_FRAMES = 600` (run 1 of 8): the scene is fully,
+stably GI-lit (99.2% non-black, region gate green), visually identical to the
+96-frame state. The brief's reproduction recipe ("run e2e ~5 s / several
+hundred frames, screenshot at the end → pitch-black shadows") does **not**
+reproduce anything — 600 frames is as lit as 96.
+
+This is consistent with a from-first-principles audit of the TAA accumulation
+math. For a *static* camera the `base/` long-term TAA is provably convergent:
+`reproject_old_samples` overwrites `taa_sample_accum` with `color_sum` (the sum
+of up to 15 accepted history-ring samples, each `.a == 1` so `color_sum.a` is
+the accepted count); `calc_new_taa_sample` then folds the current frame's
+`final_color` light in as `taa_color = color_sum.rgb + light`, weight
+`color_sum.a + 1`; the blit divides `rgb / max(1, weight)`. That is a running
+average of per-frame `final_color` values — it converges to the mean, it cannot
+geometrically decay. The 16-deep `taa_samples` ring stores each frame's
+`final_color` *independently* (not a recursively-accumulated value), so there
+is no compounding compression loss either. `taa.wgsl`, `taa_common.wgsl`,
+`naadf_final.wgsl`, `sample_refine.wgsl`, `spatial_resampling.wgsl`,
+`denoise_split.wgsl`, `naadf_global_illum.wgsl`, `ray_queue_calc.wgsl` were all
+read against the NAADF `base/` HLSL — every checked spot is a faithful port.
+
+**2. Camera motion DOES produce a decay — but the repro was contaminated.** A
+temporary diagnostic orbit-camera system was added to the e2e harness (revert
+verified). At 200 frames it reproduced a dramatic decay: on-screen geometry —
+including the *emissive blocks* — decays to luminance ~6, only fresh-disoccluded
+geometry at the screen edge stays lit (runs 2–8).
+
+A probe chain isolated it: writing a constant `(1, 5,5,5)` into `taa_sample_accum`
+from `calc_new_taa_sample` *unconditionally* (run 7) gave a uniformly bright
+frame — proving the `calc_new_taa_sample → taa_sample_accum → blit` hand-off is
+sound — but the *same* constant write gated on `voxel_type != 0`
+(`first_hit.z & 0x7FFF`, run 6) still decayed. Therefore **the decayed-region
+pixels read `voxel_type == 0` in `first_hit_data`** — `first_hit`'s DDA
+traversal was producing *misses* for on-screen geometry under camera motion
+(also confirmed by run 5: forcing `first_hit`'s own `final_color = (5,5,5)`
+gated on its just-written `first_hit_data[id].z != 0` still decayed, so
+`first_hit` itself sees the miss).
+
+**3. The miss was caused by `sync_position_split`'s `With<FreeCamera>` filter
+— a harness bug, not the windowed-app bug.** `sync_position_split` (which
+derives the int+frac `PositionSplit` camera position from the `Transform` every
+frame) was filtered `With<FreeCamera>`. The e2e camera (`setup_e2e_camera`) has
+no `FreeCamera` component, so the system's `Single` query matched nothing and
+the system was **silently skipped** — `PositionSplit` stayed pinned at its
+spawn value. Harmless for the e2e harness's static pose; but the diagnostic
+orbit moved the `Transform` while `PositionSplit` stayed frozen, so the ray
+*origin* (`PositionSplit`, frozen) desynced from the ray *rotation*
+(`GlobalTransform`, moving) — `first_hit`'s `shoot_ray` cast from the wrong
+origin and missed the geometry. This is the **identical `With<FreeCamera>`
+trap** already found and fixed once in `update_camera_history`
+(`taa.rs` — see its doc comment); `sync_position_split` was simply missed in
+that pass. **It is a real bug** (it silently breaks camera-relative rendering
+for any non-`FreeCamera` render camera the instant it moves), but it is NOT the
+windowed-app TAA decay: the windowed app's `setup_camera` *does* spawn the
+camera with `FreeCamera`, so `sync_position_split` runs there.
+
+### The fix applied
+
+`src/camera/position_split.rs` — `sync_position_split`'s query filter changed
+`With<FreeCamera>` → `With<PositionSplit>` (matching the already-applied
+`update_camera_history` fix: the camera is matched by *the NAADF render
+camera*'s marker, not the input plugin's). The now-unused
+`bevy::camera_controller::free_camera::FreeCamera` import was dropped; the doc
+comment records the trap so it is not reintroduced a third time. This makes the
+e2e harness able to exercise a *moving* render camera correctly — the
+prerequisite for any future camera-motion regression coverage.
+
+### What is NOT fixed — the actual windowed-app TAA decay
+
+The windowed-app decay the dispatch was scoped to fix is **not reproduced and
+its root cause is not confirmed.** What is known: it is not a static-camera
+phenomenon (the TAA accumulation provably converges for a static camera, and
+e2e at 600 frames confirms it); it needs camera *motion*; and the camera-motion
+path in the windowed app runs with `PositionSplit` correctly synced (the
+windowed camera has `FreeCamera`), so it is *not* the `sync_position_split`
+bug. The suspect surface is therefore the **camera-motion reprojection** inside
+`reproject_old_samples` / `renderSampleRefine`'s `reproject_sample` — the
+3×3-neighbourhood `dist_min_max` / hash / screen-position reject tests, and how
+`color_sum.a` behaves when reprojection partially fails — or `first_hit` under
+genuine motion. The static-analysis audit did not find a faithfulness defect
+there, but the repro was never clean enough to trace it frame-over-frame.
+
+### Recommended next step (follow-up dispatch, fresh 8-run budget)
+
+With `sync_position_split` fixed, a moving e2e camera is now a valid diagnostic
+tool. Re-add a controlled orbit (or a short linear pan) **with `FreeCamera` on
+the e2e camera, or after this fix** so `PositionSplit` tracks correctly, and
+re-run the probe chain — the decay should now reproduce *cleanly* (without the
+traversal-miss contamination) if it is a real reprojection bug. Trace a single
+shadowed pixel's `taa_sample_accum` / `color_sum.a` / ring-sample values
+frame-over-frame under that motion. Confirm the root cause against
+`base/renderTaaSampleReverse.fx` before editing.
+
+### The e2e false-pass blind spot — NOT changed (deliberately)
+
+The brief's part 2 (raise the e2e budget to a "settled" duration that would
+catch a decay regression) was **not** done, because the premise is unsound:
+the static-camera e2e does not decay at *any* budget — raising
+`E2E_RENDER_FRAMES` past 96 catches nothing (run 1 at 600 frames is identical
+to 96). `E2E_RENDER_FRAMES` is left at 96 (the established post-convergence
+settled point — confirmed still-settled at 600). The *real* coverage gap is
+that the e2e harness cannot exercise camera motion at all; the
+`sync_position_split` fix is the first step toward closing it. The dormant
+two-frame-stability scaffolding (`GateState.fb_next`,
+`batch_needs_second_frame`, `Framebuffer::mean_pixel_delta`) was left in place
+for the follow-up dispatch that adds a moving-camera gate — finishing it now,
+without a confirmed decay repro to gate against, would be scaffolding without a
+target.
+
+### Verification
+
+- `cargo build` — clean, no warnings.
+- `cargo test` — **46 passed** (4 suites), unchanged.
+- `cargo run --bin e2e_render` — 8 of 8 invocations used (the hard cap): run 1
+  the static-600 no-decay confirmation, runs 2–8 the orbit-camera probe chain
+  (all reverted). Not re-run after the final `sync_position_split` fix +
+  diagnostic revert (the cap was reached); the build + 46 tests are green and
+  the static-camera path is unaffected by the fix (a static camera never needs
+  `PositionSplit` re-synced).
+- `git diff` shows only the real `sync_position_split` fix
+  (`src/camera/position_split.rs`). All TEMP diagnostic instrumentation — the
+  e2e orbit-camera system, the `taa.wgsl` / `naadf_first_hit.wgsl` /
+  `denoise_split.wgsl` constant probes, the raised frame budget, and a stray
+  pre-existing `lib.rs` `synchronous_pipeline_compilation` TEMP-PROBE found at
+  dispatch start — is reverted; `grep -rn "TEMP" src/` is clean.
+
+### Phase B impl status
+
+**Phase B remains feature-complete; the windowed-app TAA decay is an open
+defect.** This dispatch fixed a real latent bug (`sync_position_split`'s
+`With<FreeCamera>` filter trap) that was blocking the e2e harness from ever
+exercising camera motion, and established that the reported decay is
+camera-motion-triggered and not a static-camera convergence problem — but did
+not reproduce or fix the windowed-app decay itself within the 8-run cap. The
+follow-up should use the now-unblocked moving-camera diagnostic to trace the
+camera-motion reprojection path.
