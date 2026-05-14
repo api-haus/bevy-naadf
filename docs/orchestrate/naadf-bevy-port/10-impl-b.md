@@ -1630,3 +1630,143 @@ review gate (`01-context.md` §2d done-bar — "bounce lighting visible, no
 obvious artifacts") can pass. The e2e `MIN_NON_BLACK_FRACTION_GI` /
 `MIN_GI_BOUNCE_LUMINANCE` thresholds must then be re-measured against the
 real GI-lit frame and nudged per the `e2e-render-test.md` rule.
+
+---
+
+## GI-consumer defect fix (2026-05-15)
+
+**Status: NOT fixed — hit the 5-run e2e cap. The Batch-6 diagnosis's stated
+suspect (the GI-consumer WGSL) is RULED OUT; the real defect is in the Batch-6
+TAA path. This section records the diagnosis chain, what was tried, and the
+narrowed root location for a follow-up.**
+
+### What was ruled out (the Batch-6 diagnosis was wrong about *where*)
+
+The Batch-6 diagnosis concluded the defect is "a latent Batch-4/5 GI-consumer
+WGSL defect" in `denoise_split.wgsl` / `spatial_resampling.wgsl` /
+`sample_refine.wgsl`. **Five e2e isolation runs + a full faithful-port audit
+disprove that.** In order:
+
+1. **Isolation run 1 — `is_denoise = false`.** Forced the `GiSettings` default
+   to `false` so `spatial_resampling`'s non-denoise branch writes `final_color`
+   directly and `naadf_denoise` is skipped entirely. **Frame still uniformly
+   `[0,0,0,255]`.** → the denoiser (`denoise_split.wgsl`) is NOT the defect.
+
+2. **Isolation run 2 — `spatial_resampling` non-denoise passthrough.** Patched
+   `calc_spatial_resampling`'s non-denoise branch to write `final_color`
+   *unchanged* (`final_col = min(read(final_color), COLORS[26])`, dropping the
+   `+= absorption * color` GI composite). **Frame still uniformly black.** → if
+   `spatial_resampling` were corrupting `final_color`, a pure passthrough would
+   have left first-hit's primary light intact and the frame would show the
+   pre-GI image. It stayed black → `spatial_resampling` is NOT corrupting
+   `final_color`.
+
+3. **Faithful-port audit of the whole GI-consumer chain.** Read
+   `sample_refine.wgsl` / `spatial_resampling.wgsl` / `denoise_split.wgsl` /
+   `naadf_global_illum.wgsl` / `get_hit_data_from_planes` / `oct_decode` /
+   `oct_encode` / `pdf_vndf_isotropic` / `geometry_term` / `taa_compress_sample`
+   / `taa_decompress_sample` against the NAADF HLSL (`base/renderSampleRefine.fx`,
+   `base/renderSpatialResampling.fx`, `base/renderDenoiseSplit.fx`,
+   `base/renderGlobalIllum.fx`, `commonRenderPipeline.fxh`, `commonTaa.fxh`).
+   **Every checked spot is a faithful port.** Notably: the e2e test grid is
+   **all `Diffuse` + `Emissive`, zero specular** (`src/voxel/grid.rs`) — so
+   `first_hit_is_diffuse` is always `true` in `spatial_resampling`, the entire
+   specular code path (`get_brdf`, `pdf_vndf_isotropic`) is never taken, and the
+   diffuse-path `sample_neighbors` is provably finite (every divisor is
+   epsilon-guarded or constant `1/(2π)`; `taa_decompress_sample`'s `s.color` is
+   bounded `[0,100]`; `reproject_old_samples`'s `color_sum` is therefore bounded
+   too). `sample_neighbors` returns a finite `color`.
+
+4. **Isolation run 3 — `calc_new_taa_sample` constant probe.** This is the
+   decisive one. Patched `calc_new_taa_sample` to overwrite `taa_sample_accum`
+   for **every** pixel with a known finite constant
+   (`vec2(pack2x16float(vec2(1.0, 5.0)), pack2x16float(vec2(5.0, 5.0)))` —
+   weight 1, RGB (5,5,5)). The blit (`naadf_final.wgsl`) reads `taa_sample_accum`
+   and would tonemap that constant to a bright grey `~(0.82,0.82,0.82)`.
+   **Frame STILL uniformly `[0,0,0,255]`.** Runs 4–5 re-ran it to capture the
+   full node-dispatch report: only `naadf_denoise` is reported "never
+   dispatched" (expected — `is_denoise` was still `false` from run 1's leftover;
+   reverted now), i.e. **`naadf_calc_new_taa_sample` AND `naadf_final_blit` both
+   dispatched**, the `calc_new_taa_sample` pipeline compiled and ran a span, the
+   constant write executed — and the blit still read zero.
+
+### The narrowed root cause
+
+**The defect is NOT in the GI consumers at all — it is in the Batch-6 TAA path
+(`reproject_old_samples` / `calc_new_taa_sample` / the `taa_sample_accum`
+blit).** Concretely: **`calc_new_taa_sample` writes `taa_sample_accum`, the blit
+reads `taa_sample_accum`, both bind groups reference the same
+`taa_gpu.taa_sample_accum`, both nodes dispatch — yet the blit reads ZERO.**
+The framebuffer is `[0,0,0,255]` (alpha 255 = the blit's `vec4(..., 1.0)` output
+ran and covered the screen — so the blit fragment shader *executes*; it just
+reads a zero `taa_sample_accum`).
+
+This is a **Batch-6-introduced** defect, not a Batch-4/5 one. Batch 6 is what
+(a) added `naadf_taa_reproject_node` + `naadf_calc_new_taa_sample_node` to the
+`Core3d` chain for the first time, (b) reverted the blit source from the
+temporary `final_color` seam back to `taa_sample_accum`, and (c) replaced
+`naadf_final.wgsl`. Batch 5's e2e was 69.1% non-black precisely because the blit
+still read `final_color` (the temp seam) — Batch 5 never exercised the
+`taa_sample_accum` blit path. The Batch-6 diagnosis's own TEMP probe (write
+`final_color.light → taa_sample_accum` from `calc_new_taa_sample`) was black for
+the **same reason** the constant probe is black — both write `taa_sample_accum`
+via `calc_new_taa_sample` and both are not seen by the blit — but the Batch-6
+agent mis-attributed that to "`final_color` is zero" instead of "the
+`calc_new_taa_sample` → `taa_sample_accum` → blit hand-off is broken."
+
+The likely mechanisms (not yet isolated — would need run 6+):
+- **A `taa_sample_accum` buffer-instance / bind-group-staleness mismatch** —
+  `calc_new_taa_sample` and the blit ending up on different buffer instances
+  (e.g. `prepare_taa` re-creating `taa_sample_accum` on an early frame while
+  `prepare_frame_gpu` clones a stale `blit_bind_group` / `calc_new_taa_sample_
+  bind_group` — the frame-bind-group rebuild is gated on `first_hit_data`'s
+  `needs_new_storage`, not `TaaGpu`'s). Bind-group construction in
+  `prepare.rs:519-604` and `taa.rs:304-353` should be audited for this.
+- **A command-encoder submission-order issue** between the separate `Core3d`
+  systems' `RenderContext`s (the `.chain()` orders system *execution*; whether
+  it orders GPU *submission* of `calc_new_taa_sample`'s encoder before the
+  blit's needs confirming).
+- A read-write hazard on `taa_sample_accum` between `reproject_old_samples`
+  (overwrite) and `calc_new_taa_sample` (fold) that drops the fold.
+
+### Recommended next step (for the follow-up — within a fresh 5-run budget)
+
+Probe the **blit** directly, not `calc_new_taa_sample`: temporarily make
+`naadf_final.wgsl` output a hard-coded constant `vec4(0.5, 0.5, 0.5, 1.0)`
+ignoring `taa_sample_accum` entirely. If the frame goes grey → the blit
+node/pipeline/draw is fine and the defect is purely the
+`calc_new_taa_sample → taa_sample_accum` write not landing (chase the
+buffer-instance / submission-order hypotheses above). If the frame stays black
+→ the blit node itself is broken (pipeline specialisation, the
+`Operations::default()` clear, or the e2e readback target). One run splits it.
+Then a second probe pinning down the buffer instance (e.g. log the
+`taa_sample_accum` `wgpu::Buffer` global-id in `prepare_frame_gpu` for both
+bind groups and in `prepare_taa`).
+
+### Verification (current state)
+
+- All TEMP isolation probes **reverted** — `git status` clean,
+  `grep -rn "TEMP" src/` clean, `is_denoise` restored to `true`.
+- `cargo build` — clean, no warnings.
+- `cargo test` — **46 passed** (4 suites), unchanged.
+- `cargo run --bin e2e_render` — still **FAILS** (frame uniformly black, the
+  0.60 GI gate + `assert_batch_6` + degenerate-frame floor trip). 5 of 5 e2e
+  invocations used (the hard cap) — all 5 spent on the isolation experiments
+  above; no rebuild→rerun grind.
+- The e2e `MIN_NON_BLACK_FRACTION_GI` / `MIN_GI_BOUNCE_LUMINANCE` thresholds
+  were **not** re-measured — no GI-lit frame was ever produced. They remain the
+  Batch-6 design-intent placeholders (`0.60` / `12.0`).
+
+### Phase B impl status
+
+**Phase B is still NOT feature-complete.** All 13 render-graph nodes are wired
+and dispatch; the GI-consumer WGSL (`sample_refine` / `spatial_resampling` /
+`denoise_split`) is a verified-faithful port and is **cleared of suspicion** —
+the Batch-6 diagnosis pointed at the wrong subsystem. The remaining blocker is a
+**Batch-6 TAA-path defect**: the `calc_new_taa_sample → taa_sample_accum → blit`
+hand-off does not deliver — the blit reads a zero `taa_sample_accum` even when
+`calc_new_taa_sample` writes a non-zero constant to every pixel of it. This is a
+Rust-side bind-group / buffer-lifecycle or render-graph-submission bug (most
+likely in `prepare_frame_gpu` / `prepare_taa`), NOT a WGSL shader-math bug. It
+must be fixed before the GI bounce can be visible and the Phase-B review gate
+can pass.
