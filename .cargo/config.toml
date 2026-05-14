@@ -1,0 +1,9 @@
+# Build-time environment (DLSS_SDK, VULKAN_SDK) is intentionally NOT set here —
+# those are machine-specific paths and live in a gitignored `.envrc` instead
+# (see `.envrc.example`). direnv exports them; otherwise source `.envrc` or
+# export them yourself before invoking cargo.
+
+# Faster linking with mold. Remove this section if you don't have clang + mold.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

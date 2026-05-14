@@ -1,0 +1,15 @@
+# Environment for building and running bevy-naadf.
+#
+# Copy this file to `.envrc` (gitignored) and set the values for your machine.
+# With direnv it loads automatically; otherwise source it or export the
+# variables however you prefer. After editing `.envrc`, run `direnv allow`.
+#
+# Both variables are read by the `dlss_wgpu` build script at build time, and
+# DLSS_SDK is also read at runtime so NGX can locate the DLSS feature libraries.
+
+# Root of an NVIDIA DLSS SDK checkout at tag v310.5.3 — https://github.com/NVIDIA/DLSS
+export DLSS_SDK="/path/to/DLSS"
+
+# Vulkan headers + loader prefix. The system prefix is fine on most Linux
+# distros; point at the LunarG SDK's versioned directory if you use that.
+export VULKAN_SDK="/usr"
