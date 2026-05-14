@@ -27,6 +27,7 @@ render), no editor GUI / persistence / importers.
 | `08-review-a2.md` | `review` group | Phase A-2 (TAA) verification — faithful-port + 0.25-spp-readiness (sample-count signal) |
 | `09-design-b.md` | `design` group | Phase B (GI) architecture design |
 | `10-impl-b.md` | `impl` group | Phase B (GI) implementation log |
+| `e2e-render-test.md` | `delegate-architect` | headless e2e integration render-test harness design — replaces the live `cargo run` smoke-run as the impl-agent verification step |
 | `design-exploration-qa.md` | orchestrator | methodology/capability/VRAM Q&A reference (lineage, PBR texturing, dynamic entities, microvoxels, LOD, TAA-history VRAM lever) — read before scoping features it covers; holds one binding decision (§6) |
 
 **Phase B is being done in a git worktree:** `/mnt/archive4/DEV/bevy-naadf/.claude/worktrees/phase-b-gi` (branch `feat/phase-b-gi`, from `main` at the Phase-A-2-close commit). All Phase-B orchestrate files, briefs, and code use absolute paths under that worktree.
