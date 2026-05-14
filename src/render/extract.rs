@@ -50,7 +50,12 @@ pub struct ExtractedWorld {
 pub struct ExtractedCameraData {
     /// The camera's int+frac camera-relative position (D1).
     pub position_split: PositionSplit,
-    /// `world_from_clip` — the inverse view-projection `getRayDir` needs.
+    /// Rotation-only `view_from_clip` — the inverse view-projection `getRayDir`
+    /// needs. Built from a *translation-free* view matrix (mirrors NAADF's
+    /// origin-based `invViewProjTransform`, `Camera.cs:199`): the camera world
+    /// translation is stripped before inverting, so `getRayDir` can treat the
+    /// unprojected vector as a pure direction. The ray *origin* is supplied
+    /// separately via [`PositionSplit`].
     pub inv_view_proj: Mat4,
     /// Render-target size in pixels, taken from the camera viewport.
     pub viewport_size: UVec2,
@@ -89,10 +94,13 @@ pub fn extract_world(
 /// `ExtractSchedule` system: copy the camera's `PositionSplit` + inverse
 /// view-projection + viewport size into [`ExtractedCameraData`].
 ///
-/// The inverse view-projection is `world_from_clip` —
-/// `(clip_from_view * world_from_view⁻¹)⁻¹` — which the WGSL `getRayDir`
-/// transforms an NDC ray by (translation drops out after normalisation,
-/// `03-design.md` §5.2).
+/// The inverse view-projection is a rotation-only `view_from_clip` —
+/// `(clip_from_view * world_from_view_rot⁻¹)⁻¹` — built from a *translation-free*
+/// view matrix so the WGSL `getRayDir` can treat the unprojected NDC point as a
+/// pure direction (`03-design.md` §5.2). This mirrors NAADF's origin-based
+/// `invViewProjTransform` (`Camera.cs:199` — `CreateLookAt(Vector3::ZERO, …)`):
+/// the camera world translation is *not* baked in; the ray origin is supplied
+/// separately via `PositionSplit`.
 pub fn extract_camera(
     mut extracted: ResMut<ExtractedCameraData>,
     cameras: Extract<Query<(&Camera, &GlobalTransform, &PositionSplit), With<Camera3d>>>,
@@ -101,9 +109,14 @@ pub fn extract_camera(
         return;
     };
     let clip_from_view = camera.clip_from_view();
-    let world_from_view = global_transform.affine();
-    let clip_from_world = clip_from_view * Mat4::from(world_from_view).inverse();
-    let inv_view_proj = clip_from_world.inverse();
+    // NAADF builds invCamMatrix from a view matrix at the ORIGIN
+    // (Camera.cs:199 — CreateLookAt(Vector3::ZERO, camDir, Up)): rotation only,
+    // no camera translation. getRayDir then treats the unprojected vector as a
+    // pure direction. Mirror that — use the rotation-only part of
+    // world_from_view, so no translation column reaches the inverse.
+    let world_from_view_rot = Mat4::from_quat(global_transform.rotation());
+    let clip_from_view_rot = clip_from_view * world_from_view_rot.inverse();
+    let inv_view_proj = clip_from_view_rot.inverse();
 
     let viewport_size = camera
         .physical_viewport_size()

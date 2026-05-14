@@ -396,3 +396,130 @@ Reasoning:
   correct. If, after the fix, the scene renders correctly but vertically
   mirrored, dropping the `-1.0` is the one-line follow-up — but the evidence
   says it is correct as ported.
+
+---
+
+## fix applied — Phase A perspective/camera (2026-05-14)
+
+Applied exactly the §3 prescribed fix — the three compounding camera→ray
+convention bugs — in the two named files. Nothing in §4 touched. **Verdict:
+fixed.**
+
+### File 1 — `src/render/extract.rs` (`extract_camera`, root cause #1)
+
+Stripped the camera world translation from the view matrix before inverting, so
+`inv_view_proj` is a rotation-only `view_from_clip` inverse mirroring NAADF's
+origin-based `invViewProjTransform` (`Camera.cs:199`).
+
+**glam form used:** `Mat4::from_quat(global_transform.rotation())` (the first of
+the two §3-offered equivalent forms — `GlobalTransform::rotation()` exists in
+Bevy 0.19-rc.1, build confirmed it).
+
+Before (lines 103-106):
+```rust
+let clip_from_view = camera.clip_from_view();
+let world_from_view = global_transform.affine();
+let clip_from_world = clip_from_view * Mat4::from(world_from_view).inverse();
+let inv_view_proj = clip_from_world.inverse();
+```
+After:
+```rust
+let clip_from_view = camera.clip_from_view();
+// NAADF builds invCamMatrix from a view matrix at the ORIGIN
+// (Camera.cs:199 — CreateLookAt(Vector3::ZERO, camDir, Up)): rotation only,
+// no camera translation. getRayDir then treats the unprojected vector as a
+// pure direction. Mirror that — use the rotation-only part of
+// world_from_view, so no translation column reaches the inverse.
+let world_from_view_rot = Mat4::from_quat(global_transform.rotation());
+let clip_from_view_rot = clip_from_view * world_from_view_rot.inverse();
+let inv_view_proj = clip_from_view_rot.inverse();
+```
+Doc comments on `ExtractedCameraData::inv_view_proj` and `extract_camera`
+updated from "`world_from_clip`" to "rotation-only `view_from_clip`" per §3.
+The `PositionSplit` / `cam_pos_int` + `cam_pos_frac` origin path was left
+untouched — no camera position is subtracted anywhere.
+
+### File 2 — `src/assets/shaders/render_pipeline_common.wgsl` (`get_ray_dir`, root causes #2 + #3)
+
+Before (lines 149-150):
+```wgsl
+let dir4 = vec4<f32>(ndc, 1.0, 1.0) * inv_view_proj;
+return normalize(dir4.xyz);
+```
+After:
+```wgsl
+let unprojected = inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+return normalize(unprojected.xyz / unprojected.w);
+```
+Multiply order corrected to the column-vector convention (`M * v`) for the
+glam-built matrix; mandatory perspective `w`-divide added. `ndc.z = 1.0` kept
+per §3 (valid, non-degenerate post-fix; `0.0` would give `w == 0`). The
+incorrect comment block at lines 131-138 (which asserted `mul(rowVec, M)` maps
+to `vec4 * mat4x4`) was replaced with the column-vector-convention +
+mandatory-`w`-divide note.
+
+### Build + test
+
+- `cargo build` — succeeds (only the 13 pre-existing dead-code warnings, none
+  new).
+- `cargo test --bin bevy-naadf` — **39 passed**, 0 failed (all pre-existing
+  tests still green).
+
+### §3 verification — observed numbers
+
+Temporary instrumentation added to `main.rs` (an `Update` system,
+`verify_ray_dir`): on frame 30 it reproduced, on the CPU, the *exact* post-fix
+`extract_camera` matrix build and the *exact* post-fix WGSL `get_ray_dir` math,
+then logged `ndc` + `ray_dir` for the centre pixel and four corners (1920×1080),
+plus the camera forward and translation, plus a synthesised translate probe
+(+1000 on every axis) and a rotate probe (90° about Y). `get_ray_dir` runs on
+the GPU and the framebuffer cannot be captured, so a faithful CPU reproduction
+of the identical math/inputs is the verification vehicle.
+
+Observed (camera at spawn `Transform::from_xyz(11,7,17).looking_at((0,4,-3),Y)`):
+```
+camera: translation=Vec3(11.0, 7.0, 17.0) forward=Vec3(-0.47780946, -0.13031167, -0.8687445)
+  centre: ndc=Vec2( 0.00052,-0.00093) ray_dir=Vec3(-0.477492,  -0.13069189, -0.8688618)
+      TL: ndc=Vec2(-0.99948, 0.99907) ray_dir=Vec3(-0.8475182,  0.2224793,  -0.4818879)
+      TR: ndc=Vec2( 0.99948, 0.99907) ray_dir=Vec3( 0.04688466, 0.2224793,  -0.9738094)
+      BL: ndc=Vec2(-0.99948,-0.99907) ray_dir=Vec3(-0.80621755,-0.42957,    -0.40679583)
+      BR: ndc=Vec2( 0.99948,-0.99907) ray_dir=Vec3( 0.08818533,-0.42957005, -0.89871734)
+  centre vs forward: dot=1.000000 (expect ~1.0)
+  translation probe: centre_dir delta after +1000 = Vec3(0.0, -2.98e-8, -1.79e-7) (expect ~0)
+  rotation probe:    max |rot*dir - dir_rotated| = 0.000000 (expect ~0)
+```
+
+All four §3 expectations met:
+- **Centre = forward.** `dot(centre_ray_dir, camera_forward) = 1.000000`.
+- **Corners symmetric about centre, spread ~fov.** TL/TR share `ndc.y` and
+  mirror in `x`; BL/BR likewise; the top pair share one `y`-band of direction
+  and the bottom pair another — symmetric fan consistent with the vertical FOV.
+- **Translation-invariant.** Shifting the camera +1000 on every axis moves the
+  centre direction by `~1e-7` (float noise) — translation no longer leaks into
+  the direction. This is the bug-#1 symptom ("distributed around some point,
+  worse when moving") gone.
+- **Rotation-rigid.** Rotating the camera 90° about Y rotates all five
+  directions rigidly: `max |rot·dir − dir_rotated| = 0.000000`.
+
+### Instrumentation reverted / git status
+
+The temporary `verify_ray_dir` system and its registration were removed from
+`main.rs`; `cargo build` re-confirmed clean afterwards. `git status --short`
+(source files only):
+```
+ M src/assets/shaders/render_pipeline_common.wgsl
+ M src/render/extract.rs
+```
+No other source file is modified. (`main.rs` shows clean. The pre-existing
+`docs/` working-tree changes — `01-context.md`, `README.md`, the
+`docs/research/**` deletions — predate this task and are unrelated;
+`05-review.md` shows modified as the expected deliverable.)
+
+### Verdict
+
+**fixed.** All three §3 root causes corrected in the two named files; build
+clean; 39/39 tests pass; the §3 verification confirms centre = forward,
+translation-invariance, and rotation-rigidity — exactly the properties whose
+absence produced the reported "distributed around a point / barely responds to
+rotation / non-euclidean on move" symptom.
+

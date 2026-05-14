@@ -132,10 +132,16 @@ const FLAG_IS_TAA: u32 = 4u;
 //   float2 screenPos = (pixelPos + 0.5 + pixelOffset) / float2(w, h);
 //   normalize(mul(float4((screenPos*2-1) * float2(1,-1), 1, 1), camTransform).xyz)
 //
-// HLSL `mul(rowVec, M)` is `vec4 * mat4x4` in WGSL with the same (column-major)
-// matrix bytes — so the port is a direct `dir4 * inv_view_proj`. Translation
-// drops out after the `normalize`, so passing the full `world_from_clip` is
-// fine (`03-design.md` §5.2).
+// `inv_view_proj` is built by `extract_camera` as a glam (column-major) matrix,
+// so the unprojection uses the column-vector convention — `M * v`, NOT `v * M`
+// (`v * M` would evaluate `Mᵀ @ v`, a transpose). The perspective `w`-divide is
+// mandatory: NAADF's HLSL skips it only because its `invCamMatrix` is
+// rotation-only, making `w` per-pixel-constant — the port reproduces the
+// rotation-only matrix (`extract.rs`), but still does the divide explicitly so
+// the direction is correct regardless. `ndc.z = 1.0` is the NEAR plane under
+// Bevy's reverse-Z projection; for the translation-free view matrix the
+// normalized direction is `ndc.z`-invariant after the divide, so `1.0` is a
+// valid, non-degenerate choice (`0.0` would give `w == 0`).
 fn get_ray_dir(
     inv_view_proj: mat4x4<f32>,
     pixel_pos: vec2<u32>,
@@ -146,8 +152,8 @@ fn get_ray_dir(
     let screen_pos = (vec2<f32>(pixel_pos) + vec2<f32>(0.5, 0.5) + pixel_offset)
         / vec2<f32>(f32(screen_width), f32(screen_height));
     let ndc = (screen_pos * 2.0 - vec2<f32>(1.0, 1.0)) * vec2<f32>(1.0, -1.0);
-    let dir4 = vec4<f32>(ndc, 1.0, 1.0) * inv_view_proj;
-    return normalize(dir4.xyz);
+    let unprojected = inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    return normalize(unprojected.xyz / unprojected.w);
 }
 
 // --- Phase-A G-buffer pack (renderFirstHit.fx `compressFirstHitData`) -------
