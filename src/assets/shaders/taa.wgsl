@@ -85,23 +85,33 @@
 
 // --- struct decls (mirror `gpu_types::GpuTaaParams` / `GpuCameraHistorySlot`)
 //
-// No explicit padding members — naga-oil's composable-module round-trip
-// rejects them, and WGSL's `vec3`→16-byte / `vec2`→8-byte slotting reproduces
-// the padded Rust `#[repr(C)]` layout (`06-design-a2.md` §4.4, the same
-// convention as `render_pipeline_common.wgsl`'s `GpuCamera`).
+// The `vec3` 16-byte / `vec2` 8-byte WGSL slotting reproduces the padded Rust
+// `#[repr(C)]` layout *only* when a `vec3` is followed by another 16-byte-
+// aligned member (or ends the struct) — the `render_pipeline_common.wgsl`
+// `GpuCamera` case. It does NOT hold when a `vec3` is followed by a scalar:
+// WGSL packs the scalar into the `vec3`'s trailing 4 bytes (offset +12), but
+// the Rust struct has an explicit `_pad` `u32` there, so the scalar lands at
+// +16. `GpuTaaParams` has exactly that — `cam_pos_frac: vec3` followed by
+// `screen_width: u32` — so its position fields are declared `vec4` here: the
+// Rust `_pad0` / `_pad1` `u32`s become the `.w` lanes, and every member from
+// `screen_width` on lands at the offset the 192-byte Rust struct writes it to.
+// (Reading `screen_width` 4 bytes early was the Batch-6 black-frame bug — it
+// decoded `_pad1 == 0`, so `reproject_old_samples` / `calc_new_taa_sample`'s
+// `pixel_index >= screen_width * screen_height` guard rejected every thread and
+// `taa_sample_accum` was never written.)
 
 // TAA reproject-pass uniform (mirrors `gpu_types::GpuTaaParams`, 192 bytes):
 //   inv_view_proj  (0..64)   — C# invCamMatrix, rotation-only inverse view-proj
 //   view_proj      (64..128) — C# camMatrix, rotation-only view-proj (current)
-//   cam_pos_int    slot 128  — C# camPosInt
-//   cam_pos_frac   slot 144  — C# camPosFrac
+//   cam_pos_int    (128..144) — C# camPosInt + `_pad0` in `.w`
+//   cam_pos_frac   (144..160) — C# camPosFrac + `_pad1` in `.w`
 //   screen_width   160, screen_height 164, frame_count 168, taa_index 172
 //   sample_age     176
 struct GpuTaaParams {
     inv_view_proj: mat4x4<f32>,
     view_proj: mat4x4<f32>,
-    cam_pos_int: vec3<i32>,
-    cam_pos_frac: vec3<f32>,
+    cam_pos_int: vec4<i32>,
+    cam_pos_frac: vec4<f32>,
     screen_width: u32,
     screen_height: u32,
     frame_count: u32,
@@ -166,8 +176,8 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    let cam_pos_int = params.cam_pos_int;
-    let cam_pos_frac = params.cam_pos_frac;
+    let cam_pos_int = params.cam_pos_int.xyz;
+    let cam_pos_frac = params.cam_pos_frac.xyz;
     let screen_width = params.screen_width;
     let screen_height = params.screen_height;
 
@@ -391,8 +401,8 @@ fn calc_new_taa_sample(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    let cam_pos_int = cnts_params.cam_pos_int;
-    let cam_pos_frac = cnts_params.cam_pos_frac;
+    let cam_pos_int = cnts_params.cam_pos_int.xyz;
+    let cam_pos_frac = cnts_params.cam_pos_frac.xyz;
     let screen_width = cnts_params.screen_width;
     let screen_height = cnts_params.screen_height;
 

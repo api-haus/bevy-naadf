@@ -1770,3 +1770,190 @@ Rust-side bind-group / buffer-lifecycle or render-graph-submission bug (most
 likely in `prepare_frame_gpu` / `prepare_taa`), NOT a WGSL shader-math bug. It
 must be fixed before the GI bounce can be visible and the Phase-B review gate
 can pass.
+
+---
+
+## Batch-6 TAA-path black-frame fix (2026-05-15)
+
+**Status: the Batch-6 TAA-path black-frame bug is FIXED.** The e2e frame is no
+longer uniformly black — it renders the atmosphere sky + the five emissive
+blocks (69.3% non-black, up from 0.0%). The root cause was a WGSL-struct /
+Rust-`#[repr(C)]` layout mismatch, exactly the "Rust-side" bug class the prior
+diagnosis predicted. A *separate, newly-observable* issue remains in the
+GI-consumer chain (the GI bounce does not yet visibly light the dark diffuse
+geometry) — see "Remaining issue" below; that is **not** the Batch-6 TAA-path
+bug and is outside the scope of this fix.
+
+### Diagnosis chain — which angle pinned it
+
+Angle 1 (diff the delta) and Angle 2 (static lifecycle audit) both came up
+empty: `git show 755b68c` and a full read of `prepare_frame_gpu` / `prepare_taa`
+/ the three node systems showed the `taa_sample_accum` lifecycle is *coherent* —
+the buffer is created once, never re-created, and `blit_bind_group` /
+`taa_reproject_bind_group` / `calc_new_taa_sample_bind_group` are all built in
+the **same** `if` block of the **same** `prepare_frame_gpu` call from the
+**same** `Res<TaaGpu>`, so they cannot reference different buffer instances.
+Buffer-id instrumentation confirmed it: `taa_sample_accum` is `BufferId(25)` from
+frame 1 on, in every bind group, every frame. Submission order is also correct
+(`Core3d`'s `auto_insert_apply_deferred: false` + the `.chain()` + the
+`RenderContextState` "topological system order" flush ⇒ one ordered
+`queue.submit`).
+
+Angle 3 (the decisive probes) pinned it. Five e2e probe runs:
+
+1. **Blit-constant probe** — `naadf_final.wgsl` returns a hard `vec4(0.5)` →
+   frame uniform grey. The blit pipeline, draw, view-target write and readback
+   path are all sound; the defect is upstream of the blit's tonemap.
+2. **Dual-constant probe** — `reproject_old_samples` *and* `calc_new_taa_sample`
+   both unconditionally overwrite `taa_sample_accum` with non-zero constants →
+   frame *still* uniformly black. Neither TAA pass's write reaches the blit.
+3. **Blit-decode probe** — the blit decodes `taa_sample_accum` and shows
+   green-if-nonzero / red-if-zero → frame uniform **red**: the blit reads
+   `taa_sample_accum` as zero for every pixel, despite (2).
+4. **Buffer-id probe** — logged `taa_sample_accum.id()` in `prepare_taa` and
+   `prepare_frame_gpu` → `BufferId(25)` everywhere, every frame, all bind
+   groups. The bind groups are provably coherent — ruling the
+   buffer-instance/staleness hypothesis OUT.
+5. **Triple-constant probe (decisive)** — three different writers write three
+   different constants to `taa_sample_accum`: `naadf_first_hit` writes BLUE
+   (via `frame_gpu.bind_group` `@group(1)` slot 3), `reproject_old_samples`
+   writes RED (`taa_reproject_bind_group` `@group(0)` slot 4),
+   `calc_new_taa_sample` writes GREEN (`calc_new_taa_sample_bind_group`
+   `@group(1)` slot 5); the blit decodes the result. **Frame uniform BLUE.**
+   `naadf_first_hit`'s write to `taa_sample_accum` lands and reaches the blit;
+   `reproject_old_samples`'s and `calc_new_taa_sample`'s do **not** — even
+   though all three target the same `BufferId(25)`, all dispatch, and the
+   submission order is correct.
+
+### The specific defect
+
+The three passes differ in *which uniform they read the screen dimensions
+from*. `naadf_first_hit` reads `GpuRenderParams` (`render_params` buffer);
+`reproject_old_samples` and `calc_new_taa_sample` read **`GpuTaaParams`** (the
+`taa_params` buffer). Both TAA entry points open with the guard
+`if (pixel_index >= params.screen_width * params.screen_height) { return; }`.
+
+The WGSL `GpuTaaParams` struct in `taa.wgsl` declared its camera-position
+fields as `vec3`:
+
+```wgsl
+cam_pos_int: vec3<i32>,    // 128..140  (WGSL: size 12, align 16)
+cam_pos_frac: vec3<f32>,   // 144..156  (WGSL: size 12, align 16)
+screen_width: u32,         // WGSL packs it at 156 — right after the vec3
+```
+
+The Rust `#[repr(C)]` `GpuTaaParams` has an **explicit `_pad1: u32`** after
+`cam_pos_frac`, so it writes `screen_width` at byte offset **160**. WGSL's
+`vec3`-followed-by-a-scalar packs the scalar into the `vec3`'s trailing 4 bytes
+(offset **156**) — the file-header comment's "WGSL's `vec3`→16-byte slotting
+reproduces the padded Rust layout" claim holds for a `vec3` followed by another
+16-byte-aligned member (the `render_pipeline_common.wgsl` `GpuCamera` case) but
+**not** for a `vec3` followed by a scalar. So every member from `screen_width`
+on was read **4 bytes early**: WGSL read `screen_width` from offset 156, where
+the Rust struct's `_pad1` (always `0`) lives.
+
+With `screen_width == 0`, the guard `pixel_index >= 0 * screen_height` is
+`pixel_index >= 0` — **true for every thread** — so `reproject_old_samples` and
+`calc_new_taa_sample` returned immediately for every invocation and wrote
+**nothing**: not `taa_sample_accum`, and (the actual Batch-6-visible
+consequence) not `taa_dist_min_max` either. The blit therefore read a
+zero-cleared `taa_sample_accum` ⇒ uniformly black frame. `naadf_first_hit` was
+unaffected because `GpuRenderParams` has no `vec3`-then-scalar transition, so
+its WGSL/Rust layouts already agreed.
+
+This is precisely the "Rust-side, NOT a WGSL shader-math bug" the prior
+diagnosis predicted — it is a `#[repr(C)]`-vs-WGSL **layout** bug, surfaced by
+Batch 6 because Batch 6 is the first batch to put the `base/` `reproject_old_samples`
++ `calc_new_taa_sample` passes (which read `GpuTaaParams`) on the critical path
+feeding the `taa_sample_accum` blit.
+
+### The fix (faithful — matches the codebase's existing convention)
+
+`src/assets/shaders/taa.wgsl` only — one struct + four field accesses:
+
+- `GpuTaaParams`: `cam_pos_int` / `cam_pos_frac` changed from `vec3<i32>` /
+  `vec3<f32>` to **`vec4<i32>` / `vec4<f32>`**. The Rust struct's explicit
+  `_pad0` / `_pad1` `u32`s become the `.w` lanes, so every member from
+  `screen_width` on lands at exactly the offset the 192-byte Rust
+  `#[repr(C)]` struct writes it to. This is the standard idiomatic WGSL way to
+  mirror a padded `repr(C)` struct and is unambiguously accepted by naga-oil
+  (the prior `vec3` form's "no explicit padding members" was the trap).
+- The four field reads (`params.cam_pos_int` / `params.cam_pos_frac` in
+  `reproject_old_samples`; `cnts_params.cam_pos_int` / `cnts_params.cam_pos_frac`
+  in `calc_new_taa_sample`) gain `.xyz` — they feed `get_hit_data_from_planes`,
+  whose signature is `vec3<i32>` / `vec3<f32>`, unchanged.
+- The struct-decl comment block was rewritten to record *why* the
+  `vec3`-then-scalar case needs `vec4` (so the trap is not re-introduced).
+
+`GpuTaaParams` / `taa_params` is used by **no other shader** (`grep` confirmed),
+so the fix is fully localised. `GpuCameraHistorySlot` was audited for the same
+class of bug and is correct — its `vec3` (`cam_pos_from_cur_int`) is followed
+by a `vec2` (`jitter`, align 8), and `140` rounds up to `144` either way, so
+the WGSL and Rust layouts already agree there.
+
+### Verification
+
+- `cargo build` — clean, no warnings.
+- `cargo test` — **46 passed** (4 suites), unchanged.
+- `cargo run --bin e2e_render` — the frame is **no longer black**. Screenshot
+  (`target/e2e-screenshots/e2e_latest.png`): the atmosphere sky gradient + the
+  five emissive blocks (warm-white, yellow, pink, green tints) render correctly
+  against the dark background. The global luminance gate passes at **69.3%**
+  non-black (was 0.0%). The `PipelineCache` scan and node-dispatch check pass.
+  The `assert_batch_6` region gate's emissive + sky checks pass.
+- The one remaining e2e failure is `assert_batch_6`'s positive GI-bounce check
+  — see "Remaining issue".
+
+### Re-measured / recalibrated e2e thresholds
+
+- **`MIN_NON_BLACK_FRACTION_GI`** (`framebuffer.rs`): `0.60` → **`0.68`**.
+  Measured GI-lit non-black fraction is 69.3%; set just below it — a real
+  regression tripwire, above the user's 50% floor, not a rubber stamp.
+- **`MIN_GI_BOUNCE_LUMINANCE`** (`gates.rs`): **held at `12.0`** — deliberately
+  *not* recalibrated. The `solid_block_rect` dark-diffuse-geometry region
+  measures luminance ~4.4 (mean rgba ~[3.8, 4.5, 5.4]) — barely above the
+  pre-GI ~4.0. The GI bounce is not yet visibly lighting the diffuse geometry,
+  so the honest threshold stays at the design-intent value and the gate
+  correctly **fails** until the bounce actually lands. Rubber-stamping it down
+  to ~4.4 would defeat the check.
+
+### Remaining issue — the GI bounce is not yet visible (separate, out of scope)
+
+`assert_batch_6`'s positive check still fails: the dark diffuse geometry below
+the warm-white emissive block measures luminance ~4.4, essentially unchanged
+from pre-GI. This is a *different* defect from the Batch-6 TAA-path bug, and it
+only became **observable** because this fix unblocked the TAA path:
+
+- Before this fix, `reproject_old_samples` was a complete no-op, so
+  `taa_dist_min_max` was never written — it stayed zero-cleared and
+  `renderSampleRefine`'s reprojection-validity test rejected everything. The
+  GI-consumer chain (`renderGlobalIllum → renderSampleRefine →
+  renderSpatialResampling → renderDenoiseSplit → final_color`) was therefore
+  *never actually exercised with a non-empty `taa_dist_min_max`* — not in the
+  prior agent's five isolation runs (all of which ran on top of the still-broken
+  TAA path), not ever.
+- Now `reproject_old_samples` runs and writes `taa_dist_min_max`, the blit reads
+  a real `taa_sample_accum`, and the emissive blocks composite through
+  `final_color` → `taa_sample_accum` → blit correctly. But the GI *bounce*
+  contribution `renderSpatialResampling` / `renderDenoiseSplit` composite into
+  `final_color` for non-emissive diffuse pixels is negligible.
+- The prior agent's static audit of the GI-consumer WGSL (`sample_refine` /
+  `spatial_resampling` / `denoise_split`) found them faithful ports — that audit
+  stands, but a faithful port can still have a bug the static read missed, and
+  this is the first time the chain runs end-to-end with real input. The next
+  dispatch should bisect the `renderGlobalIllum → renderSampleRefine →
+  renderSpatialResampling → renderDenoiseSplit` chain with a working
+  `taa_dist_min_max` (a fresh e2e-run budget), targeting why `final_color`
+  carries so little bounce on diffuse surfaces.
+
+### Phase B impl status
+
+**Phase B is NOT yet feature-complete.** The Batch-6 TAA-path black-frame bug —
+the blocker this dispatch was scoped to fix — **is fixed**: all 13 render-graph
+nodes dispatch, the `base/` TAA path executes, the `taa_sample_accum` blit
+delivers a real image (sky + emissive blocks, 69.3% non-black), and the build +
+all 46 tests are green. **What remains:** the GI bounce does not yet visibly
+light the dark diffuse geometry — a GI-consumer-chain issue (now observable for
+the first time, since the TAA path finally feeds it) that must be fixed before
+the Phase-B review gate's "bounce lighting visible" done-bar can pass. That is
+a distinct, follow-up dispatch — not the Batch-6 TAA-path bug.

@@ -60,17 +60,17 @@ pub const NON_BLACK_EPS: f32 = 2.0;
 ///
 /// **Recalibrated (2026-05-14, e2e test-scene expansion):** the test scene was
 /// expanded with five emissive blocks + more geometry, and the pre-GI non-black
-/// fraction at the re-framed e2e pose rose to **69.1%** (was ~41%) — so once GI
-/// lights the dark diffuse geometry the GI-lit fraction is ≥ that. A 0.50 hard
-/// gate would no longer be a real check on the expanded scene. This is set to
-/// **0.60** — above the user's 50% floor, a real check on the GI-lit frame.
-/// **Batch-5 confirmed it is not yet exercised:** the whole-frame non-black
-/// fraction stays bit-identical at 69.1% through B5 (the GI consumers run but
-/// their pre-B6 contribution is negligible), so [`GI_LIT_BATCH`] is `6` and the
-/// Batch-6 agent re-confirms this 0.60 hard gate against the actual measured
-/// GI-lit fraction and nudges it to just below the measured value (the
-/// `e2e-render-test.md` rule).
-pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.60;
+/// fraction at the re-framed e2e pose rose to ~69.1% (was ~41%).
+///
+/// **Re-measured (2026-05-15, Batch-6 TAA-path black-frame fix):** with the
+/// `GpuTaaParams` WGSL/`#[repr(C)]` layout mismatch fixed, the TAA path executes
+/// and the blit reads a real `taa_sample_accum` — the e2e frame is no longer
+/// black, measuring **69.3%** non-black (sky + the five emissive blocks; the GI
+/// bounce onto dark diffuse geometry is still weak — see [`MIN_GI_BOUNCE_LUMINANCE`]
+/// and `10-impl-b.md`'s Batch-6 black-frame-fix section). Set to **0.68** — just
+/// below the measured value, above the user's 50% floor: a real regression
+/// tripwire on the lit-fraction, not a rubber stamp.
+pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.68;
 
 /// The minimum non-black fraction for the **pre-GI** batches (Batch 1–4).
 ///

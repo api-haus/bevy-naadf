@@ -392,10 +392,20 @@ fn assert_batch_6(state: &GateState) -> Result<(), String> {
 
 /// The minimum `solid_block_rect` luminance for [`assert_batch_6`]'s positive
 /// "GI bounce is visible" check. The dark diffuse voxel geometry measured
-/// luminance ~4 (near-black) through Batch 5; Batch 6's GI bounce lights it.
-/// Set just below the measured GI-lit value (re-confirmed against the actual
-/// Batch-6 readback — the `e2e-render-test.md` rule, same discipline as
-/// `MIN_NON_BLACK_FRACTION_GI`).
+/// luminance ~4 (near-black) through Batch 5; Batch 6's GI bounce should light
+/// it.
+///
+/// **Held at the 12.0 design-intent value (2026-05-15, Batch-6 TAA-path
+/// black-frame fix).** With the `GpuTaaParams` layout bug fixed, the TAA path
+/// works and the frame is no longer black — but the `solid_block_rect` region
+/// still measures luminance ~4.4 (mean rgba ~[3.8, 4.5, 5.4]), barely above the
+/// pre-GI ~4.0. The GI bounce is *not yet* visibly lighting the dark diffuse
+/// geometry: a remaining issue in the GI-consumer chain (`renderGlobalIllum →
+/// renderSampleRefine → renderSpatialResampling → renderDenoiseSplit →
+/// final_color`) that only became observable now that the TAA path delivers a
+/// real `taa_sample_accum`. This threshold is deliberately **not** rubber-
+/// stamped down to 4.4 — the gate honestly fails until the GI bounce actually
+/// lands (see `10-impl-b.md`'s Batch-6 black-frame-fix section).
 const MIN_GI_BOUNCE_LUMINANCE: f32 = 12.0;
 
 // --- Dispatch tables -------------------------------------------------------
