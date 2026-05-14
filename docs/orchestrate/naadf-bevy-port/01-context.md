@@ -58,6 +58,24 @@ begin until Phase A is reviewed.
 
 ---
 
+## 2b. Design-phase Q&A decisions (2026-05-14)
+
+After the `research` phase surfaced 7 open questions, a narrow second Q&A resolved the four
+that change the design brief. These are binding alongside Q1–Q4.
+
+| # | Question | User's choice | Consequence |
+|---|---|---|---|
+| D1 | Camera precision — `PositionSplit` is pervasive; every render shader uses `camPosInt`+`camPosFrac` | **Port `PositionSplit` faithfully** | Implement NAADF's int+frac camera (`pos_int: IVec3` + `pos_frac: Vec3`) and thread both through every WGSL render pass; G-buffer plane reconstruction / TAA / GI reprojection all in int+frac space. User note: *"port with its own camera-relative rendering, then explore this problemspace later"* — faithful NAADF camera-relative rendering now; alternatives (origin rebasing, plain f32) explicitly deferred. |
+| D2 | Phase-A content path — importers are out of scope (Q1) but Phase A needs voxels on screen | **Hard-coded test grid** | Phase A builds a voxel grid procedurally in Rust (primitives / simple shapes). NO `.vox` reader, NO `WorldGenerator` port in Phase A — the generator is deferred. Smallest content path. |
+| D3 | Bevy Solari — currently wired into the scaffold | **Strip entirely** | Remove `bevy_solari` from `Cargo.toml`; delete `SolariPlugins` from `src/main.rs`; delete the Solari camera components (`SolariLighting`/`Pathtracer`, `CameraMainTextureUsages` STORAGE_BINDING, `Msaa::Off` if Solari-only) from `src/camera.rs`. No reference renderer kept. **This resolves the "open tension" noted in §3 below — strip, do not keep dormant.** |
+| D4 | Long-term 32-frame TAA — Phase A or Phase B? | **Phase B, don't pre-design** | Phase A ships with TAA off; layouts are NOT pre-designed for it. Phase B adds TAA and accepts whatever refactor it then needs. Smallest possible Phase A. |
+
+**Net effect — Phase A is the smallest runnable slice:** `PositionSplit` camera + hard-coded
+voxel test grid + AADF data structure + DDA-with-AADF traversal + albedo first-hit WGSL render.
+No Solari, no TAA, no world generator, no file I/O.
+
+---
+
 ## 3. Reuse audit summary
 
 Full audit: `docs/orchestrate/naadf-bevy-port/00-reuse-audit.md`. Condensed verdict:
@@ -85,13 +103,13 @@ the voxel type / layered-material system; `World/Render` + the `Content/shaders/
 tree; the long-term-memory TAA & resampling pipeline. (`Gui/`, persistence, settings, IO,
 importers are greenfield too but **out of scope** per Q1.)
 
-### Open tension for the `design` phase to resolve (do not resolve before then)
+### Open tension — RESOLVED by D3
 
 The scaffold currently wires in `bevy_solari` (`Cargo.toml` features; `SolariPlugins` in
 `src/main.rs`; Solari camera components `SolariLighting`/`Pathtracer` + `CameraMainTextureUsages`
-STORAGE_BINDING in `src/camera.rs`). Per Q2, Solari is **not** the GI substrate. The `design`
-phase must decide: strip Solari entirely, or keep it dormant behind a feature flag as a
-reference/A-B comparison renderer. Flag this explicitly in `03-design.md`; do not silently pick.
+STORAGE_BINDING in `src/camera.rs`). Per Q2, Solari is **not** the GI substrate. **Decision D3
+(see §2b): strip Solari entirely** — remove the dependency, the plugins, and the Solari camera
+components. Do not keep it dormant.
 
 ---
 

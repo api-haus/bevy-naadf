@@ -40,8 +40,9 @@ render), no editor GUI / persistence / importers.
 
 - [x] Step 2 — Re-implementation audit → `00-reuse-audit.md`
 - [x] Step 4 — Architectural Q&A (4 questions answered 2026-05-14)
+- [x] Design-phase Q&A (4 questions answered 2026-05-14 — D1–D4 in `01-context.md` §2b)
 - [x] Step 5 — Context files written (`README.md`, `01-context.md`)
-- [ ] `research` phase → `02-research.md`
+- [x] `research` phase → `02-research.md` (done 2026-05-14, ~36 KB)
 - [ ] `design` phase → `03-design.md`
 - [ ] `impl` phase → `04-impl.md`
 - [ ] `review` phase → `05-review.md`
