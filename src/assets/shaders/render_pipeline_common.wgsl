@@ -1,17 +1,23 @@
 // render_pipeline_common.wgsl — render-pipeline constants, the voxel-type
-// decompress, the camera / render-params uniforms, ray-direction setup, and
-// the Phase-A G-buffer pack.
+// decompress, the camera / render-params uniforms, ray-direction setup, the
+// G-buffer pack, the specular-path virtual-path reconstruction, and the
+// screen-projection helpers.
 //
 // Derives from: render/common/commonRenderPipeline.fxh +
 // render/versions/albedo/renderFirstHit.fx's uniform block + the
-// `compressFirstHitData` helper (`03-design.md` §5.5).
+// `compressFirstHitData` helper (`03-design.md` §5.5, `09-design-b.md` §2.2 /
+// §5.2).
 //
-// **Phase-A subset** — the `HIT_*` / `SURFACE_*` consts, `VoxelType` +
-// `decompressVoxelType`, the `NORMAL[8]` LUT, `getRayDir`, and
-// `compressFirstHitData` are ported now. The specular-path
-// `getHitDataFromPlanes` virtual-path reconstruction is Phase B
-// (`02-research.md` §5.1 — this header splits A/B); Phase A's final blit reads
-// the `shaded_color` stand-in directly, so it is not needed yet.
+// Phase A: the `HIT_*` / `SURFACE_*` consts, `VoxelType` +
+// `decompressVoxelType`, the `NORMAL[8]` LUT, `getRayDir`, `compressFirstHitData`.
+// Phase B adds (`09-design-b.md` §5.2): the full specular `getHitDataFromPlanes`
+// (the 3-iteration specular-reflection loop + `SPECULAR_MIRROR_FAC` LUT, entity
+// branch omitted), `getReflectanceFresnel`, `getSpecularNormals`, `getTang`, the
+// `getScreenPosProjection` / `getScreenIndexProjection` pair (promoted here from
+// `taa.wgsl` so `renderSampleRefine` / `renderSpatialResampling` can share
+// them), the `FirstHitResult` + `SampleValid` structs, and the
+// `is_diffuse` parameter on `compress_first_hit_data` (the 5-arg `base/`
+// variant — `base/renderFirstHit.fx:18`).
 //
 // naga-oil import module.
 
@@ -45,6 +51,42 @@ const NORMAL: array<vec3<f32>, 8> = array<vec3<f32>, 8>(
     vec3<f32>(0.0, 0.0, 1.0),
     vec3<f32>(0.0, 0.0, 0.0),
 );
+
+// The per-axis mirror-fac LUT indexed by the 3-bit normal index — used by
+// `get_hit_data_from_planes` to fold the accumulated reflection sign
+// (HLSL `static const float3 SPECULAR_MIRROR_FAC[7]`).
+const SPECULAR_MIRROR_FAC: array<vec3<f32>, 7> = array<vec3<f32>, 7>(
+    vec3<f32>(1.0, 1.0, 1.0),
+    vec3<f32>(-1.0, 1.0, 1.0),
+    vec3<f32>(-1.0, 1.0, 1.0),
+    vec3<f32>(1.0, -1.0, 1.0),
+    vec3<f32>(1.0, -1.0, 1.0),
+    vec3<f32>(1.0, 1.0, -1.0),
+    vec3<f32>(1.0, 1.0, -1.0),
+);
+
+// The first-hit virtual-path reconstruction result (HLSL `struct FirstHitResult`).
+struct FirstHitResult {
+    pos: vec3<f32>,
+    normal: vec3<f32>,
+    normal_mirror_fac: vec3<f32>,
+    dist: f32,
+    normal_tang: u32,
+    ray_dir: vec3<f32>,
+}
+
+// The compressed lit GI sample (HLSL `struct SampleValid { uint4 data1, data2 }`).
+// GPU-only working data — mirrors `gpu_types::GpuSampleValid` (a raw `[u32;8]`);
+// the shaders pack/unpack the bitfields directly (`renderGlobalIllum.fx:34-48`).
+//
+// PORT NOTE: the HLSL field names are `data1` / `data2`, but naga-oil rejects
+// trailing-digit identifiers in a composable module's struct ("must not require
+// substitution according to naga writeback rules"). The fields are `data_a` /
+// `data_b` here — same `data1` / `data2` content, naga-oil-safe names.
+struct SampleValid {
+    data_a: vec4<u32>,
+    data_b: vec4<u32>,
+}
 
 // --- voxel-type material (commonRenderPipeline.fxh) -------------------------
 
@@ -98,9 +140,11 @@ struct GpuCamera {
 //
 // Again no explicit padding — WGSL's `vec3` 16-byte slotting + `vec2` 8-byte
 // alignment reproduce the padded Rust `#[repr(C)]` layout: the four `u32`s sit
-// at 0/4/8/12, `taa_index`/`flags`/`exposure` at 16/20/24, `sky_sun_dir` slots
-// to 32, `sun_color` to 48, `taa_jitter` to 64, `bounding_box_min` to 80,
-// `bounding_box_max` to 96 — total 112 bytes.
+// at 0/4/8/12, `taa_index`/`flags`/`exposure`/`tone_mapping_fac` at 16/20/24/28,
+// `sky_sun_dir` slots to 32, `sun_color` to 48, `taa_jitter` to 64,
+// `bounding_box_min` to 80, `bounding_box_max` to 96 — total 112 bytes.
+// `tone_mapping_fac` replaces the former implicit pad at offset 28
+// (`09-design-b.md` §5.9 — used by Batch 6's `base/` final blit).
 struct GpuRenderParams {
     screen_width: u32,
     screen_height: u32,
@@ -111,6 +155,7 @@ struct GpuRenderParams {
     // packed `showRayStep` / `checkSun` / `isTAA` — see the `FLAG_*` consts.
     flags: u32,
     exposure: f32,
+    tone_mapping_fac: f32,
 
     sky_sun_dir: vec3<f32>,
     sun_color: vec3<f32>,
@@ -159,30 +204,193 @@ fn get_ray_dir(
 // --- Phase-A G-buffer pack (renderFirstHit.fx `compressFirstHitData`) -------
 
 // `compressFirstHitData` — pack the first-hit result into the `vec4<u32>`
-// G-buffer element (HLSL `compressFirstHitData(dist, normTangs, voxelTypeRaw,
-// entity)`).
+// G-buffer element. The `base/` variant (HLSL `base/renderFirstHit.fx:18` —
+// `compressFirstHitData(dist, normTangs, voxelTypeRaw, isDiffuse, entity)`) has
+// 5 args: `.y = isDiffuse | ...` instead of the `albedo/` variant's `.y = 1 | ...`.
+// (The Phase-A/A-2 call sites pass `1u` for `is_diffuse` until Batch 2 ports
+// the `base/` first-hit — `09-design-b.md` §2.3.)
 //
 //   .x = entity        | (normTangs.x << 15)
-//   .y = 1             | (normTangs.y << 15)   // the `1` = "is hit" flag
+//   .y = isDiffuse     | (normTangs.y << 15)
 //   .z = voxelTypeRaw  | (normTangs.z << 15)
 //   .w = f16(dist)&0x7FFF | (normTangs.w << 15)
 fn compress_first_hit_data(
     dist: f32,
     norm_tangs: vec4<u32>,
     voxel_type_raw: u32,
+    is_diffuse: u32,
     entity: u32,
 ) -> vec4<u32> {
     var first_hit: vec4<u32>;
     first_hit.x = entity | (norm_tangs.x << 15u);
-    first_hit.y = 1u | (norm_tangs.y << 15u);
+    first_hit.y = is_diffuse | (norm_tangs.y << 15u);
     first_hit.z = voxel_type_raw | (norm_tangs.z << 15u);
     let dist_bits = pack2x16float(vec2<f32>(dist, 0.0)) & 0x7FFFu;
     first_hit.w = dist_bits | (norm_tangs.w << 15u);
     return first_hit;
 }
 
-// Keep `PI` referenced so the import is not dead (a future Phase-A-2 / B
-// addition to this module will use it directly).
-fn touch_pi() -> f32 {
-    return PI;
+// --- Phase-B: specular helpers (commonRenderPipeline.fxh) -------------------
+
+// `getReflectanceFresnel` — Schlick Fresnel reflectance from an index-of-
+// refraction triple (HLSL `getReflectanceFresnel`).
+fn get_reflectance_fresnel(ior: vec3<f32>, cos_theta: f32) -> vec3<f32> {
+    let r0 = pow((vec3<f32>(1.0) - ior) / (vec3<f32>(1.0) + ior), vec3<f32>(2.0));
+    return r0 + (vec3<f32>(1.0) - r0) * pow(1.0 - cos_theta, 5.0);
+}
+
+// `getSpecularNormals` — pack the 3-bit normal index of each mirror-bounce
+// plane (0..2) whose *next* plane is populated (HLSL `getSpecularNormals`).
+fn get_specular_normals(hit: vec4<u32>) -> u32 {
+    var normals = 0u;
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        let next_normal_tang = hit[i + 1u] >> 15u;
+        if (next_normal_tang != 0u) {
+            normals |= ((hit[i] >> 15u) & 0x7u) << (i * 3u);
+        }
+    }
+    return normals;
+}
+
+// `getTang` — the deepest populated plane's normal-tang code (HLSL `getTang`).
+fn get_tang(first_hit: vec4<u32>) -> u32 {
+    var normal_tang = 0u;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let new_normal_tang = first_hit[i] >> 15u;
+        if (new_normal_tang != 0u) {
+            normal_tang = new_normal_tang;
+        }
+    }
+    return normal_tang;
+}
+
+// --- Phase-B: screen-projection helpers ------------------------------------
+// Port of `getScreenPosProjection` + `getScreenIndexProjection`
+// (`commonRenderPipeline.fxh:133-152`). Promoted here from `taa.wgsl` (where
+// A-2 kept them local) so `taa.wgsl` / `sample_refine.wgsl` /
+// `spatial_resampling.wgsl` can share them (`09-design-b.md` §5.2). WGSL has no
+// `out` params and no default args, so these return small structs and take
+// `pixel_offset` explicitly.
+//
+// MATRIX CONVENTION: the HLSL `mul(float4(pos,1), transformation)` is the
+// column-vector `transformation * vec4(pos, 1.0)` against a glam matrix — the
+// `05-review.md` perspective-fix convention. Do NOT swap to `v * M`.
+
+struct ScreenPosProj {
+    valid: bool,
+    screen_pos: vec2<f32>,
+}
+
+fn get_screen_pos_projection(
+    screen_width: u32,
+    screen_height: u32,
+    pos: vec3<f32>,
+    transformation: mat4x4<f32>,
+) -> ScreenPosProj {
+    var r: ScreenPosProj;
+    let screen_projection = transformation * vec4<f32>(pos, 1.0);
+    let ndc = screen_projection.xyz / screen_projection.w;
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0
+        || ndc.z < 0.0 || ndc.z > 1.0) {
+        r.valid = false;
+        r.screen_pos = vec2<f32>(0.0, 0.0);
+        return r;
+    }
+    var ndc_y = ndc;
+    ndc_y.y = ndc_y.y * -1.0;
+    let ndc01 = (ndc_y.xy + vec2<f32>(1.0, 1.0)) * 0.5;
+    r.valid = true;
+    r.screen_pos = ndc01 * vec2<f32>(f32(screen_width), f32(screen_height));
+    return r;
+}
+
+struct ScreenIndexProj {
+    valid: bool,
+    screen_index: u32,
+}
+
+fn get_screen_index_projection(
+    screen_width: u32,
+    screen_height: u32,
+    pos: vec3<f32>,
+    transformation: mat4x4<f32>,
+    pixel_offset: vec2<f32>,
+) -> ScreenIndexProj {
+    let proj = get_screen_pos_projection(screen_width, screen_height, pos, transformation);
+    // HLSL clamps `screenPos + pixelOffset` to `[0, (w-1, h-1)]` even when
+    // `valid` is false — the index is still computed (and benignly clamped);
+    // the caller gates on `valid`.
+    let clamped = clamp(
+        proj.screen_pos + pixel_offset,
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(f32(screen_width - 1u), f32(screen_height - 1u)),
+    );
+    let screen_pos_int = vec2<u32>(clamped);
+    var r: ScreenIndexProj;
+    r.valid = proj.valid;
+    r.screen_index = screen_pos_int.x + screen_pos_int.y * screen_width;
+    return r;
+}
+
+// --- Phase-B: the full specular `getHitDataFromPlanes` ---------------------
+// Port of `commonRenderPipeline.fxh:154-213` — the 3-iteration specular-
+// reflection loop + the tail. The `#ifdef ENTITIES` block (`:183-203`) is
+// OMITTED (Phase B is entity-free — `09-design-b.md` §1 / §5.2), so the
+// `entityInstancesHistory` + `taaIndex` parameters are dropped.
+//
+// When planes 1-3 are `HIT_UNDEFINED` the loop runs zero iterations and this
+// reduces *exactly* to A-2's single-plane `get_hit_data_from_planes_a2` — so
+// `taa.wgsl` calling this in place of its old local helper is not a behaviour
+// change for the albedo path (`09-design-b.md` §5.2).
+//
+// `pos` is built from `cam_pos_frac` only — never adding `cam_pos_int` (the D1
+// camera-relative trick), so the virtual hit position stays current-camera-int-
+// relative.
+fn get_hit_data_from_planes(
+    first_hit: vec4<u32>,
+    cam_pos_int: vec3<i32>,
+    cam_pos_frac: vec3<f32>,
+    ray_dir: vec3<f32>,
+) -> FirstHitResult {
+    var r: FirstHitResult;
+    r.normal = vec3<f32>(0.0, 0.0, 0.0);
+    r.normal_tang = first_hit.x >> 15u;
+    r.pos = cam_pos_frac;
+    r.dist = 0.0;
+    r.normal_mirror_fac = vec3<f32>(1.0, 1.0, 1.0);
+    r.ray_dir = ray_dir;
+
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        let next_normal_tang = first_hit[i + 1u] >> 15u;
+        if (next_normal_tang == HIT_UNDEFINED) {
+            break;
+        }
+        // Apply reflection.
+        r.normal_mirror_fac *= SPECULAR_MIRROR_FAC[r.normal_tang & 0x7u];
+        r.normal = NORMAL[r.normal_tang & 0x7u];
+        let ray_dir_comp_for_normal = abs(dot(r.ray_dir, r.normal));
+        let dist_to_tang = abs(
+            dot(r.pos, abs(r.normal))
+            - (f32(r.normal_tang >> 3u) - dot(vec3<f32>(cam_pos_int), abs(r.normal)))
+        );
+        let dist_fac = dist_to_tang / ray_dir_comp_for_normal;
+        r.dist += dist_fac;
+        r.pos += r.ray_dir * dist_fac + r.normal * 0.01;
+        r.ray_dir = reflect(r.ray_dir, r.normal);
+        r.normal_tang = next_normal_tang;
+    }
+
+    // The `#ifdef ENTITIES` block is omitted — Phase B is entity-free.
+
+    // Tail (`commonRenderPipeline.fxh:205-211`).
+    r.normal = NORMAL[r.normal_tang & 0x7u];
+    let ray_dir_comp_for_normal = abs(dot(r.ray_dir, r.normal));
+    let dist_to_tang = abs(
+        dot(r.pos, abs(r.normal))
+        - (f32(r.normal_tang >> 3u) - dot(vec3<f32>(cam_pos_int), abs(r.normal)))
+    );
+    let dist_fac = dist_to_tang / ray_dir_comp_for_normal;
+    r.dist += dist_fac;
+    r.pos += r.ray_dir * dist_fac;
+    return r;
 }

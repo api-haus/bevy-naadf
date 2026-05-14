@@ -51,7 +51,9 @@ use bevy::render::renderer::RenderDevice;
 use bevy::render::view::ExtractedView;
 use bevy::shader::Shader;
 
-use crate::render::gpu_types::{GpuCamera, GpuRenderParams, GpuTaaParams, GpuWorldMeta};
+use crate::render::gpu_types::{
+    GpuAtmosphereParams, GpuCamera, GpuRenderParams, GpuTaaParams, GpuWorldMeta,
+};
 
 /// Asset paths of the Phase-A entry-point WGSL shaders + the Phase-A-2 TAA
 /// reproject shader.
@@ -60,9 +62,13 @@ pub const FINAL_BLIT_SHADER: &str = "shaders/naadf_final.wgsl";
 /// Asset path of the Phase-A-2 TAA reproject compute shader (`06-design-a2.md`
 /// §8.4) — port of `albedo/renderTaaSampleReverse.fx`.
 pub const TAA_REPROJECT_SHADER: &str = "shaders/taa.wgsl";
+/// Asset path of the Phase-B atmosphere precompute compute shader
+/// (`09-design-b.md` §5.1) — port of `base/renderAtmosphere.fx`.
+pub const ATMOSPHERE_SHADER: &str = "shaders/naadf_atmosphere.wgsl";
 
 /// Compute-shader workgroup size — `[numthreads(64,1,1)]` in the HLSL
-/// `albedo/renderFirstHit.fx` `calcFirstHit` (`03-design.md` §5.1).
+/// `albedo/renderFirstHit.fx` `calcFirstHit` (`03-design.md` §5.1). The Phase-B
+/// atmosphere / GI passes also use a 64-wide group.
 pub const FIRST_HIT_WORKGROUP_SIZE: u32 = 64;
 
 /// The Phase-A render pipelines + bind-group layouts (`03-design.md` §5).
@@ -89,11 +95,19 @@ pub struct NaadfPipelines {
     /// storage). The reproject pass does not traverse the voxel world, so it
     /// binds no `@group(0)` world data — this is its only group.
     pub taa_reproject_layout: BindGroupLayoutDescriptor,
+    /// `@group(0)` for the Phase-B atmosphere precompute pass: `atmosphere_params`
+    /// (uniform), `atmosphere_comp` (read-write storage) — `09-design-b.md`
+    /// §4.3. The precompute pass writes one quarter of `atmosphere_comp` per
+    /// frame; it binds no `@group(0)` world data.
+    pub atmosphere_layout: BindGroupLayoutDescriptor,
     /// Cached id of the `naadf_first_hit` compute pipeline.
     pub first_hit_pipeline: CachedComputePipelineId,
     /// Cached id of the `taa.wgsl` `reproject_old_samples` compute pipeline
     /// (`06-design-a2.md` §8.4).
     pub taa_reproject_pipeline: CachedComputePipelineId,
+    /// Cached id of the `naadf_atmosphere.wgsl` `precompute_atmosphere` compute
+    /// pipeline (`09-design-b.md` §4.3 / §5.1).
+    pub atmosphere_pipeline: CachedComputePipelineId,
     /// Per-`TextureFormat` cache of the `naadf_final` fullscreen render
     /// pipeline (see the module doc — the colour-target format is per-view).
     pub blit_pipelines: HashMap<TextureFormat, CachedRenderPipelineId>,
@@ -123,6 +137,8 @@ impl FromWorld for NaadfPipelines {
             NonZeroU64::new(std::mem::size_of::<GpuWorldMeta>() as u64).unwrap();
         let taa_params_size =
             NonZeroU64::new(std::mem::size_of::<GpuTaaParams>() as u64).unwrap();
+        let atmosphere_params_size =
+            NonZeroU64::new(std::mem::size_of::<GpuAtmosphereParams>() as u64).unwrap();
 
         // --- @group(0): world data ------------------------------------------
         // chunks: texture_3d<u32>; blocks / voxels / voxel_types: runtime-sized
@@ -211,6 +227,21 @@ impl FromWorld for NaadfPipelines {
             ),
         );
 
+        // --- @group(0): the Phase-B atmosphere precompute pass --------------
+        // `atmosphere_params` uniform; `atmosphere_comp` read-write storage
+        // (`09-design-b.md` §4.3). The precompute pass binds no `@group(0)`
+        // world data — this is its single group.
+        let atmosphere_layout = BindGroupLayoutDescriptor::new(
+            "naadf_atmosphere_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(atmosphere_params_size)),
+                    storage_buffer_sized(false, None), // atmosphere_comp: array<vec4<u32>>, rw
+                ),
+            ),
+        );
+
         // --- compute pipeline (single, format-agnostic) ---------------------
         let first_hit_shader = asset_server.load(FIRST_HIT_SHADER);
         let first_hit_pipeline =
@@ -241,6 +272,17 @@ impl FromWorld for NaadfPipelines {
                 ..default()
             });
 
+        // --- the Phase-B atmosphere precompute pipeline ---------------------
+        let atmosphere_shader = asset_server.load(ATMOSPHERE_SHADER);
+        let atmosphere_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_atmosphere_pipeline".into()),
+                layout: vec![atmosphere_layout.clone()],
+                shader: atmosphere_shader,
+                entry_point: Some(Cow::from("precompute_atmosphere")),
+                ..default()
+            });
+
         // The blit pipeline is queued lazily per target format — see
         // `prepare_blit_pipeline`. Capture the vertex state + fragment shader
         // handle so re-queuing is cheap.
@@ -257,8 +299,10 @@ impl FromWorld for NaadfPipelines {
             blit_layout,
             taa_layout,
             taa_reproject_layout,
+            atmosphere_layout,
             first_hit_pipeline,
             taa_reproject_pipeline,
+            atmosphere_pipeline,
             blit_pipelines: HashMap::default(),
             blit_vertex,
             blit_shader,

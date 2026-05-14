@@ -155,8 +155,11 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // --- G-buffer write ----------------------------------------------------
     // The HLSL only writes `firstHitData` inside `if (isTAA)`; Phase A writes
     // it unconditionally so plane 0 is always populated (`03-design.md` §5.3).
+    // `is_diffuse` is `1u` here — Phase A/A-2's single-plane first-hit treats
+    // every hit as diffuse; the real `is_diffuse` classification arrives with
+    // Batch 2's 4-plane `base/` first-hit (`09-design-b.md` §2.3 / §6.2).
     first_hit_data[pixel_index] =
-        compress_first_hit_data(distance_ray, norm_tangs, voxel_type_raw, entity);
+        compress_first_hit_data(distance_ray, norm_tangs, voxel_type_raw, 1u, entity);
 
     // --- taa_samples ring write (HLSL `if (isTAA)` block) ------------------
     // `renderFirstHit.fx:109-117` — when TAA is on, compress the shaded sample

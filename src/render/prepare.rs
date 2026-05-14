@@ -324,7 +324,10 @@ pub fn prepare_frame_gpu(
             FLAG_CHECK_SUN
         },
         exposure: 1.5,
-        _pad0: 0,
+        // C# `Settings.data.general.toneMappingFac` — a constant in the port
+        // (`09-design-b.md` §5.9). Consumed by Batch 6's `base/` final blit;
+        // set now so the layout slot carries the right value from Batch 1 on.
+        tone_mapping_fac: 1.0,
         sky_sun_dir,
         _pad1: 0,
         sun_color: Vec3::new(1.0, 0.95, 0.85),

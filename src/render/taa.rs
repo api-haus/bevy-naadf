@@ -58,6 +58,12 @@ pub struct CameraHistory {
     /// Per-frame translation-free (rotation-only) view-proj matrix
     /// (C# `taaSampleCamTransform[128]`).
     pub view_proj: [Mat4; CAMERA_HISTORY_DEPTH],
+    /// Per-frame *inverse* translation-free view-proj matrix
+    /// (C# `taaSampleCamTransformInvers[128]`). Phase B's `renderSampleRefine`
+    /// binds this ring as its `camRotOld` parameter and calls `getRayDir` with
+    /// it (`09-design-b.md` §3.6). Populated as `view_proj.inverse()` in
+    /// [`update_camera_history`].
+    pub view_proj_inv: [Mat4; CAMERA_HISTORY_DEPTH],
     /// Per-frame Halton jitter (C# `taaSampleJitter[128]`).
     pub jitter: [Vec2; CAMERA_HISTORY_DEPTH],
     /// Monotonic frame counter (C# `WorldRender.frameCount`).
@@ -78,6 +84,7 @@ impl Default for CameraHistory {
         Self {
             positions: [PositionSplit::default(); CAMERA_HISTORY_DEPTH],
             view_proj: [Mat4::IDENTITY; CAMERA_HISTORY_DEPTH],
+            view_proj_inv: [Mat4::IDENTITY; CAMERA_HISTORY_DEPTH],
             jitter: [Vec2::ZERO; CAMERA_HISTORY_DEPTH],
             frame_count: 0,
             // frame_count == 0 ⇒ taa_index == 127 (CAMERA_HISTORY_DEPTH - 1).
@@ -172,11 +179,17 @@ pub fn update_camera_history(
     };
 
     let view_proj = rotation_only_view_proj(camera, transform.rotation);
+    // C# `taaSampleCamTransformInvers[taaIndex] = camera.invViewProjTransform`
+    // (`WorldRenderBase.cs:147`) — Phase B's `renderSampleRefine` needs the
+    // inverse rotation-only view-proj ring (`09-design-b.md` §3.6). One extra
+    // `.inverse()` per frame — cheap.
+    let view_proj_inv = view_proj.inverse();
 
     let slot = taa_index as usize;
     // `*position_split` is current — `sync_position_split` runs before this.
     history.positions[slot] = *position_split;
     history.view_proj[slot] = view_proj;
+    history.view_proj_inv[slot] = view_proj_inv;
     history.jitter[slot] = jitter;
     history.taa_index = taa_index;
     history.current_jitter = jitter;
@@ -325,6 +338,7 @@ pub fn prepare_taa(
     let current_pos = extracted_camera.position_split;
     let mut history_slots = [GpuCameraHistorySlot {
         view_proj: Mat4::IDENTITY,
+        view_proj_inv: Mat4::IDENTITY,
         cam_pos_from_cur_int: Vec3::ZERO,
         _pad0: 0,
         jitter: Vec2::ZERO,
@@ -334,6 +348,11 @@ pub fn prepare_taa(
         let rel = extracted_history.positions[i] - current_pos;
         history_slots[i] = GpuCameraHistorySlot {
             view_proj: extracted_history.view_proj[i],
+            // C# `taaSampleCamTransformInvers[i]` — `renderSampleRefine`'s
+            // `camRotOld` (`09-design-b.md` §3.6). The reproject pass does not
+            // read it; uploaded now so the slot layout matches the widened
+            // struct and Batch 3+'s `renderSampleRefine` has the data.
+            view_proj_inv: extracted_history.view_proj_inv[i],
             cam_pos_from_cur_int: rel.to_world(),
             _pad0: 0,
             jitter: extracted_history.jitter[i],

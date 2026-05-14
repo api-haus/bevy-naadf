@@ -150,6 +150,10 @@ pub struct ExtractedCameraHistory {
     pub positions: [PositionSplit; CAMERA_HISTORY_DEPTH],
     /// Per-frame translation-free view-proj matrix (C# `taaSampleCamTransform[128]`).
     pub view_proj: [Mat4; CAMERA_HISTORY_DEPTH],
+    /// Per-frame *inverse* translation-free view-proj matrix
+    /// (C# `taaSampleCamTransformInvers[128]`) — Phase B's `renderSampleRefine`
+    /// `camRotOld` ring (`09-design-b.md` §3.6 / §10.2).
+    pub view_proj_inv: [Mat4; CAMERA_HISTORY_DEPTH],
     /// Per-frame Halton jitter (C# `taaSampleJitter[128]`).
     pub jitter: [Vec2; CAMERA_HISTORY_DEPTH],
     /// Monotonic frame counter (C# `frameCount`).
@@ -168,6 +172,7 @@ impl Default for ExtractedCameraHistory {
         Self {
             positions: [PositionSplit::default(); CAMERA_HISTORY_DEPTH],
             view_proj: [Mat4::IDENTITY; CAMERA_HISTORY_DEPTH],
+            view_proj_inv: [Mat4::IDENTITY; CAMERA_HISTORY_DEPTH],
             jitter: [Vec2::ZERO; CAMERA_HISTORY_DEPTH],
             frame_count: 0,
             taa_index: (CAMERA_HISTORY_DEPTH as u32) - 1,
@@ -191,6 +196,7 @@ pub fn extract_camera_history(
     };
     extracted.positions = history.positions;
     extracted.view_proj = history.view_proj;
+    extracted.view_proj_inv = history.view_proj_inv;
     extracted.jitter = history.jitter;
     extracted.frame_count = history.frame_count;
     extracted.taa_index = history.taa_index;

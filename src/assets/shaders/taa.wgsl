@@ -24,10 +24,14 @@
 //     Phase A omitted the `ENTITIES` traversal branch. `entityPosChange` is
 //     `(0,0,0)` without entities, so wherever the HLSL adds it the port simply
 //     does not have the term.
-//   * `getHitDataFromPlanes` reduces to a single-plane reconstruction
-//     (`get_hit_data_from_planes_a2`, §7.3) — planes 1-3 are `HIT_UNDEFINED` in
-//     the albedo path, so the HLSL specular-reflection loop runs zero
-//     iterations and the function is just its tail.
+//   * `getHitDataFromPlanes`: A-2 kept a local single-plane reduction
+//     (`get_hit_data_from_planes_a2`); Phase B Batch 1 replaces it with an
+//     import of the now-shared full `get_hit_data_from_planes` from
+//     `render_pipeline_common.wgsl` (`09-design-b.md` §5.2). In the albedo path
+//     planes 1-3 are `HIT_UNDEFINED`, so the full version's specular-reflection
+//     loop runs zero iterations and reduces *exactly* to the old A-2 tail — not
+//     a behaviour change. The `get_screen_pos_projection` /
+//     `get_screen_index_projection` helpers are likewise now shared imports.
 //   * The rough-specular reweight branch (`renderTaaSampleReverse.fx:138-148`)
 //     is left as a structural dead-`if` comment: `extra_data` is provably 0 in
 //     the albedo path (`06-design-a2.md` §3.2), so the branch never executes;
@@ -38,7 +42,11 @@
 //
 // naga-oil import module entry point: `reproject_old_samples`.
 
-#import "shaders/render_pipeline_common.wgsl"::{get_ray_dir, NORMAL, HIT_UNDEFINED, ENTITY_FREE}
+#import "shaders/render_pipeline_common.wgsl"::{
+    get_ray_dir, NORMAL, HIT_UNDEFINED, ENTITY_FREE,
+    get_hit_data_from_planes, FirstHitResult,
+    get_screen_pos_projection, get_screen_index_projection,
+}
 #import "shaders/taa_common.wgsl"::{
     taa_decompress_sample, taa_hash_from_data, taa_neighbor_offsets, TAA_SAMPLE_RING_DEPTH,
 }
@@ -70,12 +78,19 @@ struct GpuTaaParams {
 }
 
 // One slot of the 128-deep camera-history ring (mirrors
-// `gpu_types::GpuCameraHistorySlot`, 96 bytes/slot):
-//   view_proj            (0..64)  — C# camRotOld[i] (rotation-only view-proj)
-//   cam_pos_from_cur_int slot 64  — C# taaOldCamPosFromCurCamInt[i]
-//   jitter               slot 80  — C# taaJitterOld[i]
+// `gpu_types::GpuCameraHistorySlot`, 160 bytes/slot):
+//   view_proj            (0..64)   — C# camRotOld[i] (rotation-only view-proj)
+//   view_proj_inv        (64..128) — C# taaSampleCamTransformInvers[i]
+//   cam_pos_from_cur_int slot 128  — C# taaOldCamPosFromCurCamInt[i]
+//   jitter               slot 144  — C# taaJitterOld[i]
+//
+// `view_proj_inv` is the Phase-B addition (`09-design-b.md` §3.6) — the
+// reproject pass does not read it, but the slot layout must match the widened
+// Rust struct so the `camera_history` storage buffer round-trips. Batch 3+'s
+// `renderSampleRefine` is the consumer.
 struct GpuCameraHistorySlot {
     view_proj: mat4x4<f32>,
+    view_proj_inv: mat4x4<f32>,
     cam_pos_from_cur_int: vec3<f32>,
     jitter: vec2<f32>,
 }
@@ -89,118 +104,9 @@ struct GpuCameraHistorySlot {
 @group(0) @binding(3) var<storage, read> taa_samples: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read_write> taa_sample_accum: array<vec2<u32>>;
 
-// --- get_hit_data_from_planes_a2 -------------------------------------------
-// Single-plane reduction of `getHitDataFromPlanes`
-// (`commonRenderPipeline.fxh:205-211`). In A-2 only plane 0 is filled (Phase
-// A's first-hit only sets `normTangs[0]`; planes 1-3 are `HIT_UNDEFINED`), so
-// the HLSL's 3-iteration specular-reflection loop runs zero iterations and the
-// function reduces to its tail. The full specular `getHitDataFromPlanes` (the
-// loop, `SPECULAR_MIRROR_FAC`, the `ENTITIES` block) is Phase B.
-struct FirstHitResultA2 {
-    // Virtual hit position, in CURRENT-camera-int-relative space (built from
-    // `cam_pos_frac` only — never adding `cam_pos_int`; the D1 trick).
-    pos: vec3<f32>,
-    normal: vec3<f32>,
-    // (1,1,1) in A-2 — no specular bounces, so the mirror-fac is identity.
-    normal_mirror_fac: vec3<f32>,
-    dist: f32,
-    normal_tang: u32,
-    ray_dir: vec3<f32>,
-}
-
-fn get_hit_data_from_planes_a2(
-    first_hit: vec4<u32>,
-    cam_pos_int: vec3<i32>,
-    cam_pos_frac: vec3<f32>,
-    ray_dir: vec3<f32>,
-) -> FirstHitResultA2 {
-    var r: FirstHitResultA2;
-    // plane-0 normal-tang code (HLSL `firstHitResult.normalTang = firstHit.x >> 15`).
-    let normal_tang = first_hit.x >> 15u;
-    r.normal_tang = normal_tang;
-    r.normal = NORMAL[normal_tang & 0x7u];
-    let ray_dir_comp_for_normal = abs(dot(ray_dir, r.normal));
-    // HLSL: distToTang = abs(dot(pos, abs(normal))
-    //                        - (float)((normalTang >> 3) - dot(camPosInt, abs(normal))))
-    // — `pos` here is `camPosFrac` (the function's initial `firstHitResult.pos`).
-    let dist_to_tang = abs(
-        dot(cam_pos_frac, abs(r.normal))
-        - (f32(normal_tang >> 3u) - dot(vec3<f32>(cam_pos_int), abs(r.normal)))
-    );
-    let dist_fac = dist_to_tang / ray_dir_comp_for_normal;
-    // HLSL: firstHitResult.pos += firstHitResult.rayDir * distFac;  (pos was camPosFrac)
-    r.pos = cam_pos_frac + ray_dir * dist_fac;
-    r.dist = dist_fac;
-    r.normal_mirror_fac = vec3<f32>(1.0, 1.0, 1.0);
-    r.ray_dir = ray_dir;
-    return r;
-}
-
-// --- get_screen_pos_projection / get_screen_index_projection ---------------
-// Port of `getScreenPosProjection` + `getScreenIndexProjection`
-// (`commonRenderPipeline.fxh:133-152`). WGSL has no `out` params and no
-// default args, so these return small structs and take `pixel_offset`
-// explicitly.
-//
-// MATRIX CONVENTION: the HLSL `mul(float4(pos,1), transformation)` is the
-// column-vector `transformation * vec4(pos, 1.0)` against a glam matrix — the
-// `05-review.md` perspective-fix convention. Do NOT swap to `v * M`.
-
-struct ScreenPosProj {
-    valid: bool,
-    screen_pos: vec2<f32>,
-}
-
-fn get_screen_pos_projection(
-    screen_width: u32,
-    screen_height: u32,
-    pos: vec3<f32>,
-    transformation: mat4x4<f32>,
-) -> ScreenPosProj {
-    var r: ScreenPosProj;
-    let screen_projection = transformation * vec4<f32>(pos, 1.0);
-    let ndc = screen_projection.xyz / screen_projection.w;
-    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0
-        || ndc.z < 0.0 || ndc.z > 1.0) {
-        r.valid = false;
-        r.screen_pos = vec2<f32>(0.0, 0.0);
-        return r;
-    }
-    var ndc_y = ndc;
-    ndc_y.y = ndc_y.y * -1.0;
-    let ndc01 = (ndc_y.xy + vec2<f32>(1.0, 1.0)) * 0.5;
-    r.valid = true;
-    r.screen_pos = ndc01 * vec2<f32>(f32(screen_width), f32(screen_height));
-    return r;
-}
-
-struct ScreenIndexProj {
-    valid: bool,
-    screen_index: u32,
-}
-
-fn get_screen_index_projection(
-    screen_width: u32,
-    screen_height: u32,
-    pos: vec3<f32>,
-    transformation: mat4x4<f32>,
-    pixel_offset: vec2<f32>,
-) -> ScreenIndexProj {
-    let proj = get_screen_pos_projection(screen_width, screen_height, pos, transformation);
-    // HLSL clamps `screenPos + pixelOffset` to `[0, (w-1, h-1)]` even when
-    // `valid` is false — the index is still computed (and benignly clamped);
-    // the caller gates on `valid`.
-    let clamped = clamp(
-        proj.screen_pos + pixel_offset,
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(f32(screen_width - 1u), f32(screen_height - 1u)),
-    );
-    let screen_pos_int = vec2<u32>(clamped);
-    var r: ScreenIndexProj;
-    r.valid = proj.valid;
-    r.screen_index = screen_pos_int.x + screen_pos_int.y * screen_width;
-    return r;
-}
+// `get_hit_data_from_planes`, `FirstHitResult`, `get_screen_pos_projection`,
+// `get_screen_index_projection` are imported from `render_pipeline_common.wgsl`
+// (Phase B Batch 1 promoted them out of this file — `09-design-b.md` §5.2).
 
 // --- the reproject + accumulation pass -------------------------------------
 @compute @workgroup_size(64, 1, 1)
@@ -252,7 +158,7 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
         ));
         let cur_first_hit =
             first_hit_data[cur_pixel_pos.x + cur_pixel_pos.y * screen_width];
-        let cur_first_hit_result = get_hit_data_from_planes_a2(
+        let cur_first_hit_result = get_hit_data_from_planes(
             cur_first_hit, cam_pos_int, cam_pos_frac, ray_dir,
         );
 
