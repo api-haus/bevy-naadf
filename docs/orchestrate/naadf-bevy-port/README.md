@@ -49,7 +49,7 @@ B (GI) → C (GPU construction/editing)**. One gated phase at a time.
 - [x] `research` phase → `02-research.md` (whole paper + in-scope C# tree, phase-tagged, ~36 KB)
 - [x] `design` phase (**Phase A**) → `03-design.md` (~33 KB; 12-step Phase-A impl sequence)
 - [x] `impl` phase (**Phase A**) → `04-impl.md` — Batch 1 (steps 1–6) + Batch 2 (steps 7–12) done 2026-05-14; 39 tests pass, builds + smoke-runs clean
-- [~] `review` phase (**Phase A**) → `05-review.md` — **review gate FAILED**: user interactive test shows broken perspective/camera (suspected MonoGame↔wgpu coordinate-convention mismatch). Diagnostic dispatch pending.
+- [~] `review` phase (**Phase A**) → `05-review.md` — review gate found a broken-perspective regression; **diagnosis done** (3 compounding camera→ray convention bugs, high confidence, 2 files); **fix dispatch pending** → then user re-test.
 - [ ] Phase A-2 (TAA): design → impl → review
 - [ ] Phase B (GI): design → impl → review
 - [ ] Phase C (GPU construction/editing): design → impl → review
