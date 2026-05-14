@@ -3,6 +3,3 @@
 
 # Local environment — machine-specific paths (see .envrc.example)
 .envrc
-
-# Research papers (PRIVATE)
-docs/research
