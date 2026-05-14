@@ -16,6 +16,7 @@ mod voxel;
 mod world;
 
 use bevy::{
+    asset::AssetPlugin,
     camera_controller::free_camera::FreeCameraPlugin,
     diagnostic::FrameTimeDiagnosticsPlugin,
     prelude::*,
@@ -62,10 +63,17 @@ fn main() {
     )));
 
     app.insert_resource(args).add_plugins((
-        DefaultPlugins,
+        // The NAADF WGSL render shaders live in `src/assets/shaders/`
+        // (`03-design.md` §1 module layout) — point the asset server there.
+        DefaultPlugins.set(AssetPlugin {
+            file_path: "src/assets".to_string(),
+            ..default()
+        }),
         FreeCameraPlugin,
         FrameTimeDiagnosticsPlugin::default(),
         RenderDiagnosticsPlugin,
+        world::WorldPlugin,
+        render::NaadfRenderPlugin,
     ));
 
     app.add_systems(

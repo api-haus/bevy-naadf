@@ -366,3 +366,312 @@ logged above (the `hud.rs` compile-fix in step 2, the `sync_position_split`
 scheduling resolution in step 3, the two-pass encode in step 5) are all small
 and local, made and logged per the brief's "small local deviations are fine"
 allowance.
+
+---
+
+## impl findings — Phase A Batch 2 (steps 7–12) (2026-05-14)
+
+Executed steps 7–12 of the `03-design.md` §8 Phase-A implementation sequence, in
+order. Every step ends at a compiling state; step 7 passes the full test suite;
+steps 11–12 were smoke-run on the windowed GPU app. Toolchain: pinned stable
+`rust-toolchain.toml`, `mold` linker, default-feature build (with `dlss` — the
+SDK env vars are set on this machine).
+
+**Correction to a Batch 1 note:** the NAADF C# + HLSL source IS readable at
+`/mnt/archive4/DEV/NAADF/NAADF/` via the Read/Glob tools — the Batch 1 agent's
+"empty/inaccessible" report was a shell-hook quirk affecting plain `ls`/`find`
+only. Steps 9–11 ported from the actual `.fx`/`.fxh` files (`rayTracing.fxh`,
+`common/*.fxh`, `settings.fxh`, `versions/albedo/{renderFirstHit,renderFinal}.fx`).
+
+### Step 7 — `GrowableBuffer` — `world/buffer.rs`
+
+**Files filled:** `src/world/buffer.rs`.
+
+- `GrowableBuffer<T: Pod>` — the `DynamicStructuredBuffer` equivalent. `new`
+  (clamps capacity ≥ 1, wgpu rejects 0-size buffers), `reserve` (grows to
+  `max(min_capacity, capacity * GROWTH_FACTOR)` with `GROWTH_FACTOR = 2` per
+  design §3.1, single `copy_buffer_to_buffer` old→new, returns the old buffer so
+  the caller keeps it alive past the encoder submit), `write` (`queue.write_buffer`
+  + logical-length tracking), `upload_all` (the build-once convenience path).
+  `debug_assert!` on `max_buffer_size` keeps the ceiling visible (design §3.2 —
+  no chunked copies in Phase A).
+- **Deviation (small, logged) — `upload_all` discards instead of copies.** The
+  first cut had `upload_all` call `reserve` (which copies old→new) then `write`.
+  The grow-and-copy test surfaced a real wgpu ordering hazard: `queue.write_buffer`
+  is applied *before* the command buffer of the same submit, so the
+  `copy_buffer_to_buffer` (copying the old, never-written zeros) ran *after* the
+  write and clobbered elements 0..old_cap. Fix: `upload_all` uses a private
+  `reserve_discard` that reallocs *without* copying — correct, since `upload_all`
+  overwrites the whole buffer anyway, and it removes the hazard. `reserve` itself
+  (the general grow-and-preserve path) is unchanged and its dedicated test passes.
+- **Unit tests (5):** capacity clamp; write-within-capacity (no grow); the
+  grow-and-copy path (fill 4, reserve 6 → cap 8, old contents 0..4 survive the
+  copy + new write 4..6 lands); `min_capacity` beating the growth factor; and
+  `upload_all` grows-then-writes. The tests build a headless render world
+  (`MinimalPlugins` + `AssetPlugin` + `ImagePlugin` + `RenderPlugin`) and pull
+  the `RenderDevice`/`RenderQueue` after `app.finish()` — `RenderPlugin::ready`
+  blocks `finish` until the async device request resolves, so no render schedule
+  is ever run (which would panic without a window). Tests skip gracefully (print
+  + return) if no adapter is available.
+
+**Build + tests:** `cargo build` clean; `cargo test --bin bevy-naadf` →
+**37 passed** (the 32 pre-existing + 5 new).
+
+### Step 8 — render-world resources + extract/prepare — `render/{gpu_types,extract,prepare,pipelines,mod}.rs`, `world/mod.rs`, `main.rs`
+
+**Files filled:** `src/render/gpu_types.rs`, `src/render/extract.rs`,
+`src/render/prepare.rs`, `src/render/pipelines.rs`, `src/render/mod.rs`,
+`src/world/mod.rs`. **Files edited:** `src/main.rs` (added `WorldPlugin` +
+`NaadfRenderPlugin` to `add_plugins`).
+
+- `gpu_types.rs`: `#[repr(C)]` + `bytemuck::Pod` structs — `GpuCamera`
+  (inv-view-proj + int+frac camera position, 96 B), `GpuRenderParams` (screen
+  size / frame counters / sun term / jitter / packed flags / exposure / bbox,
+  112 B), `GpuWorldMeta` (chunk-grid extent + voxel-space bbox, 48 B),
+  `GpuVoxelType` (the 128-bit `Uint4` material entry). `GpuVoxelType::from_voxel_type`
+  packs base|layer|f16(roughness) + the 6 f16 colour channels exactly as the C#
+  `compressForRender`; a hand-rolled `f16_bits` does the f32→f16. Compile-time
+  `assert!`s lock the struct sizes to what the WGSL declares; 2 unit tests cover
+  `f16_bits` + the material pack.
+- `extract.rs`: `ExtractedWorld` + `ExtractedCameraData` render-world resources;
+  `extract_world` (build-once — mirrors the CPU buffers only on `WorldData.dirty`)
+  and `extract_camera` (every frame — `PositionSplit` + `inv_view_proj` =
+  `(clip_from_view · world_from_view⁻¹)⁻¹` + viewport size).
+- `prepare.rs`: `WorldGpu` (chunk `R32Uint` 3D texture, CPU-built and
+  `write_texture`-uploaded per design §6.1; `blocks`/`voxels`/`voxel_types`
+  `GrowableBuffer`s; `world_meta` uniform; `@group(0)` bind group) created once
+  by `prepare_world_gpu`. `FrameGpu` (camera/params uniforms rewritten each
+  frame; `first_hit_data` `vec4<u32>`/pixel + `shaded_color` `vec2<u32>`/pixel
+  storage buffers re-created on viewport resize and cleared on creation; the
+  `@group(1)` compute bind group + the blit bind group) by `prepare_frame_gpu`.
+- `pipelines.rs`: `NaadfPipelines` (`FromWorld`, built in `RenderStartup` via
+  `init_gpu_resource`) — the three bind-group-layout descriptors + the compute
+  pipeline id. Uniform layout entries use `uniform_buffer_sized` (the `#[repr(C)]`
+  structs are not `ShaderType`); storage entries use `storage_buffer_sized` /
+  `storage_buffer_read_only_sized` matching each WGSL `var<storage,...>` access.
+- **Deviation (small, logged):** design §8 puts the bind-group *layouts* in
+  step 8 and the *pipeline ids* in steps 10–11; I put both in `pipelines.rs` at
+  step 8 (the layouts can't exist without the resource that holds them, and the
+  pipeline `queue_*` calls just need shader handles, which `asset_server.load`
+  produces immediately). The graph *node systems* (`graph.rs`) stayed no-op
+  stubs through step 8, wired into the `Core3d` schedule so `NaadfRenderPlugin`
+  compiles — filled in steps 10–11.
+
+**Build:** `cargo build` clean.
+
+### Step 9 — WGSL world data + traversal — `assets/shaders/{common,world_data,ray_tracing_common,render_pipeline_common,ray_tracing}.wgsl`
+
+**Files created:** the five WGSL import modules.
+
+- `common.wgsl` — `PI` + `flatten_index` (the HLSL `FLATTEN_INDEX` macro).
+- `world_data.wgsl` — the `@group(0)` bindings: `chunks` (`texture_3d<u32>`),
+  `blocks`/`voxels` (`array<u32>`, read), `voxel_types` (`array<vec4<u32>>`,
+  read), `world_meta` (uniform). Phase A is entity-free so the chunk texture is
+  `u32`, not the `Rg64Uint`/`ENTITIES` widening.
+- `ray_tracing_common.wgsl` — the Phase-A subset of `commonRayTracing.fxh`:
+  PCG / xoroshiro64* RNG (`pcg_hash`, `init_rand`, `xoroshiro64star`, `next_rand`,
+  `next_rand2`) + octahedral encode/decode. VNDF-GGX / hemisphere sampling / the
+  quaternion (de)compress are Phase B (the header splits A/B per `02-research.md`).
+- `render_pipeline_common.wgsl` — the Phase-A subset of `commonRenderPipeline.fxh`
+  + `renderFirstHit.fx`'s uniform block: the `HIT_*`/`SURFACE_*` consts, the
+  `NORMAL[8]` LUT, `VoxelType` + `decompress_voxel_type`, the `GpuCamera` /
+  `GpuRenderParams` struct decls, `get_ray_dir`, `compress_first_hit_data`. The
+  specular-path `getHitDataFromPlanes` is Phase B.
+- `ray_tracing.wgsl` — **`shoot_ray`, the AADF DDA**, ported faithfully from the
+  no-entities path of `rayTracing.fxh`'s `shootRay(int3 rayOriginInt, ...)`, plus
+  `ray_aabb`, `RayResult`, the `MAX_RAY_STEPS_*` consts. The chunk→block→voxel
+  descent, the AADF empty-cuboid skip (`bounds_in_dir` from the 5-bit chunk /
+  2-bit block-voxel fields selected by ray sign), the two-voxels-per-`u32`
+  addressing (`02-research.md` divergence #4), and the DDA step are all matched
+  to the HLSL. HLSL `step`/`mad`/`rcp`/`frac` mapped to WGSL `step`/`fma`-as-`a*b+c`/
+  `1.0/x`/`fract`. The `#ifdef ENTITIES` branch is omitted (design §7.5).
+- **Deviation (small, logged):** the C# `shootRay` relies on a `uint3` cast of a
+  negative cell wrapping huge so the `>= boundingBoxMax` test trips. WGSL keeps
+  the cell signed, so I added an explicit `any(cur_cell < bounding_box_min)`
+  break alongside the `>= bounding_box_max` one — same effect, just made explicit
+  for signed coords.
+
+WGSL has no `#include`; these are naga-oil import modules referenced via
+quoted-path `#import "shaders/foo.wgsl"::{...}` (which Bevy's shader loader
+auto-loads as asset dependencies — verified against the loader source).
+
+**Build:** `cargo build` clean (WGSL is asset data, not rustc-compiled — actual
+WGSL validation happens at pipeline-compile time, exercised in steps 10–11).
+
+### Step 10 — WGSL first-hit + pipeline + node — `assets/shaders/naadf_first_hit.wgsl`, `render/graph.rs`
+
+**Files created:** `src/assets/shaders/naadf_first_hit.wgsl`.
+**Files filled:** `src/render/graph.rs` (`naadf_first_hit_node`).
+
+- `naadf_first_hit.wgsl` — the `@workgroup_size(64,1,1)` compute entry
+  `calc_first_hit`, a faithful port of `albedo/renderFirstHit.fx`'s `calcFirstHit`
+  no-TAA path: per-pixel ray setup via `get_ray_dir`, `ray_aabb` volume clip,
+  `shoot_ray` primary trace, a sun shadow ray + a cheap ambient term, then the
+  G-buffer + shaded-colour writes.
+- **Deviations (small, logged, all per design §5.3 + D4):** the HLSL only writes
+  `firstHitData` inside `if (isTAA)` — Phase A writes it unconditionally so the
+  G-buffer plane 0 is always populated; the `taaSamples` ring write is omitted
+  entirely (that buffer does not exist in Phase A); the HLSL's `taaSampleAccum`
+  write becomes Phase A's `shaded_color` write (identical `vec2<u32>` element
+  format, so the final blit stays a near-verbatim `renderFinal.fx` port).
+- `graph.rs` `naadf_first_hit_node` — a `Core3d`-schedule system (Bevy 0.19's
+  render API has no node-trait — a render-graph node is just a system recording
+  via `RenderContext`). Dispatches `ceil(pixel_count / 64)` workgroups of the
+  compute pipeline, binds `@group(0)` (world) + `@group(1)` (frame). Wrapped in a
+  `time_span("naadf_first_hit")` for the HUD.
+
+**Build:** `cargo build` clean.
+
+### Step 11 — WGSL final blit — `assets/shaders/naadf_final.wgsl`, `render/graph.rs` — **the Phase-A deliverable**
+
+**Files created:** `src/assets/shaders/naadf_final.wgsl`.
+**Files filled:** `src/render/graph.rs` (`naadf_final_blit_node`).
+
+- `naadf_final.wgsl` — the fullscreen `@fragment fn fragment`, a near-verbatim
+  port of `albedo/renderFinal.fx`'s `MainPS`: read `shaded_color[pixel_index]`,
+  divide RGB by `max(1, weight)`, apply the verified tonemap
+  (`mix(curColor/(exposure+luminance), tv, tv)` with `tv = curColor/(1+curColor)`),
+  output. The C# `Cube`+PS trick becomes Bevy's `FullscreenShader` triangle
+  (`02-research.md` divergence #9); `HDR` is off (design §5.4).
+- `graph.rs` `naadf_final_blit_node` — a fullscreen render pass into the view
+  target's main texture, binds the blit bind group, `draw(0..3, 0..1)`. Wrapped
+  in a `time_span("naadf_final_blit")`. Both nodes run in `Core3dSystems::PostProcess`,
+  chained, before `tonemapping`.
+
+**Smoke-run findings (this is real signal — the definitive visual check is the
+user's at the review gate):** the first `cargo run` surfaced three concrete
+issues, each chased and fixed:
+  1. **naga-oil rejected `_pad*` struct members** ("Composable module
+     identifiers must not require substitution") — and after renaming to `pad*`
+     it *still* rejected them (the writeback round-trip drops/renames explicit
+     padding members). Fix: removed the explicit padding members from the WGSL
+     struct decls entirely — WGSL's std140-ish `vec3`-to-16-byte slotting +
+     `vec2` 8-byte alignment reproduce the padded `#[repr(C)]` Rust layout
+     exactly (offsets verified field-by-field, documented in the WGSL).
+  2. **storage-access mismatch** — the bind-group *layouts* declared
+     `blocks`/`voxels`/`voxel_types` + the blit's `first_hit_data`/`shaded_color`
+     as read-write, but the WGSL declares them `var<storage, read>`. Fix:
+     switched those layout entries to `storage_buffer_read_only_sized`.
+  3. **colour-target format mismatch** — the blit pipeline hard-coded
+     `Rgba8UnormSrgb`, but the `Core3d` view target's main texture format is
+     chosen per-camera (observed as both `Rgba16Float` and `Rgba8UnormSrgb`).
+     Fix (**deviation, logged**): the blit pipeline is now queued *lazily
+     per-`TextureFormat`* — `NaadfPipelines.blit_pipelines` is a
+     `HashMap<TextureFormat, CachedRenderPipelineId>`, a `prepare_blit_pipeline`
+     system reads each view's `ExtractedView::target_format` and queues the
+     matching variant, and `naadf_final_blit_node` picks the variant by the
+     view's format. This is the lightweight form of the `FullscreenMaterial`
+     specialiser pattern — a localized addition, not a redesign.
+- **After the fixes, `cargo run` is clean:** window opens on the RTX 5080 /
+  Vulkan, the AADF test grid builds (`32 chunks, 1536 blocks, 2144 voxel-u32s,
+  64x32x64 voxels`), the two-pass render graph (first-hit compute → final blit)
+  compiles and runs with **no WGSL compile errors, no pipeline-validation
+  errors, no panics**, and exits cleanly when the smoke-run timeout fires. The
+  voxel scene's on-screen appearance is the user's review-gate check (this
+  environment can't capture the framebuffer), but the full pipeline compiling +
+  running clean is exactly the signal the brief asks for at this gate.
+
+**Build:** `cargo build` clean.
+
+### Step 12 — HUD re-point + polish — `hud.rs`, `README.md`
+
+**Files edited:** `src/hud.rs`, `README.md`.
+
+- `hud.rs`: re-pointed the GPU-timing paths at the NAADF render-node span names
+  — `render/naadf_first_hit/elapsed_gpu` + `render/naadf_final_blit/elapsed_gpu`
+  (the path format `RenderDiagnosticsPlugin` builds from a `time_span` is
+  `render/<span>/<field>`). `write_timing` re-added and called for both passes;
+  it prefers the GPU-timestamp diagnostic and falls back to the `elapsed_cpu`
+  one when the backend has no timestamp queries. A `const fn` compile-time check
+  asserts the HUD's hard-coded paths stay in step with the `render::graph` span
+  constants. Renderer-mode string updated to mention the AADF DDA.
+- `README.md`: rewrote the intro / "What it does" (it described the old Solari
+  proof-of-concept), the controls table, and the project layout to the current
+  module tree, and replaced the 3-item Solari roadmap with the **four-phase
+  split** (toolchain PoC → Phase A → Phase A-2 TAA → Phase B GI → Phase C GPU
+  construction), Phase A marked complete.
+- Timing spans were registered in the two render nodes back in steps 10–11
+  (`time_span` calls in `graph.rs`), so step 12 only needed the HUD side.
+
+**Build + run:** `cargo build` clean; `cargo test --bin bevy-naadf` →
+**39 passed, 0 failed** (32 pre-existing + 5 `GrowableBuffer` + 2 `GpuVoxelType`).
+Final `cargo run` smoke-run: clean — window opens, grid builds, no errors /
+panics / validation errors, exits clean on the timeout. HUD draws over the
+NAADF passes (it is a UI pass, after `tonemapping`); whether the FPS + per-pass
+timing lines are populated and the voxel scene is correctly lit is the user's
+review-gate visual check.
+
+---
+
+## State at end of Phase A
+
+- **Step 7 — `GrowableBuffer`:** the growable GPU storage buffer (realloc +
+  `copy_buffer_to_buffer` on growth, factor 2; `upload_all` discards-and-reallocs
+  to avoid a wgpu queued-write ordering hazard). 5 device-backed unit tests.
+- **Step 8 — render-world plumbing:** `gpu_types.rs` (`#[repr(C)]` bytemuck
+  mirrors + `GpuVoxelType` 128-bit pack), `extract.rs` (`ExtractedWorld` /
+  `ExtractedCameraData`), `prepare.rs` (`WorldGpu` chunk-3D-texture + growable
+  block/voxel/type buffers + `FrameGpu` uniforms/G-buffer/bind-groups),
+  `pipelines.rs` (3 bind-group layouts + compute pipeline + per-format blit
+  pipeline cache), `NaadfRenderPlugin` wiring extract → prepare → the two
+  `Core3d` graph nodes. `WorldPlugin` is the main-world seam (resources are
+  inserted by `setup_test_grid`).
+- **Step 9 — WGSL substrate:** `common`, `world_data`, `ray_tracing_common`
+  (RNG/oct), `render_pipeline_common` (consts/`VoxelType`/`get_ray_dir`/
+  G-buffer pack), and **`ray_tracing` — `shoot_ray`, the AADF DDA**, all ported
+  faithfully from the NAADF HLSL, entity branch omitted.
+- **Step 10 — first-hit:** `naadf_first_hit.wgsl` (compute, ports `calcFirstHit`)
+  + `naadf_first_hit_node` dispatching it.
+- **Step 11 — final blit (the deliverable):** `naadf_final.wgsl` (fullscreen
+  tonemap, ports `MainPS`) + `naadf_final_blit_node`; the app renders the voxel
+  scene through the two-pass NAADF graph and the user can fly through it.
+- **Step 12 — HUD + docs:** HUD timing paths re-pointed at the NAADF render
+  nodes; `README.md` roadmap updated to the four-phase split.
+- **Build:** `cargo build` clean (13 dead-code warnings — all "pub item /
+  variant defined, not yet consumed": `decode`/`unpack_voxel`/`to_world` used by
+  tests + Phase B; `WorldGpu` fields held alive behind the bind group; the
+  `MetallicRough`/`MetallicMirror` material variants + `FLAG_SHOW_RAY_STEP`/
+  `FLAG_IS_TAA` + `GrowableBuffer::reserve`/`capacity`/… are Phase-A-2 / B / C
+  surface. Same warning profile as Batch 1 — no real issues).
+- **Tests:** `cargo test --bin bevy-naadf` → **39 passed, 0 failed.**
+- **Smoke-run:** `cargo run` launches on the RTX 5080 / Vulkan, builds the AADF
+  test grid, the first-hit compute + final-blit render graph compile and run
+  with no WGSL / pipeline-validation errors and no panics, exits clean.
+
+### Deviations from `03-design.md` (all small + local, logged inline above)
+
+1. **`upload_all` reallocs without copying** (step 7) — avoids a real wgpu
+   queued-write-vs-copy ordering hazard; `reserve` (grow-and-preserve) unchanged.
+2. **bind-group layouts live in `pipelines.rs` at step 8**, not split between
+   steps 8 and 10–11 — the layouts can't exist apart from the resource holding
+   them; graph node *systems* stayed stubs through step 8.
+3. **explicit `_pad` members removed from the WGSL structs** (step 11) —
+   naga-oil's composable-module round-trip rejects them; WGSL's natural `vec3`/
+   `vec2` slotting reproduces the padded `#[repr(C)]` Rust layout (offsets
+   verified, documented in the WGSL). The Rust `#[repr(C)]` structs keep their
+   `_pad*` fields.
+4. **explicit `any(cur_cell < bounding_box_min)` break in `shoot_ray`** (step 9)
+   — the C# leans on `uint3`-cast wraparound for negative cells; WGSL keeps the
+   cell signed, so the out-of-world test is made explicit.
+5. **the final-blit pipeline is queued lazily per `TextureFormat`** (step 11) —
+   the `Core3d` view target's main-texture format is per-camera; a single
+   hard-coded format fails validation. The per-format cache + `prepare_blit_pipeline`
+   is the lightweight `FullscreenMaterial`-specialiser pattern.
+
+None of these is a large redesign; each is the kind of "small local deviation,
+made and logged" the brief explicitly allows. No blocker required pausing for
+orchestrator/user consultation.
+
+## Verdict
+
+**Phase A complete.** Steps 7–12 done; `cargo build` clean; `cargo test --bin
+bevy-naadf` → 39 passed / 0 failed; `cargo run` smoke-runs clean — the
+two-pass NAADF render graph (AADF-DDA first-hit compute → fullscreen tonemap
+blit) compiles and runs on the RTX 5080 / Vulkan with no WGSL or
+pipeline-validation errors and no panics. The faithful HLSL→WGSL port (Q2) of
+`shootRay` / `calcFirstHit` / `MainPS` + the shared headers is in place; the
+int+frac `PositionSplit` camera (D1) is threaded through; Phase A keeps the
+`shaded_color` blit-source stand-in (D4 — no TAA machinery). Scope stopped at
+step 12 — no Phase A-2 / B / C work started. **Ready for the Phase-A review
+gate** — the one remaining check is the user's interactive visual confirmation
+that the voxel scene renders correctly lit and is flyable.

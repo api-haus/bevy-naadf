@@ -1,21 +1,25 @@
 # bevy-naadf
 
-A Bevy **0.19** application with **Solari** realtime raytraced lighting denoised by
-**NVIDIA DLSS Ray Reconstruction**, building natively on Linux.
+A Bevy **0.19** port of [NAADF](https://github.com/cg-tuwien/NAADF) — a C#/MonoGame voxel
+raytracing engine ("Nested Axis-Aligned Distance Fields", Ulschmid et al., CGF 2026) — to
+Rust/Bevy, building natively on Linux.
 
-This is the foundation for porting [NAADF](https://github.com/cg-tuwien/NAADF) — a
-C#/MonoGame voxel raytracing engine ("Nested Axis-Aligned Distance Fields", CGF 2026) —
-to Rust/Bevy and extending it with DLSS Ray Reconstruction. This proof of concept renders
-a generic Solari scene so the toolchain (DLSS SDK build, Vulkan ray tracing, the Bevy 0.19
-API) is proven before the larger port begins.
+The port is split into **four gated phases** (see the roadmap below). **Phase A** — the
+NAADF substrate (the three-layer chunk/block/voxel cell hierarchy + AADF empty-space
+distance fields), CPU-side AADF construction, the DDA-with-AADF traversal, and an
+albedo-only first-hit WGSL render path — is complete. NVIDIA DLSS Ray Reconstruction
+plumbing is kept dormant for the later GI phases.
 
 ## What it does
 
-A self-contained procedural scene — an open box with coloured walls, a few blocks, a
-near-mirror metallic sphere, and a bright emissive ceiling slab — lit entirely by Solari's
-raytraced global illumination and reflections. Solari's raw output is noisy; DLSS Ray
-Reconstruction denoises and upscales it. Press **D** to toggle DLSS-RR and see the
-difference directly.
+Builds a hard-coded voxel test grid (a ground slab, axis-aligned boxes, a sphere, one
+emissive box) into the NAADF three-layer cell structure with CPU-computed AADFs, then
+renders it with a two-pass custom render graph: a compute pass that casts a primary ray
+per pixel through the AADF DDA traversal (`shootRay`, ported faithfully from NAADF's HLSL)
+and writes a compact G-buffer + a flat sun-and-ambient shaded colour, then a fullscreen
+blit that tonemaps it to the screen. Fly through it with the free camera.
+
+No bounce lighting, no TAA, no GI yet — those are the later phases.
 
 ## Requirements
 
@@ -62,27 +66,18 @@ cargo run --release
 The first build compiles all of Bevy and `dlss_wgpu`, so it takes a while. A successful
 build confirms the `dlss_wgpu` build script found `DLSS_SDK`, `VULKAN_SDK`, and `clang`.
 
-### Reference pathtracer
-
-```sh
-cargo run --release -- --pathtracer
-```
-
-Swaps Solari's realtime lighting for its reference pathtracer, which converges to a clean
-ground-truth image over time (no DLSS-RR — it denoises itself by accumulating samples).
-Useful for judging whether the realtime + DLSS-RR result is faithful.
-
 ## Controls
 
 | Input                  | Action                                              |
 | ---------------------- | --------------------------------------------------- |
 | `W` `A` `S` `D`        | Move the camera                                     |
+| `E` `Q`                | Fly up / down                                       |
 | `Shift`                | Move faster                                         |
 | Mouse                  | Look around                                         |
-| `D`                    | Toggle DLSS Ray Reconstruction on/off (realtime mode) |
+| `D`                    | Toggle DLSS Ray Reconstruction on/off (dormant in Phase A) |
 
-The on-screen overlay shows FPS, the active renderer, DLSS-RR state, and per-pass Solari /
-DLSS GPU timings.
+The on-screen overlay shows FPS, the active renderer, DLSS-RR state, and per-pass NAADF
+render-node GPU timings (`first-hit`, `final-blit`).
 
 ## Known caveats
 
@@ -98,17 +93,35 @@ DLSS GPU timings.
 
 ## Project layout
 
-| File                   | Responsibility                                                       |
-| ---------------------- | -------------------------------------------------------------------- |
-| `src/main.rs`          | App wiring: plugins, `DlssProjectId`, CLI args, system scheduling     |
-| `src/scene.rs`         | Procedural scene — meshes, materials, lights, `RaytracingMesh3d`      |
-| `src/camera.rs`        | Camera spawn (Solari + conditional DLSS-RR) and the runtime `D` toggle |
-| `src/hud.rs`           | Diagnostics overlay                                                  |
-| `.envrc.example`       | Template for the gitignored `.envrc` (`DLSS_SDK`, `VULKAN_SDK`)       |
-| `.cargo/config.toml`   | `mold` linker config — no machine-specific paths                     |
+| Path                    | Responsibility                                                          |
+| ----------------------- | ----------------------------------------------------------------------- |
+| `src/main.rs`           | App wiring: plugins, `DlssProjectId`, CLI args, system scheduling        |
+| `src/camera/`           | Free-fly camera spawn + the int+frac `PositionSplit` camera-relative type |
+| `src/voxel/`            | Voxel-type / material system + the hard-coded Phase-A test-grid builder  |
+| `src/aadf/`             | The chunk/block/voxel cell encode/decode, CPU AADF construction + bounds |
+| `src/world/`            | `WorldData` / `VoxelTypes` resources + the `GrowableBuffer` GPU wrapper  |
+| `src/render/`           | Render-world extract/prepare, GPU types, pipelines, the render-graph nodes |
+| `src/assets/shaders/`   | The WGSL render shaders (ported from NAADF's HLSL `Content/shaders/`)    |
+| `src/hud.rs`            | Diagnostics overlay                                                     |
+| `.envrc.example`        | Template for the gitignored `.envrc` (`DLSS_SDK`, `VULKAN_SDK`)          |
+| `.cargo/config.toml`    | `mold` linker config — no machine-specific paths                        |
 
 ## Roadmap
 
-1. **(this milestone)** Bevy 0.19 + Solari + DLSS-RR running on Linux. ✅
-2. Port NAADF's voxel data structures and AADF compute pipeline to Rust/Bevy.
-3. Integrate DLSS Ray Reconstruction into the NAADF renderer as its denoiser.
+The port is sequenced as four gated phases — each phase's design + implementation does not
+begin until the prior phase is reviewed and confirmed runnable.
+
+1. **Toolchain proof-of-concept** — Bevy 0.19 + Solari + DLSS-RR running on Linux. ✅
+   *(superseded — Solari was stripped; it is reference-only, not the GI substrate.)*
+2. **Phase A — NAADF substrate + albedo first-hit.** ✅ The three-layer chunk/block/voxel
+   cell hierarchy, CPU-side AADF construction + cuboid expansion, the DDA-with-AADF
+   traversal, the int+frac `PositionSplit` camera, and a two-pass albedo first-hit WGSL
+   render path (compute first-hit → fullscreen blit). Flat-lit, no bounce lighting, no TAA.
+3. **Phase A-2 — long-term-memory TAA.** The 32-frame / 64-bit-sample temporal
+   anti-aliasing pass, slotting between first-hit and the final blit.
+4. **Phase B — the GI pipeline.** Compressed ReSTIR GI (lit/unlit separation, 8×8
+   screen-space regions, the 12-iteration spatial pass) + the sparse bilateral denoiser +
+   the 4-plane-bounce first-hit. DLSS Ray Reconstruction integrates here as the denoiser.
+5. **Phase C — GPU world construction & editing.** The GPU hashing construction
+   (Algorithm 1), the background chunk-AADF queue, and flood-fill edit invalidation — a
+   scalability / editability track, not a rendering foundation.

@@ -22,6 +22,7 @@ render), no editor GUI / persistence / importers.
 | `03-design.md` | `design` group | crate/module layout, ECS decomposition, render-graph plan, subsystem→Bevy mapping |
 | `04-impl.md` | `impl` group | phased porting work log |
 | `05-review.md` | `review` group | verification against source behaviour + the paper |
+| `design-exploration-qa.md` | orchestrator | methodology/capability/VRAM Q&A reference (lineage, PBR texturing, dynamic entities, microvoxels, LOD, TAA-history VRAM lever) — read before scoping features it covers; holds one binding decision (§6) |
 
 ## Agent groups
 
@@ -47,8 +48,8 @@ B (GI) → C (GPU construction/editing)**. One gated phase at a time.
 - [x] Step 5 — Context files written (`README.md`, `01-context.md`)
 - [x] `research` phase → `02-research.md` (whole paper + in-scope C# tree, phase-tagged, ~36 KB)
 - [x] `design` phase (**Phase A**) → `03-design.md` (~33 KB; 12-step Phase-A impl sequence)
-- [~] `impl` phase (**Phase A**) → `04-impl.md` — Batch 1 (steps 1–6) done 2026-05-14, 32 tests pass; Batch 2 (steps 7–12) pending
-- [ ] `review` phase (**Phase A**) → `05-review.md`
+- [x] `impl` phase (**Phase A**) → `04-impl.md` — Batch 1 (steps 1–6) + Batch 2 (steps 7–12) done 2026-05-14; 39 tests pass, builds + smoke-runs clean
+- [~] `review` phase (**Phase A**) → `05-review.md` — **review gate FAILED**: user interactive test shows broken perspective/camera (suspected MonoGame↔wgpu coordinate-convention mismatch). Diagnostic dispatch pending.
 - [ ] Phase A-2 (TAA): design → impl → review
 - [ ] Phase B (GI): design → impl → review
 - [ ] Phase C (GPU construction/editing): design → impl → review
