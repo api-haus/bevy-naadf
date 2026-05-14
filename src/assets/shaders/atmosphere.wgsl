@@ -274,9 +274,12 @@ fn atmosphere_oct_index(
     ray_dir.z *= xz_scale;
 
     let oct = oct_encode(ray_dir);
+    // HLSL `uint2(oct.x * (texSizeX-1), ...)` implicitly truncates float→uint
+    // in the `uint2(...)` constructor; WGSL requires explicit `u32()` casts
+    // (naga rejects building a `vec2<u32>` from `f32` components).
     let comp_pos = vec2<u32>(
-        oct.x * f32(atmosphere_tex_size_x - 1u),
-        oct.y * f32(atmosphere_tex_size_y - 1u),
+        u32(oct.x * f32(atmosphere_tex_size_x - 1u)),
+        u32(oct.y * f32(atmosphere_tex_size_y - 1u)),
     );
     return comp_pos.x + comp_pos.y * atmosphere_tex_size_x;
 }

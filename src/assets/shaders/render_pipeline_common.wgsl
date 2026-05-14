@@ -168,6 +168,13 @@ struct GpuRenderParams {
 const FLAG_SHOW_RAY_STEP: u32 = 1u;
 const FLAG_CHECK_SUN: u32 = 2u;
 const FLAG_IS_TAA: u32 = 4u;
+// The `base/` first-hit ray-marches the atmosphere along each primary-ray
+// segment (`WorldRenderBase.isAtmosphereInteraction`). Phase B / Batch 2.
+const FLAG_IS_ATMOSPHERE_INTERACTION: u32 = 8u;
+// The final blit decodes its source as `final_color`'s packing (no weight
+// field) — the Batch-2 deliberate temporary seam (`09-design-b.md` §11 Batch 2
+// step 8). Batch 6 reverts the blit source to `taa_sample_accum` + clears this.
+const FLAG_BLIT_FINAL_COLOR: u32 = 16u;
 
 // --- ray-direction setup (commonRenderPipeline.fxh `getRayDir`) -------------
 

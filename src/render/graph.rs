@@ -44,30 +44,33 @@ pub const TAA_REPROJECT_SPAN: &str = "naadf_taa_reproject";
 /// `render/naadf_final_blit/elapsed_gpu`.
 pub const FINAL_BLIT_SPAN: &str = "naadf_final_blit";
 
-/// `Core3d` system: the NAADF first-hit compute pass.
+/// `Core3d` system: the NAADF 4-plane-bounce first-hit compute pass
+/// (`09-design-b.md` §6 — the Phase-B `base/renderFirstHit.fx` port).
 ///
-/// Faithful port of the C# `WorldRenderAlbedo` first-hit dispatch: one compute
+/// Faithful port of the C# `WorldRenderBase` first-hit dispatch: one compute
 /// pass running `naadf_first_hit.wgsl`'s `calc_first_hit` over
 /// `ceil(pixel_count / 64)` workgroups, binding `@group(0)` (world) +
-/// `@group(1)` (frame) + `@group(2)` (the TAA sample ring). Writes
-/// `first_hit_data` + `taa_sample_accum`, and — when `FLAG_IS_TAA` is set — one
-/// `taa_samples` ring slot (`06-design-a2.md` §6).
+/// `@group(1)` (frame — now including `first_hit_absorption` + `final_color`) +
+/// `@group(2)` (the read-only precomputed atmosphere). Writes `first_hit_data`
+/// + `first_hit_absorption` + `final_color`.
 ///
-/// Skips silently until the world + frame + TAA GPU resources exist and the
-/// compute pipeline has finished compiling. The `@group(2)` bind group is
-/// always bound (the shader's `if` guards the ring write), matching how the
-/// Phase-A flags are handled at runtime rather than via pipeline variants.
+/// Phase B Batch 2 restructure (`09-design-b.md` §6.3): the `@group(2)`
+/// `taa_samples` ring binding is GONE — the `base/` first-hit does not write
+/// the ring (that moves to `CalcNewTaaSample` in Batch 6). `@group(2)` is now
+/// the read-only atmosphere (`applyAtmosphere` on a miss + `addLightForDirection`
+/// along the atmosphere-interaction path). The `base/` first-hit also no
+/// longer writes `taa_sample_accum`.
+///
+/// Skips silently until the world + frame GPU resources exist and the compute
+/// pipeline has finished compiling.
 pub fn naadf_first_hit_node(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,
     pipelines: Res<NaadfPipelines>,
     world_gpu: Option<Res<WorldGpu>>,
     frame_gpu: Option<Res<FrameGpu>>,
-    taa_gpu: Option<Res<TaaGpu>>,
 ) {
-    let (Some(world_gpu), Some(frame_gpu), Some(taa_gpu)) =
-        (world_gpu, frame_gpu, taa_gpu)
-    else {
+    let (Some(world_gpu), Some(frame_gpu)) = (world_gpu, frame_gpu) else {
         return;
     };
     let Some(pipeline) =
@@ -91,7 +94,9 @@ pub fn naadf_first_hit_node(
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &world_gpu.bind_group, &[]);
         pass.set_bind_group(1, &frame_gpu.bind_group, &[]);
-        pass.set_bind_group(2, &taa_gpu.taa_first_hit_bind_group, &[]);
+        // `@group(2)` — the read-only precomputed atmosphere (Phase B Batch 2,
+        // replaces the A-2 `taa_samples` ring group — `09-design-b.md` §6.3).
+        pass.set_bind_group(2, &frame_gpu.first_hit_atmosphere_bind_group, &[]);
         pass.dispatch_workgroups(workgroups, 1, 1);
     }
     time_span.end(render_context.command_encoder());
@@ -114,6 +119,13 @@ pub fn naadf_first_hit_node(
 /// Otherwise skips silently until the TAA + frame GPU resources exist and the
 /// reproject pipeline has finished compiling (the Phase-A
 /// `let Some(...) else { return };` pattern).
+///
+/// Phase B Batch 2: this node is temporarily OUT of the render-graph chain
+/// (`09-design-b.md` §11 Batch 2 step 8) — the `base/` first-hit no longer
+/// writes `taa_sample_accum` / `taa_samples`, so reprojection has nothing to
+/// reproject until Batch 6 ports `CalcNewTaaSample`. Kept defined so Batch 6
+/// only needs to re-add it to the chain.
+#[allow(dead_code)]
 pub fn naadf_taa_reproject_node(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,

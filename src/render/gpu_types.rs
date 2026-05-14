@@ -116,6 +116,19 @@ pub const FLAG_SHOW_RAY_STEP: u32 = 1 << 0;
 pub const FLAG_CHECK_SUN: u32 = 1 << 1;
 /// `flags` bit: write a TAA sample. Always clear in Phase A (D4).
 pub const FLAG_IS_TAA: u32 = 1 << 2;
+/// `flags` bit: the `base/` first-hit ray-marches the atmosphere along each
+/// primary-ray segment travelled (the C# `WorldRenderBase.isAtmosphereInteraction`
+/// — `WorldRenderBase.cs:16,224`; defaults to `true`). Phase B / Batch 2.
+pub const FLAG_IS_ATMOSPHERE_INTERACTION: u32 = 1 << 3;
+/// `flags` bit: the final blit decodes its source as `final_color`'s packing
+/// (`.x = f16(r)|f16(g)<<16, .y = f16(b)`, no weight) rather than
+/// `taa_sample_accum`'s packing (`.x = f16(weight)|f16(r)<<16, ...`). This is
+/// the **Batch-2 deliberate temporary seam** (`09-design-b.md` §11 Batch 2
+/// step 8): the `base/` first-hit no longer writes `taa_sample_accum` and the
+/// TAA reproject node is out of the chain, so the blit reads `final_color`
+/// directly. Batch 6 wires `CalcNewTaaSample`, reverts the blit source to
+/// `taa_sample_accum`, and clears this bit.
+pub const FLAG_BLIT_FINAL_COLOR: u32 = 1 << 4;
 
 /// World-meta uniform — the world geometry the traversal shader needs that is
 /// not per-frame: the chunk-grid extent and the voxel-space bounding box.

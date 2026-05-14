@@ -19,13 +19,24 @@
 // `HDR` is off in Phase A (`03-design.md` §5.4) — the C# `#ifdef HDR` branches
 // are dropped.
 
-#import "shaders/render_pipeline_common.wgsl"::{GpuRenderParams, FLAG_SHOW_RAY_STEP}
+#import "shaders/render_pipeline_common.wgsl"::{
+    GpuRenderParams, FLAG_SHOW_RAY_STEP, FLAG_BLIT_FINAL_COLOR,
+}
 
 // --- the final-blit pass's own small bind group (`03-design.md` §2.6) -------
 // first_hit_data (unused in the blit but bound for layout stability),
-// taa_sample_accum (the blit source), render_params (screen size + exposure).
+// blit_source (the blit source), render_params (screen size + exposure).
+//
+// Phase B Batch 2 (`09-design-b.md` §11 Batch 2 step 8 — the deliberate
+// temporary seam): `blit_source` is `final_color` instead of `taa_sample_accum`.
+// `final_color` packs raw light with NO weight field
+// (`base/renderFirstHit.fx:128` — `.x = f16(r)|f16(g)<<16, .y = f16(b)`),
+// whereas `taa_sample_accum` packs `.x = f16(weight)|f16(r)<<16, ...`. The
+// `FLAG_BLIT_FINAL_COLOR` bit (set by `prepare_frame_gpu` this batch) selects
+// the `final_color` decode. Batch 6 reverts the bind-group source to
+// `taa_sample_accum` and clears the flag — this branch then goes dormant.
 @group(0) @binding(0) var<storage, read> first_hit_data: array<vec4<u32>>;
-@group(0) @binding(1) var<storage, read> taa_sample_accum: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> blit_source: array<vec2<u32>>;
 @group(0) @binding(2) var<uniform> params: GpuRenderParams;
 
 @fragment
@@ -34,14 +45,21 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel_pos = vec2<i32>(floor(position.xy));
     let pixel_index = u32(pixel_pos.x) + u32(pixel_pos.y) * params.screen_width;
 
-    // `uint2 colSamples = taaSampleAccum[pixelIndex];`
-    let col_samples = taa_sample_accum[pixel_index];
-    // `float weight = f16tof32(colSamples.x & 0xFFFF);`
-    let weight = unpack2x16float(col_samples.x).x;
-    // RGB is `f16(.x>>16), f16(.y&0xFFFF), f16(.y>>16)` / max(1, weight).
-    let rgb_x = unpack2x16float(col_samples.x);
-    let rgb_y = unpack2x16float(col_samples.y);
-    var cur_color = vec3<f32>(rgb_x.y, rgb_y.x, rgb_y.y) / max(1.0, weight);
+    // `uint2 colSamples = blitSource[pixelIndex];`
+    let col_samples = blit_source[pixel_index];
+    let lo = unpack2x16float(col_samples.x);
+    let hi = unpack2x16float(col_samples.y);
+    var cur_color: vec3<f32>;
+    if ((params.flags & FLAG_BLIT_FINAL_COLOR) != 0u) {
+        // `final_color` packing — raw light, no weight: RGB = `(.x&0xFFFF,
+        // .x>>16, .y&0xFFFF)`. (Batch-2 temporary seam.)
+        cur_color = vec3<f32>(lo.x, lo.y, hi.x);
+    } else {
+        // `taa_sample_accum` packing — `weight = .x & 0xFFFF`, RGB =
+        // `(.x>>16, .y&0xFFFF, .y>>16)` / max(1, weight).
+        let weight = lo.x;
+        cur_color = vec3<f32>(lo.y, hi.x, hi.y) / max(1.0, weight);
+    }
 
     // Ray-step debug view: `.x` holds the raw step count, shown as greyscale.
     if ((params.flags & FLAG_SHOW_RAY_STEP) != 0u) {

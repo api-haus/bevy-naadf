@@ -83,12 +83,20 @@ pub struct NaadfPipelines {
     /// The final-blit pass's own small layout: `first_hit_data`,
     /// `taa_sample_accum`, `render_params`.
     pub blit_layout: BindGroupLayoutDescriptor,
-    /// `@group(2)` for the first-hit pass — the `taa_samples` 16-ring write
-    /// (`06-design-a2.md` §5.2). One read-write storage binding. The layout
-    /// descriptor was created in Phase A-2 Batch 1 step 5 so `TaaGpu` could
-    /// build its `taa_first_hit_bind_group` field; Batch 2 step 6 extends the
-    /// first-hit pipeline's *layout* to actually bind this group.
+    /// The `taa_samples` 16-ring write layout — one read-write storage binding
+    /// (`06-design-a2.md` §5.2). `TaaGpu` builds its `taa_first_hit_bind_group`
+    /// field against this. Phase B Batch 2 moves the `taa_samples` ring write
+    /// OFF the first-hit pass (the `base/` first-hit does not write it —
+    /// `09-design-b.md` §6.3); the layout stays so `TaaGpu`'s bind-group field
+    /// keeps compiling — Batch 6 re-homes it onto the `calc_new_taa_sample`
+    /// pipeline.
     pub taa_layout: BindGroupLayoutDescriptor,
+    /// `@group(3)` for the Phase-B 4-plane first-hit pass — the precomputed
+    /// atmosphere (`09-design-b.md` §4.4 / §6.3): `atmosphere_params` (uniform),
+    /// `atmosphere_comp` (read-only storage). Distinct from `atmosphere_layout`
+    /// (the precompute pass's `@group(0)`, which has `atmosphere_comp` as
+    /// *read-write* storage) — the first-hit only reads the buffer.
+    pub atmosphere_read_layout: BindGroupLayoutDescriptor,
     /// The TAA reproject pass's single bind group layout (`06-design-a2.md`
     /// §5.3): `taa_params` (uniform), `camera_history` / `first_hit_data` /
     /// `taa_samples` (read-only storage), `taa_sample_accum` (read-write
@@ -160,10 +168,15 @@ impl FromWorld for NaadfPipelines {
         );
 
         // --- @group(1): frame data ------------------------------------------
-        // camera + render_params uniforms; first_hit_data + taa_sample_accum
-        // read-write storage arrays. (`taa_sample_accum` is the Phase A-2
-        // rename of Phase A's `shaded_color` stand-in — same type / access,
-        // the buffer just moved into `TaaGpu` — `06-design-a2.md` §5.1.)
+        // camera + render_params uniforms; first_hit_data + taa_sample_accum +
+        // first_hit_absorption + final_color read-write storage arrays.
+        // Phase B Batch 2 widens this by 2 bindings: the `base/` first-hit
+        // writes `firstHitData` + `firstHitAbsorption` + `finalColor`
+        // (`base/renderFirstHit.fx:6-8`, `09-design-b.md` §3.4 / §6.3).
+        // `taa_sample_accum` stays bound at slot 3 for layout stability — the
+        // `base/` first-hit no longer writes it (`ReprojectOld` +
+        // `CalcNewTaaSample` do — Batch 6), the shader touches it so naga keeps
+        // the binding.
         let frame_layout = BindGroupLayoutDescriptor::new(
             "naadf_frame_bind_group_layout",
             &BindGroupLayoutEntries::sequential(
@@ -173,6 +186,8 @@ impl FromWorld for NaadfPipelines {
                     uniform_buffer_sized(false, Some(params_size)),
                     storage_buffer_sized(false, None), // first_hit_data: array<vec4<u32>>, rw
                     storage_buffer_sized(false, None), // taa_sample_accum: array<vec2<u32>>, rw
+                    storage_buffer_sized(false, None), // first_hit_absorption: array<vec2<u32>>, rw
+                    storage_buffer_sized(false, None), // final_color: array<vec2<u32>>, rw
                 ),
             ),
         );
@@ -242,19 +257,38 @@ impl FromWorld for NaadfPipelines {
             ),
         );
 
+        // --- @group(3): the 4-plane first-hit's read-only atmosphere --------
+        // `atmosphere_params` uniform; `atmosphere_comp` *read-only* storage
+        // (`09-design-b.md` §4.4 / §6.3). The first-hit only samples the
+        // precomputed buffer — `applyAtmosphere` (miss) +
+        // `addLightForDirection` (the atmosphere-interaction path).
+        let atmosphere_read_layout = BindGroupLayoutDescriptor::new(
+            "naadf_atmosphere_read_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(atmosphere_params_size)),
+                    storage_buffer_read_only_sized(false, None), // atmosphere_comp: array<vec4<u32>>
+                ),
+            ),
+        );
+
         // --- compute pipeline (single, format-agnostic) ---------------------
         let first_hit_shader = asset_server.load(FIRST_HIT_SHADER);
         let first_hit_pipeline =
             pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
                 label: Some("naadf_first_hit_pipeline".into()),
-                // `@group(2)` is the TAA-sample-ring write (`06-design-a2.md`
-                // §6.2) — the first-hit pass writes one `taa_samples` slot when
-                // `FLAG_IS_TAA` is set. Always bound; the shader's `if` guards
-                // the write.
+                // Phase B Batch 2: the layout is `[world, frame, atmosphere]`
+                // (`09-design-b.md` §6.3). The `@group(2)` `taa_samples` ring
+                // is GONE — the `base/` first-hit no longer writes it; it
+                // re-homes onto the `calc_new_taa_sample` pipeline (Batch 6).
+                // `@group(3)` is the read-only precomputed atmosphere
+                // (`applyAtmosphere` on a miss + `addLightForDirection` along
+                // the atmosphere-interaction path).
                 layout: vec![
                     world_layout.clone(),
                     frame_layout.clone(),
-                    taa_layout.clone(),
+                    atmosphere_read_layout.clone(),
                 ],
                 shader: first_hit_shader,
                 entry_point: Some(Cow::from("calc_first_hit")),
@@ -300,6 +334,7 @@ impl FromWorld for NaadfPipelines {
             taa_layout,
             taa_reproject_layout,
             atmosphere_layout,
+            atmosphere_read_layout,
             first_hit_pipeline,
             taa_reproject_pipeline,
             atmosphere_pipeline,

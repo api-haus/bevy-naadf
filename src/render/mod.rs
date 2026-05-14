@@ -36,7 +36,10 @@ use extract::{
     extract_camera, extract_camera_history, extract_taa_config, extract_world,
     ExtractedCameraData, ExtractedCameraHistory, ExtractedTaaConfig, ExtractedWorld,
 };
-use graph::{naadf_final_blit_node, naadf_first_hit_node, naadf_taa_reproject_node};
+// `naadf_taa_reproject_node` stays defined in `graph.rs` but is OUT of the
+// render-graph chain in Batch 2 (`09-design-b.md` §11 Batch 2 step 8 — the
+// `base/` TAA rewire is Batch 6); not imported here so the chain stays honest.
+use graph::{naadf_final_blit_node, naadf_first_hit_node};
 use graph_b::naadf_atmosphere_node;
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
@@ -87,28 +90,34 @@ impl Plugin for NaadfRenderPlugin {
                 Render,
                 prepare_frame_gpu.in_set(RenderSystems::PrepareBindGroups),
             )
-            // Render graph: first-hit compute -> TAA reproject compute ->
-            // final-blit fullscreen, all in PostProcess (the first-hit pass
-            // raytraces independently of the main 3D pass) and before
-            // tonemapping so the HUD draws over. The TAA node slots between
-            // first-hit and the blit (`06-design-a2.md` §8.2 — NAADF places
-            // TAA unusually early); `.chain()` gives the render-graph edges and
+            // Render graph — Phase B Batch 2 (`09-design-b.md` §11 Batch 2
+            // step 8): atmosphere precompute -> 4-plane first-hit -> final-blit
+            // fullscreen, all in PostProcess (the first-hit pass raytraces
+            // independently of the main 3D pass) and before tonemapping so the
+            // HUD draws over. `.chain()` gives the render-graph edges and
             // wgpu's automatic buffer barriers serialise the shared-buffer
-            // accesses (`first_hit_data`, `taa_sample_accum`, `taa_samples`).
+            // accesses (`atmosphere_comp`, `first_hit_data`, `final_color`).
             //
-            // Phase B prepends `naadf_atmosphere_node` as the *first* node —
-            // NAADF's dispatch order runs the atmosphere precompute before the
-            // first-hit pass (`WorldRenderBase.cs:205-228`, `09-design-b.md`
-            // §4.2). The atmosphere pass is independent of first-hit/TAA/blit
-            // (it writes only `atmosphere_comp`), so chaining it first is
-            // purely an ordering convenience; Batch 2+ wire its output into
-            // the first-hit + GI passes.
+            // `naadf_atmosphere_node` runs first — NAADF's dispatch order runs
+            // the atmosphere precompute before the first-hit pass
+            // (`WorldRenderBase.cs:205-228`, `09-design-b.md` §4.2). Batch 2
+            // wires its output into the first-hit pass (`@group(2)`).
+            //
+            // `naadf_taa_reproject_node` is DELIBERATELY OUT of the chain this
+            // batch: the `base/` first-hit no longer writes `taa_sample_accum`
+            // / `taa_samples`, so the A-2 reproject + the `taa_sample_accum`
+            // blit source are temporarily broken. Batch 2's minimal fix points
+            // the final blit at `final_color` directly (the 4-plane first-hit
+            // result). Batch 6 wires the proper `base/` TAA path
+            // (`ReprojectOld` + `CalcNewTaaSample`) and reverts the blit
+            // source — the node + the `*_taa_reproject*` plumbing stay in the
+            // tree (`graph.rs`, `prepare.rs`) so Batch 6 only re-adds them to
+            // the chain.
             .add_systems(
                 Core3d,
                 (
                     naadf_atmosphere_node,
                     naadf_first_hit_node,
-                    naadf_taa_reproject_node,
                     naadf_final_blit_node,
                 )
                     .chain()
