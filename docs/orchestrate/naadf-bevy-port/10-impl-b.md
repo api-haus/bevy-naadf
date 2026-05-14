@@ -360,3 +360,243 @@ One blocking issue, in **shared Batch-1 WGSL**, not in new Batch-2 code:
   will write `taa_sample_accum` from its own pipeline; the first-hit's slot-3
   binding can stay (harmless) or B6 can drop it from `frame_layout` — designer's
   call, not load-bearing.
+
+---
+
+## Batch 3 — `rayQueueCalc` + `globalIllum` (the GI sample generators)
+
+`09-design-b.md` §11 Batch 3 (steps 9–11). Builds the Phase-B GI buffer set
+(`GiGpu` — every §3.7 buffer) + the first two GI passes: `rayQueueCalc` (the
+adaptive ~0.25-spp ray-queue builder) and `renderGlobalIllum` (the ≤3-bounce
+secondary-ray tracer). These produce GI samples into buffers that nothing reads
+yet — the done-bar is "the passes dispatch clean", not "the image changes". Ends
+▶ runnable; the Batch-2 image is unchanged.
+
+### Files created
+
+| file | what it is | NAADF provenance |
+|---|---|---|
+| `src/assets/shaders/gi_params.wgsl` | the shared per-frame GI uniform struct `GpuGiParams` (288 B) + the `GI_FLAG_*` consts. naga-oil import module — imported by `ray_queue_calc.wgsl` + `naadf_global_illum.wgsl` (and the later GI passes). No explicit pad members — the four `vec3` rows are contiguous then the scalar tail begins on a fresh 16-byte boundary, so WGSL's std140-ish padding reproduces the Rust `#[repr(C)]` layout (the `vec3`-then-scalar trap that bit `AtmosphereParams` does NOT apply — verified field-by-field). | the union of every `base/` GI pass's scalar uniforms (`rayQueueCalc.fx:9-10`, `renderGlobalIllum.fx:16-28`, `renderSampleRefine.fx:21-32`, `renderSpatialResampling.fx:15-27`, `renderDenoiseSplit.fx:11-14`) |
+| `src/assets/shaders/ray_queue_calc.wgsl` | the two `rayQueueCalc` compute entries: `calc_ray_queue` (`[numthreads(64,1,1)]` — the `should_ray` adaptive test, the inline group-shared prefix-counter, the queue write) + `calc_ray_queue_store` (`[numthreads(1,1,1)]` — converts the raw queued-pixel count to the indirect workgroup count). The `addToCounterAddressBuffer` group-shared prefix-counter is ported **inline** (it needs `var<workgroup>` at entry-point scope — not a reusable shared fn). | `base/rayQueueCalc.fx` `calcRayQueue` + `calcRayQueueStore`; `commonOther.fxh:6-22` `addToCounterAddressBuffer` |
+| `src/assets/shaders/naadf_global_illum.wgsl` | the `calcGlobalIlum` compute entry — the ≤3-bounce secondary-ray tracer: per-queued-pixel ray setup, the primary-surface BRDF interaction (mirror / rough-VNDF / diffuse), the ≤3-bounce loop (`shoot_ray`, atmosphere Russian-roulette on miss, albedo, sun-sample, emissive, surface-effect bounce), `compress_color` + lit/unlit classification, the group-shared sample-count atomics, the wrapping ring write into `valid_samples` / `invalid_samples`. `compress_sample_valid` / `compress_sample_invalid` ported. | `base/renderGlobalIllum.fx` `calcGlobalIlum` + `compressSampleValid` + `compressSampleInvalid` |
+| `src/render/gi.rs` | the `GiGpu` render-world resource (every §3.7 GI buffer + the `gi_params` uniform + the resize-trigger geometry); `GiBindGroups` (the mixed bind groups, built by `prepare_frame_gpu`); `prepare_gi` (creates/resizes/seeds the buffers, uploads `GpuGiParams`); the `accum_index_of` / `rand_salts_of` / `bucket_grid_of` helpers + the storage-count consts. 3 unit tests. | `WorldRenderBase.cs:104-171` (buffer creation), `:181` (`globalIlumAccumIndex`), `:157-159` (bucket grid) |
+
+### Files changed
+
+| file | change |
+|---|---|
+| `src/main.rs` | `AppArgs` gains `gi: GiSettings` — a new `GiSettings` struct (the C# `SettingDataRenderBase` slider *defaults* as constants: `bounce_count=3`, `global_illum_max_accum=128`, `spatial_resample_size=500`, `denoise_thresh=400`, `radius_lit_factor=3`, `noise_suppression_factor=0.4`, `spatial_visibility_count=80`, the 5 bools all `true`). `Default`-impl'd; `main()` constructs `gi: GiSettings::default()`. |
+| `src/render/extract.rs` | += `ExtractedGiConfig` (a flat `Copy` mirror of `AppArgs.gi`) + `extract_gi_config` — the A-2 `ExtractedTaaConfig` pattern. |
+| `src/render/gpu_types.rs` | **unchanged** — `GpuGiParams` (288 B) + `GpuSampleValid` (32 B) + the `GI_FLAG_*` consts were already declared in Batch 1; Batch 3 only consumes them. |
+| `src/render/pipelines.rs` | `NaadfPipelines` += `ray_queue_layout` (`@group(0)` for `rayQueueCalc`: `gi_params` uniform + `first_hit_data` RO + `ray_queue` RW + `ray_queue_indirect` RW + `taa_sample_accum` RO), `global_illum_layout` (`@group(1)` for `globalIllum`: `gi_params` + 8 storage bindings), `empty_layout` + `empty_bind_group` (the entry-less placeholder for `globalIllum`'s skipped `@group(2)` — see below), `ray_queue_pipeline` + `ray_queue_store_pipeline` + `global_illum_pipeline` (cached compute ids). New `RAY_QUEUE_SHADER` / `GLOBAL_ILLUM_SHADER` path consts. The `globalIllum` pipeline layout is `[world, global_illum, empty, atmosphere_read]`. |
+| `src/render/prepare.rs` | `prepare_frame_gpu` gains `Res<GiGpu>` + `Option<Res<GiBindGroups>>` and builds the **mixed** GI bind groups into a new `GiBindGroups` resource (`ray_queue_bind_group` + `global_illum_bind_group`) — mixing `GiGpu` + `FrameGpu` + `TaaGpu` buffers, rebuilt on the same `pixel_count` resize trigger. Waits on `GiGpu` alongside `TaaGpu` / `AtmosphereGpu` before building any bind group (`09-design-b.md` §10.3). |
+| `src/render/graph_b.rs` | += `naadf_ray_queue_node` (TWO dispatches in one node: `RayQueue` over `ceil(pixel_count/64)` workgroups then `RayQueueStore` over 1) + `naadf_global_illum_node` (indirect dispatch off `ray_queue_indirect`, binds `@group(0)` world / `@group(1)` GI / `@group(2)` `empty_bind_group` / `@group(3)` the read-only atmosphere — reuses `FrameGpu.first_hit_atmosphere_bind_group`, same `atmosphere_read_layout` as the first-hit). New `RAY_QUEUE_SPAN` / `GLOBAL_ILLUM_SPAN` HUD-span consts. |
+| `src/render/mod.rs` | `pub mod gi` declared; `ExtractedGiConfig` `init_resource`'d; `extract_gi_config` added to `ExtractSchedule`; `prepare_gi` added to `PrepareResources` (alongside `prepare_world_gpu` / `prepare_taa` / `prepare_atmosphere`); the `Core3d` chain gains `naadf_ray_queue_node` + `naadf_global_illum_node` between `naadf_first_hit_node` and `naadf_final_blit_node`. |
+
+### Mapping to NAADF source
+
+- **`ray_queue_calc.wgsl`** is `base/rayQueueCalc.fx` verbatim. `shouldRay`
+  (`:12-21`) → `should_ray`: the `accum / 2`, `round(clamp(fac*2,0,3)+1)`
+  `mod_size`, the `(frameIndex*4 + x + y) % mod_size == 0` spatial-temporal
+  pattern — explicit `u32(round(...))` cast (HLSL truncates implicitly).
+  `shouldAdd = (firstHitData[ID].z & 0x7FFF) != 0 && shouldRay(...)`
+  (`:29`) — `accum` is `unpack2x16float(taa_sample_accum[id].x).x`. The HLSL
+  `RWByteAddressBuffer groupCount` is `ray_queue_indirect` (C# binds
+  `rayQueueIndirectBuffer` into `groupCount` — `WorldRenderBase.cs:280`); the
+  `.Load(0)`/`.Store(0)`/`.InterlockedAdd(0,...)` byte-address ops at offset 0
+  are element `[0]` = `GroupCountX`, so `ray_queue_indirect` is declared
+  `array<atomic<u32>, 5>` and the inline counter does
+  `atomicAdd(&ray_queue_indirect[0], ...)`. `calcRayQueueStore` reads `[0]`,
+  writes `(v+63)/64`.
+- **`addToCounterAddressBuffer`** (`commonOther.fxh:6-22`) ported inline into
+  `ray_queue_calc.wgsl` per `09-design-b.md` §5.6 — `var<workgroup> index_group:
+  atomic<u32>` + `index_group_base: u32`, the three `workgroupBarrier()`s, the
+  per-lane `atomicAdd(&index_group, ...)` then lane-0
+  `atomicAdd(&ray_queue_indirect[0], ...)`. HLSL `groupshared uint indexGroup = 0`
+  initialises at module scope; WGSL `var<workgroup>` does NOT — lane 0 zeroes
+  `index_group` before the first barrier (the C# relies on each dispatch starting
+  freshly-zeroed; naga gives no such guarantee).
+- **`naadf_global_illum.wgsl`** is `base/renderGlobalIllum.fx:60-291`
+  `calcGlobalIlum`. The primary-surface BRDF interaction (`:97-116`), the
+  ≤3-bounce loop `for bounce in 0..min(maxBounceCount,3)` (`:121-235`), the
+  compress+classify tail (`:237-289`). The HLSL `do { ... } while` rough-specular
+  loops become WGSL `loop { ...; if (!(cond)) { break; } count++; }`. The HLSL
+  `applyAtmosphere(curPosInt+curPosFrac, curDir, ..., 16)` on a secondary-ray
+  miss (`:131-132`) — the `atmoMul = 16` Russian-roulette compensation — uses the
+  Batch-1-split `atmosphere_oct_index` + `apply_atmosphere` (the caller fetches
+  the octahedral slot itself; `apply_atmosphere` can't take the storage buffer by
+  `ptr`). `compressSampleValid` (`:34-48`) / `compressSampleInvalid` (`:50-58`)
+  ported with explicit `u32()` casts on the `octEncode(sampleDir) * 2^22`
+  coordinates. The group-shared `sharedResCount` + the storage-buffer
+  `InterlockedAdd(globalIlumSampleCounts[3+accumIndex].x|.y, ...)` →
+  `var<workgroup> shared_res_count: atomic<u32>` + `sample_counts` declared
+  `array<SampleCountSlot>` where `SampleCountSlot { valid: atomic<u32>, invalid:
+  atomic<u32> }` (`09-design-b.md` §5.5 / §12 #5). `#ifdef ENTITIES` blocks
+  omitted (`entitySample = ENTITY_FREE` always, the entity params absent).
+- **`gi.rs`** mirrors `WorldRenderBase.cs:104-171`. Buffer element sizes from
+  `09-design-b.md` §3.1; `bucket_count = ceil(w/8)*ceil(h/8)`
+  (`:157-159`); `accum_index = maxAccum - (frameCount % maxAccum) - 1` (`:181`).
+  The three indirect buffers are seeded on creation — `ray_queue_indirect =
+  [0,1,1,0,0]`, `valid_dispatch = invalid_dispatch = [1,1,1,0,0]`
+  (`:136,168,170`). `sample_counts` (131 elements) is fixed-size, zero-cleared
+  only on creation (it carries the 128-frame ring). The `sunColor` is the CPU
+  `Atmosphere::get_light_for_point((0,10,0))` (`WorldRender.cs:96` — the Batch-1
+  CPU atmosphere port). Everything uses plain `create_buffer`, not
+  `GrowableBuffer` (the GI buffers never grow — `09-design-b.md` §3.1).
+
+### The per-pixel sample-count signal — data flow (the ~0.25-spp realisation)
+
+This is the headline 2× GI speedup, now actually exercised:
+
+1. **A-2's TAA** exposes the per-pixel accumulated sample count in
+   `taa_sample_accum[px].x & 0xFFFF` (an f16). (In the *full* `base/` pipeline
+   `ReprojectOld` writes it — that is Batch 6; in Batch 3 it is the zero-cleared
+   buffer the Batch-2 first-hit leaves untouched, so every pixel reads `accum ≈ 0`
+   → `mod_size == 1` → every hit pixel is queued every frame, i.e. 1 spp. That is
+   correct-but-not-yet-adaptive — the adaptive rate only kicks in once Batch 6
+   wires `ReprojectOld` to fill `taa_sample_accum.x`. Documented as a cross-batch
+   dependency, exactly like Batch 4's `taa_dist_min_max` gap.)
+2. **`naadf_ray_queue_node` → `calc_ray_queue`** reads `taa_sample_accum[id].x`,
+   runs `should_ray` per hit pixel, and for the pixels that pass reserves a slot
+   in the global counter (`ray_queue_indirect[0]`) via the inline group-shared
+   prefix-counter and writes the packed pixel position into `ray_queue`.
+3. **`calc_ray_queue_store`** (1 thread) reads the raw queued-pixel count from
+   `ray_queue_indirect[0]` and rewrites it as the workgroup count `(v+63)/64`.
+4. **`naadf_global_illum_node`** dispatches `calc_global_ilum` **indirect** off
+   `ray_queue_indirect` — one thread per *queued* pixel, so GI cost scales with
+   the adaptive rate, not the screen. Each thread reads `ray_queue[globalID.x]`,
+   traces the ≤3-bounce ray, and writes a lit/unlit sample into the
+   `valid_samples` / `invalid_samples` rings + bumps the 128-frame
+   `sample_counts` ring.
+
+Render-graph ordering (`mod.rs` `.chain()`) guarantees first-hit → ray_queue →
+global_illum; wgpu's automatic buffer barriers serialise the shared-buffer
+accesses (`ray_queue`, `ray_queue_indirect`, `first_hit_data`).
+
+### Design ambiguities adjudicated
+
+1. **`compressSampleValid`'s `sampleSpecularNormals` parameter — `normTangs`
+   directly, NOT `getSpecularNormals(...)`.** `09-design-b.md` §8.1 mentions
+   `compress_sample_valid` and §5.2 lists `get_specular_normals` as a shared
+   helper, which could read as "globalIllum calls `getSpecularNormals`". The
+   HLSL is authoritative: `renderGlobalIllum.fx:280` passes the `normTangs`
+   `uint3` of secondary-bounce plane codes **directly** as the
+   `sampleSpecularNormals` parameter; `compressSampleValid` packs `.x`/`.y`/`.z`
+   each `<< 15` into `data2`. `getSpecularNormals` (`commonRenderPipeline.fxh`)
+   is `renderSampleRefine`'s helper, applied to the *first-hit* G-buffer planes —
+   a different thing. Followed the HLSL: `compress_sample_valid` takes the raw
+   `norm_tangs` `vec3<u32>`. (`get_specular_normals` stays in
+   `render_pipeline_common.wgsl` from Batch 1 — Batch 4's `sampleRefine` uses it.)
+2. **`globalIllum`'s `@group(2)` — an entry-less placeholder.**
+   `09-design-b.md` §8.1 / §4.6 specify `globalIllum` binds `@group(0)` world +
+   `@group(1)` GI + `@group(3)` atmosphere — it skips `@group(2)` entirely. wgpu
+   pipeline layouts are a `Vec` indexed by group number, so index 2 needs *some*
+   layout. Added an entry-less `empty_layout` (`BindGroupLayoutDescriptor::new(_,
+   &[])`) + a one-time `empty_bind_group`; `naadf_global_illum_node` does
+   `set_bind_group(2, &pipelines.empty_bind_group, &[])`. The design's stated
+   `@group(3)` numbering is honoured exactly (the alternative — renumbering
+   atmosphere to `@group(2)` — would have been simpler but deviates from the
+   design's explicit group plan; the placeholder is the faithful choice).
+3. **The per-frame `ray_queue_indirect[0]` reset — a Batch-3 designed seam.**
+   `09-design-b.md` §7.3 says `ray_queue_indirect[0]` must be zeroed each frame
+   *before* `calcRayQueue`, and that NAADF does it in `ClearBucketsAndCalcMask`
+   (a `sampleRefine` pass — Batch 4). Without it, `calcRayQueue`'s `atomicAdd`
+   onto element `[0]` would carry the previous frame's workgroup count into the
+   next frame's count. **Resolution:** `prepare_gi` re-seeds `ray_queue_indirect`
+   to `[0,1,1,0,0]` from the CPU every frame — a minimal Batch-3-local fix so
+   Batch 3 is correct *standalone* (the same designed-seam pattern as Batch 2's
+   temporary `final_color` blit source). When Batch 4 lands
+   `ClearBucketsAndCalcMask`'s in-shader reset, this CPU re-seed becomes
+   redundant and Batch 4 can drop it. Flagged in `gi.rs` + `mod.rs`.
+
+### Bugs found + fixed during the Batch-3 smoke-run
+
+Three blocking issues, all in new Batch-3 WGSL, all fixed:
+
+1. **naga-oil rejects the trailing-digit struct field `rand_counter2`.** The
+   Batch-1 carry-forward exactly: naga-oil's composable-module writeback rejects
+   trailing-digit identifiers. `gi_params.wgsl`'s `rand_counter2` (mirroring the
+   C# `randCounter2`) → `rand_counter_b`; the `naadf_global_illum.wgsl` use site
+   updated. The WGSL field name is read positionally by offset — not
+   load-bearing — same fix as Batch 1's `SampleValid.data_a`/`data_b`. (The Rust
+   `GpuGiParams.rand_counter2` field name is unaffected — the rule is WGSL-only.)
+2. **`let _ = <imported-fn>(...)` is invalid after naga-oil's import rewrite.**
+   `naadf_global_illum.wgsl` discarded the unused `radianceCompWithAbsorption`
+   (computed in the HLSL `:237`, never read — kept only for RNG-state fidelity)
+   with `let _ = compress_color(...)`. naga-oil rewrites the call to a namespaced
+   form and then "Identifier can't be `_`". Fixed: a named throwaway
+   (`let _unused_... = compress_color(...)`) for the call; for the binding-only
+   `camera_history` reference, WGSL's phony-assignment `_ = expr;` (no `let`).
+3. **`fac` is a `float3`, not a scalar — sun-sample type error.**
+   `renderGlobalIllum.fx:169` is `float3 fac = saturate(...) * 2` — HLSL
+   broadcasts the scalar to a `float3` (the rough-specular branch multiplies it
+   by the `vec3` Fresnel `F`, and `radiance += ... * fac` is all `vec3`). The
+   port had `var fac` as a scalar `f32`, so `fac = fac * (... * f)` assigned a
+   `vec3` to a scalar — naga "Entry point invalid". Fixed: `var fac =
+   vec3<f32>(clamp(...) * 2.0)`.
+
+### Verification
+
+- `cargo build --bin bevy-naadf` — clean (pre-existing dead-code warnings only;
+  new ones: `GiGpu.bucket_count` / `bucket_size` "never read" — Batch 4's
+  `sampleRefine` reads them; `NaadfPipelines.empty_layout` "never read" — only
+  used inside `from_world`; expected forward-looking warnings, same pattern as
+  Batch 1/2).
+- `cargo test --bin bevy-naadf` — **44 passed** (was 41; +3 from `gi.rs`:
+  `accum_index_walks_the_ring`, `rand_salts_are_two_distinct_per_frame_values`,
+  `bucket_grid_ceils_to_eights`).
+- One smoke-run after the three fixes: launches clean (RTX 5080, Vulkan), builds
+  the NAADF test grid (32 chunks, 64×32×64 voxels), runs ~38 s, exits cleanly
+  (exit code 0) on window close with **no panic, no DeviceLost/Timeout, no
+  naga/WGSL/validation/composable-module errors**. The render-graph chain —
+  atmosphere precompute → 4-plane first-hit → `rayQueueCalc` (2 dispatches) →
+  `globalIllum` (indirect dispatch) → final-blit — compiles and dispatches every
+  frame. The image is the unchanged Batch-2 4-plane first-hit (the GI passes
+  write `ray_queue` / `valid_samples` / `invalid_samples` / `sample_counts` —
+  buffers the blit does not read; the GI result is not composited until Batch 5).
+  No TEMP debug instrumentation was added.
+
+### Notes for the next batch (B4 — `sampleRefine`, the 5 passes)
+
+- **`GpuGiParams` is fully populated and uploaded.** B4's `sampleRefine` passes
+  bind `gi_params` (the design's `sample_refine_bind_group` — `09-design-b.md`
+  §8.2). Every field B4 needs (`accum_index`, `bucket_size_x/y`, `bucket_count`,
+  the storage-count constants, `rand_counter`/`rand_counter_b`,
+  `sample_max_accum`) is live. **WGSL field-name note:** the second RNG salt is
+  `gi_params.rand_counter_b` in WGSL (not `rand_counter2` — naga-oil trailing-
+  digit rule); the Rust struct field stays `rand_counter2`.
+- **The GI buffers B4 needs are all created/sized/seeded by `prepare_gi`:**
+  `valid_samples` / `invalid_samples` (read by B4), `valid_samples_refined` /
+  `valid_samples_compressed` / `bucket_info` (written by B4 — `bucket_count`-
+  sized, resize-on-viewport), `sample_counts` (the 128-frame ring — fixed-size,
+  zero-cleared only on creation), `valid_dispatch` / `invalid_dispatch` (the
+  indirect-arg buffers B4's `ComputeValidHistory` writes — seeded `[1,1,1,0,0]`).
+  `GiGpu.bucket_count` / `bucket_size` are populated for B4's dispatch math.
+- **`ray_queue_indirect[0]` per-frame reset — B4 owns moving it in-shader.**
+  Batch 3's `prepare_gi` re-seeds `ray_queue_indirect` to `[0,1,1,0,0]` from the
+  CPU every frame (the Batch-3 designed seam — see "Design ambiguities" #3). B4's
+  `ClearBucketsAndCalcMask` does the proper in-shader reset (`renderSampleRefine.fx:39`
+  — `groupCount.Store(0, 0)`, *and* it clears `sample_counts[3+accumIndex]`).
+  Once B4 lands that, the `prepare_gi` CPU re-seed is redundant — B4 can delete
+  the `render_queue.write_buffer(&resources.ray_queue_indirect, ...)` line in
+  `gi.rs` (it is clearly marked). B4 must also insert `naadf_sample_refine_clear_node`
+  at its §4.2 position — **before** `naadf_ray_queue_node` in the chain.
+- **The mixed-bind-group pattern is established.** `prepare_frame_gpu` builds
+  `GiBindGroups` (currently `ray_queue_bind_group` + `global_illum_bind_group`).
+  B4 adds `sample_refine_bind_group` to `GiBindGroups` the same way — it mixes
+  `GiGpu` + `FrameGpu` (`first_hit_data`) + `TaaGpu` (`taa_dist_min_max` —
+  *not yet written* until B6, see below — and `camera_history` for the
+  `view_proj_inv` ring). `prepare_frame_gpu` already takes `Res<GiGpu>`.
+- **`taa_dist_min_max` is the zero-cleared buffer until B6** (`09-design-b.md`
+  §11 Batch 4 step 13 already calls this out): B4's `CountValidAndRefine` /
+  `CountInvalid` validity test reads `taa_dist_min_max`, but the Batch-2
+  `albedo/` reproject pass does not write it and B6 is what rewires the `base/`
+  `ReprojectOld`. So in B4 the validity test rejects everything — the passes
+  dispatch clean, the data is just empty. Correct-but-empty, never invalid.
+- **The `empty_layout` / `empty_bind_group` placeholder pattern is available**
+  if any B4 pass also skips a `@group` index — `NaadfPipelines.empty_bind_group`
+  is a ready entry-less bind group.
+- **`get_specular_normals` is unused so far** — it is in
+  `render_pipeline_common.wgsl` (Batch 1) but neither Batch 2 nor Batch 3 calls
+  it. B4's `sampleRefine` is its first consumer (`renderSampleRefine.fx` applies
+  it to the first-hit G-buffer planes).

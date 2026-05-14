@@ -226,3 +226,33 @@ pub fn extract_taa_config(
         extracted.enabled = args.taa;
     }
 }
+
+/// Render-world mirror of `AppArgs.gi` — the Phase-B GI pipeline settings
+/// (`09-design-b.md` §3.8 / §10.2). `AppArgs` is a main-world resource; the
+/// render-world `prepare_gi` system needs these to build `GpuGiParams`, and
+/// `naadf_denoise_node` (Batch 5) gates on `is_denoise`. Like A-2's
+/// `ExtractedTaaConfig` — a flat `Copy` mirror, re-copied each frame.
+#[derive(Resource, Clone, Copy)]
+pub struct ExtractedGiConfig {
+    /// The mirrored GI settings.
+    pub settings: crate::GiSettings,
+}
+
+impl Default for ExtractedGiConfig {
+    fn default() -> Self {
+        Self {
+            settings: crate::GiSettings::default(),
+        }
+    }
+}
+
+/// `ExtractSchedule` system: mirror `AppArgs.gi` into the render-world
+/// [`ExtractedGiConfig`] (`09-design-b.md` §10.2).
+pub fn extract_gi_config(
+    mut extracted: ResMut<ExtractedGiConfig>,
+    args: Extract<Option<Res<crate::AppArgs>>>,
+) {
+    if let Some(args) = &*args {
+        extracted.settings = args.gi;
+    }
+}

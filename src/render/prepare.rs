@@ -32,6 +32,7 @@ use bevy::render::renderer::{RenderDevice, RenderQueue};
 
 use crate::render::atmosphere::AtmosphereGpu;
 use crate::render::extract::{ExtractedCameraData, ExtractedCameraHistory, ExtractedWorld};
+use crate::render::gi::{GiBindGroups, GiGpu};
 use crate::render::gpu_types::{
     GpuCamera, GpuRenderParams, GpuVoxelType, GpuWorldMeta, FLAG_BLIT_FINAL_COLOR,
     FLAG_CHECK_SUN, FLAG_IS_ATMOSPHERE_INTERACTION, FLAG_IS_TAA,
@@ -279,8 +280,10 @@ pub fn prepare_frame_gpu(
     extracted_history: Res<ExtractedCameraHistory>,
     extracted_taa: Res<crate::render::extract::ExtractedTaaConfig>,
     existing: Option<ResMut<FrameGpu>>,
+    existing_gi_bind_groups: Option<Res<GiBindGroups>>,
     taa_gpu: Option<Res<TaaGpu>>,
     atmosphere_gpu: Option<Res<AtmosphereGpu>>,
+    gi_gpu: Option<Res<GiGpu>>,
     pipelines: Res<NaadfPipelines>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
@@ -291,12 +294,18 @@ pub fn prepare_frame_gpu(
     }
     // `TaaGpu` (created in `PrepareResources` by `prepare_taa`) owns
     // `taa_sample_accum`; `AtmosphereGpu` (created by `prepare_atmosphere`)
-    // owns the precomputed atmosphere buffer + uniform. Wait for both before
-    // building the bind groups (`09-design-b.md` §10.3).
+    // owns the precomputed atmosphere buffer + uniform; `GiGpu` (created by
+    // `prepare_gi`) owns every Phase-B GI buffer. Wait for all three before
+    // building the bind groups (`09-design-b.md` §10.3) — the mixed GI bind
+    // groups (`GiBindGroups`) reference `GiGpu` + `FrameGpu` + `TaaGpu`, so
+    // they are built here, after all three exist.
     let Some(taa_gpu) = taa_gpu else {
         return;
     };
     let Some(atmosphere_gpu) = atmosphere_gpu else {
+        return;
+    };
+    let Some(gi_gpu) = gi_gpu else {
         return;
     };
     let viewport = extracted_camera.viewport_size.max(UVec2::ONE);
@@ -555,6 +564,56 @@ pub fn prepare_frame_gpu(
             frame.taa_reproject_bind_group.clone(),
         )
     };
+
+    // --- the mixed GI bind groups (`09-design-b.md` §10.3) ------------------
+    // `GiBindGroups` mixes `GiGpu` + `FrameGpu` + `TaaGpu` buffers, so it is
+    // built here (after all three resources exist) rather than in `prepare_gi`.
+    // Rebuilt on the same `pixel_count` resize trigger as the frame buffers —
+    // every buffer it references (`first_hit_data` / `first_hit_absorption` /
+    // `final_color` / `taa_sample_accum` / the GI buffers) is `pixel_count`-
+    // sized and re-created together. `camera_history` is fixed-size, but a
+    // rebuild that re-references it is harmless.
+    //
+    // Batch 3 builds two: `ray_queue_bind_group` (`@group(0)` of the
+    // `rayQueueCalc` passes) and `global_illum_bind_group` (`@group(1)` of
+    // `renderGlobalIllum`). Batches 4-6 add the rest.
+    let gi_bind_groups_stale = match &existing_gi_bind_groups {
+        Some(bg) => bg.pixel_count != pixel_count,
+        None => true,
+    };
+    if needs_new_storage || existing_gi_bind_groups.is_none() || gi_bind_groups_stale {
+        let ray_queue_bind_group = render_device.create_bind_group(
+            "naadf_ray_queue_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.ray_queue_layout),
+            &BindGroupEntries::sequential((
+                gi_gpu.gi_params.as_entire_buffer_binding(),
+                first_hit_data.as_entire_buffer_binding(),
+                gi_gpu.ray_queue.as_entire_buffer_binding(),
+                gi_gpu.ray_queue_indirect.as_entire_buffer_binding(),
+                taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
+            )),
+        );
+        let global_illum_bind_group = render_device.create_bind_group(
+            "naadf_global_illum_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.global_illum_layout),
+            &BindGroupEntries::sequential((
+                gi_gpu.gi_params.as_entire_buffer_binding(),
+                first_hit_data.as_entire_buffer_binding(),
+                first_hit_absorption.as_entire_buffer_binding(),
+                gi_gpu.valid_samples.as_entire_buffer_binding(),
+                gi_gpu.invalid_samples.as_entire_buffer_binding(),
+                gi_gpu.sample_counts.as_entire_buffer_binding(),
+                final_color.as_entire_buffer_binding(),
+                gi_gpu.ray_queue.as_entire_buffer_binding(),
+                taa_gpu.camera_history.as_entire_buffer_binding(),
+            )),
+        );
+        commands.insert_resource(GiBindGroups {
+            ray_queue_bind_group,
+            global_illum_bind_group,
+            pixel_count,
+        });
+    }
 
     commands.insert_resource(FrameGpu {
         camera: camera_buf,

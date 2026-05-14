@@ -35,6 +35,58 @@ pub enum GridPreset {
     Default,
 }
 
+/// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#
+/// `WorldRenderBase` ImGui sliders (`SettingDataRenderBase`) become these
+/// `AppArgs` constants — there is no GI settings GUI in the port (§1). The
+/// values are the C# slider *defaults*.
+#[derive(Clone, Copy, Debug)]
+pub struct GiSettings {
+    /// Max secondary-ray bounce count (C# `bounceCount`).
+    pub bounce_count: u32,
+    /// GI accumulation-ring depth (C# `globalIllumMaxAccum`).
+    pub global_illum_max_accum: u32,
+    /// Spatial-resampling neighbour-search size (C# `spatialResampleSize`).
+    pub spatial_resample_size: f32,
+    /// Spatial-resampling visibility ray-step count (C# `spatialVisibilityCount`).
+    pub spatial_visibility_count: u32,
+    /// Denoiser threshold (C# `denoiseThresh`).
+    pub denoise_thresh: f32,
+    /// Lit-radius factor (C# `radiusLitFactor`).
+    pub radius_lit_factor: f32,
+    /// Noise-suppression factor (C# `noiseSuppressionFactor`).
+    pub noise_suppression_factor: f32,
+    /// The 1↔0.25-spp toggle (C# `skipSamples`) — drives `rayQueueCalc`.
+    pub skip_samples: bool,
+    /// Run the sparse bilateral denoiser (C# `isDenoise`).
+    pub is_denoise: bool,
+    /// Brightness-level the bucket samples (C# `isSampleLeveling`).
+    pub is_sample_leveling: bool,
+    /// Vary the spatial-resampling radius per pixel (C# `isVaryingResmaplingRadius`).
+    pub is_varying_resampling_radius: bool,
+    /// Apply the in-volume atmosphere interaction (C# `isAtmosphereInteraction`).
+    pub is_atmosphere_interaction: bool,
+}
+
+impl Default for GiSettings {
+    fn default() -> Self {
+        // The `SettingDataRenderBase` defaults (`WorldRenderBase.cs:14-25`).
+        Self {
+            bounce_count: 3,
+            global_illum_max_accum: 128,
+            spatial_resample_size: 500.0,
+            spatial_visibility_count: 80,
+            denoise_thresh: 400.0,
+            radius_lit_factor: 3.0,
+            noise_suppression_factor: 0.4,
+            skip_samples: true,
+            is_denoise: true,
+            is_sample_leveling: true,
+            is_varying_resampling_radius: true,
+            is_atmosphere_interaction: true,
+        }
+    }
+}
+
 /// Command-line options, parsed once and stored as a resource (`03-design.md` §4.1).
 #[derive(Resource, Clone, Copy)]
 pub struct AppArgs {
@@ -43,12 +95,15 @@ pub struct AppArgs {
     /// Long-term TAA. Wired but always `false` in Phase A (D4) — Phase A-2
     /// turns it on.
     pub taa: bool,
+    /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8).
+    pub gi: GiSettings,
 }
 
 fn main() {
     let args = AppArgs {
         grid_preset: GridPreset::default(),
         taa: true,
+        gi: GiSettings::default(),
     };
 
     let mut app = App::new();

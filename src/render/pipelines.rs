@@ -42,17 +42,18 @@ use bevy::render::render_resource::{
     binding_types::{
         storage_buffer_read_only_sized, storage_buffer_sized, texture_3d, uniform_buffer_sized,
     },
-    BindGroupLayoutDescriptor, BindGroupLayoutEntries, CachedComputePipelineId,
-    CachedRenderPipelineId, ColorTargetState, ColorWrites, ComputePipelineDescriptor,
-    FragmentState, PipelineCache, RenderPipelineDescriptor, ShaderStages, TextureFormat,
-    TextureSampleType, VertexState,
+    BindGroup, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+    CachedComputePipelineId, CachedRenderPipelineId, ColorTargetState, ColorWrites,
+    ComputePipelineDescriptor, FragmentState, PipelineCache, RenderPipelineDescriptor,
+    ShaderStages, TextureFormat, TextureSampleType, VertexState,
 };
 use bevy::render::renderer::RenderDevice;
 use bevy::render::view::ExtractedView;
 use bevy::shader::Shader;
 
 use crate::render::gpu_types::{
-    GpuAtmosphereParams, GpuCamera, GpuRenderParams, GpuTaaParams, GpuWorldMeta,
+    GpuAtmosphereParams, GpuCamera, GpuGiParams, GpuRenderParams, GpuTaaParams,
+    GpuWorldMeta,
 };
 
 /// Asset paths of the Phase-A entry-point WGSL shaders + the Phase-A-2 TAA
@@ -65,6 +66,12 @@ pub const TAA_REPROJECT_SHADER: &str = "shaders/taa.wgsl";
 /// Asset path of the Phase-B atmosphere precompute compute shader
 /// (`09-design-b.md` §5.1) — port of `base/renderAtmosphere.fx`.
 pub const ATMOSPHERE_SHADER: &str = "shaders/naadf_atmosphere.wgsl";
+/// Asset path of the Phase-B `rayQueueCalc` compute shader (`09-design-b.md`
+/// §5.1, §7) — port of `base/rayQueueCalc.fx`.
+pub const RAY_QUEUE_SHADER: &str = "shaders/ray_queue_calc.wgsl";
+/// Asset path of the Phase-B `renderGlobalIllum` compute shader
+/// (`09-design-b.md` §5.1, §8.1) — port of `base/renderGlobalIllum.fx`.
+pub const GLOBAL_ILLUM_SHADER: &str = "shaders/naadf_global_illum.wgsl";
 
 /// Compute-shader workgroup size — `[numthreads(64,1,1)]` in the HLSL
 /// `albedo/renderFirstHit.fx` `calcFirstHit` (`03-design.md` §5.1). The Phase-B
@@ -108,6 +115,25 @@ pub struct NaadfPipelines {
     /// §4.3. The precompute pass writes one quarter of `atmosphere_comp` per
     /// frame; it binds no `@group(0)` world data.
     pub atmosphere_layout: BindGroupLayoutDescriptor,
+    /// An entry-less bind-group layout — wgpu pipeline layouts are a `Vec`
+    /// indexed by group number, so a shader that uses `@group(0)` + `@group(1)`
+    /// + `@group(3)` (skipping `@group(2)`) needs a placeholder at index 2.
+    /// `naadf_global_illum.wgsl` does exactly that (`09-design-b.md` §8.1 binds
+    /// world `@group(0)`, GI `@group(1)`, atmosphere `@group(3)`).
+    pub empty_layout: BindGroupLayoutDescriptor,
+    /// `@group(0)` for the Phase-B `rayQueueCalc` passes (`09-design-b.md`
+    /// §4.5): `gi_params` (uniform), `first_hit_data` (read-only storage),
+    /// `ray_queue` (read-write storage), `ray_queue_indirect` (read-write
+    /// storage), `taa_sample_accum` (read-only storage). Shared by both the
+    /// `RayQueue` and `RayQueueStore` passes.
+    pub ray_queue_layout: BindGroupLayoutDescriptor,
+    /// `@group(1)` for the Phase-B `renderGlobalIllum` pass (`09-design-b.md`
+    /// §8.1): `gi_params` (uniform), `first_hit_data` (read-only),
+    /// `first_hit_absorption` / `valid_samples` / `invalid_samples` /
+    /// `sample_counts` / `final_color` (read-write), `ray_queue` (read-only),
+    /// `camera_history` (read-only). `globalIllum` also binds `@group(0)` world
+    /// + `@group(3)` atmosphere.
+    pub global_illum_layout: BindGroupLayoutDescriptor,
     /// Cached id of the `naadf_first_hit` compute pipeline.
     pub first_hit_pipeline: CachedComputePipelineId,
     /// Cached id of the `taa.wgsl` `reproject_old_samples` compute pipeline
@@ -116,6 +142,22 @@ pub struct NaadfPipelines {
     /// Cached id of the `naadf_atmosphere.wgsl` `precompute_atmosphere` compute
     /// pipeline (`09-design-b.md` §4.3 / §5.1).
     pub atmosphere_pipeline: CachedComputePipelineId,
+    /// Cached id of the `ray_queue_calc.wgsl` `calc_ray_queue` compute pipeline
+    /// (`09-design-b.md` §4.5 / §7) — the adaptive ray-queue builder.
+    pub ray_queue_pipeline: CachedComputePipelineId,
+    /// Cached id of the `ray_queue_calc.wgsl` `calc_ray_queue_store` compute
+    /// pipeline (`[numthreads(1,1,1)]`) — converts the raw queued-pixel count
+    /// into the indirect workgroup count for `globalIllum`.
+    pub ray_queue_store_pipeline: CachedComputePipelineId,
+    /// Cached id of the `naadf_global_illum.wgsl` `calc_global_ilum` compute
+    /// pipeline (`09-design-b.md` §4.6 / §8.1) — the ≤3-bounce GI tracer,
+    /// dispatched indirect off `ray_queue_indirect`.
+    pub global_illum_pipeline: CachedComputePipelineId,
+    /// An entry-less bind group for `empty_layout` — `naadf_global_illum_node`
+    /// must `set_bind_group(2, ...)` since the `globalIllum` pipeline layout
+    /// has a placeholder at index 2 (`09-design-b.md` §8.1 — the shader skips
+    /// `@group(2)`). Created once in `from_world`.
+    pub empty_bind_group: BindGroup,
     /// Per-`TextureFormat` cache of the `naadf_final` fullscreen render
     /// pipeline (see the module doc — the colour-target format is per-view).
     pub blit_pipelines: HashMap<TextureFormat, CachedRenderPipelineId>,
@@ -273,6 +315,60 @@ impl FromWorld for NaadfPipelines {
             ),
         );
 
+        let gi_params_size =
+            NonZeroU64::new(std::mem::size_of::<GpuGiParams>() as u64).unwrap();
+
+        // --- the entry-less placeholder layout ------------------------------
+        // wgpu pipeline layouts are a `Vec` indexed by group number;
+        // `naadf_global_illum.wgsl` uses `@group(0)` + `@group(1)` + `@group(3)`
+        // (skipping `@group(2)` — `09-design-b.md` §8.1), so index 2 needs a
+        // placeholder with zero bindings — a `BindGroupLayoutDescriptor` over an
+        // empty entry slice.
+        let empty_layout =
+            BindGroupLayoutDescriptor::new("naadf_empty_bind_group_layout", &[]);
+
+        // --- @group(0): the Phase-B `rayQueueCalc` bind group ---------------
+        // `gi_params` uniform; `first_hit_data` read-only storage; `ray_queue` +
+        // `ray_queue_indirect` read-write storage; `taa_sample_accum` read-only
+        // storage (`09-design-b.md` §4.5). Shared by `RayQueue` + `RayQueueStore`.
+        let ray_queue_layout = BindGroupLayoutDescriptor::new(
+            "naadf_ray_queue_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(gi_params_size)),
+                    storage_buffer_read_only_sized(false, None), // first_hit_data
+                    storage_buffer_sized(false, None),           // ray_queue, rw
+                    storage_buffer_sized(false, None),           // ray_queue_indirect, rw
+                    storage_buffer_read_only_sized(false, None), // taa_sample_accum
+                ),
+            ),
+        );
+
+        // --- @group(1): the Phase-B `renderGlobalIllum` bind group ----------
+        // `gi_params` uniform; `first_hit_data` / `ray_queue` / `camera_history`
+        // read-only storage; `first_hit_absorption` / `valid_samples` /
+        // `invalid_samples` / `sample_counts` / `final_color` read-write storage
+        // (`09-design-b.md` §8.1). `globalIllum` also binds `@group(0)` world +
+        // `@group(3)` atmosphere.
+        let global_illum_layout = BindGroupLayoutDescriptor::new(
+            "naadf_global_illum_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(gi_params_size)),
+                    storage_buffer_read_only_sized(false, None), // first_hit_data
+                    storage_buffer_sized(false, None),           // first_hit_absorption, rw
+                    storage_buffer_sized(false, None),           // valid_samples, rw
+                    storage_buffer_sized(false, None),           // invalid_samples, rw
+                    storage_buffer_sized(false, None),           // sample_counts, rw
+                    storage_buffer_sized(false, None),           // final_color, rw
+                    storage_buffer_read_only_sized(false, None), // ray_queue
+                    storage_buffer_read_only_sized(false, None), // camera_history
+                ),
+            ),
+        );
+
         // --- compute pipeline (single, format-agnostic) ---------------------
         let first_hit_shader = asset_server.load(FIRST_HIT_SHADER);
         let first_hit_pipeline =
@@ -317,15 +413,62 @@ impl FromWorld for NaadfPipelines {
                 ..default()
             });
 
+        // --- the Phase-B `rayQueueCalc` pipelines (Batch 3) -----------------
+        // Both passes share the `ray_queue_layout` `@group(0)` — `RayQueue` is
+        // `[numthreads(64,1,1)]`, `RayQueueStore` is `[numthreads(1,1,1)]`
+        // (`09-design-b.md` §4.5 / §7). One shader file, two entry points.
+        let ray_queue_shader = asset_server.load(RAY_QUEUE_SHADER);
+        let ray_queue_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_ray_queue_pipeline".into()),
+                layout: vec![ray_queue_layout.clone()],
+                shader: ray_queue_shader.clone(),
+                entry_point: Some(Cow::from("calc_ray_queue")),
+                ..default()
+            });
+        let ray_queue_store_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_ray_queue_store_pipeline".into()),
+                layout: vec![ray_queue_layout.clone()],
+                shader: ray_queue_shader,
+                entry_point: Some(Cow::from("calc_ray_queue_store")),
+                ..default()
+            });
+
+        // --- the Phase-B `renderGlobalIllum` pipeline (Batch 3) -------------
+        // Layout `[world, global_illum, empty, atmosphere_read]` — the shader
+        // uses `@group(0)` world + `@group(1)` GI + `@group(3)` atmosphere
+        // (`09-design-b.md` §8.1); index 2 is the entry-less placeholder.
+        // Dispatched INDIRECT off `ray_queue_indirect` (`WorldRenderBase.cs:323`).
+        let global_illum_shader = asset_server.load(GLOBAL_ILLUM_SHADER);
+        let global_illum_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_global_illum_pipeline".into()),
+                layout: vec![
+                    world_layout.clone(),
+                    global_illum_layout.clone(),
+                    empty_layout.clone(),
+                    atmosphere_read_layout.clone(),
+                ],
+                shader: global_illum_shader,
+                entry_point: Some(Cow::from("calc_global_ilum")),
+                ..default()
+            });
+
         // The blit pipeline is queued lazily per target format — see
         // `prepare_blit_pipeline`. Capture the vertex state + fragment shader
         // handle so re-queuing is cheap.
         let blit_vertex = fullscreen_shader.to_vertex_state();
         let blit_shader = asset_server.load(FINAL_BLIT_SHADER);
 
-        // Keep `render_device` referenced — future Phase-A-2 / B work creates
-        // samplers here; for Phase A the layouts/pipelines need only the cache.
-        let _ = render_device;
+        // The entry-less bind group for `empty_layout` — `globalIllum`'s
+        // pipeline layout has a placeholder at `@group(2)`, so the node must
+        // bind *something* there. Created once here.
+        let empty_bind_group = render_device.create_bind_group(
+            "naadf_empty_bind_group",
+            &pipeline_cache.get_bind_group_layout(&empty_layout),
+            &[],
+        );
 
         NaadfPipelines {
             world_layout,
@@ -335,9 +478,16 @@ impl FromWorld for NaadfPipelines {
             taa_reproject_layout,
             atmosphere_layout,
             atmosphere_read_layout,
+            empty_layout,
+            ray_queue_layout,
+            global_illum_layout,
             first_hit_pipeline,
             taa_reproject_pipeline,
             atmosphere_pipeline,
+            ray_queue_pipeline,
+            ray_queue_store_pipeline,
+            global_illum_pipeline,
+            empty_bind_group,
             blit_pipelines: HashMap::default(),
             blit_vertex,
             blit_shader,
