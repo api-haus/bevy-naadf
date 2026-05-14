@@ -304,8 +304,8 @@ fn reproject_sample(first_hit_packed: vec4<u32>) -> ReprojResult {
     var r: ReprojResult;
     r.valid = false;
 
-    let cam_pos_int = gi_params.cam_pos_int;
-    let cam_pos_frac = gi_params.cam_pos_frac;
+    let cam_pos_int = gi_params.cam_pos_int.xyz;
+    let cam_pos_frac = gi_params.cam_pos_frac.xyz;
 
     let pixel_pos_old = vec2<u32>(
         first_hit_packed.y & 0x7FFFu,
@@ -444,7 +444,7 @@ fn count_valid_data_and_refine(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
 ) {
-    let cam_pos_int = gi_params.cam_pos_int;
+    let cam_pos_int = gi_params.cam_pos_int.xyz;
     let start_index = sample_counts[0].x;
     let total_count = sample_counts[1].x;
     let group_shuffle_coprime = sample_counts[2].x;

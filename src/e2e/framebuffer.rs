@@ -66,11 +66,20 @@ pub const NON_BLACK_EPS: f32 = 2.0;
 /// `GpuTaaParams` WGSL/`#[repr(C)]` layout mismatch fixed, the TAA path executes
 /// and the blit reads a real `taa_sample_accum` — the e2e frame is no longer
 /// black, measuring **69.3%** non-black (sky + the five emissive blocks; the GI
-/// bounce onto dark diffuse geometry is still weak — see [`MIN_GI_BOUNCE_LUMINANCE`]
-/// and `10-impl-b.md`'s Batch-6 black-frame-fix section). Set to **0.68** — just
-/// below the measured value, above the user's 50% floor: a real regression
-/// tripwire on the lit-fraction, not a rubber stamp.
-pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.68;
+/// bounce onto dark diffuse geometry was still weak at that point).
+///
+/// **Re-measured (2026-05-15, GI-bounce visibility fix):** the second
+/// `vec3`-then-scalar uniform-layout bug — this one in `GpuGiParams` — was
+/// found and fixed (the `sun_color` `vec3` followed by `screen_width` shifted
+/// every GI-uniform scalar 4 bytes early, so `bucket_count == 0` ⇒
+/// `clear_buckets_and_calc_mask` populated nothing ⇒ the whole `sampleRefine →
+/// spatialResampling` reservoir chain was dead). With it fixed (and the e2e
+/// frame budget raised to 96 so NAADF's temporal-accumulation GI converges) the
+/// GI bounce now visibly lights the diffuse geometry — the e2e frame measures
+/// **99.2%** non-black. Set to **0.95** — just below the measured value, a real
+/// regression tripwire on the GI-lit fraction (it trips hard if the GI chain
+/// regresses to the pre-fix ~69% sky+emissive-only state), not a rubber stamp.
+pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.95;
 
 /// The minimum non-black fraction for the **pre-GI** batches (Batch 1–4).
 ///

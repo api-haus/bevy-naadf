@@ -10,22 +10,37 @@
 //
 // LAYOUT — naga-oil composable-module structs cannot carry the `_pad0`-style /
 // `data1`-style identifiers the Rust `#[repr(C)]` struct uses (naga writeback
-// rejects trailing-digit identifiers and bare `_padN`). But the WGSL std140-ish
-// uniform layout pads a `vec3` to a 16-byte slot anyway, so this struct needs
-// NO explicit pad members and is still byte-identical to the padded Rust
-// struct: `inv_view_proj` (0..64), `view_proj` (64..128), then four 16-byte
-// `vec3` rows — `cam_pos_int` (128, slot 128..144), `cam_pos_frac` (144),
-// `sky_sun_dir` (160), `sun_color` (176) — then the 24-`u32` scalar tail
-// (`screen_width` at 192 … the last `u32` at 192 + 23*4 = 284, struct end 288).
-// This is the *same* convention `render_pipeline_common.wgsl`'s `GpuCamera` /
-// `GpuRenderParams` use (and it holds here because every `vec3` row IS followed
-// by another `vec3` or by a u32 that the Rust struct also pads — verified
-// field-by-field against `gpu_types::GpuGiParams`).
+// rejects trailing-digit identifiers and bare `_padN`).
 //
-// (The `vec3`-then-scalar uniform trap that bit `AtmosphereParams` in Batch 1
-// does NOT apply here: there is no `vec3` immediately followed by a lone scalar
-// — the four `vec3` rows are contiguous, then the scalar tail begins on a fresh
-// 16-byte boundary at offset 192.)
+// CRITICAL — the `vec3`-then-scalar uniform trap (the SAME bug that bit
+// `AtmosphereParams` in Batch 1 and `GpuTaaParams` in Batch 6). A WGSL
+// `vec3<T>` has size 12 / align 16. When a `vec3` is followed by another
+// 16-byte-aligned member (or ends the struct) WGSL's `vec3`→16-byte slotting
+// reproduces the padded Rust `#[repr(C)]` layout — so the first three rows
+// (`cam_pos_int`/`cam_pos_frac`/`sky_sun_dir`, each `vec3` followed by a `vec3`)
+// would be fine as bare `vec3`. But the FOURTH row, `sun_color` (`vec3<f32>`,
+// 176..188), is followed by `screen_width` (a lone `u32`) — and WGSL packs that
+// scalar into `sun_color`'s trailing 4 bytes (offset 188), whereas the Rust
+// struct has an explicit `_pad3: u32` there and writes `screen_width` at 192.
+// A bare-`vec3` `sun_color` therefore shifts EVERY scalar-tail field 4 bytes
+// early: `screen_width` reads Rust's `_pad3` (always 0) ⇒ `pixel_count == 0`,
+// `bucket_count` reads a wrong value ⇒ `clear_buckets_and_calc_mask`'s
+// `global_id.x >= bucket_count` guard rejects every lane ⇒ `bucket_info` never
+// populated ⇒ the entire `renderSampleRefine → renderSpatialResampling` GI
+// reservoir chain produces nothing ⇒ NO visible GI bounce on diffuse geometry.
+// (The original "verified field-by-field — no explicit pad needed" claim here
+// was WRONG, exactly as the identical `GpuTaaParams` claim was — `10-impl-b.md`
+// Batch-6 TAA-path fix.)
+//
+// THE FIX (2026-05-15) — declare ALL FOUR position/colour rows as `vec4`: the
+// Rust `_pad0`/`_pad1`/`_pad2`/`_pad3` `u32`s become the `.w` lanes, so every
+// member from `screen_width` on lands at exactly the offset the 288-byte Rust
+// `#[repr(C)]` struct writes it to. Consumers read `.xyz`. This is the standard
+// idiomatic WGSL way to mirror a padded `repr(C)` struct (the same fix
+// `GpuTaaParams` got). Layout: `inv_view_proj` (0..64), `view_proj` (64..128),
+// `cam_pos_int` vec4 (128..144), `cam_pos_frac` vec4 (144..160), `sky_sun_dir`
+// vec4 (160..176), `sun_color` vec4 (176..192), then the 24-`u32` scalar tail
+// (`screen_width` at 192 … the last `u32` at 284, struct end 288).
 //
 // naga-oil import module.
 
@@ -35,14 +50,18 @@ struct GpuGiParams {
     inv_view_proj: mat4x4<f32>,
     // C# `camMatrix` — `sampleRefine`'s reproject (rotation-only view-proj).
     view_proj: mat4x4<f32>,
-    // C# `camPosInt`.
-    cam_pos_int: vec3<i32>,
-    // C# `camPosFrac`.
-    cam_pos_frac: vec3<f32>,
-    // C# `skySunDir` — shared with the atmosphere uniform.
-    sky_sun_dir: vec3<f32>,
+    // C# `camPosInt` — `vec4` so the Rust `_pad0` is the `.w` lane (see the
+    // LAYOUT note above); consumers read `.xyz`.
+    cam_pos_int: vec4<i32>,
+    // C# `camPosFrac` — `vec4` (Rust `_pad1` in `.w`); consumers read `.xyz`.
+    cam_pos_frac: vec4<f32>,
+    // C# `skySunDir` — shared with the atmosphere uniform. `vec4` (Rust `_pad2`
+    // in `.w`); consumers read `.xyz`.
+    sky_sun_dir: vec4<f32>,
     // C# `sunColor` = `Atmosphere.GetLightForPoint` (`09-design-b.md` §9.2).
-    sun_color: vec3<f32>,
+    // `vec4` (Rust `_pad3` in `.w`) — this is the row whose bare-`vec3` form was
+    // the bug; consumers read `.xyz`.
+    sun_color: vec4<f32>,
     // --- the 24-u32 scalar tail (offset 192) -------------------------------
     screen_width: u32,
     screen_height: u32,

@@ -184,8 +184,8 @@ fn calc_global_ilum(
     }
     workgroupBarrier();
 
-    let cam_pos_int = gi_params.cam_pos_int;
-    let cam_pos_frac = gi_params.cam_pos_frac;
+    let cam_pos_int = gi_params.cam_pos_int.xyz;
+    let cam_pos_frac = gi_params.cam_pos_frac.xyz;
     let screen_width = gi_params.screen_width;
     let screen_height = gi_params.screen_height;
 
@@ -336,7 +336,7 @@ fn calc_global_ilum(
             }
 
             let sun_dir_rand = get_uniform_hemisphere_sample(
-                vec2<f32>(next_rand(&rand), next_rand(&rand)), gi_params.sky_sun_dir, 0.9999,
+                vec2<f32>(next_rand(&rand), next_rand(&rand)), gi_params.sky_sun_dir.xyz, 0.9999,
             );
             // HLSL `float3 fac = saturate(...) * 2` — the scalar is broadcast to
             // a `float3` (the rough-specular branch multiplies it by the `vec3`
@@ -366,7 +366,7 @@ fn calc_global_ilum(
                     MAX_RAY_STEPS_SUN_SECONDARY, &temp,
                 );
                 if (!sun_blocked) {
-                    radiance += cur_absorption * gi_params.sun_color * fac * 1.0;
+                    radiance += cur_absorption * gi_params.sun_color.xyz * fac * 1.0;
                 }
             }
         }

@@ -167,7 +167,7 @@ fn sample_neighbors(
     type_index: u32,
 ) -> vec3<f32> {
     var rand = init_rand(vec3<u32>(pixel_pos, gi_params.rand_counter));
-    let cam_pos_int = gi_params.cam_pos_int;
+    let cam_pos_int = gi_params.cam_pos_int.xyz;
 
     var sum_weight: f32 = 0.0;
 
@@ -381,7 +381,7 @@ fn sample_neighbors(
                 neighbor.sample_dir,
                 normalize(
                     vec3<f32>(cam_pos_int - neighbor.vis_pos_int)
-                    + (gi_params.cam_pos_frac - neighbor.vis_pos_frac)
+                    + (gi_params.cam_pos_frac.xyz - neighbor.vis_pos_frac)
                 ),
                 first_hit_type.roughness, first_hit.normal,
             ),
@@ -531,7 +531,7 @@ fn sample_neighbors(
     // lands at end-of-Batch-5 even though the reservoir loop yields nothing
     // until Batch 6 fills `taa_dist_min_max` (see the module header).
     let sun_dir_rand = get_uniform_hemisphere_sample(
-        vec2<f32>(next_rand(&rand), next_rand(&rand)), gi_params.sky_sun_dir, 0.9999,
+        vec2<f32>(next_rand(&rand), next_rand(&rand)), gi_params.sky_sun_dir.xyz, 0.9999,
     );
     var sun_temp: RayResult;
     let is_sun_blocked = shoot_ray(
@@ -556,7 +556,7 @@ fn sample_neighbors(
             weight *= (0.5 * d * g_in * g_out * f)
                 / (4.0 * sun_dir_cos_theta * dot(-first_hit.ray_dir, first_hit.normal));
         }
-        color += gi_params.sun_color * weight;
+        color += gi_params.sun_color.xyz * weight;
     }
 
     return color;
@@ -566,7 +566,7 @@ fn sample_neighbors(
 // `[numthreads(64,1,1)]`.
 @compute @workgroup_size(64, 1, 1)
 fn calc_spatial_resampling(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let cam_pos_int = gi_params.cam_pos_int;
+    let cam_pos_int = gi_params.cam_pos_int.xyz;
     let screen_width = gi_params.screen_width;
     let screen_height = gi_params.screen_height;
 
@@ -587,7 +587,7 @@ fn calc_spatial_resampling(@builtin(global_invocation_id) global_id: vec3<u32>) 
 
     var color = vec3<f32>(0.0, 0.0, 0.0);
     let first_hit_result: FirstHitResult = get_hit_data_from_planes(
-        first_hit, cam_pos_int, gi_params.cam_pos_frac, ray_dir,
+        first_hit, cam_pos_int, gi_params.cam_pos_frac.xyz, ray_dir,
     );
     let first_hit_type_index = first_hit.z & 0x7FFFu;
     if (first_hit_result.normal_tang != HIT_NOTHING) {

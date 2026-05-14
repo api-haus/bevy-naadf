@@ -1957,3 +1957,184 @@ light the dark diffuse geometry — a GI-consumer-chain issue (now observable fo
 the first time, since the TAA path finally feeds it) that must be fixed before
 the Phase-B review gate's "bounce lighting visible" done-bar can pass. That is
 a distinct, follow-up dispatch — not the Batch-6 TAA-path bug.
+
+---
+
+## GI-bounce visibility fix (2026-05-15)
+
+**Status: FIXED — the GI bounce now visibly lights the dark diffuse geometry.**
+The previously-near-black voxel structure (towers, back wall + arch, pillars,
+boxes, spheres, ground) is now fully lit by colored GI bounce from the five
+emissive blocks; the sky stays clean, the emissive blocks still render. The e2e
+`assert_batch_6` region gate + the `MIN_NON_BLACK_FRACTION_GI` liveness gate
+both pass **honestly** at the design-intent `MIN_GI_BOUNCE_LUMINANCE = 12.0`.
+Two root causes — a second `vec3`-then-scalar uniform-layout bug (the real
+defect) and the e2e frame budget (a temporal-renderer test-infra requirement).
+
+### Stage-by-stage trace — where the bounce died
+
+The diagnosis followed the GI data flow `globalIllum → rayQueueCalc →
+sampleRefine → valid_samples_compressed → spatialResampling → denoiser →
+final_color → calc_new_taa_sample → taa_sample_accum → blit`, with targeted
+buffer-to-visible-output probes (the technique used successfully earlier in
+this debug). Eight e2e runs:
+
+1. **Frame-budget probe (run 1).** Per the brief's candidate #5, bumped
+   `E2E_RENDER_FRAMES` 8 → 96. Result: `solid_block_rect` still **4.3** (vs the
+   12.0 threshold). So the frame budget alone is NOT the cause — there is a
+   real bug. (But it ruled candidate #5 *in* as a *contributing* factor — see
+   below.)
+2. **`calc_new_taa_sample` ×8 passthrough + spatial `final_color = color`
+   probe (run 2).** PASSED, 100% non-black — proved the GI consumer chain
+   produces *something*.
+3. **Denoiser bilateral-vs-raw split probe (run 3).** `color` (bilateral) and
+   `color_orig` (raw spatial) BOTH dark after `* absorption` — pushed the
+   suspect upstream of the denoiser.
+4. **`sample_neighbors` raw-magnitude probe (run 4)** — spatial overwrites
+   `final_color = color`, denoiser no-op'd, `calc_new_taa_sample` raw
+   passthrough. Result **4.4** — proved `sample_neighbors` itself produces only
+   ~0.017 luminance; the bug is in the GI consumer chain, not the TAA path.
+5. **Reservoir-counter diagnostic probe (run 5)** — `sample_neighbors` returns
+   `(passed-normal count, populated-bucket count, neighbor-color magnitude)`.
+   All three ≈ **0** for the diffuse geometry — the 12-iteration reservoir loop
+   never even passes the bucket normal-mask test.
+6. **`bucket_info` own-bucket probe (run 6)** — `sample_neighbors` returns the
+   pixel's own bucket state. `normal_mask`, `valid_stored`, AND `bucket.y`
+   (distance) all **0** — `bucket_info` is entirely zero.
+7. **`clear_buckets_and_calc_mask` constant-write probe (run 7)** — `clear`
+   writes a hard constant `0x3F`/`1` into `bucket_info`; the own-bucket probe
+   *still* reads zero. So `clear_buckets_and_calc_mask`'s `bucket_info` writes
+   **never land** — even a forced constant. Since the bind groups are coherent
+   (`clear` and `spatialResampling` both bind `gi_gpu.bucket_info`) and `clear`
+   IS in the chain, the only remaining mechanism: `clear`'s per-lane
+   `if (global_id.x >= gi_params.bucket_count) return;` guard rejects **every**
+   lane → it writes nothing → `bucket_info` stays zero-cleared.
+8. **Final confirmation run (run 8)** — post-fix, see Verification.
+
+### Root cause #1 (the real defect) — a second `vec3`-then-scalar `GpuGiParams` layout bug
+
+`gi_params.wgsl`'s `GpuGiParams` declared its four position/colour rows as bare
+`vec3` — `cam_pos_int` / `cam_pos_frac` / `sky_sun_dir` / `sun_color`. A WGSL
+`vec3<T>` has size 12 / align 16. The first three rows are each followed by
+another `vec3`, so WGSL's `vec3`→16-byte slotting reproduces the padded Rust
+`#[repr(C)]` layout. But the **fourth** row, `sun_color` (`vec3<f32>`,
+176..188), is followed by `screen_width` — a lone `u32`. WGSL packs that scalar
+into `sun_color`'s trailing 4 bytes (offset **188**), whereas the Rust struct
+has an explicit `_pad3: u32` there and writes `screen_width` at **192**.
+
+So every `GpuGiParams` scalar-tail field was read **4 bytes early**: WGSL
+`screen_width` decoded Rust's `_pad3` (always `0`), `screen_height` decoded
+Rust's `screen_width`, … `bucket_count` decoded a wrong neighbouring value.
+With `bucket_count` wrong (effectively a small/zero value),
+`clear_buckets_and_calc_mask`'s `if (global_id.x >= gi_params.bucket_count)
+return;` guard rejected every bucket lane ⇒ `bucket_info` never populated ⇒
+`sampleRefine`'s reproject-and-refine produced empty `valid_samples_compressed`
+⇒ `spatialResampling`'s 12-iteration reservoir loop found `normal_mask == 0`
+for every bucket and selected nothing ⇒ **no indirect GI bounce composited into
+`final_color`**. The emissive blocks still rendered because the first-hit pass
+writes their emission directly into `final_color` and reads `GpuRenderParams`
+(no `vec3`-then-scalar transition), not `GpuGiParams`.
+
+This is **the identical bug class** that bit `AtmosphereParams` (Batch 1) and
+`GpuTaaParams` (Batch 6's TAA-path black-frame fix). The `gi_params.wgsl`
+header comment explicitly — and wrongly — claimed "the `vec3`-then-scalar
+uniform trap … does NOT apply here … verified field-by-field"; that "verified"
+claim was as wrong as the identical `GpuTaaParams` claim was. The bug stayed
+latent until this dispatch because Batch 6 was the first batch to wire
+`taa_dist_min_max`, which is what first made the `sampleRefine →
+spatialResampling` chain actually *try* to run end-to-end.
+
+**Confirmation against NAADF source:** not an HLSL-faithfulness issue at all —
+NAADF's HLSL `cbuffer` packing and the C# uploader agree by construction; this
+is purely a WGSL-port `#[repr(C)]`-vs-WGSL-`std140` layout mismatch on the Bevy
+side, exactly as the two prior instances were.
+
+### Root cause #2 (contributing) — the e2e frame budget vs. NAADF's temporal GI
+
+NAADF's compressed-ReSTIR GI is a *temporal* algorithm: `renderGlobalIllum`
+writes lit/unlit samples into the 128-frame `sample_counts` accumulation ring,
+and `renderSampleRefine`'s `refineBuckets` has a hard gate
+(`base/renderSampleRefine.fx:411` — `if (newValidCount + newInvalidCount < 12)
+curCompressedIndex = 0`) that zeros a bucket's compressed output until it has
+accumulated ≥12 samples across the temporal window. The original e2e budget of
+**8 render frames** never fills the ring far enough — even with root cause #1
+fixed, 8 frames would not reach the 12-sample threshold for stable buckets.
+The fix raises `E2E_RENDER_FRAMES` 8 → **96** (comfortably past the
+up-to-64-frame `computeValidHistory` ring-capacity window). The e2e camera is a
+fixed pose, so every extra frame is pure deterministic convergence — no scene
+change. **This is the allowed test-infrastructure change** (the brief's
+candidate #5 / the explicit exception): the GI pipeline is a faithful port, it
+just needs the frame budget a temporal-accumulation renderer requires.
+
+### The fix (files changed, what and why)
+
+- **`src/assets/shaders/gi_params.wgsl`** — `GpuGiParams`'s `cam_pos_int` /
+  `cam_pos_frac` / `sky_sun_dir` / `sun_color` changed from `vec3<…>` to
+  **`vec4<…>`**: the Rust `_pad0`/`_pad1`/`_pad2`/`_pad3` `u32`s become the
+  `.w` lanes, so every member from `screen_width` on lands at exactly the
+  offset the 288-byte Rust `#[repr(C)]` struct writes it to. The struct-header
+  comment block was rewritten to record *why* the `vec3`-then-scalar case needs
+  `vec4` (so the trap is not re-introduced a fourth time). This is the standard
+  idiomatic WGSL way to mirror a padded `repr(C)` struct — the same fix
+  `GpuTaaParams` got in the Batch-6 TAA-path fix. `gpu_types::GpuGiParams` (the
+  Rust side) is unchanged — it was already correct (288 B, explicit pads); the
+  `const _: assert!` size check still holds.
+- **`src/assets/shaders/naadf_global_illum.wgsl`**,
+  **`src/assets/shaders/sample_refine.wgsl`**,
+  **`src/assets/shaders/spatial_resampling.wgsl`** — every read of the four
+  now-`vec4` fields gains `.xyz` (12 call sites total). They feed
+  `get_hit_data_from_planes` / `get_uniform_hemisphere_sample` / the sun-colour
+  adds — all `vec3`-typed, so `.xyz` is the exact, type-correct adaptation.
+  `ray_queue_calc.wgsl` imports `GpuGiParams` but reads only scalar-tail fields
+  (`screen_width` / `frame_count` / `flags`) — no `.xyz` edit needed, but it
+  *benefits* from the fix (it too had been reading those fields 4 bytes early).
+- **`src/e2e/mod.rs`** — `E2E_RENDER_FRAMES` 8 → 96 (root cause #2; the
+  test-infra change). The const's doc comment records the temporal-GI
+  accumulation requirement + the `refineBuckets` `< 12` gate citation.
+- **`src/e2e/framebuffer.rs`** — `MIN_NON_BLACK_FRACTION_GI` 0.68 → **0.95**
+  (honest recalibration): with the fix the GI-lit e2e frame measures **99.2%**
+  non-black; 0.95 is just below the measured value — a real regression
+  tripwire that trips hard if the GI chain regresses to the pre-fix
+  ~69% sky+emissive-only state. `MIN_GI_BOUNCE_LUMINANCE` is **held at 12.0** —
+  the design-intent value; the bounce now *genuinely* clears it, so no
+  rubber-stamp recalibration was needed or done.
+
+### Verification
+
+- `cargo build` — clean, no warnings.
+- `cargo test` — **46 passed** (4 suites), unchanged.
+- `cargo run --bin e2e_render` — exits **0**, all gates green: luminance gate
+  `batch 6 — 99.2% non-black; threshold 95%`, then `PASS (batch 6) — 96 render
+  frames, … per-batch region gate green, every pipeline created cleanly, every
+  expected render-graph node dispatched.` `assert_batch_6`'s positive
+  GI-bounce check (`solid_block_rect` brightened past `MIN_GI_BOUNCE_LUMINANCE
+  = 12.0`) passes.
+- **Visual assessment of `target/e2e-screenshots/e2e_latest.png`:** the
+  previously-near-black voxel structure is now **fully and visibly lit by
+  colored GI bounce** — the sand/grey towers and the back wall (with its arch
+  doorway now clearly visible) read warmly lit; the ground plane is lit; there
+  is soft colored bounce tinting near the colored emissive blocks (pink / blue
+  / green casts on nearby surfaces); the boxes, pillars and spheres are all
+  lit. The five emissive blocks still render bright; the atmosphere sky band
+  stays clean across the top with no streaks or rings. This is a real,
+  observable, colored GI bounce — the Phase-B done-bar.
+- 8 of 8 e2e invocations used (the hard cap): runs 1–7 were the diagnosis
+  probes (all reverted), run 8 the post-fix confirmation. `grep -rn "TEMP"
+  src/` is clean; `git diff` shows only the real fix (`gi_params.wgsl` + the 3
+  consumer shaders), the honest threshold recalibration (`framebuffer.rs`), and
+  the test-infra frame-budget bump (`mod.rs`) — no debug residue.
+
+### Phase B impl status
+
+**Phase B impl is now FEATURE-COMPLETE.** The full NAADF `WorldRenderBase`
+real-time GI pipeline — all 13 render-graph nodes — runs end-to-end: 4-plane
+first-hit → `base/` long-term-memory TAA → adaptive `rayQueueCalc` →
+compressed-ReSTIR `globalIllum` → 5-pass `sampleRefine` → `spatialResampling`
+(Algorithm 2) → sparse bilateral denoiser → `calc_new_taa_sample` → final blit.
+The GI bounce **visibly lights the diffuse geometry** with colored bounce from
+the emissive blocks, the build + all 46 tests are green, and the e2e harness
+passes honestly (the region gate at the design-intent `MIN_GI_BOUNCE_LUMINANCE
+= 12.0`, the liveness gate recalibrated to the real 99.2% GI-lit fraction). The
+remaining work for Phase B is the **user interactive review gate**
+(`01-context.md` §2d done-bar — "bounce lighting visible, temporally stable,
+no obvious artifacts"), not further implementation.

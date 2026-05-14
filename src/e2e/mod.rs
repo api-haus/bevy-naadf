@@ -55,7 +55,26 @@ pub const E2E_HEIGHT: u32 = 256;
 /// render-graph pipeline has been **created**, which is exactly what the §3.1
 /// `PipelineCache` scan needs (R3). If a future batch adds a pipeline still
 /// `Queued` at the scan, the fix is bumping this const, not a redesign.
-pub const E2E_RENDER_FRAMES: u32 = 8;
+///
+/// **Phase B GI accumulation requirement (2026-05-15).** NAADF's compressed-
+/// ReSTIR GI is a *temporal* algorithm: `renderGlobalIllum` writes lit/unlit
+/// samples into the 128-frame `sample_counts` accumulation ring, and
+/// `renderSampleRefine`'s `refineBuckets` has a hard gate
+/// (`renderSampleRefine.fx:411` — `if (newValidCount + newInvalidCount < 12)
+/// curCompressedIndex = 0`) that zeros a bucket's compressed output until it
+/// has accumulated ≥12 samples across the temporal window. With the original
+/// 8-frame budget the ring barely filled — buckets never reached the 12-sample
+/// threshold, `valid_samples_compressed` stayed empty, and
+/// `renderSpatialResampling`'s reservoir loop found `bucket_valid_stored == 0`
+/// for every bucket ⇒ NO indirect GI bounce composited into `final_color` (only
+/// the negligible independent sun sample survived). The GI pipeline is a
+/// faithful port — it simply needs the frame budget a temporal-accumulation
+/// renderer requires. 96 frames is comfortably past the up-to-64-frame
+/// `computeValidHistory` ring-capacity window, so the buckets fully populate
+/// and the GI bounce converges to a stable, visible result. The e2e camera is
+/// a fixed pose (`setup_e2e_camera`), so every extra frame is pure convergence
+/// — no scene change, fully deterministic.
+pub const E2E_RENDER_FRAMES: u32 = 96;
 
 /// The fixed directory every run writes its readback screenshot PNG(s) into
 /// (`e2e-render-test.md` Implementation log — 2026-05-14 screenshot-to-disk
