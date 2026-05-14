@@ -162,9 +162,9 @@ pub struct GiGpu {
 /// because they reference `GiGpu` + `FrameGpu` + `TaaGpu` buffers and must be
 /// built after all three resources exist (`09-design-b.md` §10.3).
 ///
-/// Batch 3 lands two of them; the rest (`sample_refine_bind_group`,
-/// `spatial_resampling_bind_group`, `denoise_bind_group`,
-/// `calc_new_taa_sample_bind_group`) arrive in Batches 4-6.
+/// Batch 3 lands two of them, Batch 4 adds `sample_refine_bind_group`; the rest
+/// (`spatial_resampling_bind_group`, `denoise_bind_group`,
+/// `calc_new_taa_sample_bind_group`) arrive in Batches 5-6.
 #[derive(Resource)]
 pub struct GiBindGroups {
     /// `@group(0)` for the `ray_queue_calc` passes (`09-design-b.md` §4.5):
@@ -176,6 +176,23 @@ pub struct GiBindGroups {
     /// `valid_samples` (rw), `invalid_samples` (rw), `sample_counts` (rw),
     /// `final_color` (rw), `ray_queue` (read), `camera_history` (read).
     pub global_illum_bind_group: BindGroup,
+    /// `@group(0)` shared by all 5 `sample_refine` passes (`09-design-b.md`
+    /// §8.2): `gi_params`, `first_hit_data` (read), `bucket_info` (rw),
+    /// `valid_samples` (read), `valid_samples_refined` (rw),
+    /// `valid_samples_compressed` (rw), `invalid_samples` (read),
+    /// `sample_counts` (rw), `taa_dist_min_max` (read — `TaaGpu`),
+    /// `ray_queue_indirect` (rw), `camera_history` (read — `TaaGpu`). Mixes
+    /// `GiGpu` + `FrameGpu` + `TaaGpu`, so built here in `prepare_frame_gpu`.
+    /// (`valid_dispatch` / `invalid_dispatch` are NOT here — see
+    /// `sample_refine_dispatch_bind_group`.)
+    pub sample_refine_bind_group: BindGroup,
+    /// `@group(1)` for `sample_refine`'s `compute_valid_history` pass ONLY —
+    /// `valid_dispatch` + `invalid_dispatch` (rw). The wgpu indirect-vs-storage
+    /// split (`09-design-b.md` §8.2): these buffers are written by
+    /// `compute_valid_history` and then consumed as `dispatch_workgroups_indirect`
+    /// sources by the two count passes, so they cannot be bound rw in the shared
+    /// `@group(0)` (the count passes bind that group).
+    pub sample_refine_dispatch_bind_group: BindGroup,
     /// Pixel count these bind groups' buffers were sized for — the rebuild
     /// trigger (mirrors `FrameGpu.pixel_count`).
     pub pixel_count: u32,
@@ -238,19 +255,15 @@ pub fn prepare_gi(
     // `ray_queue_indirect[0]` is the queued-pixel counter: `calcRayQueue`
     // `atomicAdd`s into it, `calcRayQueueStore` rewrites it as the workgroup
     // count. It MUST be zeroed each frame *before* `calcRayQueue` runs
-    // (`09-design-b.md` §7.3) — in NAADF that reset is `ClearBucketsAndCalcMask`'s
-    // job, but that pass is Batch 4. **Batch-3 designed seam:** re-seed
-    // `ray_queue_indirect` to `[0,1,1,0,0]` from the CPU every frame here, so
-    // Batch 3 is correct standalone (without it `[0]` would carry the previous
-    // frame's workgroup count into the next frame's `atomicAdd`, over-launching
-    // `globalIllum`). When Batch 4 lands `ClearBucketsAndCalcMask`'s in-shader
-    // reset this CPU re-seed becomes redundant — Batch 4 can drop it (the same
-    // designed-seam pattern as Batch 2's temporary `final_color` blit source).
-    render_queue.write_buffer(
-        &resources.ray_queue_indirect,
-        0,
-        bytemuck::cast_slice(&[0u32, 1u32, 1u32, 0u32, 0u32]),
-    );
+    // (`09-design-b.md` §7.3). Batch 3 re-seeded `ray_queue_indirect` from the
+    // CPU here every frame as a standalone-correctness seam; **Batch 4 moves
+    // that reset in-shader** — `clear_buckets_and_calc_mask` (the first
+    // sample-refine pass, scheduled BEFORE `naadf_ray_queue_node` in the
+    // `09-design-b.md` §4.2 chain) does `ray_queue_indirect[0] = 0u` when
+    // `global_id.x == 0` (`renderSampleRefine.fx:39`). The CPU re-seed is
+    // therefore deleted — the in-shader reset is the faithful NAADF behaviour.
+    // (`ray_queue_indirect` is still seeded `[0,1,1,0,0]` *on creation* in
+    // `create_gi_buffers` so `[1]`/`[2]` = `GroupCountY/Z` = 1.)
 
     // --- upload the per-frame GI uniform -----------------------------------
     let frame_count = extracted_history.frame_count;

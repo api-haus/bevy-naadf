@@ -886,3 +886,262 @@ stays as-is per the task constraint — this is a record only.)
   `cargo run --bin e2e_render` invocations.
 - No TEMP debug instrumentation added; the rect-derivation used an offline PNG
   analysis script, not in-tree code.
+
+---
+
+## Batch 4 — sampleRefine (2026-05-14)
+
+`09-design-b.md` §11 Batch 4 (steps 12–14). Builds the 5-pass
+`renderSampleRefine` stage — the compressed-ReSTIR brightness-leveling stage:
+it takes the lit/unlit GI samples `renderGlobalIllum` (Batch 3) wrote into the
+temporal rings, reprojects each into the current frame's 8×8 screen-space
+bucket grid via the camera-history rings, counts per-bucket lit/unlit totals,
+and brightness-levels the survivors with the `COLOR_DIF_PROB` exponential-
+difference probability table. Still buffer-only — the 5 passes write
+`valid_samples_refined` / `valid_samples_compressed` / `bucket_info`, which
+nothing reads until Batch 5's `spatialResampling`. Ends ▶ runnable; the
+Batch-2/3 image is unchanged.
+
+### Files created
+
+| file | what it is | NAADF provenance |
+|---|---|---|
+| `src/assets/shaders/sample_refine.wgsl` | the 5-pass sample-refine stage as 5 compute entry points in one naga-oil module — `clear_buckets_and_calc_mask`, `compute_valid_history`, `count_valid_data_and_refine`, `count_invalid_data`, `refine_buckets`. Shared helpers `shuffle_group` + `reproject_sample` (the byte-identical reprojection the two count passes run). All 5 entries share `@group(0)` = `sample_refine_bind_group`; `compute_valid_history` additionally binds `@group(1)` (the indirect-arg buffers — see "Design ambiguities" #1). | `base/renderSampleRefine.fx` (441 lines — the 5 `cs_5_0` passes + `ShuffleGroup`) |
+
+### Files changed
+
+| file | change |
+|---|---|
+| `src/render/pipelines.rs` | `NaadfPipelines` += `sample_refine_layout` (`@group(0)`, 11 bindings: `gi_params` uniform + `first_hit_data`/`valid_samples`/`invalid_samples`/`taa_dist_min_max`/`camera_history` RO + `bucket_info`/`valid_samples_refined`/`valid_samples_compressed`/`sample_counts`/`ray_queue_indirect` RW) + `sample_refine_dispatch_layout` (`@group(1)`, `valid_dispatch`+`invalid_dispatch` RW — the wgpu indirect-vs-storage split, #1 below); `sample_refine_clear` / `_valid_history` / `_count_valid` / `_count_invalid` / `_buckets` cached compute pipelines (the `valid_history` one's layout vec carries both groups, the other 4 only `@group(0)`); new `SAMPLE_REFINE_SHADER` path const. |
+| `src/render/taa.rs` | `TaaGpu` += `taa_dist_min_max: Buffer` (`pixel_count` × `vec2<u32>` — `base/renderTaaSampleReverse.fx`'s `ReprojectOld` extra output, §3.5). Created/resized/zero-cleared alongside `taa_samples` (`create_screen_buffers` now returns the triple; `prepare_taa`'s match + the clear encoder + the `TaaGpu` insert all thread it). Batch 4 lands the *buffer* so `sample_refine_bind_group` can reference it; Batch 6 wires the `base/` `ReprojectOld` shader write (until then it is the zero-cleared buffer — see "Cross-batch dependency"). |
+| `src/render/gi.rs` | `GiBindGroups` += `sample_refine_bind_group` + `sample_refine_dispatch_bind_group`. **`prepare_gi`'s per-frame CPU re-seed of `ray_queue_indirect` is DELETED** — Batch 4's `clear_buckets_and_calc_mask` moves that reset in-shader (see below). The on-creation seed in `create_gi_buffers` stays (`[1]`/`[2]` = `GroupCountY/Z` = 1). |
+| `src/render/prepare.rs` | `prepare_frame_gpu` builds the two new mixed bind groups into `GiBindGroups` (alongside the Batch-3 `ray_queue` / `global_illum` groups, same `pixel_count` resize trigger). `sample_refine_bind_group` mixes `GiGpu` + `FrameGpu` (`first_hit_data`) + `TaaGpu` (`taa_dist_min_max` + `camera_history`); `sample_refine_dispatch_bind_group` is `GiGpu`-only (`valid_dispatch` + `invalid_dispatch`). |
+| `src/render/graph_b.rs` | += `SAMPLE_REFINE_SPAN` (one combined HUD/dispatch-check span shared by all 5 passes — `09-design-b.md` §4.7 recommendation) + the 5 node systems `naadf_sample_refine_clear_node` / `_valid_history_node` / `_count_valid_node` / `_count_invalid_node` / `_buckets_node`. `clear` / `buckets` dispatch `ceil(bucket_count/64)` workgroups; `valid_history` dispatches `(1,1,1)` and also sets `@group(1)`; `count_valid` / `count_invalid` `dispatch_workgroups_indirect` off `valid_dispatch` / `invalid_dispatch`. |
+| `src/render/mod.rs` | the 5 nodes imported + wired into the `Core3d` `.chain()` at their §4.2 positions: `naadf_sample_refine_clear_node` inserted **between `naadf_first_hit_node` and `naadf_ray_queue_node`** (it owns the in-shader `ray_queue_indirect[0]` reset that `calcRayQueue` then `atomicAdd`s into); the other 4 inserted **after `naadf_global_illum_node`, before `naadf_final_blit_node`** (they consume the GI sample rings `globalIllum` filled). |
+| `src/e2e/gates.rs` | `CURRENT_BATCH` 3 → 4; `assert_batch_4` added (re-runs the B2 emissive/solid/sky region gate — Batch 4 leaves the image unchanged — plus the optional `hash_baseline(4)` tripwire); `batch_gate` / `expected_spans` gain their B4 arms (`expected_spans` adds the single `naadf_sample_refine` span — the 5 passes share one span). `hash_baseline` kept returning `None` for B4 — see "e2e harness" below. |
+
+### How the 5 passes map to `base/renderSampleRefine.fx`
+
+The WGSL is a faithful function-by-function port of the 5 HLSL `cs_5_0` passes:
+
+- **`clear_buckets_and_calc_mask`** ← `clearBucketsAndCalcMask`
+  (`renderSampleRefine.fx:33-69`). Lane 0 of the whole dispatch does the
+  per-frame reset (`sample_counts[3+accumIndex] = (0,0)` +
+  `ray_queue_indirect[0] = 0`); every bucket lane `< bucket_count` scans its
+  8×8 pixel region's `first_hit_data` into the bucket's normal-mask +
+  min/max-distance, written to `bucket_info[bucket]`. The HLSL `getTang` is the
+  Batch-1 shared helper; `f32tof16` ↔ `pack2x16float(... ).x & 0xFFFF`.
+- **`compute_valid_history`** ← `computeValidHistory`
+  (`renderSampleRefine.fx:71-101`, `[numthreads(1,1,1)]`). Walks the 128-frame
+  `sample_counts` ring back from `accum_index`, summing until the ring-buffer
+  capacity is hit, then writes `sample_counts[0]` (write cursors), `[1]`
+  (totals), `[2]` (`find_coprime` shuffle seeds — the Batch-1 shared
+  `common.wgsl` helpers), and `valid_dispatch[0]` / `invalid_dispatch[0]` (the
+  `next_pow2`-padded workgroup counts for the two indirect count passes).
+- **`count_valid_data_and_refine`** ← `countValidDataAndRefine`
+  (`renderSampleRefine.fx:108-253`, indirect off `valid_dispatch`). For each
+  lit sample in the temporal ring (walked in the `shuffle_group` coprime order):
+  `reproject_sample` reconstructs the old-frame virtual first-hit, reprojects
+  its virtual surface into the current camera (`view_proj * vec4(pos,1)` — the
+  `M*v` convention), screen-bucket-indexes it, runs the pdf-ratio + the
+  `taa_dist_min_max` distance/specular-normal validity tests; on pass,
+  `atomicAdd(bucket_info[i].x, 1<<6)` reserves a refined slot and — if there is
+  space — reconstructs the secondary-bounce sample and packs a `refinedSample`
+  `vec4<u32>` into `valid_samples_refined[bucket*32 + slot]`. The
+  `getRayDir(camRotOld[...])` uses `camera_history[i].view_proj_inv` (the
+  INVERSE ring — §3.6, see "Design ambiguities" #2).
+- **`count_invalid_data`** ← `countInvalidData` (`renderSampleRefine.fx:255-338`,
+  indirect off `invalid_dispatch`). The same `reproject_sample` for unlit
+  samples; just `atomicAdd(bucket_info[i].x, 1<<18)` — no sample reconstructed
+  or stored.
+- **`refine_buckets`** ← `refineBuckets` (`renderSampleRefine.fx:340-417`). Per
+  bucket: find the bucket's max compressed-colour level over its ≤32 refined
+  samples (the HLSL function-`static uint compColorMaxStorage[32]` → a
+  `var<function> array<u32,32>` local — bounded by `effectiveValidCount ≤ 32`),
+  then for each refined sample remove weakly-lit ones with
+  `COLOR_DIF_PROB[maxColorDif]` probability (the Batch-1 shared
+  `color_compression.wgsl` table), compensate the survivors (the
+  `darkeningOffset` distance-variance term), write ≤8 to
+  `valid_samples_compressed`, and pack the bucket's lit/invalid ratio + count
+  into `bucket_info[i].x`.
+
+HLSL implicit-truncation class (the carry-forward): explicit `i32()` casts on
+`int2 screenPosBucket = ndc01 * float2(...)` and `int3 newColorComp = max(0,
+int3(...) + maxColorDif - darkeningOffset)`, explicit `u32()` on the
+`surfacePosInt` frac term and the oct-encode coordinates, explicit `vec3<i32>`
+broadcast where the HLSL adds a scalar `maxColorDif` to an `int3`. Every
+`#ifdef ENTITIES` block (`renderSampleRefine.fx:141-153,215-227,285-296`)
+omitted — Phase B is entity-free; `entityInstancesHistory` is not bound, the
+`surfaceEntity` / `sampleEntity` branches dropped.
+
+### `ray_queue_indirect[0]` reset moved in-shader; the B3 CPU seed deleted
+
+Confirmed against `09-design-b.md` §7.3 + §4.2 and `renderSampleRefine.fx:36-40`:
+**`clear_buckets_and_calc_mask` (the first sample-refine pass) owns the
+per-frame `ray_queue_indirect[0]` reset.** It is the first pass of
+`renderSampleRefine`, and NAADF's dispatch order (`WorldRenderBase.cs:272-273`
+`ClearBucketsAndCalcMask`, then `:285` `RayQueue`) puts it **before**
+`rayQueueCalc` — so `clear_buckets_and_calc_mask`'s lane-0
+`ray_queue_indirect[0] = 0u` is the proper in-shader reset. Batch 4:
+
+- `naadf_sample_refine_clear_node` is wired into the `Core3d` chain **between
+  `naadf_first_hit_node` and `naadf_ray_queue_node`** (`render/mod.rs`), so the
+  in-shader reset runs every frame before `calcRayQueue`'s `atomicAdd`.
+- Batch 3's clearly-marked CPU re-seed in `prepare_gi`
+  (`render_queue.write_buffer(&resources.ray_queue_indirect, ...)`) is
+  **deleted**. The `gi.rs` comment block where it sat is rewritten to record
+  the hand-off. The on-*creation* seed in `create_gi_buffers` stays (it seeds
+  `[1]`/`[2]` = `GroupCountY/Z` = 1 once; `[0]` is then zeroed in-shader every
+  frame).
+
+### Cross-batch dependency — `taa_dist_min_max` empty until Batch 6
+
+`09-design-b.md` §11 Batch 4 step 13 calls this out: `count_valid_data_and_refine`
+/ `count_invalid_data` read `taa_dist_min_max` for the per-pixel reprojection
+distance / specular-normal validity test, but the `base/` `ReprojectOld` that
+*writes* `taa_dist_min_max` is not wired until Batch 6 (the A-2 `albedo/`
+reproject pass does not write it). Batch 4 creates the **buffer**
+(`TaaGpu.taa_dist_min_max`, zero-cleared) so `sample_refine_bind_group` can
+reference it; until Batch 6, `dist_min == dist_max == 0` so the `distMinMax`
+test (`dist_cur < dist_min_max.x * 1022/1024 || ...`) rejects every reprojected
+sample. The 5 passes still dispatch clean — the refine buffers just stay empty.
+Correct-but-empty, never invalid — exactly the designed-in cross-batch seam.
+
+### Design ambiguities adjudicated
+
+1. **`valid_dispatch` / `invalid_dispatch` — split into their own `@group(1)`,
+   NOT in the shared sample-refine bind group.** `09-design-b.md` §8.2 lists
+   `valid_dispatch` (rw) + `invalid_dispatch` (rw) in the single
+   `sample_refine_bind_group` (13 bindings). The e2e harness surfaced the wgpu
+   conflict: `count_valid_data_and_refine` binds that group (so the buffers are
+   `STORAGE_READ_WRITE`) **and** `dispatch_workgroups_indirect`s off them
+   (`INDIRECT`) — wgpu forbids both within one dispatch's usage scope
+   ("`BufferUses(STORAGE_READ_WRITE)` is an exclusive usage"). Resolution: the
+   two indirect-arg buffers move to a dedicated `@group(1)`
+   (`sample_refine_dispatch_layout`) bound **only** by
+   `naadf_sample_refine_valid_history_node` (the *only* pass that writes them —
+   `renderSampleRefine.fx:99-100`); the count passes get the buffers purely as
+   `dispatch_workgroups_indirect` sources (not a shader binding), so no usage
+   conflict. The shared `@group(0)` drops 13→11 bindings. This is a faithful
+   realisation of the design's intent ("the sample-refine stage needs these
+   buffers") — the split is forced by the wgpu indirect-vs-storage exclusivity
+   rule, which the design's "one shared bind group" wording did not account
+   for. Documented in the WGSL + `pipelines.rs`.
+2. **`camRotOld` = the INVERSE camera-history ring.** Followed `09-design-b.md`
+   §3.6 exactly: `WorldRenderBase.cs:346` binds `taaSampleCamTransformInvers`
+   (the inverse rotation-only view-proj) into `renderSampleRefine`'s `camRotOld`
+   parameter, while `renderGlobalIllum` / `renderTaaSampleReverse` bind the
+   non-inverse `taaSampleCamTransform`. So `reproject_sample` passes
+   `camera_history[frame_index_old].view_proj_inv` to the shared `get_ray_dir`
+   (which already takes an *inverse* view-proj — Batch 1 plumbed `view_proj_inv`
+   onto the 160-byte `GpuCameraHistorySlot`).
+3. **`sample_counts` declared plain (not atomic) in this module.**
+   `naadf_global_illum.wgsl` declares the SAME `sample_counts` buffer as
+   `array<SampleCountSlot>` with `atomic<u32>` members (it does per-thread
+   `InterlockedAdd`s). `sample_refine` does only plain loads/stores on it
+   (`computeValidHistory` reads/writes `[0..2]`, `clearBucketsAndCalcMask`
+   stores `[3+accumIndex]` — no atomic adds). WGSL allows per-module
+   binding-type views of one buffer, so `sample_refine.wgsl` declares it plain
+   `array<vec2<u32>>` — simpler, and the byte layout is identical. Same for
+   `ray_queue_indirect` (plain `array<u32,5>` here — `clearBucketsAndCalcMask`
+   does a plain `.Store(0,0)`).
+
+### Bug found + fixed during the e2e run
+
+Two blocking issues, both surfaced in a single e2e run (the harness's
+single-run all-errors property held), both fixed:
+
+1. **`@builtin(group_id)` is not a WGSL builtin.** `count_valid_data_and_refine`
+   / `count_invalid_data` ported HLSL `SV_GroupID` as `@builtin(group_id)` —
+   naga: "unknown builtin: `group_id`". The WGSL builtin is `workgroup_id`.
+   Fixed both entry points (5 sample-refine pipelines failed to compile;
+   `naadf_sample_refine` never dispatched). Logging this as the next variant of
+   the HLSL→WGSL semantic-mapping class.
+2. **The `valid_dispatch` / `invalid_dispatch` usage conflict** — see "Design
+   ambiguities" #1. Surfaced as a `Queue::submit` validation error
+   ("conflicting usages ... `STORAGE_READ_WRITE` ... `INDIRECT`"); fixed by the
+   `@group(1)` split.
+
+### Verification
+
+- `cargo build` — clean, **no new warnings** (the Batch-3 forward-looking
+  dead-code warnings on `GiGpu.bucket_count` / `bucket_size` are now resolved —
+  Batch 4's `naadf_sample_refine_*_node`s read `bucket_count` for their dispatch
+  math).
+- `cargo test` — **46 passed** (unchanged — Batch 4 added no unit tests; the 5
+  passes are GPU-only working code, exercised by the e2e harness, and the
+  existing `gi.rs` helper tests still cover `accum_index` / `bucket_grid` /
+  `rand_salts`).
+- `cargo run --bin e2e_render` — exits **0**, all gates green: luminance gate
+  `batch 4 — 69.1% non-black; threshold 50%` (Batch 4 is still in the pre-GI
+  regime — `GI_LIT_BATCH = 5`, so the B1–B4 0.50 floor applies, NOT the B5 0.60
+  hard gate; 69.1% clears it with margin), then `PASS (batch 4) — … per-batch
+  region gate green, every pipeline created cleanly, every expected
+  render-graph node dispatched` (the `naadf_sample_refine` span is now in
+  `expected_spans` and the node-dispatch check confirms it fired). **53
+  pipelines created cleanly** (was 48 + the 5 new sample-refine pipelines).
+  Used **3 of the 5** allotted `cargo run --bin e2e_render` invocations.
+- **Visual assessment of `e2e_latest.png`:** the frame is **stable vs. Batch
+  2/3 — no visible change, exactly as the design predicts.** The warm-white
+  emissive block renders bright just above centre, the magenta block bright in
+  the lower-left, the green block on the right; the dark diffuse voxel
+  structure fills the mid/lower frame near-black (pre-GI, correct); the
+  atmosphere-tinted sky band is clean across the top with no streaks or rings.
+  Batch 4's 5 `sampleRefine` passes write `valid_samples_refined` /
+  `valid_samples_compressed` / `bucket_info` — buffers the final blit does not
+  read — so the GI refinement is not composited into the visible image until
+  the denoiser path lands. The done-bar ("the 5 passes dispatch clean, image
+  unchanged") is met.
+- **e2e harness — `hash_baseline`:** the harness's "Remaining issue" suggested
+  Batch 4 bless the first stability-hash baseline by pinning the Batch-3
+  readback hash. On reflection that is not sensible to commit — the readback is
+  only bit-identical run-to-run *on the same binary/GPU* (the harness's own
+  §6.1 caveat), so a literal derived on this dev box would spuriously fail
+  elsewhere. `hash_baseline(4)` is kept `None` (the deliberate-deferral path the
+  harness doc allows); `assert_batch_4` re-runs the B2 emissive/solid/sky region
+  gate as the primary "image unchanged" check, which catches gross regressions.
+  The `gates.rs` comment records this reasoning.
+- No TEMP debug instrumentation was added.
+
+### Notes for the next batch (B5 — `spatialResampling` + `denoiseSplit`)
+
+- **`valid_samples_compressed` + `bucket_info` are populated by Batch 4 and B5's
+  `spatialResampling` is their first consumer** (`renderSpatialResampling.fx`
+  `getSampleData` decodes `valid_samples_compressed`; the 12-iteration neighbour
+  loop reads `bucket_info`). Both are `bucket_count`-sized, created by
+  `prepare_gi`, resize-on-viewport. Note the cross-batch caveat below.
+- **The refine buffers are *correct-but-empty* until Batch 6.** Batch 4's
+  reprojection validity test rejects every sample because `taa_dist_min_max` is
+  the zero-cleared buffer (Batch 6 wires `ReprojectOld`'s write). So in B5,
+  `valid_samples_compressed` will decode as empty / all-zero until B6 lands —
+  B5's `spatialResampling` "dispatches clean" on empty refine data exactly the
+  way B4 dispatches clean on empty `taa_dist_min_max`. B5's done-bar of "GI
+  bounce becomes visible" therefore *also* depends on B6 — re-read
+  `09-design-b.md` §11 Batch 5 step 15: it temporarily sets
+  `GiSettings.is_denoise = false` and relies on Batch-2's temporary
+  `final_color` blit to show the spatial-resampling write. Whether the bounce is
+  actually visible in B5 vs. only after B6's `taa_dist_min_max` lands is worth
+  the B5 agent confirming against the design — the buffers being empty pre-B6 is
+  a real constraint on B5's "GI visible" claim.
+- **`TaaGpu.taa_dist_min_max` exists** (created/resized/zero-cleared by
+  `prepare_taa` alongside `taa_samples`). Batch 6 only needs to add the
+  `ReprojectOld` *shader write* + the reproject `@group(0)` rw binding — the
+  buffer plumbing is done.
+- **The mixed-bind-group pattern + the `@group(1)` indirect-split pattern are
+  established.** `prepare_frame_gpu` builds `GiBindGroups` (now
+  `ray_queue` + `global_illum` + `sample_refine` + `sample_refine_dispatch`).
+  B5 adds `spatial_resampling_bind_group` + `denoise_bind_group` the same way.
+  If any B5 pass both binds an indirect buffer rw AND dispatches indirect off
+  it, the `@group(1)` split (Batch 4 "Design ambiguities" #1) is the pattern to
+  reuse — but B5's `spatialResampling` / `denoiseSplit` are plain
+  (non-indirect) `ceil(pixel_count/64)` dispatches (`WorldRenderBase.cs:397,
+  412-416`), so this should not recur.
+- **`SAMPLE_REFINE_SPAN` is one combined span for all 5 passes** — if B5/B6's
+  HUD work wants per-pass timing it would need 5 distinct span consts; the
+  design (§4.7) explicitly recommends the one-span form, kept.
+- **B4 luminance regime:** `GI_LIT_BATCH = 5`, so B5 is the first batch the
+  0.60 hard luminance gate applies to. The B5 agent must re-run the e2e harness
+  and confirm the GI-lit frame clears 0.60 (per `e2e-render-test.md` — nudge
+  `MIN_NON_BLACK_FRACTION_GI` to just below the measured value if it lands
+  under, a real check not a rubber stamp). The current pre-GI frame is at
+  69.1%, so there is headroom.

@@ -226,6 +226,16 @@ pub struct TaaGpu {
     /// The per-pixel accumulated colour + count — `pixel_count` × `vec2<u32>`.
     /// The real `taaSampleAccum`; replaces Phase A's `shaded_color`.
     pub taa_sample_accum: Buffer,
+    /// The `base/renderTaaSampleReverse.fx` `ReprojectOld` extra output —
+    /// `pixel_count` × `vec2<u32>` (`09-design-b.md` §3.5). `.x` = packed
+    /// `f16(distMin) | f16(distMax)<<16`, `.y` = the packed specular-normal
+    /// validity mask. `STORAGE | COPY_DST`, zero-cleared on creation, resized
+    /// with `taa_samples`. Batch 4 lands the *buffer* (so the sample-refine
+    /// bind group can reference it); Batch 6 wires the `base/` `ReprojectOld`
+    /// shader write — until then it is the zero-cleared buffer (`09-design-b.md`
+    /// §11 Batch 4 step 13 — the sample-refine validity test rejects
+    /// everything, correct-but-empty).
+    pub taa_dist_min_max: Buffer,
     /// The 128-deep camera-history ring — `128` × `GpuCameraHistorySlot`,
     /// fixed-size (not resized on viewport change). Rewritten every frame.
     pub camera_history: Buffer,
@@ -284,11 +294,18 @@ pub fn prepare_taa(
     // resized. On resize the whole `taa_samples` ring is discarded (it is
     // screen-space); the next ~16 frames rebuild it from zeroed (rejected)
     // history, which is correct and unavoidable (NAADF does the same).
-    let (taa_samples, taa_sample_accum, camera_history, taa_params, needs_new_storage) =
-        match &existing {
+    let (
+        taa_samples,
+        taa_sample_accum,
+        taa_dist_min_max,
+        camera_history,
+        taa_params,
+        needs_new_storage,
+    ) = match &existing {
             Some(taa) if taa.pixel_count == pixel_count => (
                 taa.taa_samples.clone(),
                 taa.taa_sample_accum.clone(),
+                taa.taa_dist_min_max.clone(),
                 taa.camera_history.clone(),
                 taa.taa_params.clone(),
                 false,
@@ -296,11 +313,12 @@ pub fn prepare_taa(
             Some(taa) => {
                 // Viewport changed — re-create only the screen-space buffers;
                 // keep the fixed-size `camera_history` / `taa_params`.
-                let (taa_samples, taa_sample_accum) =
+                let (taa_samples, taa_sample_accum, taa_dist_min_max) =
                     create_screen_buffers(&render_device, pixel_count);
                 (
                     taa_samples,
                     taa_sample_accum,
+                    taa_dist_min_max,
                     taa.camera_history.clone(),
                     taa.taa_params.clone(),
                     true,
@@ -308,7 +326,7 @@ pub fn prepare_taa(
             }
             None => {
                 // First build — create everything.
-                let (taa_samples, taa_sample_accum) =
+                let (taa_samples, taa_sample_accum, taa_dist_min_max) =
                     create_screen_buffers(&render_device, pixel_count);
                 let camera_history = render_device.create_buffer(&BufferDescriptor {
                     label: Some("naadf_taa_camera_history"),
@@ -323,19 +341,30 @@ pub fn prepare_taa(
                     usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                (taa_samples, taa_sample_accum, camera_history, taa_params, true)
+                (
+                    taa_samples,
+                    taa_sample_accum,
+                    taa_dist_min_max,
+                    camera_history,
+                    taa_params,
+                    true,
+                )
             }
         };
 
     // Zero-clear the screen-space buffers when freshly (re)created so the
     // first ~16 frames — before the sample ring is full — read zeroed
     // (rejected) history rather than garbage (`06-design-a2.md` §2.1).
+    // `taa_dist_min_max` is zero-cleared here too — Batch 6 wires its shader
+    // write; until then it stays the zero-cleared buffer (`09-design-b.md` §11
+    // Batch 4 step 13).
     if needs_new_storage {
         let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("naadf_clear_taa_buffers"),
         });
         encoder.clear_buffer(&taa_samples, 0, None);
         encoder.clear_buffer(&taa_sample_accum, 0, None);
+        encoder.clear_buffer(&taa_dist_min_max, 0, None);
         render_queue.submit([encoder.finish()]);
     }
 
@@ -405,6 +434,7 @@ pub fn prepare_taa(
     commands.insert_resource(TaaGpu {
         taa_samples,
         taa_sample_accum,
+        taa_dist_min_max,
         camera_history,
         taa_params,
         pixel_count,
@@ -412,11 +442,14 @@ pub fn prepare_taa(
     });
 }
 
-/// Create the two screen-space TAA buffers (`taa_samples` 16-ring +
-/// `taa_sample_accum`) for `pixel_count` pixels. `STORAGE | COPY_DST` — the
-/// COPY_DST is for the `clear_buffer` zero-fill + (Batch 2) any explicit
-/// uploads.
-fn create_screen_buffers(render_device: &RenderDevice, pixel_count: u32) -> (Buffer, Buffer) {
+/// Create the three screen-space TAA buffers (`taa_samples` 16-ring +
+/// `taa_sample_accum` + `taa_dist_min_max`) for `pixel_count` pixels.
+/// `STORAGE | COPY_DST` — the COPY_DST is for the `clear_buffer` zero-fill +
+/// (Batch 2) any explicit uploads.
+fn create_screen_buffers(
+    render_device: &RenderDevice,
+    pixel_count: u32,
+) -> (Buffer, Buffer, Buffer) {
     // wgpu rejects zero-length buffers — `pixel_count` is already `>= 1`.
     // `taa_samples`: pixel_count * 16 × vec2<u32> (8 bytes each).
     let taa_samples = render_device.create_buffer(&BufferDescriptor {
@@ -432,5 +465,14 @@ fn create_screen_buffers(render_device: &RenderDevice, pixel_count: u32) -> (Buf
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    (taa_samples, taa_sample_accum)
+    // `taa_dist_min_max`: pixel_count × vec2<u32> (8 bytes each) — the `base/`
+    // `ReprojectOld` extra output (`09-design-b.md` §3.5). Batch 4 creates the
+    // buffer; Batch 6 wires the shader write.
+    let taa_dist_min_max = render_device.create_buffer(&BufferDescriptor {
+        label: Some("naadf_taa_dist_min_max"),
+        size: (pixel_count as u64) * 8,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (taa_samples, taa_sample_accum, taa_dist_min_max)
 }

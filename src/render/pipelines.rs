@@ -72,6 +72,10 @@ pub const RAY_QUEUE_SHADER: &str = "shaders/ray_queue_calc.wgsl";
 /// Asset path of the Phase-B `renderGlobalIllum` compute shader
 /// (`09-design-b.md` §5.1, §8.1) — port of `base/renderGlobalIllum.fx`.
 pub const GLOBAL_ILLUM_SHADER: &str = "shaders/naadf_global_illum.wgsl";
+/// Asset path of the Phase-B `renderSampleRefine` compute shader
+/// (`09-design-b.md` §5.1, §5.7, §8.2) — the 5-pass sample-refine stage, port
+/// of `base/renderSampleRefine.fx`. One file, five entry points.
+pub const SAMPLE_REFINE_SHADER: &str = "shaders/sample_refine.wgsl";
 
 /// Compute-shader workgroup size — `[numthreads(64,1,1)]` in the HLSL
 /// `albedo/renderFirstHit.fx` `calcFirstHit` (`03-design.md` §5.1). The Phase-B
@@ -134,6 +138,26 @@ pub struct NaadfPipelines {
     /// `camera_history` (read-only). `globalIllum` also binds `@group(0)` world
     /// + `@group(3)` atmosphere.
     pub global_illum_layout: BindGroupLayoutDescriptor,
+    /// `@group(0)` for the Phase-B `renderSampleRefine` passes (`09-design-b.md`
+    /// §8.2). One shared layout bound by all 5 sample-refine entry points
+    /// (`WorldRenderBase.cs` re-binds the same effect 5×). 11 bindings:
+    /// `gi_params` (uniform), `first_hit_data` (read), `bucket_info` (rw),
+    /// `valid_samples` (read), `valid_samples_refined` (rw),
+    /// `valid_samples_compressed` (rw), `invalid_samples` (read),
+    /// `sample_counts` (rw), `taa_dist_min_max` (read), `ray_queue_indirect`
+    /// (rw), `camera_history` (read). The sample-refine passes do not traverse
+    /// the voxel world. (`valid_dispatch` / `invalid_dispatch` are NOT here —
+    /// see `sample_refine_dispatch_layout`.)
+    pub sample_refine_layout: BindGroupLayoutDescriptor,
+    /// `@group(1)` for `renderSampleRefine`'s `compute_valid_history` pass ONLY
+    /// (`09-design-b.md` §8.2 — the wgpu-forced split). `valid_dispatch` +
+    /// `invalid_dispatch` (both rw storage): `compute_valid_history` writes
+    /// them, then `count_valid_data_and_refine` / `count_invalid_data` consume
+    /// them as `dispatch_workgroups_indirect` sources. wgpu forbids a buffer
+    /// being bound `STORAGE_READ_WRITE` AND used as `INDIRECT` in one dispatch,
+    /// so they cannot sit in the shared `@group(0)` (the count passes bind that
+    /// group). Only the `valid_history` pipeline's layout includes this group.
+    pub sample_refine_dispatch_layout: BindGroupLayoutDescriptor,
     /// Cached id of the `naadf_first_hit` compute pipeline.
     pub first_hit_pipeline: CachedComputePipelineId,
     /// Cached id of the `taa.wgsl` `reproject_old_samples` compute pipeline
@@ -153,6 +177,25 @@ pub struct NaadfPipelines {
     /// pipeline (`09-design-b.md` §4.6 / §8.1) — the ≤3-bounce GI tracer,
     /// dispatched indirect off `ray_queue_indirect`.
     pub global_illum_pipeline: CachedComputePipelineId,
+    /// Cached id of `sample_refine.wgsl`'s `clear_buckets_and_calc_mask`
+    /// (`09-design-b.md` §4.7 / §8.2) — the per-frame ring/queue reset + the
+    /// per-bucket normal-mask + min/max-distance scan.
+    pub sample_refine_clear_pipeline: CachedComputePipelineId,
+    /// Cached id of `sample_refine.wgsl`'s `compute_valid_history`
+    /// (`[numthreads(1,1,1)]`) — the 128-frame ring walk + the indirect-arg
+    /// write for the two count passes.
+    pub sample_refine_valid_history_pipeline: CachedComputePipelineId,
+    /// Cached id of `sample_refine.wgsl`'s `count_valid_data_and_refine` —
+    /// dispatched INDIRECT off `valid_dispatch`; reprojects lit samples into the
+    /// 8×8 bucket grid and writes `valid_samples_refined`.
+    pub sample_refine_count_valid_pipeline: CachedComputePipelineId,
+    /// Cached id of `sample_refine.wgsl`'s `count_invalid_data` — dispatched
+    /// INDIRECT off `invalid_dispatch`; reprojects unlit samples, `atomicAdd`s
+    /// the bucket's invalid count.
+    pub sample_refine_count_invalid_pipeline: CachedComputePipelineId,
+    /// Cached id of `sample_refine.wgsl`'s `refine_buckets` — the
+    /// `COLOR_DIF_PROB` brightness-leveling, writes `valid_samples_compressed`.
+    pub sample_refine_buckets_pipeline: CachedComputePipelineId,
     /// An entry-less bind group for `empty_layout` — `naadf_global_illum_node`
     /// must `set_bind_group(2, ...)` since the `globalIllum` pipeline layout
     /// has a placeholder at index 2 (`09-design-b.md` §8.1 — the shader skips
@@ -369,6 +412,52 @@ impl FromWorld for NaadfPipelines {
             ),
         );
 
+        // --- @group(0): the Phase-B `renderSampleRefine` bind group ---------
+        // One shared layout for all 5 sample-refine passes (`09-design-b.md`
+        // §8.2). 11 bindings — within wgpu's `maxBindingsPerBindGroup` default.
+        // `bucket_info` / `sample_counts` / `ray_queue_indirect` are bound
+        // `storage_buffer_sized` (rw): the WGSL declares `bucket_info` as
+        // `array<BucketInfoSlot>` (with an `atomic<u32>` member),
+        // `sample_counts` / `ray_queue_indirect` as plain arrays — all need
+        // read-write access. `valid_dispatch` / `invalid_dispatch` are NOT in
+        // this group — they go in `sample_refine_dispatch_layout` (the wgpu
+        // indirect-vs-storage-exclusivity split).
+        let sample_refine_layout = BindGroupLayoutDescriptor::new(
+            "naadf_sample_refine_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(gi_params_size)),
+                    storage_buffer_read_only_sized(false, None), // first_hit_data
+                    storage_buffer_sized(false, None),           // bucket_info, rw (atomic)
+                    storage_buffer_read_only_sized(false, None), // valid_samples
+                    storage_buffer_sized(false, None),           // valid_samples_refined, rw
+                    storage_buffer_sized(false, None),           // valid_samples_compressed, rw
+                    storage_buffer_read_only_sized(false, None), // invalid_samples
+                    storage_buffer_sized(false, None),           // sample_counts, rw
+                    storage_buffer_read_only_sized(false, None), // taa_dist_min_max
+                    storage_buffer_sized(false, None),           // ray_queue_indirect, rw
+                    storage_buffer_read_only_sized(false, None), // camera_history
+                ),
+            ),
+        );
+
+        // --- @group(1): `compute_valid_history`'s indirect-arg buffers ------
+        // `valid_dispatch` + `invalid_dispatch` (both rw storage). Only the
+        // `valid_history` pipeline binds this group; the count passes get the
+        // buffers as `dispatch_workgroups_indirect` sources (no shader binding),
+        // so there is no `STORAGE_READ_WRITE` ⨉ `INDIRECT` usage conflict.
+        let sample_refine_dispatch_layout = BindGroupLayoutDescriptor::new(
+            "naadf_sample_refine_dispatch_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    storage_buffer_sized(false, None), // valid_dispatch, rw
+                    storage_buffer_sized(false, None), // invalid_dispatch, rw
+                ),
+            ),
+        );
+
         // --- compute pipeline (single, format-agnostic) ---------------------
         let first_hit_shader = asset_server.load(FIRST_HIT_SHADER);
         let first_hit_pipeline =
@@ -455,6 +544,54 @@ impl FromWorld for NaadfPipelines {
                 ..default()
             });
 
+        // --- the Phase-B `renderSampleRefine` pipelines (Batch 4) -----------
+        // One shader file, five entry points (`09-design-b.md` §8.2); all five
+        // bind the single `sample_refine_layout` `@group(0)`. `clear` /
+        // `count_valid` / `count_invalid` / `buckets` are `[numthreads(64,1,1)]`,
+        // `valid_history` is `[numthreads(1,1,1)]`. `count_valid` / `count_invalid`
+        // are dispatched INDIRECT (`WorldRenderBase.cs:356,359`).
+        let sample_refine_shader = asset_server.load(SAMPLE_REFINE_SHADER);
+        // The 4 passes that bind ONLY `@group(0)` (`clear` / `count_valid` /
+        // `count_invalid` / `buckets`).
+        let mk_sample_refine = |label: &'static str, entry: &'static str| {
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some(label.into()),
+                layout: vec![sample_refine_layout.clone()],
+                shader: sample_refine_shader.clone(),
+                entry_point: Some(Cow::from(entry)),
+                ..default()
+            })
+        };
+        let sample_refine_clear_pipeline = mk_sample_refine(
+            "naadf_sample_refine_clear_pipeline",
+            "clear_buckets_and_calc_mask",
+        );
+        // `compute_valid_history` additionally binds `@group(1)` (the
+        // indirect-arg buffers it writes) — its layout vec has both groups.
+        let sample_refine_valid_history_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_sample_refine_valid_history_pipeline".into()),
+                layout: vec![
+                    sample_refine_layout.clone(),
+                    sample_refine_dispatch_layout.clone(),
+                ],
+                shader: sample_refine_shader.clone(),
+                entry_point: Some(Cow::from("compute_valid_history")),
+                ..default()
+            });
+        let sample_refine_count_valid_pipeline = mk_sample_refine(
+            "naadf_sample_refine_count_valid_pipeline",
+            "count_valid_data_and_refine",
+        );
+        let sample_refine_count_invalid_pipeline = mk_sample_refine(
+            "naadf_sample_refine_count_invalid_pipeline",
+            "count_invalid_data",
+        );
+        let sample_refine_buckets_pipeline = mk_sample_refine(
+            "naadf_sample_refine_buckets_pipeline",
+            "refine_buckets",
+        );
+
         // The blit pipeline is queued lazily per target format — see
         // `prepare_blit_pipeline`. Capture the vertex state + fragment shader
         // handle so re-queuing is cheap.
@@ -481,12 +618,19 @@ impl FromWorld for NaadfPipelines {
             empty_layout,
             ray_queue_layout,
             global_illum_layout,
+            sample_refine_layout,
+            sample_refine_dispatch_layout,
             first_hit_pipeline,
             taa_reproject_pipeline,
             atmosphere_pipeline,
             ray_queue_pipeline,
             ray_queue_store_pipeline,
             global_illum_pipeline,
+            sample_refine_clear_pipeline,
+            sample_refine_valid_history_pipeline,
+            sample_refine_count_valid_pipeline,
+            sample_refine_count_invalid_pipeline,
+            sample_refine_buckets_pipeline,
             empty_bind_group,
             blit_pipelines: HashMap::default(),
             blit_vertex,

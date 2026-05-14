@@ -50,9 +50,9 @@ pub fn e2e_camera_transform() -> Transform {
 
 /// The highest batch currently implemented — the `ASSERT` step runs this
 /// batch's region gate (older batches' gates are kept as called helpers so an
-/// earlier-gate regression still trips). Phase B Batches 1-3 exist
-/// (`10-impl-b.md`); bump this as B4/B5/B6 land.
-pub const CURRENT_BATCH: u32 = 3;
+/// earlier-gate regression still trips). Phase B Batches 1-4 exist
+/// (`10-impl-b.md`); bump this as B5/B6 land.
+pub const CURRENT_BATCH: u32 = 4;
 
 // --- Gate rectangles -------------------------------------------------------
 //
@@ -120,9 +120,18 @@ fn sky_rect(fb: &Framebuffer) -> Rect {
 // would be re-derived on the dev box anyway. B4 (the first "no visible change"
 // batch to land *after* the harness) blesses the first real baseline by
 // capturing the Batch-3 readback hash and pinning it here.
+// Batch-4 note: the e2e-render-test.md "Remaining issue" suggested B4 bless the
+// first real baseline by pinning the Batch-3 readback hash. On reflection that
+// is NOT sensible to commit: the readback is only bit-identical run-to-run *on
+// the same binary / GPU* (the harness's own §6.1 caveat — "a committed hash
+// literal would just be re-derived on the dev box"), so a literal derived on
+// this box would spuriously fail on every other. Kept `None` for B4 — the
+// region gate (`assert_batch_4` re-runs the B2 emissive/solid/sky gate) is the
+// primary "image unchanged" check and catches gross regressions; the hash
+// remains the optional tripwire it was always specified as (§6.1). This is the
+// deliberate-deferral path the harness doc itself allows.
 fn hash_baseline(batch: u32) -> Option<u64> {
     match batch {
-        // 4 => Some(0x________________),  // blessed by B4 from the B3 readback
         _ => None,
     }
 }
@@ -220,6 +229,32 @@ fn assert_batch_3(state: &GateState) -> Result<(), String> {
     Ok(())
 }
 
+/// Batch 4 gate — Phase B Batch 4 (the 5 `renderSampleRefine` passes) writes
+/// the 8×8-bucket refine buffers (`valid_samples_refined` /
+/// `valid_samples_compressed` / `bucket_info`) that the blit does not read, so
+/// the image is **unchanged from Batch 2/3** (`10-impl-b.md` Batch 4 done-bar:
+/// "the 5 passes dispatch clean", not "the image changes" — `valid_samples_
+/// compressed` is first read by Batch 5's `spatialResampling`). The gate is
+/// therefore the Batch-2 region gate re-run, plus — once a baseline is blessed
+/// — the §6.1 stability-hash equality. The `PipelineCache` error scan +
+/// node-dispatch check (run unconditionally by the driver) cover the 5 new B4
+/// pipelines + the `naadf_sample_refine` span.
+fn assert_batch_4(state: &GateState) -> Result<(), String> {
+    assert_batch_2(state)?;
+    if let Some(baseline) = hash_baseline(4) {
+        let actual = state.fb.stability_hash();
+        if actual != baseline {
+            return Err(format!(
+                "Batch 4: stability hash {actual:#018x} != baseline {baseline:#018x} — \
+                 Batch 4 must leave the image unchanged from Batch 2/3 (the 5 \
+                 sample-refine passes only write GI refine buffers the blit does not \
+                 read). An unexpected image change is a regression."
+            ));
+        }
+    }
+    Ok(())
+}
+
 // --- Dispatch tables -------------------------------------------------------
 
 /// The expected render-graph spans for a given batch — the node-dispatch check
@@ -228,6 +263,11 @@ fn assert_batch_3(state: &GateState) -> Result<(), String> {
 /// Batches 1-3 node set (`render/mod.rs` `Core3d` chain + `graph_b.rs` /
 /// `graph.rs` span consts): atmosphere precompute → 4-plane first-hit →
 /// rayQueueCalc → globalIllum → final blit.
+///
+/// Batch 4 adds `naadf_sample_refine` — the 5 `renderSampleRefine` passes are 5
+/// separate node systems but share ONE span (`graph_b.rs SAMPLE_REFINE_SPAN` —
+/// `09-design-b.md` §4.7 "one span recommended"), so one new row entry covers
+/// all five. B5 adds the denoiser span, B6 the TAA-node spans.
 pub fn expected_spans(batch: u32) -> &'static [&'static str] {
     match batch {
         0..=3 => &[
@@ -237,13 +277,13 @@ pub fn expected_spans(batch: u32) -> &'static [&'static str] {
             "naadf_global_illum",
             "naadf_final_blit",
         ],
-        // B4 adds `naadf_sample_refine*`, B5 the denoiser, B6 the TAA nodes —
-        // each batch extends this row (`e2e-render-test.md` §6.4).
+        // B4: + `naadf_sample_refine` (the 5 sample-refine passes' shared span).
         _ => &[
             "naadf_atmosphere",
             "naadf_first_hit",
             "naadf_ray_queue",
             "naadf_global_illum",
+            "naadf_sample_refine",
             "naadf_final_blit",
         ],
     }
@@ -268,7 +308,8 @@ pub fn batch_gate(batch: u32, state: &GateState) -> Result<(), String> {
         0..=1 => Ok(()),
         2 => assert_batch_2(state),
         3 => assert_batch_3(state),
-        // B4+ : add `4 => assert_batch_4(state)`, etc.
-        _ => assert_batch_3(state),
+        4 => assert_batch_4(state),
+        // B5+ : add `5 => assert_batch_5(state)`, etc.
+        _ => assert_batch_4(state),
     }
 }

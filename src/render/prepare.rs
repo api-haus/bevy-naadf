@@ -576,7 +576,10 @@ pub fn prepare_frame_gpu(
     //
     // Batch 3 builds two: `ray_queue_bind_group` (`@group(0)` of the
     // `rayQueueCalc` passes) and `global_illum_bind_group` (`@group(1)` of
-    // `renderGlobalIllum`). Batches 4-6 add the rest.
+    // `renderGlobalIllum`). Batch 4 adds `sample_refine_bind_group` (`@group(0)`
+    // shared by all 5 sample-refine passes — it mixes `GiGpu` + `FrameGpu`
+    // (`first_hit_data`) + `TaaGpu` (`taa_dist_min_max` + `camera_history`),
+    // exactly the mixed pattern). Batches 5-6 add the rest.
     let gi_bind_groups_stale = match &existing_gi_bind_groups {
         Some(bg) => bg.pixel_count != pixel_count,
         None => true,
@@ -608,9 +611,47 @@ pub fn prepare_frame_gpu(
                 taa_gpu.camera_history.as_entire_buffer_binding(),
             )),
         );
+        // `sample_refine_bind_group` (`@group(0)` for all 5 sample-refine
+        // passes — `09-design-b.md` §8.2). 11 bindings, matching
+        // `pipelines.sample_refine_layout` order exactly. `taa_dist_min_max` is
+        // the zero-cleared `TaaGpu` buffer until Batch 6 wires `ReprojectOld`'s
+        // write — the sample-refine validity test rejects everything until then
+        // (correct-but-empty, `09-design-b.md` §11 Batch 4 step 13).
+        let sample_refine_bind_group = render_device.create_bind_group(
+            "naadf_sample_refine_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.sample_refine_layout),
+            &BindGroupEntries::sequential((
+                gi_gpu.gi_params.as_entire_buffer_binding(),
+                first_hit_data.as_entire_buffer_binding(),
+                gi_gpu.bucket_info.as_entire_buffer_binding(),
+                gi_gpu.valid_samples.as_entire_buffer_binding(),
+                gi_gpu.valid_samples_refined.as_entire_buffer_binding(),
+                gi_gpu.valid_samples_compressed.as_entire_buffer_binding(),
+                gi_gpu.invalid_samples.as_entire_buffer_binding(),
+                gi_gpu.sample_counts.as_entire_buffer_binding(),
+                taa_gpu.taa_dist_min_max.as_entire_buffer_binding(),
+                gi_gpu.ray_queue_indirect.as_entire_buffer_binding(),
+                taa_gpu.camera_history.as_entire_buffer_binding(),
+            )),
+        );
+        // `sample_refine_dispatch_bind_group` (`@group(1)`, `compute_valid_history`
+        // only) — `valid_dispatch` + `invalid_dispatch`. The wgpu split: these
+        // are written here and consumed as `dispatch_workgroups_indirect`
+        // sources by the count passes, so they cannot be bound rw in the shared
+        // `@group(0)`.
+        let sample_refine_dispatch_bind_group = render_device.create_bind_group(
+            "naadf_sample_refine_dispatch_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.sample_refine_dispatch_layout),
+            &BindGroupEntries::sequential((
+                gi_gpu.valid_dispatch.as_entire_buffer_binding(),
+                gi_gpu.invalid_dispatch.as_entire_buffer_binding(),
+            )),
+        );
         commands.insert_resource(GiBindGroups {
             ray_queue_bind_group,
             global_illum_bind_group,
+            sample_refine_bind_group,
+            sample_refine_dispatch_bind_group,
             pixel_count,
         });
     }

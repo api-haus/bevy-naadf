@@ -43,7 +43,12 @@ use gi::prepare_gi;
 // render-graph chain in Batch 2 (`09-design-b.md` §11 Batch 2 step 8 — the
 // `base/` TAA rewire is Batch 6); not imported here so the chain stays honest.
 use graph::{naadf_final_blit_node, naadf_first_hit_node};
-use graph_b::{naadf_atmosphere_node, naadf_global_illum_node, naadf_ray_queue_node};
+use graph_b::{
+    naadf_atmosphere_node, naadf_global_illum_node, naadf_ray_queue_node,
+    naadf_sample_refine_buckets_node, naadf_sample_refine_clear_node,
+    naadf_sample_refine_count_invalid_node, naadf_sample_refine_count_valid_node,
+    naadf_sample_refine_valid_history_node,
+};
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
 use taa::prepare_taa;
@@ -141,19 +146,42 @@ impl Plugin for NaadfRenderPlugin {
             // image changes" — the GI result is not composited until the
             // denoiser in Batch 5).
             //
-            // NAADF interleaves `ClearBucketsAndCalcMask` (a `sampleRefine`
-            // pass) before `rayQueueCalc` to reset `ray_queue_indirect[0]` each
-            // frame (`09-design-b.md` §7.3); that node is Batch 4. Until then,
-            // `prepare_gi` re-seeds `ray_queue_indirect` from the CPU every
-            // frame (a Batch-3 designed seam — see `gi.rs`), so the counter
-            // does not carry across frames and Batch 3 is correct standalone.
+            // Phase B Batch 4 (`09-design-b.md` §11 Batch 4 / §4.2): the 5
+            // `renderSampleRefine` passes land as 5 separate `Core3d` node
+            // systems — they interleave with `rayQueueCalc` / `globalIllum` in
+            // NAADF's dispatch order, so they cannot be one node:
+            //   * `naadf_sample_refine_clear_node` runs BEFORE
+            //     `naadf_ray_queue_node` — it owns the in-shader per-frame
+            //     `ray_queue_indirect[0]` reset (`renderSampleRefine.fx:39`,
+            //     §7.3), which **replaces** Batch 3's CPU re-seed in
+            //     `prepare_gi` (now deleted).
+            //   * the other four (`valid_history` → `count_valid` →
+            //     `count_invalid` → `buckets`) run AFTER `naadf_global_illum_node`
+            //     — they consume the GI sample rings `globalIllum` filled and
+            //     produce `valid_samples_compressed` + `bucket_info`. Nothing
+            //     reads those until Batch 5's `spatialResampling`, so the image
+            //     is unchanged through Batch 4 (the done-bar is "the 5 passes
+            //     dispatch clean", not "the image changes").
+            //   * `count_valid` / `count_invalid` dispatch INDIRECT off
+            //     `valid_dispatch` / `invalid_dispatch`, written by
+            //     `valid_history` (`WorldRenderBase.cs:356,359`).
+            //   * CROSS-BATCH: `taa_dist_min_max` is the zero-cleared `TaaGpu`
+            //     buffer until Batch 6 wires `ReprojectOld`'s write — the
+            //     sample-refine reprojection validity test rejects everything
+            //     until then (correct-but-empty — `09-design-b.md` §11 Batch 4
+            //     step 13).
             .add_systems(
                 Core3d,
                 (
                     naadf_atmosphere_node,
                     naadf_first_hit_node,
+                    naadf_sample_refine_clear_node,
                     naadf_ray_queue_node,
                     naadf_global_illum_node,
+                    naadf_sample_refine_valid_history_node,
+                    naadf_sample_refine_count_valid_node,
+                    naadf_sample_refine_count_invalid_node,
+                    naadf_sample_refine_buckets_node,
                     naadf_final_blit_node,
                 )
                     .chain()
