@@ -48,6 +48,85 @@ pub fn e2e_camera_transform() -> Transform {
     Transform::from_xyz(86.0, 42.0, 90.0).looking_at(Vec3::new(32.0, 16.0, 32.0), Vec3::Y)
 }
 
+/// The point the e2e camera always looks at — the `GridPreset::Default` scene
+/// centre. Shared by [`e2e_camera_transform`] and [`e2e_orbit_camera_transform`]
+/// so the motion path keeps the same framing target as the static pose.
+pub const E2E_LOOK_TARGET: Vec3 = Vec3::new(32.0, 16.0, 32.0);
+
+/// A deterministic camera pose along the moving-camera e2e motion path
+/// (`10-impl-b.md` — TAA camera-motion reprojection coverage).
+///
+/// `t` runs `0.0 → 1.0` over the motion phase. **The path is OPEN, not closed:**
+/// - `e2e_orbit_camera_transform(0.0)` = [`e2e_motion_start_transform`] — the
+///   pose the `WARMUP` phase renders at.
+/// - `e2e_orbit_camera_transform(1.0)` = [`e2e_camera_transform`] — the fixed
+///   pose the readback happens at and every gate rectangle is derived from.
+///
+/// An *open* path is the load-bearing design choice. A *closed* orbit (warmup,
+/// move away, come back to the warmup pose) lets the readback land on a pose
+/// the camera has already accumulated 96 frames of same-pose GI/TAA history at
+/// — so even a broken reprojection finds that same-pose history again and the
+/// decay is masked. An open path readback-poses the camera somewhere it has
+/// **never been static**: every GI/TAA history sample contributing to the
+/// readback frame had to arrive *through the camera-motion reprojection*. If
+/// the reprojection is faithful, the shadowed/indirect regions stay GI-lit; if
+/// it is broken (the TAA shadow decay-to-black bug), they decay to black during
+/// the move and are still black at the readback.
+///
+/// The camera always looks at the scene centre ([`E2E_LOOK_TARGET`]); it both
+/// **orbits** (yaw sweep) and **dollies** (radius change) between the two
+/// endpoints, so every frame changes both rotation and translation — the full
+/// camera-motion reprojection workload.
+///
+/// The interpolation is **linear in `t`** — *constant* angular + radial
+/// velocity, deliberately *not* eased. An easing curve (smoothstep etc.) has
+/// zero velocity at `t == 1`, so the last few motion frames before the readback
+/// would be nearly static and the running average would re-converge — masking
+/// exactly the decay this phase exists to catch (the same masking trap a long
+/// `SETTLE` or a closed orbit has). A constant-velocity path keeps the camera
+/// moving at full speed right up to the readback pose, so a TAA camera-motion
+/// reprojection decay is freshly present, not washed out.
+pub fn e2e_orbit_camera_transform(t: f32) -> Transform {
+    // Linear — constant velocity, no easing (see the doc comment: easing's
+    // zero end-velocity would mask the decay).
+    let s = t;
+
+    // Both endpoints expressed relative to the shared look target.
+    let end = e2e_camera_transform().translation - E2E_LOOK_TARGET;
+    let start = e2e_motion_start_transform().translation - E2E_LOOK_TARGET;
+    let end_radius = end.length();
+    let start_radius = start.length();
+    let end_yaw = end.x.atan2(end.z);
+    let start_yaw = start.x.atan2(start.z);
+
+    // Interpolate yaw, radius and height between the two endpoints.
+    let yaw = start_yaw + (end_yaw - start_yaw) * s;
+    let radius = start_radius + (end_radius - start_radius) * s;
+    let height = start.y + (end.y - start.y) * s;
+
+    // Horizontal radius from the (radius, height) on the sphere of this yaw.
+    let horizontal = (radius * radius - height * height).max(0.0).sqrt();
+    let offset = Vec3::new(yaw.sin() * horizontal, height, yaw.cos() * horizontal);
+    Transform::from_translation(E2E_LOOK_TARGET + offset).looking_at(E2E_LOOK_TARGET, Vec3::Y)
+}
+
+/// The pose the moving-camera e2e [`WARMUP` phase](crate::e2e::E2E_WARMUP_FRAMES)
+/// renders at — the `t == 0` endpoint of [`e2e_orbit_camera_transform`].
+///
+/// A deliberately *different* vantage from [`e2e_camera_transform`]: a wider,
+/// higher, more yawed-around view of the same `GridPreset::Default` scene. The
+/// `MOTION` phase then sweeps from here to the fixed readback pose — ~95° of
+/// yaw and a large radius+height change — so the readback pose is one the
+/// camera arrives at fresh, with no same-pose history (see
+/// [`e2e_orbit_camera_transform`]'s open-path rationale). The exact pose is not
+/// gated against — only the readback pose ([`e2e_camera_transform`]) is — so it
+/// just needs to (a) frame the scene so the warmup GI converges on real
+/// geometry and (b) be far enough from the readback pose that the motion is a
+/// genuine reprojection workload.
+pub fn e2e_motion_start_transform() -> Transform {
+    Transform::from_xyz(-28.0, 70.0, 96.0).looking_at(E2E_LOOK_TARGET, Vec3::Y)
+}
+
 /// The highest batch currently implemented — the `ASSERT` step runs this
 /// batch's region gate (older batches' gates are kept as called helpers so an
 /// earlier-gate regression still trips). Phase B Batches 1-6 exist
@@ -114,6 +193,22 @@ fn solid_block_rect(fb: &Framebuffer) -> Rect {
 /// ~133 (gate `[10, 230]` and `> solid`).
 fn sky_rect(fb: &Framebuffer) -> Rect {
     Rect::from_fractional(fb, 0.05, 0.04, 0.45, 0.16)
+}
+
+/// A one-line diagnostic of the three gate regions' mean luminance — printed
+/// every run by the driver so a moving-camera TAA decay shows up as a
+/// `solid`-region downtrend even when the gate still passes by a margin
+/// (`10-impl-b.md` — TAA shadow decay-to-black coverage).
+pub fn region_luminance_report(fb: &Framebuffer) -> String {
+    let emissive = Framebuffer::luminance(fb.region_mean(emissive_rect(fb)));
+    let solid = Framebuffer::luminance(fb.region_mean(solid_block_rect(fb)));
+    let sky = Framebuffer::luminance(fb.region_mean(sky_rect(fb)));
+    format!(
+        "region luminance — emissive {emissive:.1}, solid(GI-lit diffuse) {solid:.1}, \
+         sky {sky:.1}  (solid is the TAA camera-motion decay tripwire — the readback is \
+         post-camera-motion, so solid should stay >= {MIN_GI_BOUNCE_AFTER_MOTION}; a \
+         decay collapses it toward ~4-6)"
+    )
 }
 
 // --- Stability-hash baselines ----------------------------------------------
@@ -347,6 +442,20 @@ fn assert_batch_5(state: &GateState) -> Result<(), String> {
 ///    Batch 5 (`10-impl-b.md` Batch-5 "How the e2e harness batch-tracker was
 ///    set") — it correctly belongs here, at the batch the bounce actually
 ///    lands.
+/// 3. **The TAA camera-motion stability check (2026-05-15).** The readback
+///    happens at the `t == 1` end of the open camera-motion path — a pose the
+///    camera was **never static at** before the readback (`e2e/mod.rs` —
+///    `WARMUP` was at the *start* pose, `MOTION` swept here, `SETTLE` is a
+///    single frame). So every GI/TAA history sample lighting the diffuse
+///    geometry in the readback frame had to arrive *through the TAA
+///    camera-motion reprojection*. If `reproject_old_samples` /
+///    `reproject_sample` decayed the shadowed/indirect GI under motion (the
+///    `10-impl-b.md` "TAA shadow decay-to-black" bug class), the diffuse
+///    geometry would be near-black here. The gate asserts it stayed *robustly*
+///    GI-lit past [`MIN_GI_BOUNCE_AFTER_MOTION`] — a meaningfully higher bar
+///    than the bare `MIN_GI_BOUNCE_LUMINANCE` "bounce is visible at all"
+///    floor, so a *partial* camera-motion decay (history thinning toward black
+///    without fully vanishing) is also caught.
 fn assert_batch_6(state: &GateState) -> Result<(), String> {
     let fb = state.fb;
 
@@ -387,6 +496,28 @@ fn assert_batch_6(state: &GateState) -> Result<(), String> {
         ));
     }
 
+    // (3) The TAA camera-motion stability check — the readback pose is one the
+    // camera reached only by *moving* (the open motion path), so a GI-lit
+    // diffuse region here proves the TAA camera-motion reprojection carried
+    // the bounce through the motion. A camera-motion reprojection decay
+    // (`10-impl-b.md` — TAA shadow decay-to-black) would thin or black this
+    // out; the bar is meaningfully above the bare visibility floor so even a
+    // *partial* decay trips it.
+    if solid_lum < MIN_GI_BOUNCE_AFTER_MOTION {
+        return Err(format!(
+            "Batch 6: TAA camera-motion reprojection decay — the GI-lit diffuse \
+             geometry measured luminance {solid_lum:.1} at the post-camera-motion \
+             readback pose (expected >= {MIN_GI_BOUNCE_AFTER_MOTION}, mean rgba \
+             {solid:?}). The readback pose is reached only by camera motion (the open \
+             `MOTION` path — `e2e/mod.rs`), so every GI/TAA history sample here came \
+             through the reprojection: a thinned/black diffuse region means \
+             `reproject_old_samples` / `reproject_sample` is dropping reprojected GI \
+             history under camera motion. Trace the 3×3 `dist_min_max` / hash / \
+             screen-position rejects + `color_sum.a` in `taa.wgsl` against \
+             `base/renderTaaSampleReverse.fx`."
+        ));
+    }
+
     Ok(())
 }
 
@@ -407,6 +538,31 @@ fn assert_batch_6(state: &GateState) -> Result<(), String> {
 /// stamped down to 4.4 — the gate honestly fails until the GI bounce actually
 /// lands (see `10-impl-b.md`'s Batch-6 black-frame-fix section).
 const MIN_GI_BOUNCE_LUMINANCE: f32 = 12.0;
+
+/// The minimum `solid_block_rect` luminance for [`assert_batch_6`]'s **TAA
+/// camera-motion stability** check — the tripwire for the `10-impl-b.md` "TAA
+/// shadow decay-to-black" bug class.
+///
+/// The e2e readback now happens at the end of an *open* camera-motion path
+/// (`e2e/mod.rs` — `WARMUP` at the start pose, `MOTION` sweeps to the readback
+/// pose, `SETTLE` is one frame), so the readback pose is one the camera was
+/// **never static at**: every GI/TAA history sample lighting the diffuse
+/// geometry had to come through the TAA camera-motion reprojection. With a
+/// faithful reprojection the `solid_block_rect` region measures luminance
+/// **~235** at the post-motion readback (verified across multiple
+/// motion-profile runs, 2026-05-15) — essentially as bright as a static-camera
+/// render, confirming the reprojection carries the GI bounce through camera
+/// motion without decay.
+///
+/// The threshold is **150.0** — far below the measured ~235 (so normal
+/// frame-to-frame variation never trips it) yet far above both the bare
+/// `MIN_GI_BOUNCE_LUMINANCE = 12.0` "bounce visible at all" floor and the ~4-6
+/// luminance a camera-motion decay collapses the region to (`10-impl-b.md` —
+/// the decay drives shadowed/indirect regions toward pitch black). A *partial*
+/// decay — reprojected history thinning the bounce toward black without fully
+/// vanishing — also lands well under 150 and is caught. This is a real
+/// regression tripwire, not a rubber stamp.
+const MIN_GI_BOUNCE_AFTER_MOTION: f32 = 150.0;
 
 // --- Dispatch tables -------------------------------------------------------
 

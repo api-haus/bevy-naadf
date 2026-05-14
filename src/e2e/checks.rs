@@ -23,9 +23,10 @@
 //!   that is inserted into **both** worlds (the same cross-world-channel pattern
 //!   `RenderDiagnosticsPlugin` itself uses for `RenderDiagnosticsMutex`). The
 //!   driver's `ASSERT` step reads the latest result from the main-world handle.
-//!   By the time `ASSERT` runs (frame `E2E_RENDER_FRAMES + …`) the cache is long
-//!   settled and `synchronous_pipeline_compilation` guarantees every queued
-//!   pipeline has reached its terminal `Ok`/`Err` state.
+//!   By the time `ASSERT` runs (frame `E2E_WARMUP_FRAMES + E2E_MOTION_FRAMES +
+//!   E2E_SETTLE_FRAMES + …`) the cache is long settled and
+//!   `synchronous_pipeline_compilation` guarantees every queued pipeline has
+//!   reached its terminal `Ok`/`Err` state.
 
 use std::sync::{Arc, Mutex};
 
@@ -91,7 +92,7 @@ pub fn scan_pipeline_errors_render_system(
         Err(format!(
             "{not_ready} of {total} pipeline(s) still Queued/Creating — a render node never \
              ran (frame budget too short, or a conditional node's condition was false in the \
-             e2e scene). Bump E2E_RENDER_FRAMES or check the scene."
+             e2e scene). Bump E2E_WARMUP_FRAMES or check the scene."
         ))
     } else if total == 0 {
         Err(

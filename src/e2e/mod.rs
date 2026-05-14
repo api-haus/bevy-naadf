@@ -44,14 +44,14 @@ pub const E2E_WIDTH: u32 = 256;
 /// Fixed e2e window resolution height — see [`E2E_WIDTH`].
 pub const E2E_HEIGHT: u32 = 256;
 
-/// Render frames the driver counts in the `RUN` phase before requesting the
-/// readback (`e2e-render-test.md` §3.3 / §4.1).
+/// Render frames the driver counts in the `WARMUP` phase — static at the fixed
+/// pose, before the camera starts moving (`e2e-render-test.md` §3.3 / §4.1).
 ///
 /// Comfortably above the resource-build latency (~3 frames: extract the world,
 /// prepare GPU resources, first full graph execution) with margin for the
 /// camera-history ring to spin up. With `synchronous_pipeline_compilation:
 /// true` (`AppConfig::e2e`) every pipeline a render node queues is resolved to
-/// `Ok`/`Err` the same frame it is queued — so by the time `RUN` ends every
+/// `Ok`/`Err` the same frame it is queued — so by the time `WARMUP` ends every
 /// render-graph pipeline has been **created**, which is exactly what the §3.1
 /// `PipelineCache` scan needs (R3). If a future batch adds a pipeline still
 /// `Queued` at the scan, the fix is bumping this const, not a redesign.
@@ -71,10 +71,39 @@ pub const E2E_HEIGHT: u32 = 256;
 /// faithful port — it simply needs the frame budget a temporal-accumulation
 /// renderer requires. 96 frames is comfortably past the up-to-64-frame
 /// `computeValidHistory` ring-capacity window, so the buckets fully populate
-/// and the GI bounce converges to a stable, visible result. The e2e camera is
-/// a fixed pose (`setup_e2e_camera`), so every extra frame is pure convergence
-/// — no scene change, fully deterministic.
-pub const E2E_RENDER_FRAMES: u32 = 96;
+/// and the GI bounce converges to a stable, visible result.
+pub const E2E_WARMUP_FRAMES: u32 = 96;
+
+/// Render frames the driver counts in the `MOTION` phase — the camera sweeps a
+/// deterministic open path ([`gates::e2e_orbit_camera_transform`]) from the
+/// motion-start pose to the fixed readback pose, exercising the TAA
+/// camera-motion reprojection (`10-impl-b.md` — TAA shadow decay-to-black
+/// coverage).
+///
+/// 48 frames over the full ~95°-yaw + large radius/height sweep is a brisk
+/// ~2°/frame camera move with a substantial per-frame translation step — every
+/// frame is a real, demanding reprojection step (the regime the TAA
+/// reprojection path must hold the GI bounce through), while still being slow
+/// enough that the recent-frame history overlaps the current frame (so the
+/// reprojection genuinely *runs* rather than every sample disoccluding off
+/// screen). The path is open: frame 48 lands exactly on the fixed readback
+/// pose, which the camera has never been static at.
+pub const E2E_MOTION_FRAMES: u32 = 48;
+
+/// Render frames the driver counts in the `SETTLE` phase — static at the fixed
+/// readback pose, immediately after the camera stops moving.
+///
+/// Kept at the **bare minimum (1 frame)** on purpose. The readback pose is one
+/// the camera has never been static at; a faithful TAA reprojection has carried
+/// the GI bounce here through the motion and the shadowed/indirect regions are
+/// still GI-lit, a broken reprojection has decayed them to black during the
+/// move and they are still black. The decay must be caught *immediately* after
+/// the motion — every extra static frame lets the static-camera running average
+/// re-converge from same-pose `taa_samples` and washes the regression out (the
+/// same masking trap a long settle / a closed orbit / an eased path has). 1
+/// frame is just enough to guarantee the camera is cleanly at the `t == 1`
+/// readback pose for one rendered frame before `SHOOT` captures it.
+pub const E2E_SETTLE_FRAMES: u32 = 1;
 
 /// The fixed directory every run writes its readback screenshot PNG(s) into
 /// (`e2e-render-test.md` Implementation log — 2026-05-14 screenshot-to-disk
@@ -133,7 +162,14 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<driver::E2eState>()
         .init_resource::<driver::E2eOutcome>()
         .add_systems(Startup, setup_e2e_camera)
-        .add_systems(Update, driver::e2e_driver);
+        // The driver owns the deterministic camera motion — it writes the
+        // camera `Transform` + `PositionSplit` during the `MOTION` / `SETTLE`
+        // phases. It must run *before* `sync_position_split` (and thus before
+        // `update_camera_history`, which is `.after(sync_position_split)`) so
+        // this frame's first-hit / TAA-reproject / camera-history all see the
+        // new pose the same frame the driver sets it — no one-frame lag
+        // between the camera rotation and its `PositionSplit` origin.
+        .add_systems(Update, driver::e2e_driver.before(crate::camera::sync_position_split));
 
     // The render-world half of the pipeline scan: the scan system runs every
     // render frame in the `Render` schedule (after all the prepare/queue
@@ -150,19 +186,30 @@ pub fn add_e2e_systems(app: &mut App) {
     }
 }
 
-/// Spawn the fixed-pose e2e camera — the determinism anchor
+/// Spawn the e2e camera at the motion-path *start* pose
 /// (`e2e-render-test.md` §4.2).
 ///
 /// The same component set as the production `camera::setup_camera`, **minus
-/// `FreeCamera`**: `FreeCameraPlugin` is omitted from the e2e config, so even
-/// though the window is real and can receive focus/input, no system consumes
-/// those events to move the camera — the `Transform` never changes.
+/// `FreeCamera`**: `FreeCameraPlugin` is omitted from the e2e config, so no
+/// *input* moves the camera. The camera is **not** static, though — the
+/// bounded-frame [`driver::e2e_driver`] drives a deterministic camera move
+/// during its `MOTION` phase (writing the `Transform` + `PositionSplit` itself,
+/// as a pure function of the phase progress), so the run exercises the TAA
+/// camera-motion reprojection.
+///
+/// The camera is spawned at [`gates::e2e_motion_start_transform`] (the `t == 0`
+/// endpoint). The `WARMUP` phase renders here; the `MOTION` phase sweeps on an
+/// **open** path to [`gates::e2e_camera_transform`] (the `t == 1` readback
+/// pose); `SETTLE` + the readback happen there. The readback pose is therefore
+/// one the camera has *never been static at* — every GI/TAA history sample in
+/// the readback frame had to come through the camera-motion reprojection (see
+/// [`gates::e2e_orbit_camera_transform`]'s open-path rationale). All the
+/// camera-pose-coupled gate rectangles are derived from
+/// [`gates::e2e_camera_transform`] — the readback pose, so they stay valid.
 /// `sync_position_split` (still added) is a pure function of the `Transform`,
-/// so the `PositionSplit` is deterministic. The camera pose lives in
-/// [`gates::e2e_camera_transform`] — the single named const all the
-/// camera-pose-coupled gate rectangles are derived from (R5).
+/// so the `PositionSplit` is deterministic whichever phase the driver is in.
 fn setup_e2e_camera(mut commands: Commands) {
-    let start = gates::e2e_camera_transform();
+    let start = gates::e2e_motion_start_transform();
     commands.spawn((
         Camera3d::default(),
         Camera {
