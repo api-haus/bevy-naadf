@@ -1089,3 +1089,66 @@ analysis whether or not the gates pass).
 - The screenshot save is also batch-agnostic — `target/e2e-screenshots/
   e2e_latest.png` is written every run regardless of batch. Agents debugging a
   B4/B5/B6 render regression can `Read` it directly for a visual diff.
+
+---
+
+## Implementation log — addendum (2026-05-14): e2e test-camera repositioned off the grazing angle
+
+The e2e harness's test camera sat at a grazing, near-horizontal angle on the
+voxel volume — the saved screenshot showed hard-edged horizontal streak
+artifacts across the upper half (a known precision artifact at grazing angles /
+partially outside the volume). The camera was repositioned into a clean 3/4
+vantage and the B1–B3 gate rects re-derived for the new pose (R5). Only
+`src/e2e/gates.rs` changed; no harness mechanism touched, no debug
+instrumentation added.
+
+### Old vs new e2e camera pose
+
+| | pose (`e2e_camera_transform`, `src/e2e/gates.rs`) |
+|---|---|
+| **old** | `Transform::from_xyz(104.0, 34.0, 110.0).looking_at(Vec3::new(30.0, 24.0, 30.0), Vec3::Y)` |
+| **new** | `Transform::from_xyz(112.0, 52.0, 117.0).looking_at(Vec3::new(34.0, 20.0, 34.0), Vec3::Y)` |
+
+The old pose sat camera height y=34, only ~2 units above the volume top (y=32),
+with a look direction only ~9% downward — the upper-frame view rays skimmed
+just over the volume top, producing the streak artifact. The new pose was
+pulled **back and to the right** (world +X 104→112, +Z 110→117 — off the
+grazing line) **and raised** well clear of the volume top (y 34→52), with the
+target lifted toward the volume centre (24→20 in y, 30→34 in x/z). The view ray
+now pitches ~16° below horizontal — a clean 3/4 view that frames the 64×32×64
+volume with the atmosphere-tinted sky band still across the top. The streak
+artifact is materially reduced (thin faint lines vs. the old hard thick bands);
+the orchestrator does the final visual re-inspection.
+
+### Updated B1–B3 gate rects (`src/e2e/gates.rs`, fractional 0..1 coords)
+
+Re-derived from a fresh `save_to_disk` dump at the new pose (the dev-time aid,
+since reverted) — measured at the e2e 256×256 readback:
+
+| rect | old fractional | new fractional | measured at new pose |
+|---|---|---|---|
+| `emissive_rect`    | `(0.45, 0.42)–(0.53, 0.50)` | `(0.46, 0.40)–(0.54, 0.46)` | luminance ~231 (gate `> 120`) |
+| `solid_block_rect` | `(0.34, 0.72)–(0.50, 0.88)` | `(0.39, 0.59)–(0.62, 0.78)` | luminance ~3.2 (gate `< 90`)  |
+| `sky_rect`         | `(0.06, 0.06)–(0.40, 0.22)` | `(0.02, 0.03)–(0.39, 0.17)` | luminance ~45.9 (gate `[10, 230]` and `> solid`) |
+
+The emissive box is the largest connected bright blob, px x≈117–138, y≈98–117 at
+256×256; the dark voxel geometry forms a diamond in the lower-centre; the sky
+band sits across the upper-left. All three gate regions clear their thresholds
+with generous margin.
+
+### Luminance liveness gate
+
+Still holds at the new pose. Measured whole-frame **non-black fraction: 41.1%**
+(was 43.4% at the old pose) — comfortably above the Batch-1–4 floor of 25%
+(`MIN_NON_BLACK_FRACTION_PRE_GI`). No threshold change needed.
+
+### Verification
+
+- `cargo build` — clean (pre-existing dead-code warnings only).
+- `cargo test` — **44 passed** (unchanged — this is a camera-pose + gate-rect
+  change, no test touched).
+- `cargo run --bin e2e_render` — exits **0**. `target/e2e-screenshots/
+  e2e_latest.png` written at the new pose; stdout: luminance gate
+  `batch 3 — 41.1% non-black; threshold 25%`, then `e2e_render: PASS (batch 3)
+  — … per-batch region gate green, every pipeline created cleanly, every
+  expected render-graph node dispatched.`
