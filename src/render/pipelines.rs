@@ -117,11 +117,22 @@ pub struct NaadfPipelines {
     /// *read-write* storage) — the first-hit only reads the buffer.
     pub atmosphere_read_layout: BindGroupLayoutDescriptor,
     /// The TAA reproject pass's single bind group layout (`06-design-a2.md`
-    /// §5.3): `taa_params` (uniform), `camera_history` / `first_hit_data` /
-    /// `taa_samples` (read-only storage), `taa_sample_accum` (read-write
-    /// storage). The reproject pass does not traverse the voxel world, so it
-    /// binds no `@group(0)` world data — this is its only group.
+    /// §5.3, `09-design-b.md` §5.8.1): `taa_params` (uniform), `camera_history`
+    /// / `first_hit_data` / `taa_samples` (read-only storage), `taa_sample_accum`
+    /// / `taa_dist_min_max` (read-write storage). The reproject pass does not
+    /// traverse the voxel world, so it binds no `@group(0)` world data — this is
+    /// its only group. Phase B Batch 6 adds the `taa_dist_min_max` rw binding
+    /// (slot 5) — the `base/` `ReprojectOld` extra output.
     pub taa_reproject_layout: BindGroupLayoutDescriptor,
+    /// The `calc_new_taa_sample` pass's bind group layout (`09-design-b.md`
+    /// §4.10) — `@group(1)` (the `calc_new_taa_sample` pipeline layout is
+    /// `[empty, calc_new_taa_sample_layout]`, the same `@group`-placeholder
+    /// pattern `naadf_global_illum.wgsl` uses): `taa_params` (uniform),
+    /// `first_hit_data` / `final_color` / `voxel_types` (read-only storage),
+    /// `taa_samples` / `taa_sample_accum` (read-write storage). It does not
+    /// traverse the voxel world — it binds only `voxel_types`, not the whole
+    /// `@group(0)` world layout.
+    pub calc_new_taa_sample_layout: BindGroupLayoutDescriptor,
     /// `@group(0)` for the Phase-B atmosphere precompute pass: `atmosphere_params`
     /// (uniform), `atmosphere_comp` (read-write storage) — `09-design-b.md`
     /// §4.3. The precompute pass writes one quarter of `atmosphere_comp` per
@@ -182,8 +193,12 @@ pub struct NaadfPipelines {
     /// Cached id of the `naadf_first_hit` compute pipeline.
     pub first_hit_pipeline: CachedComputePipelineId,
     /// Cached id of the `taa.wgsl` `reproject_old_samples` compute pipeline
-    /// (`06-design-a2.md` §8.4).
+    /// (`06-design-a2.md` §8.4, `09-design-b.md` §5.8.1 — the `base/` variant).
     pub taa_reproject_pipeline: CachedComputePipelineId,
+    /// Cached id of the `taa.wgsl` `calc_new_taa_sample` compute pipeline
+    /// (`09-design-b.md` §4.10 / §5.8.2) — folds the denoised GI `final_color`
+    /// into the 16-deep `taa_samples` ring + `taa_sample_accum`.
+    pub calc_new_taa_sample_pipeline: CachedComputePipelineId,
     /// Cached id of the `naadf_atmosphere.wgsl` `precompute_atmosphere` compute
     /// pipeline (`09-design-b.md` §4.3 / §5.1).
     pub atmosphere_pipeline: CachedComputePipelineId,
@@ -341,9 +356,10 @@ impl FromWorld for NaadfPipelines {
 
         // --- the TAA reproject pass's bind group layout ---------------------
         // `taa_params` uniform; `camera_history` / `first_hit_data` /
-        // `taa_samples` read-only storage; `taa_sample_accum` read-write
-        // storage (`06-design-a2.md` §5.3). The reproject pass binds no
-        // `@group(0)` world data — this is its single group.
+        // `taa_samples` read-only storage; `taa_sample_accum` / `taa_dist_min_max`
+        // read-write storage (`06-design-a2.md` §5.3, `09-design-b.md` §5.8.1).
+        // The reproject pass binds no `@group(0)` world data — this is its
+        // single group. Phase B Batch 6 adds `taa_dist_min_max` (slot 5).
         let taa_reproject_layout = BindGroupLayoutDescriptor::new(
             "naadf_taa_reproject_bind_group_layout",
             &BindGroupLayoutEntries::sequential(
@@ -353,6 +369,27 @@ impl FromWorld for NaadfPipelines {
                     storage_buffer_read_only_sized(false, None), // camera_history
                     storage_buffer_read_only_sized(false, None), // first_hit_data
                     storage_buffer_read_only_sized(false, None), // taa_samples
+                    storage_buffer_sized(false, None),           // taa_sample_accum, rw
+                    storage_buffer_sized(false, None),           // taa_dist_min_max, rw
+                ),
+            ),
+        );
+
+        // --- the `calc_new_taa_sample` pass's bind group layout -------------
+        // `taa_params` uniform; `first_hit_data` / `final_color` / `voxel_types`
+        // read-only storage; `taa_samples` / `taa_sample_accum` read-write
+        // storage (`09-design-b.md` §4.10 / §5.8.2). Bound at `@group(1)` (the
+        // pipeline layout is `[empty, calc_new_taa_sample_layout]`).
+        let calc_new_taa_sample_layout = BindGroupLayoutDescriptor::new(
+            "naadf_calc_new_taa_sample_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(taa_params_size)),
+                    storage_buffer_read_only_sized(false, None), // first_hit_data
+                    storage_buffer_read_only_sized(false, None), // final_color
+                    storage_buffer_read_only_sized(false, None), // voxel_types
+                    storage_buffer_sized(false, None),           // taa_samples, rw
                     storage_buffer_sized(false, None),           // taa_sample_accum, rw
                 ),
             ),
@@ -556,14 +593,32 @@ impl FromWorld for NaadfPipelines {
                 ..default()
             });
 
-        // --- the TAA reproject compute pipeline (single, format-agnostic) ---
+        // --- the TAA reproject + calc-new-sample compute pipelines ----------
+        // Both entry points live in `taa.wgsl` (`09-design-b.md` §5.8). The
+        // reproject pipeline binds `taa_reproject_layout` at `@group(0)`; the
+        // `calc_new_taa_sample` pipeline binds `calc_new_taa_sample_layout` at
+        // `@group(1)` (the shader places its bindings on `@group(1)` so they do
+        // not collide with the reproject pass's `@group(0)` in the shared
+        // module — so the layout vec has the entry-less `empty_layout`
+        // placeholder at index 0).
         let taa_reproject_shader = asset_server.load(TAA_REPROJECT_SHADER);
         let taa_reproject_pipeline =
             pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
                 label: Some("naadf_taa_reproject_pipeline".into()),
                 layout: vec![taa_reproject_layout.clone()],
-                shader: taa_reproject_shader,
+                shader: taa_reproject_shader.clone(),
                 entry_point: Some(Cow::from("reproject_old_samples")),
+                ..default()
+            });
+        let calc_new_taa_sample_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_calc_new_taa_sample_pipeline".into()),
+                layout: vec![
+                    empty_layout.clone(),
+                    calc_new_taa_sample_layout.clone(),
+                ],
+                shader: taa_reproject_shader,
+                entry_point: Some(Cow::from("calc_new_taa_sample")),
                 ..default()
             });
 
@@ -726,6 +781,7 @@ impl FromWorld for NaadfPipelines {
             blit_layout,
             taa_layout,
             taa_reproject_layout,
+            calc_new_taa_sample_layout,
             atmosphere_layout,
             atmosphere_read_layout,
             empty_layout,
@@ -737,6 +793,7 @@ impl FromWorld for NaadfPipelines {
             denoise_layout,
             first_hit_pipeline,
             taa_reproject_pipeline,
+            calc_new_taa_sample_pipeline,
             atmosphere_pipeline,
             ray_queue_pipeline,
             ray_queue_store_pipeline,

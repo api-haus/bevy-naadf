@@ -117,11 +117,14 @@ begin until the prior phase is reviewed and confirmed runnable.
    cell hierarchy, CPU-side AADF construction + cuboid expansion, the DDA-with-AADF
    traversal, the int+frac `PositionSplit` camera, and a two-pass albedo first-hit WGSL
    render path (compute first-hit → fullscreen blit). Flat-lit, no bounce lighting, no TAA.
-3. **Phase A-2 — long-term-memory TAA.** The 32-frame / 64-bit-sample temporal
+3. **Phase A-2 — long-term-memory TAA.** ✅ The 16-frame / 64-bit-sample temporal
    anti-aliasing pass, slotting between first-hit and the final blit.
-4. **Phase B — the GI pipeline.** Compressed ReSTIR GI (lit/unlit separation, 8×8
-   screen-space regions, the 12-iteration spatial pass) + the sparse bilateral denoiser +
-   the 4-plane-bounce first-hit. DLSS Ray Reconstruction integrates here as the denoiser.
+4. **Phase B — the GI pipeline.** ✅ The full NAADF `WorldRenderBase` real-time GI
+   pipeline: the atmosphere precompute, the 4-plane-bounce first-hit, the adaptive
+   ~0.25-spp `rayQueueCalc` sampler, compressed ReSTIR GI (lit/unlit separation, 8×8
+   screen-space regions, the 12-iteration spatial pass), the sparse bilateral denoiser,
+   and the `base/` long-term TAA (`ReprojectOld` + `CalcNewTaaSample`). 13 render-graph
+   nodes; the GI bounce lights the scene.
 5. **Phase C — GPU world construction & editing.** The GPU hashing construction
    (Algorithm 1), the background chunk-AADF queue, and flood-fill edit invalidation — a
    scalability / editability track, not a rendering foundation.

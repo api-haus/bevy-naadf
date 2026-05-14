@@ -1,18 +1,23 @@
-//! Render-graph node systems + edges — the Phase-A node set + the Phase-A-2
-//! TAA node (`03-design.md` §5.1, `06-design-a2.md` §8).
+//! Render-graph node systems + edges — the Phase-A first-hit + final-blit
+//! nodes + the Phase-A-2/B TAA nodes (`03-design.md` §5.1, `06-design-a2.md`
+//! §8, `09-design-b.md` §4.2 / §5.8).
 //!
-//! The graph is three compute/fragment passes, chained: [`naadf_first_hit_node`]
-//! (a compute pass that raytraces the AADF world and writes `first_hit_data` +
-//! `taa_sample_accum`, and — when `FLAG_IS_TAA` is set — one `taa_samples` ring
-//! slot), then [`naadf_taa_reproject_node`] (a compute pass that reprojects up
-//! to 16 frames of history into `taa_sample_accum` — gated on the runtime TAA
-//! toggle), then [`naadf_final_blit_node`] (a fullscreen fragment pass that
-//! tonemaps `taa_sample_accum` onto the view target). All run in the `Core3d`
-//! `PostProcess` set, chained, before tonemapping (see `render::mod`).
+//! This file holds the four nodes that are *shared structure* across phases:
+//! [`naadf_first_hit_node`] (the Phase-B 4-plane-bounce first-hit compute
+//! pass), [`naadf_taa_reproject_node`] (the `base/` `ReprojectOld` compute
+//! pass), [`naadf_calc_new_taa_sample_node`] (the `base/` `CalcNewTaaSample`
+//! compute pass), and [`naadf_final_blit_node`] (the `base/renderFinal`
+//! fullscreen fragment pass). The other ~9 Phase-B GI nodes live in
+//! `graph_b.rs`.
 //!
-//! With the TAA toggle off, `naadf_taa_reproject_node` early-returns and the
-//! graph is the original Phase-A two-pass `first-hit → final-blit` path,
-//! bit-identical.
+//! Phase B Batch 6 (`09-design-b.md` §11 Batch 6): the `base/` TAA path is
+//! rewired — `naadf_taa_reproject_node` (now the `base/` variant, writing
+//! `taa_dist_min_max`) + `naadf_calc_new_taa_sample_node` (folding the denoised
+//! GI `final_color` into the 16-deep `taa_samples` ring + `taa_sample_accum`)
+//! are back in the `Core3d` chain at their `09-design-b.md` §4.2 positions, and
+//! `naadf_final_blit_node` reads `taa_sample_accum` again (the Batch-2
+//! temporary `final_color` seam is reverted). Both TAA nodes are gated on the
+//! runtime TAA toggle (`ExtractedTaaConfig.enabled`).
 //!
 //! In Bevy 0.19's render API a "render-graph node" is just a system in the
 //! `Core3d` schedule that records commands via [`RenderContext`] — there is
@@ -40,6 +45,9 @@ pub const FIRST_HIT_SPAN: &str = "naadf_first_hit";
 /// Timing-span name for the TAA reproject pass — surfaces in the HUD as
 /// `render/naadf_taa_reproject/elapsed_gpu`.
 pub const TAA_REPROJECT_SPAN: &str = "naadf_taa_reproject";
+/// Timing-span name for the `base/` `CalcNewTaaSample` pass (`09-design-b.md`
+/// §4.10) — surfaces in the HUD as `render/naadf_calc_new_taa_sample/elapsed_gpu`.
+pub const CALC_NEW_TAA_SAMPLE_SPAN: &str = "naadf_calc_new_taa_sample";
 /// Timing-span name for the final-blit pass — surfaces in the HUD as
 /// `render/naadf_final_blit/elapsed_gpu`.
 pub const FINAL_BLIT_SPAN: &str = "naadf_final_blit";
@@ -102,30 +110,30 @@ pub fn naadf_first_hit_node(
     time_span.end(render_context.command_encoder());
 }
 
-/// `Core3d` system: the NAADF TAA reproject + accumulation compute pass
-/// (`06-design-a2.md` §8.1).
+/// `Core3d` system: the NAADF `base/` TAA `ReprojectOld` compute pass
+/// (`06-design-a2.md` §8.1, `09-design-b.md` §5.8.1).
 ///
-/// Faithful port of the C# `WorldRenderAlbedo` `ReprojectOld` dispatch: one
+/// Faithful port of the C# `WorldRenderBase` `ReprojectOld` dispatch: one
 /// compute pass running `taa.wgsl`'s `reproject_old_samples` over
 /// `ceil(pixel_count / 64)` workgroups, binding the single
 /// `taa_reproject_bind_group`. Reads `first_hit_data` + `taa_samples` +
-/// `camera_history` + `taa_params`, reads-modifies-writes `taa_sample_accum`.
+/// `camera_history` + `taa_params`; writes `taa_dist_min_max` (the `base/`
+/// extra output — the per-pixel distance min/max + specular-normal validity
+/// mask `renderSampleRefine` consumes) and OVERWRITES `taa_sample_accum` with
+/// the reprojected-history sum.
 ///
 /// Gated on `ExtractedTaaConfig.enabled` (mirrors `AppArgs.taa` —
-/// `06-design-a2.md` §8.2): when TAA is off the node early-returns and
-/// `taa_sample_accum` is left untouched (the first-hit pass wrote it, the final
-/// blit reads it — exactly Phase A's `shaded_color` path, bit-identical).
+/// `06-design-a2.md` §8.2). For Phase B, TAA is on by default (the A-2
+/// done-bar) — the gate is kept for the runtime `D`-key toggle; with TAA off,
+/// `taa_sample_accum` is never written and the final blit shows first-hit
+/// albedo only (documented in `09-design-b.md` §4.10).
 ///
-/// Otherwise skips silently until the TAA + frame GPU resources exist and the
-/// reproject pipeline has finished compiling (the Phase-A
-/// `let Some(...) else { return };` pattern).
+/// Skips silently until the TAA + frame GPU resources exist and the reproject
+/// pipeline has finished compiling.
 ///
-/// Phase B Batch 2: this node is temporarily OUT of the render-graph chain
-/// (`09-design-b.md` §11 Batch 2 step 8) — the `base/` first-hit no longer
-/// writes `taa_sample_accum` / `taa_samples`, so reprojection has nothing to
-/// reproject until Batch 6 ports `CalcNewTaaSample`. Kept defined so Batch 6
-/// only needs to re-add it to the chain.
-#[allow(dead_code)]
+/// Phase B Batch 6: re-added to the `Core3d` chain at its `09-design-b.md`
+/// §4.2 position (Batch 2 had it temporarily out — the `base/` first-hit no
+/// longer writes `taa_sample_accum`/`taa_samples`).
 pub fn naadf_taa_reproject_node(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,
@@ -134,8 +142,7 @@ pub fn naadf_taa_reproject_node(
     taa_gpu: Option<Res<TaaGpu>>,
     frame_gpu: Option<Res<FrameGpu>>,
 ) {
-    // Gate the dispatch on the runtime TAA toggle — with TAA off, leaving
-    // `taa_sample_accum` untouched makes the result bit-identical to Phase A.
+    // Gate the dispatch on the runtime TAA toggle.
     if !taa_config.enabled {
         return;
     }
@@ -168,13 +175,82 @@ pub fn naadf_taa_reproject_node(
     time_span.end(render_context.command_encoder());
 }
 
+/// `Core3d` system: the NAADF `base/` TAA `CalcNewTaaSample` compute pass
+/// (`09-design-b.md` §4.10 / §5.8.2).
+///
+/// Faithful port of the C# `WorldRenderBase` `CalcNewTaaSample` dispatch: one
+/// compute pass running `taa.wgsl`'s `calc_new_taa_sample` over
+/// `ceil(pixel_count / 64)` workgroups, binding the `calc_new_taa_sample`
+/// `@group(1)` bind group (the pipeline layout is `[empty, …]` — see
+/// `pipelines.rs`). Reconstructs the first-hit virtual path, reads the denoised
+/// GI result from `final_color`, compresses it into one slot of the 16-deep
+/// `taa_samples` ring, and folds the light into `taa_sample_accum` with
+/// `sample_weight + 1`. This is the SOLE `taa_samples` writer in the `base/`
+/// pipeline (the `base/` first-hit no longer writes it — `09-design-b.md`
+/// §6.3).
+///
+/// Runs after the denoiser, before the final blit (NAADF's dispatch order —
+/// `WorldRenderBase.cs:421-422`, `09-design-b.md` §4.2). Gated on
+/// `ExtractedTaaConfig.enabled` — same as `naadf_taa_reproject_node`; with TAA
+/// off the GI result is not folded into `taa_sample_accum` (the documented
+/// `AppArgs.taa`-off behaviour — `09-design-b.md` §4.10).
+///
+/// Skips silently until the TAA + frame GPU resources exist and the
+/// `calc_new_taa_sample` pipeline has finished compiling.
+pub fn naadf_calc_new_taa_sample_node(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipelines: Res<NaadfPipelines>,
+    taa_config: Res<ExtractedTaaConfig>,
+    taa_gpu: Option<Res<TaaGpu>>,
+    frame_gpu: Option<Res<FrameGpu>>,
+) {
+    if !taa_config.enabled {
+        return;
+    }
+    let (Some(taa_gpu), Some(frame_gpu)) = (taa_gpu, frame_gpu) else {
+        return;
+    };
+    let _ = taa_gpu; // the bind group (in `FrameGpu`) carries the TAA buffers.
+    let Some(pipeline) =
+        pipeline_cache.get_compute_pipeline(pipelines.calc_new_taa_sample_pipeline)
+    else {
+        return;
+    };
+
+    let workgroups =
+        frame_gpu.pixel_count.div_ceil(FIRST_HIT_WORKGROUP_SIZE).max(1);
+
+    let diagnostics = render_context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    let encoder = render_context.command_encoder();
+    let time_span = diagnostics.time_span(encoder, CALC_NEW_TAA_SAMPLE_SPAN);
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("naadf_calc_new_taa_sample_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        // The `calc_new_taa_sample` pipeline layout is `[empty, …]` — its
+        // bindings live on `@group(1)` so they do not collide with
+        // `reproject_old_samples`'s `@group(0)` in the shared `taa.wgsl`
+        // module. `@group(0)` is the entry-less placeholder.
+        pass.set_bind_group(0, &pipelines.empty_bind_group, &[]);
+        pass.set_bind_group(1, &frame_gpu.calc_new_taa_sample_bind_group, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    time_span.end(render_context.command_encoder());
+}
+
 /// `Core3d` system: the NAADF final-blit fullscreen pass.
 ///
-/// Faithful port of the C# `albedo/renderFinal.fx` — a fullscreen-triangle
+/// Faithful port of the C# `base/renderFinal.fx` — a fullscreen-triangle
 /// fragment pass running `naadf_final.wgsl`'s `fragment` over the view target,
-/// reading `shaded_color`, tonemapping, and writing the swapchain. The C#
+/// reading `taa_sample_accum`, tonemapping (with the `tone_mapping_fac`
+/// uniform term — the `base/` variant), and writing the swapchain. The C#
 /// `Cube`+PS trick becomes a standard Bevy fullscreen triangle
-/// (`03-design.md` §5.4).
+/// (`03-design.md` §5.4). Phase B Batch 6 reverted the Batch-2 temporary
+/// `final_color` blit source.
 ///
 /// Writes the view target's main texture directly (a single non-blended
 /// `Operations::default()` clear-then-write); the HUD's UI pass then draws on

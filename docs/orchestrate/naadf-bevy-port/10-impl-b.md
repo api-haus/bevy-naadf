@@ -1416,3 +1416,217 @@ finding, *honestly*. Two batch-tracker constants were touched:
   adds the timing lines for the expensive nodes — `naadf_spatial_resampling` +
   `naadf_denoise` are both in `expected_spans` and recorded; the HUD's
   `write_timing` + `const`-checked path-pair pattern extends to them directly.
+
+---
+
+## Batch 6 — base/ TAA rewire + final blit + integration (2026-05-14)
+
+`09-design-b.md` §11 Batch 6 (steps 17–20) — the FINAL batch. Wires the `base/`
+long-term-memory TAA path (`ReprojectOld` writing `taa_dist_min_max` +
+`CalcNewTaaSample`), `taa_dist_min_max` into the bind groups + the chain,
+reverts Batch-2's temporary `final_color` blit seam, ports the `base/`
+`renderFinal` (`tone_mapping_fac`), re-adds both TAA nodes to the `Core3d`
+chain, and lands the HUD + e2e gate work. After Batch 6 the full NAADF
+`WorldRenderBase` real-time GI pipeline — 13 render-graph nodes — is wired.
+
+### Files changed
+
+| file | change |
+|---|---|
+| `src/assets/shaders/taa.wgsl` | **REWIRED to the `base/` variant** (was the A-2 `albedo/` port). `reproject_old_samples`: gains the `taa_dist_min_max` `@group(0) @binding(5)` rw binding + the write (`base/renderTaaSampleReverse.fx:79` — `f16(distMin) \| f16(distMax)<<16`, `valid_normals_spec`); un-omits the `valid_normals_spec` accumulation (`:68-70`, `get_specular_normals` is real now — the `base/` 4-plane first-hit populates planes 1-3); changes the `screenPosDistanceSqr` reject `> 1.0` → `> 16.0` (the `base/` value — item #2); changes the accum write from A-2's read-add-write to the `base/` **OVERWRITE** with `colorSum` (the `base/` first-hit writes `final_color`, not `taa_sample_accum`, so `ReprojectOld` overwrites). NEW `calc_new_taa_sample` entry point (`base/renderTaaSampleReverse.fx:170-206`) on `@group(1)` — reconstructs the first-hit virtual path, decompresses the voxel type for roughness, reads `final_color` as the current GI light, `taa_compress_sample`s it into the 16-deep `taa_samples` ring (`% TAA_SAMPLE_RING_DEPTH`), folds the light into `taa_sample_accum` with `sample_weight + 1`. |
+| `src/assets/shaders/naadf_final.wgsl` | **REPLACED in place** with the `base/renderFinal.fx` `MainPS` behaviour: the blit source is `taa_sample_accum` again (the Batch-2 temporary `final_color` seam is reverted; the `FLAG_BLIT_FINAL_COLOR` decode branch is removed); the tonemap denominator is `params.tone_mapping_fac` (`base/:55`) instead of the A-2 hardcoded `1.0`; the `showRayStep` debug reads `first_hit_data[pixelIndex].z & 0x7FFF` (`base/:44`) instead of `col_samples.x`. |
+| `src/render/pipelines.rs` | `taa_reproject_layout` += `taa_dist_min_max` rw binding (slot 5). NEW `calc_new_taa_sample_layout` (`@group(1)`, 6 bindings: `taa_params` uniform + `first_hit_data`/`final_color`/`voxel_types` RO + `taa_samples`/`taa_sample_accum` RW). NEW `calc_new_taa_sample_pipeline` — `taa.wgsl` entry `calc_new_taa_sample`, layout `[empty_layout, calc_new_taa_sample_layout]` (the shader places its bindings on `@group(1)` so they do not collide with `reproject_old_samples`'s `@group(0)` in the shared naga-oil module — the same `@group`-placeholder pattern `naadf_global_illum.wgsl` uses). |
+| `src/render/prepare.rs` | `FrameGpu` += `calc_new_taa_sample_bind_group`. `prepare_frame_gpu` gains `Option<Res<WorldGpu>>` (the `calc_new_taa_sample` bind group needs `voxel_types`) — waited-for like the other three render-world resources. `taa_reproject_bind_group` += `taa_dist_min_max` (slot 5). NEW `calc_new_taa_sample_bind_group` built (mixes `TaaGpu` + `FrameGpu` + `WorldGpu`). The blit bind group's slot 1 reverts to `taa_gpu.taa_sample_accum` (was the temporary `final_color`). `flags` no longer sets `FLAG_BLIT_FINAL_COLOR`. |
+| `src/render/graph.rs` | `naadf_taa_reproject_node` — `#[allow(dead_code)]` removed, doc updated to the `base/` variant. NEW `naadf_calc_new_taa_sample_node` + `CALC_NEW_TAA_SAMPLE_SPAN` — binds `[empty_bind_group, calc_new_taa_sample_bind_group]`, `ceil(pixel_count/64)` workgroups, gated on `ExtractedTaaConfig.enabled`. `naadf_final_blit_node` doc updated to the `base/renderFinal` variant. |
+| `src/render/mod.rs` | the `Core3d` `.chain()` gains `naadf_taa_reproject_node` (after `naadf_first_hit_node`, before `naadf_sample_refine_clear_node`) + `naadf_calc_new_taa_sample_node` (after `naadf_denoise_node`, before `naadf_final_blit_node`) — both at their `09-design-b.md` §4.2 positions. 13-node chain. |
+| `src/hud.rs` | renderer-mode string → `"Renderer: NAADF (Phase B — real-time GI)"`. Timing lines for the expensive Phase-B nodes (`09-design-b.md` §4.12): `atmosphere`, `first-hit`, `taa-reproject`, `global-illum`, `sample-refine`, `spatial-resmpl`, `denoise`, `final-blit`. The `const`-checked `matches_span` pairs extended to the 5 new `graph_b` spans. |
+| `src/e2e/gates.rs` | `CURRENT_BATCH` 5 → 6. NEW `assert_batch_6` — the first region gate that asserts the GI bounce is VISIBLE (the dark diffuse `solid_block_rect` has *brightened* past `MIN_GI_BOUNCE_LUMINANCE`) + re-runs the emissive/sky checks. `expected_spans` / `batch_gate` gain their B6 arms (`expected_spans` adds `naadf_taa_reproject` + `naadf_calc_new_taa_sample`). |
+| `README.md` | the roadmap's Phase A-2 + Phase B entries marked ✅ with the full Phase-B node inventory. |
+
+### Mapping to NAADF source
+
+- **`reproject_old_samples` (the `base/` `ReprojectOld` rewire)** ←
+  `base/renderTaaSampleReverse.fx:25-168`. The `taa_dist_min_max` write
+  (`:79`), the `validNormalsSpec` 3-field accumulation (`:68-70`), the
+  `screenPosDistanceSqr > 16.0f` reject (`:139`), and the `taaSampleAccum`
+  OVERWRITE (`:167` — `uint2(f16(colorSum.w) | f16(colorSum.r)<<16, f16(colorSum.g)
+  | f16(colorSum.b)<<16)`). The A-2 `albedo/` variant had none of these — it
+  had no `taaDistMinMax` output, folded `validNormalsSpec` to a no-op, used
+  `> 1.0`, and read-added-wrote `taaSampleAccum` (because the `albedo/`
+  first-hit pre-writes the current sample into `taaSampleAccum`; the `base/`
+  first-hit writes `finalColor` instead, so `ReprojectOld` overwrites).
+- **`calc_new_taa_sample`** ← `base/renderTaaSampleReverse.fx:170-206`
+  (`calcNewTaaSample`) verbatim: `getRayDir` (no jitter), `getHitDataFromPlanes`
+  (the shared full version), `decompressVoxelType(voxelTypeData[voxelType])`,
+  the `final_color`→`light` read (`:187-188`), the `extra_data8` 5-bit roughness
+  (`:189-192`), the `compressSample` into `taaSamples[(taaIndex % 32) ...]` →
+  `% TAA_SAMPLE_RING_DEPTH` (the §6 16-deep ring), and the `taaSampleAccum`
+  fold with `sampleWeight + 1` (`:197-205`). The HLSL `compressSample` takes
+  the f16 *bits* for `dist`; the A-2 `taa_compress_sample` helper takes a float
+  and does the `f32tof16` itself, so the float distance is passed (`65520.0`
+  for a miss, else the decoded `firstHit.w & 0x7FFF`).
+- **`naadf_final.wgsl` (the `base/renderFinal` revert)** ← `base/renderFinal.fx`
+  `MainPS` — `taaSampleAccum` blit source (`:38-40`), `toneMappingFac` tonemap
+  denominator (`:55`), `showRayStep` reading `firstHitData[pixelIndex].z &
+  0x7FFF` (`:44`). The Batch-2 temporary `final_color` seam is reverted exactly
+  as `09-design-b.md` §11 Batch 6 step 19 / the Batch-2 "the `taa_samples`
+  seam" note specify.
+- **`taa_dist_min_max` wiring** — the buffer + bind-group plumbing landed in
+  Batch 4 (`prepare_taa` creates/resizes/zero-clears it; the `sample_refine`
+  bind group references it). Batch 6 adds the missing piece: the `ReprojectOld`
+  *shader write* + the reproject `@group(0)` rw binding + the
+  `taa_reproject_bind_group` entry. Per the Batch-5 "note for B6", this is the
+  wiring that un-blocks the `renderSampleRefine` reprojection validity test ⇒
+  `valid_samples_compressed` + `bucket_info` populate ⇒ the
+  `renderSpatialResampling` reservoir loop carries real data.
+
+### Item #2 (the `screenPosDistanceSqr` threshold) — applied
+
+`16.0` is used in the Batch-6 `base/` `reproject_old_samples`. The Batch-2
+impl-log finding established that NAADF's `albedo/` source genuinely uses
+`> 1.0` and the `base/` source genuinely uses `> 16.0` — a real per-variant
+divergence, no A-2 bug, no `08-review-a2.md` erratum. Batch 6 ports the
+`base/` value faithfully (`taa.wgsl` `reproject_old_samples`, the screen-position
+reject), and the file-header deviations note records it.
+
+### Item #7 (GI settings as constants) — applied / confirmed
+
+No GI-settings GUI was added. The `WorldRenderBase` settings ship as fixed
+`AppArgs`/`GiSettings` constants (landed in Batch 3) + the A-2-style
+`TAA_SAMPLE_AGE` / `tone_mapping_fac` constants. Batch 6 added one more
+constant in this spirit: `tone_mapping_fac` is set to `1.0` in
+`prepare_frame_gpu` (C# `Settings.data.general.toneMappingFac`), exactly as A-2
+handled `taaSampleMaxAge` — a compile-time constant, not a runtime knob.
+
+### §6.3 authoritative shape (not the stale §4.4/§5.1 variant) — confirmed
+
+Batch 6 followed the authoritative `09-design-b.md` §6.3 + §11 shape, not the
+stale §4.4/§5.1 `@group(3)` "keeps the ring write" variant. Concretely: the
+first-hit pipeline's bind-group layout stays `[world, frame, atmosphere]` (the
+`taa_samples` `@group(2)` group was *removed* in Batch 2, atmosphere at
+`@group(2)`); Batch 6 does NOT resurrect a first-hit `taa_samples` binding. The
+`taa_samples` ring write lives solely in `calc_new_taa_sample` (§6.3 — "the
+`@group(2)` `taa_layout` moves off the first-hit pipeline onto the
+`calc_new_taa_sample` pipeline"). The dormant `taa_layout` descriptor +
+`TaaGpu.taa_first_hit_bind_group` field (kept since Batch 2) are now superseded
+by `calc_new_taa_sample_layout` / `FrameGpu.calc_new_taa_sample_bind_group` —
+they remain in the tree as harmless dead plumbing (a follow-up cleanup could
+drop them; not load-bearing, not Batch-6 scope to churn). The
+`FLAG_BLIT_FINAL_COLOR` flag const (gpu_types.rs + render_pipeline_common.wgsl)
+is likewise now dormant — the temporary seam it gated is reverted; left defined
+(it is `pub`, no dead-code warning) consistent with how Batch 2's other dormant
+plumbing was kept.
+
+### e2e batch-tracker state + the `assert_batch_6` gate
+
+- `CURRENT_BATCH` 5 → 6. `GI_LIT_BATCH` was already `6` (set by Batch 5's
+  honest-tracker change) — so the **0.60 hard luminance gate
+  (`MIN_NON_BLACK_FRACTION_GI`)** now engages for the first time, exactly as
+  the Batch-5 "note for B6" intended.
+- `assert_batch_6` (`gates.rs`) — the first region gate that asserts the GI
+  bounce is *visible*: (1) the emissive blocks + atmosphere sky must still
+  render (the emissive/sky portions of the Batch-2 gate — NOT the full
+  `assert_batch_2`, whose `solid_block_rect < 90` "near-black" check is exactly
+  what Batch 6 inverts), and (2) the positive check — the dark diffuse
+  `solid_block_rect` region (luminance ~4 near-black through Batch 5) must have
+  *brightened* past `MIN_GI_BOUNCE_LUMINANCE`. `expected_spans(6)` adds
+  `naadf_taa_reproject` + `naadf_calc_new_taa_sample` (the full 10-span Phase-B
+  node set; `sample_refine` + `denoise` each remain one combined span).
+- **`MIN_NON_BLACK_FRACTION_GI` / `MIN_GI_BOUNCE_LUMINANCE` were NOT
+  re-confirmed against a measured GI-lit value** — see the verification
+  section: the e2e run did not reach a GI-lit frame. The `0.60` and `12.0`
+  thresholds are the design-intent placeholders; they must be re-measured and
+  nudged once the downstream defect below is fixed.
+
+### Verification
+
+- `cargo build --bin bevy-naadf` + `cargo build --bin e2e_render` — both clean,
+  no warnings.
+- `cargo test` — **46 passed** (4 suites), unchanged from Batch 5. Batch 6
+  added no unit tests: the changes are WGSL shader logic + bind-group / pipeline
+  / node wiring (covered by the e2e `PipelineCache` scan + node-dispatch check)
+  + the e2e gate itself; there is no new CPU-side pure logic to unit-test.
+- `cargo run --bin e2e_render` — **FAILS: the frame is uniformly black** (0.0%
+  non-black; the degenerate-frame floor, the 0.60 luminance gate, and
+  `assert_batch_6` all trip). Exit code 0 (the harness reports failures
+  textually). 5 e2e invocations used (the hard cap) — see the diagnosis below.
+- The TEMP instrumentation added during diagnosis (eprintln gates in
+  `graph.rs` / `prepare.rs`, one diagnostic write in `taa.wgsl`
+  `calc_new_taa_sample`) has been **fully reverted** — `grep -rn TEMP src/`
+  is clean.
+
+### Diagnosis — Batch 6's own wiring is correct; a latent Batch-4/5 GI-consumer defect is exposed
+
+The e2e frame is uniformly `[0,0,0,255]`. Diagnosis from 5 e2e invocations +
+static analysis (no cross-frame buffer-readback instrumentation was used):
+
+1. **No pipeline / shader / device error.** The `PipelineCache::Err` scan is
+   clean; `RUST_LOG=wgpu=warn` shows no validation errors. Every new pipeline
+   (`calc_new_taa_sample`) and every changed shader (`taa.wgsl`,
+   `naadf_final.wgsl`) compiles.
+2. **Every node runs.** TEMP eprintlns confirmed `prepare_frame_gpu` builds
+   `FrameGpu` every frame (all four render-world resources present, incl. the
+   new `WorldGpu` wait), and `naadf_first_hit_node` / `naadf_taa_reproject_node`
+   / `naadf_calc_new_taa_sample_node` all DISPATCH every frame.
+3. **The blit reads `taa_sample_accum`; `taa_sample_accum` reads as zero.** A
+   TEMP probe made `calc_new_taa_sample` write `final_color`'s `light` straight
+   into `taa_sample_accum` (weight 1, bypassing the reproject fold) — the frame
+   was *still* black. Since `calc_new_taa_sample` dispatches and its write
+   definitely lands, this proves **`final_color` is zero at the point
+   `calc_new_taa_sample` reads it** (the blit-read path + the
+   `calc_new_taa_sample`-write path are otherwise sound — same buffer,
+   `.chain()`-ordered, wgpu auto-barriers, the exact pattern Batch 5's
+   `final_color` blit used).
+4. **`final_color` was non-zero through Batch 5.** Batch 2's temporary
+   `final_color` blit measured a bit-identical 69.1% non-black through
+   B2–B5 — `first_hit` writes `final_color = primary light` and that content
+   was verified. Nothing in the B6 chain writes `final_color` between the
+   denoiser and `calc_new_taa_sample` / the blit.
+5. **The only thing newly active in the B6 chain is the GI consumer data
+   flow.** B6's `taa_dist_min_max` write un-blocks `renderSampleRefine`'s
+   reprojection validity test — so for the first time `valid_samples_compressed`
+   / `bucket_info` carry real data and `renderSpatialResampling`'s 12-iteration
+   reservoir loop yields output, which `renderDenoiseSplit` then composites
+   into `final_color`. Through B5 those buffers were *correct-but-empty*
+   (`taa_dist_min_max` was zero-cleared), so the B4/B5 GI-consumer WGSL had
+   never been exercised with non-empty input.
+
+**Conclusion: Batch 6's own deliverable is correctly implemented** — the
+`base/` `ReprojectOld` + `taa_dist_min_max` write, `CalcNewTaaSample`, the
+final-blit revert, the chain wiring. It successfully un-blocked the GI data
+flow, and *that* exposed a **latent defect in the Batch-4/5 GI-consumer WGSL**
+(`sample_refine.wgsl` / `spatial_resampling.wgsl` / `denoise_split.wgsl`) that
+**corrupts `final_color` to zero once the reservoir buffers carry real data**.
+The most likely culprits, in order: (a) `denoise_split.wgsl`'s vertical pass
+producing NaN (a bilateral-weight normalisation divide-by-zero, or a bad
+`denoise_preprocessed` read) that propagates into `final_color` — the blit's
+`curColor / (toneMappingFac + curColor)` maps NaN → 0; (b) `spatial_resampling.wgsl`'s
+denoise-path branch zeroing or mis-transposing `final_color` / `denoise_preprocessed`;
+(c) `sample_refine.wgsl` writing a malformed `valid_samples_compressed` that
+`renderSpatialResampling`'s `getSampleData` decodes into a NaN/huge colour. This
+matches the design's own framing — `09-design-b.md` §11: "Batch 6 ... depends
+on every prior batch's buffers being correct"; a half-built pipeline is
+correct-but-empty, but a *fully*-built pipeline with a latent consumer bug
+surfaces only at B6.
+
+**Recommended next step (for the reviewer / a follow-up):** with `is_denoise`
+temporarily forced `false`, the spatial pass writes `final_color` directly
+(bypassing the denoiser) — this isolates (a) from (b)/(c) in one e2e run.
+Then bisect the `sample_refine → spatial_resampling → denoise` chain with a
+single targeted buffer probe. This is a Batch-4/5-code fix, not a Batch-6-design
+change.
+
+### Phase B impl status
+
+**Phase B is NOT yet feature-complete.** All 13 render-graph nodes are wired
+and dispatch cleanly, the `base/` TAA path + final blit are correctly ported
+(Batch 6's scope is done — `taa_samples` rewired into `calc_new_taa_sample`,
+`taa_dist_min_max` wired, the final blit reverted, item #2's `16.0` + item #7's
+GI-constants applied, the authoritative §6.3 shape followed), and the build +
+all 46 tests are green. **What remains:** a latent Batch-4/5 GI-consumer WGSL
+defect (diagnosed above) corrupts `final_color` to zero once the GI data flow
+is live — it must be fixed before the GI bounce is visible and the Phase-B
+review gate (`01-context.md` §2d done-bar — "bounce lighting visible, no
+obvious artifacts") can pass. The e2e `MIN_NON_BLACK_FRACTION_GI` /
+`MIN_GI_BOUNCE_LUMINANCE` thresholds must then be re-measured against the
+real GI-lit frame and nudged per the `e2e-render-test.md` rule.

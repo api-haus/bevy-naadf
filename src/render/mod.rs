@@ -39,10 +39,14 @@ use extract::{
     ExtractedTaaConfig, ExtractedWorld,
 };
 use gi::prepare_gi;
-// `naadf_taa_reproject_node` stays defined in `graph.rs` but is OUT of the
-// render-graph chain in Batch 2 (`09-design-b.md` §11 Batch 2 step 8 — the
-// `base/` TAA rewire is Batch 6); not imported here so the chain stays honest.
-use graph::{naadf_final_blit_node, naadf_first_hit_node};
+// Phase B Batch 6 (`09-design-b.md` §11 Batch 6 steps 17-18): the `base/` TAA
+// path is rewired — `naadf_taa_reproject_node` (now the `base/` variant) +
+// `naadf_calc_new_taa_sample_node` are back in the chain at their §4.2
+// positions.
+use graph::{
+    naadf_calc_new_taa_sample_node, naadf_final_blit_node, naadf_first_hit_node,
+    naadf_taa_reproject_node,
+};
 use graph_b::{
     naadf_atmosphere_node, naadf_denoise_node, naadf_global_illum_node,
     naadf_ray_queue_node, naadf_sample_refine_buckets_node,
@@ -127,16 +131,31 @@ impl Plugin for NaadfRenderPlugin {
             // (`WorldRenderBase.cs:205-228`, `09-design-b.md` §4.2). Batch 2
             // wires its output into the first-hit pass (`@group(2)`).
             //
-            // `naadf_taa_reproject_node` is DELIBERATELY OUT of the chain this
-            // batch: the `base/` first-hit no longer writes `taa_sample_accum`
-            // / `taa_samples`, so the A-2 reproject + the `taa_sample_accum`
-            // blit source are temporarily broken. Batch 2's minimal fix points
-            // the final blit at `final_color` directly (the 4-plane first-hit
-            // result). Batch 6 wires the proper `base/` TAA path
-            // (`ReprojectOld` + `CalcNewTaaSample`) and reverts the blit
-            // source — the node + the `*_taa_reproject*` plumbing stay in the
-            // tree (`graph.rs`, `prepare.rs`) so Batch 6 only re-adds them to
-            // the chain.
+            // Phase B Batch 6 (`09-design-b.md` §11 Batch 6 / §4.2): the
+            // `base/` TAA path is rewired into the chain.
+            //   * `naadf_taa_reproject_node` (the `base/` `ReprojectOld`
+            //     variant — writes `taa_dist_min_max`, the per-pixel distance
+            //     min/max + specular-normal validity mask) runs right AFTER
+            //     `naadf_first_hit_node`, BEFORE `naadf_sample_refine_clear_node`.
+            //     Its `taa_dist_min_max` write un-blocks Batch 4's
+            //     `renderSampleRefine` reprojection validity test ⇒
+            //     `valid_samples_compressed` + `bucket_info` populate ⇒ Batch
+            //     5's `renderSpatialResampling` reservoir loop yields output ⇒
+            //     the GI bounce composites into `final_color`. THIS is the
+            //     wiring that makes the bounce visible (`10-impl-b.md`
+            //     B5-vs-B6 finding).
+            //   * `naadf_calc_new_taa_sample_node` (the `base/` `CalcNewTaaSample`
+            //     pass) runs right AFTER `naadf_denoise_node`, BEFORE
+            //     `naadf_final_blit_node` — it folds the denoised GI
+            //     `final_color` into the 16-deep `taa_samples` ring +
+            //     `taa_sample_accum` (the SOLE `taa_samples` writer in the
+            //     `base/` pipeline).
+            //   * `naadf_final_blit_node` reads `taa_sample_accum` again — the
+            //     Batch-2 temporary `final_color` blit seam is reverted
+            //     (`prepare_frame_gpu` clears `FLAG_BLIT_FINAL_COLOR` + binds
+            //     `taa_sample_accum` at the blit slot).
+            //   Both TAA nodes are gated on the runtime TAA toggle
+            //   (`ExtractedTaaConfig.enabled`).
             // Phase B Batch 3 (`09-design-b.md` §11 Batch 3 steps 10-11):
             // the chain gains `naadf_ray_queue_node` + `naadf_global_illum_node`
             // between the first-hit and the final blit — `rayQueueCalc` builds
@@ -190,6 +209,7 @@ impl Plugin for NaadfRenderPlugin {
                 (
                     naadf_atmosphere_node,
                     naadf_first_hit_node,
+                    naadf_taa_reproject_node,
                     naadf_sample_refine_clear_node,
                     naadf_ray_queue_node,
                     naadf_global_illum_node,
@@ -199,6 +219,7 @@ impl Plugin for NaadfRenderPlugin {
                     naadf_sample_refine_buckets_node,
                     naadf_spatial_resampling_node,
                     naadf_denoise_node,
+                    naadf_calc_new_taa_sample_node,
                     naadf_final_blit_node,
                 )
                     .chain()

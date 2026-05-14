@@ -34,8 +34,8 @@ use crate::render::atmosphere::AtmosphereGpu;
 use crate::render::extract::{ExtractedCameraData, ExtractedCameraHistory, ExtractedWorld};
 use crate::render::gi::{GiBindGroups, GiGpu};
 use crate::render::gpu_types::{
-    GpuCamera, GpuRenderParams, GpuVoxelType, GpuWorldMeta, FLAG_BLIT_FINAL_COLOR,
-    FLAG_CHECK_SUN, FLAG_IS_ATMOSPHERE_INTERACTION, FLAG_IS_TAA,
+    GpuCamera, GpuRenderParams, GpuVoxelType, GpuWorldMeta, FLAG_CHECK_SUN,
+    FLAG_IS_ATMOSPHERE_INTERACTION, FLAG_IS_TAA,
 };
 use crate::render::pipelines::NaadfPipelines;
 use crate::render::taa::TaaGpu;
@@ -96,16 +96,26 @@ pub struct FrameGpu {
     /// `AtmosphereGpu` resources, so it is built here in `prepare_frame_gpu`
     /// (after `AtmosphereGpu` exists). `09-design-b.md` §6.3 / §10.3.
     pub first_hit_atmosphere_bind_group: BindGroup,
-    /// The final-blit pass's own bind group. In Batch 2 it binds `final_color`
-    /// at slot 1 instead of `taa_sample_accum` — the *temporary* blit source
-    /// (`09-design-b.md` §11 Batch 2 step 8); Batch 6 reverts it.
+    /// The final-blit pass's own bind group. Phase B Batch 6 reverts the
+    /// Batch-2 temporary seam: it binds `taa_sample_accum` at slot 1 again (the
+    /// real `base/` blit source — correctly filled by `ReprojectOld` +
+    /// `CalcNewTaaSample`), not `final_color` (`09-design-b.md` §11 Batch 6
+    /// step 19).
     pub blit_bind_group: BindGroup,
     /// The TAA reproject pass's single bind group (`06-design-a2.md` §5.3,
-    /// §5.5). Mixes `TaaGpu` resources (`taa_params`, `camera_history`,
-    /// `taa_samples`, `taa_sample_accum`) with `FrameGpu.first_hit_data`, so it
-    /// is built here in `prepare_frame_gpu` (after both `TaaGpu` and
-    /// `first_hit_data` exist). Consumed by `naadf_taa_reproject_node`.
+    /// §5.5, `09-design-b.md` §5.8.1). Mixes `TaaGpu` resources (`taa_params`,
+    /// `camera_history`, `taa_samples`, `taa_sample_accum`, `taa_dist_min_max`)
+    /// with `FrameGpu.first_hit_data`, so it is built here in `prepare_frame_gpu`
+    /// (after both `TaaGpu` and `first_hit_data` exist). Consumed by
+    /// `naadf_taa_reproject_node`.
     pub taa_reproject_bind_group: BindGroup,
+    /// The `calc_new_taa_sample` pass's `@group(1)` bind group (`09-design-b.md`
+    /// §4.10 / §5.8.2). Mixes `TaaGpu` (`taa_params`, `taa_samples`,
+    /// `taa_sample_accum`) + `FrameGpu` (`first_hit_data`, `final_color`) +
+    /// `WorldGpu` (`voxel_types`), so it is built here in `prepare_frame_gpu`
+    /// (after all three resources exist). Consumed by
+    /// `naadf_calc_new_taa_sample_node`.
+    pub calc_new_taa_sample_bind_group: BindGroup,
 }
 
 /// `RenderSystems::PrepareResources` system: create + upload the world GPU
@@ -284,6 +294,7 @@ pub fn prepare_frame_gpu(
     taa_gpu: Option<Res<TaaGpu>>,
     atmosphere_gpu: Option<Res<AtmosphereGpu>>,
     gi_gpu: Option<Res<GiGpu>>,
+    world_gpu: Option<Res<WorldGpu>>,
     pipelines: Res<NaadfPipelines>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
@@ -306,6 +317,13 @@ pub fn prepare_frame_gpu(
         return;
     };
     let Some(gi_gpu) = gi_gpu else {
+        return;
+    };
+    // `WorldGpu` (created in `PrepareResources` by `prepare_world_gpu` once the
+    // test grid has been extracted) owns `voxel_types` — the
+    // `calc_new_taa_sample` bind group needs it (`09-design-b.md` §4.10). Wait
+    // for it like the other three render-world resources.
+    let Some(world_gpu) = world_gpu else {
         return;
     };
     let viewport = extracted_camera.viewport_size.max(UVec2::ONE);
@@ -347,29 +365,27 @@ pub fn prepare_frame_gpu(
         // not ported (`06-design-a2.md` §4.1, §13.3).
         rand_counter: extracted_history.frame_count,
         taa_index: extracted_history.taa_index,
-        // Phase B Batch 2 flags:
+        // Phase B Batch 6 flags:
         // - `FLAG_IS_ATMOSPHERE_INTERACTION` is always set — the C#
         //   `WorldRenderBase.isAtmosphereInteraction` defaults to `true`
         //   (`WorldRenderBase.cs:16,224`), so the `base/` first-hit ray-marches
         //   the atmosphere along each primary-ray segment.
-        // - `FLAG_BLIT_FINAL_COLOR` is always set this batch — the deliberate
-        //   temporary blit seam: the final blit reads `final_color` (no weight
-        //   field) directly (`09-design-b.md` §11 Batch 2 step 8). Batch 6
-        //   reverts the blit source to `taa_sample_accum` and clears this.
+        // - `FLAG_BLIT_FINAL_COLOR` is NO LONGER set — Batch 6 reverts the
+        //   Batch-2 temporary blit seam. The final blit reads `taa_sample_accum`
+        //   again (the real `base/` blit source — correctly filled by
+        //   `ReprojectOld` + `CalcNewTaaSample`); `09-design-b.md` §11 Batch 6
+        //   step 19.
         // - `FLAG_CHECK_SUN` is left set for layout stability but is no longer
         //   read — the `base/` first-hit gets all sky light from the full
         //   atmosphere model, not the Phase-A inline sun term.
         // - `FLAG_IS_TAA` is set when `AppArgs.taa` is on (extracted into
-        //   `ExtractedTaaConfig`); the `base/` first-hit no longer writes the
-        //   `taa_samples` ring (Batch 6 re-homes that), but the flag stays
-        //   meaningful for the TAA jitter path.
+        //   `ExtractedTaaConfig`); it gates the TAA jitter path + (Batch 6) the
+        //   `naadf_taa_reproject_node` / `naadf_calc_new_taa_sample_node`
+        //   dispatch.
         flags: if extracted_taa.enabled {
-            FLAG_CHECK_SUN
-                | FLAG_IS_TAA
-                | FLAG_IS_ATMOSPHERE_INTERACTION
-                | FLAG_BLIT_FINAL_COLOR
+            FLAG_CHECK_SUN | FLAG_IS_TAA | FLAG_IS_ATMOSPHERE_INTERACTION
         } else {
-            FLAG_CHECK_SUN | FLAG_IS_ATMOSPHERE_INTERACTION | FLAG_BLIT_FINAL_COLOR
+            FLAG_CHECK_SUN | FLAG_IS_ATMOSPHERE_INTERACTION
         },
         exposure: 1.5,
         // C# `Settings.data.general.toneMappingFac` — a constant in the port
@@ -478,34 +494,34 @@ pub fn prepare_frame_gpu(
 
     // Rebuild the bind groups when storage changed; otherwise reuse.
     //
-    // Phase B Batch 2 (`09-design-b.md` §6.3 / §11 Batch 2 step 8):
-    // - The frame `@group(1)` now also binds `first_hit_absorption` (slot 4) +
+    // Phase B Batch 2 (`09-design-b.md` §6.3) — unchanged this batch:
+    // - The frame `@group(1)` binds `first_hit_absorption` (slot 4) +
     //   `final_color` (slot 5) — the `base/` first-hit's two new outputs.
     //   `taa_sample_accum` stays at slot 3 for layout stability (the `base/`
-    //   first-hit no longer writes it — it touches it so naga keeps the
-    //   binding; `ReprojectOld` + `CalcNewTaaSample` write it in Batch 6).
-    // - The first-hit's new `@group(2)` is the read-only precomputed atmosphere
-    //   (`atmosphere_params` + `atmosphere_comp`) — mixes `AtmosphereGpu`, so
-    //   built here once `AtmosphereGpu` exists.
-    // - The blit `@group(0)` binds `final_color` at slot 1 instead of
-    //   `taa_sample_accum` — the *deliberate temporary* blit source: the
-    //   `base/` first-hit no longer writes `taa_sample_accum` and the TAA
-    //   reproject node is out of the chain this batch, so pointing the blit at
-    //   `final_color` keeps the app runnable showing the 4-plane first-hit
-    //   result directly. Batch 6 rewires `ReprojectOld` + `CalcNewTaaSample`
-    //   and reverts this to `taa_sample_accum` (the same designed-seam pattern
-    //   as Phase A's `shaded_color` stand-in).
+    //   first-hit no longer writes it — `ReprojectOld` + `CalcNewTaaSample`
+    //   do).
+    // - The first-hit's `@group(2)` is the read-only precomputed atmosphere.
     //
-    // `TaaGpu`'s `taa_sample_accum` / `taa_samples` resize on the same
-    // `pixel_count` trigger as `first_hit_data`, so `needs_new_storage` covers
-    // all of them. The TAA reproject bind group still mixes `TaaGpu` with
-    // `FrameGpu.first_hit_data` and is built here (`06-design-a2.md` §5.5) — it
-    // is just not in the render-graph chain in Batch 2 (added back in Batch 6).
+    // Phase B Batch 6 (`09-design-b.md` §11 Batch 6 steps 17-19):
+    // - The blit `@group(0)` binds `taa_sample_accum` at slot 1 again — the
+    //   Batch-2 temporary `final_color` seam is REVERTED. `taa_sample_accum`
+    //   is now correctly filled by `ReprojectOld` (the reprojected history) +
+    //   `CalcNewTaaSample` (history + this frame's denoised GI light).
+    // - The TAA reproject bind group gains `taa_dist_min_max` (slot 5) — the
+    //   `base/` `ReprojectOld` extra output.
+    // - The new `calc_new_taa_sample` bind group mixes `TaaGpu` + `FrameGpu` +
+    //   `WorldGpu` (`voxel_types`) — built here once all three exist.
+    //
+    // `TaaGpu`'s `taa_sample_accum` / `taa_samples` / `taa_dist_min_max` resize
+    // on the same `pixel_count` trigger as `first_hit_data`, so
+    // `needs_new_storage` covers all of them. `voxel_types` (in `WorldGpu`) is
+    // build-once; re-referencing it on a viewport-resize rebuild is harmless.
     let (
         bind_group,
         first_hit_atmosphere_bind_group,
         blit_bind_group,
         taa_reproject_bind_group,
+        calc_new_taa_sample_bind_group,
     ) = if needs_new_storage || existing.is_none() {
         let bind_group = render_device.create_bind_group(
             "naadf_frame_bind_group",
@@ -532,9 +548,10 @@ pub fn prepare_frame_gpu(
             &pipeline_cache.get_bind_group_layout(&pipelines.blit_layout),
             &BindGroupEntries::sequential((
                 first_hit_data.as_entire_buffer_binding(),
-                // TEMPORARY blit source — `final_color`, not `taa_sample_accum`
-                // (`09-design-b.md` §11 Batch 2 step 8; reverted in Batch 6).
-                final_color.as_entire_buffer_binding(),
+                // Phase B Batch 6: the real `base/` blit source —
+                // `taa_sample_accum` (the Batch-2 temporary `final_color` seam
+                // is reverted — `09-design-b.md` §11 Batch 6 step 19).
+                taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
                 render_params_buf.as_entire_buffer_binding(),
             )),
         );
@@ -547,6 +564,25 @@ pub fn prepare_frame_gpu(
                 first_hit_data.as_entire_buffer_binding(),
                 taa_gpu.taa_samples.as_entire_buffer_binding(),
                 taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
+                // Phase B Batch 6: the `base/` `ReprojectOld` extra output.
+                taa_gpu.taa_dist_min_max.as_entire_buffer_binding(),
+            )),
+        );
+        // `calc_new_taa_sample` `@group(1)` — `09-design-b.md` §4.10. Mixes
+        // `TaaGpu` (`taa_params` / `taa_samples` / `taa_sample_accum`) +
+        // `FrameGpu` (`first_hit_data` / `final_color`) + `WorldGpu`
+        // (`voxel_types`). The pass folds the denoised GI `final_color` into
+        // the 16-deep `taa_samples` ring + `taa_sample_accum`.
+        let calc_new_taa_sample_bind_group = render_device.create_bind_group(
+            "naadf_calc_new_taa_sample_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.calc_new_taa_sample_layout),
+            &BindGroupEntries::sequential((
+                taa_gpu.taa_params.as_entire_buffer_binding(),
+                first_hit_data.as_entire_buffer_binding(),
+                final_color.as_entire_buffer_binding(),
+                world_gpu.voxel_types.buffer().as_entire_buffer_binding(),
+                taa_gpu.taa_samples.as_entire_buffer_binding(),
+                taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
             )),
         );
         (
@@ -554,6 +590,7 @@ pub fn prepare_frame_gpu(
             first_hit_atmosphere_bind_group,
             blit_bind_group,
             taa_reproject_bind_group,
+            calc_new_taa_sample_bind_group,
         )
     } else {
         let frame = existing.as_ref().unwrap();
@@ -562,6 +599,7 @@ pub fn prepare_frame_gpu(
             frame.first_hit_atmosphere_bind_group.clone(),
             frame.blit_bind_group.clone(),
             frame.taa_reproject_bind_group.clone(),
+            frame.calc_new_taa_sample_bind_group.clone(),
         )
     };
 
@@ -710,5 +748,6 @@ pub fn prepare_frame_gpu(
         first_hit_atmosphere_bind_group,
         blit_bind_group,
         taa_reproject_bind_group,
+        calc_new_taa_sample_bind_group,
     });
 }

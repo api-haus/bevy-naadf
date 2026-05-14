@@ -12,29 +12,51 @@ use bevy::{
 use bevy::anti_alias::dlss::{Dlss, DlssRayReconstructionFeature, DlssRayReconstructionSupported};
 
 use crate::render::graph::{FINAL_BLIT_SPAN, FIRST_HIT_SPAN, TAA_REPROJECT_SPAN};
+use crate::render::graph_b::{
+    ATMOSPHERE_SPAN, DENOISE_SPAN, GLOBAL_ILLUM_SPAN, SAMPLE_REFINE_SPAN,
+    SPATIAL_RESAMPLING_SPAN,
+};
 
 /// Diagnostic path of the first-hit pass's GPU time. `RenderDiagnosticsPlugin`
 /// names a `time_span(encoder, "<span>")` measurement
 /// `render/<span>/elapsed_gpu` (and `.../elapsed_cpu` as a CPU-side fallback).
 const FIRST_HIT_GPU_PATH: &str = "render/naadf_first_hit/elapsed_gpu";
-/// Diagnostic path of the Phase-A-2 TAA reproject pass's GPU time
-/// (`06-design-a2.md` §11).
+/// Diagnostic path of the Phase-A-2/B TAA reproject pass's GPU time
+/// (`06-design-a2.md` §11, `09-design-b.md` §5.8.1).
 const TAA_REPROJECT_GPU_PATH: &str = "render/naadf_taa_reproject/elapsed_gpu";
 /// Diagnostic path of the final-blit pass's GPU time.
 const FINAL_BLIT_GPU_PATH: &str = "render/naadf_final_blit/elapsed_gpu";
+/// Diagnostic paths of the Phase-B GI render-node GPU times (`09-design-b.md`
+/// §4.12 — the HUD lists the *expensive* nodes only).
+const ATMOSPHERE_GPU_PATH: &str = "render/naadf_atmosphere/elapsed_gpu";
+const GLOBAL_ILLUM_GPU_PATH: &str = "render/naadf_global_illum/elapsed_gpu";
+const SAMPLE_REFINE_GPU_PATH: &str = "render/naadf_sample_refine/elapsed_gpu";
+const SPATIAL_RESAMPLING_GPU_PATH: &str = "render/naadf_spatial_resampling/elapsed_gpu";
+const DENOISE_GPU_PATH: &str = "render/naadf_denoise/elapsed_gpu";
 /// CPU-time fallback paths — used when the backend has no timestamp queries
 /// (`RenderDiagnosticsPlugin` records `elapsed_cpu` unconditionally).
 const FIRST_HIT_CPU_PATH: &str = "render/naadf_first_hit/elapsed_cpu";
 const TAA_REPROJECT_CPU_PATH: &str = "render/naadf_taa_reproject/elapsed_cpu";
 const FINAL_BLIT_CPU_PATH: &str = "render/naadf_final_blit/elapsed_cpu";
+const ATMOSPHERE_CPU_PATH: &str = "render/naadf_atmosphere/elapsed_cpu";
+const GLOBAL_ILLUM_CPU_PATH: &str = "render/naadf_global_illum/elapsed_cpu";
+const SAMPLE_REFINE_CPU_PATH: &str = "render/naadf_sample_refine/elapsed_cpu";
+const SPATIAL_RESAMPLING_CPU_PATH: &str = "render/naadf_spatial_resampling/elapsed_cpu";
+const DENOISE_CPU_PATH: &str = "render/naadf_denoise/elapsed_cpu";
 
 // Compile-time check that the HUD's hard-coded paths stay in step with the
-// render-node span names (`render::graph`). `RenderDiagnosticsPlugin` builds
-// the path as `render/<span>/<field>`; assert the `<span>` part matches.
+// render-node span names (`render::graph` / `render::graph_b`).
+// `RenderDiagnosticsPlugin` builds the path as `render/<span>/<field>`; assert
+// the `<span>` part matches.
 const _: () = {
     assert!(matches_span(FIRST_HIT_GPU_PATH, FIRST_HIT_SPAN));
     assert!(matches_span(TAA_REPROJECT_GPU_PATH, TAA_REPROJECT_SPAN));
     assert!(matches_span(FINAL_BLIT_GPU_PATH, FINAL_BLIT_SPAN));
+    assert!(matches_span(ATMOSPHERE_GPU_PATH, ATMOSPHERE_SPAN));
+    assert!(matches_span(GLOBAL_ILLUM_GPU_PATH, GLOBAL_ILLUM_SPAN));
+    assert!(matches_span(SAMPLE_REFINE_GPU_PATH, SAMPLE_REFINE_SPAN));
+    assert!(matches_span(SPATIAL_RESAMPLING_GPU_PATH, SPATIAL_RESAMPLING_SPAN));
+    assert!(matches_span(DENOISE_GPU_PATH, DENOISE_SPAN));
 };
 
 /// `const`-evaluable check that `path` is `render/<span>/...`.
@@ -108,7 +130,7 @@ pub fn update_hud(
 
     let _ = writeln!(
         s,
-        "Renderer: NAADF (Phase A — albedo first-hit + AADF DDA)"
+        "Renderer: NAADF (Phase B — real-time GI)"
     );
 
     // DLSS Ray Reconstruction status line. Dormant in Phase A — the NAADF
@@ -128,14 +150,25 @@ pub fn update_hud(
         let _ = writeln!(s, "DLSS-RR: not compiled in (no `dlss` feature)");
     }
 
-    // Per-pass NAADF render-node GPU timings. The three render nodes
-    // (`render::graph`) wrap their work in a `time_span`, which
-    // `RenderDiagnosticsPlugin` surfaces at `render/<span>/elapsed_gpu`. On a
-    // backend with timestamp queries (Vulkan / DX12) the GPU path populates;
-    // elsewhere `write_timing` falls back to the CPU-side `elapsed_cpu`. The
-    // `taa-reproject` line sits between `first-hit` and `final-blit`, matching
-    // the render order (`06-design-a2.md` §11).
+    // Per-pass NAADF render-node GPU timings. Each render node
+    // (`render::graph` / `render::graph_b`) wraps its work in a `time_span`,
+    // which `RenderDiagnosticsPlugin` surfaces at `render/<span>/elapsed_gpu`.
+    // On a backend with timestamp queries (Vulkan / DX12) the GPU path
+    // populates; elsewhere `write_timing` falls back to the CPU-side
+    // `elapsed_cpu`. The lines are in render order (`09-design-b.md` §4.2);
+    // the HUD lists the *expensive* nodes only (`09-design-b.md` §4.12) — the
+    // cheap nodes (`ray-queue`, `calc-new-taa-sample`, `sample-refine-clear`)
+    // are folded out. `sample-refine` is one combined span for all 5
+    // `renderSampleRefine` passes; `denoise` one span for both
+    // `renderDenoiseSplit` passes.
     let _ = writeln!(s, "NAADF passes:");
+    write_timing(
+        s,
+        &diagnostics,
+        "atmosphere",
+        ATMOSPHERE_GPU_PATH,
+        ATMOSPHERE_CPU_PATH,
+    );
     write_timing(
         s,
         &diagnostics,
@@ -149,6 +182,34 @@ pub fn update_hud(
         "taa-reproject",
         TAA_REPROJECT_GPU_PATH,
         TAA_REPROJECT_CPU_PATH,
+    );
+    write_timing(
+        s,
+        &diagnostics,
+        "global-illum",
+        GLOBAL_ILLUM_GPU_PATH,
+        GLOBAL_ILLUM_CPU_PATH,
+    );
+    write_timing(
+        s,
+        &diagnostics,
+        "sample-refine",
+        SAMPLE_REFINE_GPU_PATH,
+        SAMPLE_REFINE_CPU_PATH,
+    );
+    write_timing(
+        s,
+        &diagnostics,
+        "spatial-resmpl",
+        SPATIAL_RESAMPLING_GPU_PATH,
+        SPATIAL_RESAMPLING_CPU_PATH,
+    );
+    write_timing(
+        s,
+        &diagnostics,
+        "denoise",
+        DENOISE_GPU_PATH,
+        DENOISE_CPU_PATH,
     );
     write_timing(
         s,

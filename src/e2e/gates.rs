@@ -50,21 +50,20 @@ pub fn e2e_camera_transform() -> Transform {
 
 /// The highest batch currently implemented — the `ASSERT` step runs this
 /// batch's region gate (older batches' gates are kept as called helpers so an
-/// earlier-gate regression still trips). Phase B Batches 1-5 exist
-/// (`10-impl-b.md`); bump this as B6 lands.
+/// earlier-gate regression still trips). Phase B Batches 1-6 exist
+/// (`10-impl-b.md`) — Batch 6 is the final batch, the Phase-B deliverable.
 ///
-/// **Batch 5 stays in the pre-GI luminance regime.** `09-design-b.md` §11
-/// Batch 5 step 15 claimed the GI bounce becomes visible at end-of-B5, but the
-/// Batch-5 verification (see `10-impl-b.md` Batch-5 section + [`assert_batch_5`])
-/// settled the B5-vs-B6 question: the visible-bounce milestone genuinely moves
-/// to **Batch 6**. The GI consumers (`renderSpatialResampling` /
-/// `renderDenoiseSplit`) run and write `final_color`, but the 12-iteration
-/// reservoir loop reads the `renderSampleRefine` refine buffers, which are
-/// correct-but-empty until Batch 6 wires `taa_dist_min_max`; the spatial pass's
-/// independent sun sample contributes negligibly in this enclosed test scene.
-/// So [`super::framebuffer::GI_LIT_BATCH`] is `6`, NOT `5` — B5 keeps the
-/// pre-GI floor, the honest regime (the image is stable like B3/B4).
-pub const CURRENT_BATCH: u32 = 5;
+/// **Batch 6 is the GI-lit regime.** Batch 6 wires the `base/` `ReprojectOld`
+/// pass to write `taa_dist_min_max`, which un-blocks the `renderSampleRefine →
+/// valid_samples_compressed → renderSpatialResampling` reservoir chain, so the
+/// GI bounce composites into `final_color` and (via `CalcNewTaaSample`) into
+/// `taa_sample_accum` — the blit source. The B5-vs-B6 milestone
+/// (`10-impl-b.md` Batch-5 section) settled that the visible bounce lands at
+/// Batch 6, so [`super::framebuffer::GI_LIT_BATCH`] is `6` — the 0.60 hard
+/// luminance gate applies from this batch on, and [`assert_batch_6`] is the
+/// first region gate that asserts the previously-near-black diffuse geometry
+/// has *brightened*.
+pub const CURRENT_BATCH: u32 = 6;
 
 // --- Gate rectangles -------------------------------------------------------
 //
@@ -323,6 +322,82 @@ fn assert_batch_5(state: &GateState) -> Result<(), String> {
     Ok(())
 }
 
+/// Batch 6 gate — Phase B Batch 6 (the `base/` TAA rewire + `renderFinal` +
+/// the final integration) is the **Phase-B deliverable**: the GI bounce lights
+/// the scene for the first time.
+///
+/// **This is the first region gate that asserts the GI bounce is VISIBLE.**
+/// Batch 6 wires the `base/` `ReprojectOld` to write `taa_dist_min_max`, which
+/// un-blocks the `renderSampleRefine → valid_samples_compressed →
+/// renderSpatialResampling` reservoir chain (the B5-vs-B6 milestone —
+/// `10-impl-b.md`), so the indirect GI bounce composites into `final_color`,
+/// `CalcNewTaaSample` folds it into `taa_sample_accum`, and the reverted
+/// `base/` final blit shows it.
+///
+/// The gate:
+/// 1. Re-runs the `assert_batch_2` emissive/sky checks — the emissive blocks
+///    must still render, the atmosphere sky must still be clean (the GI rewire
+///    must not have *broken* the first-hit / atmosphere image).
+/// 2. **The positive GI check:** the `solid_block_rect` region — the dark
+///    diffuse voxel geometry directly below the warm-white emissive block —
+///    was near-black pre-GI (measured luminance ~4 through Batch 5, gate
+///    `< 90` in `assert_batch_2`). Batch 6's GI bounce lights it: the gate
+///    asserts the region has *brightened* past [`MIN_GI_BOUNCE_LUMINANCE`].
+///    This is the check `assert_batch_5`'s first draft wrongly expected at
+///    Batch 5 (`10-impl-b.md` Batch-5 "How the e2e harness batch-tracker was
+///    set") — it correctly belongs here, at the batch the bounce actually
+///    lands.
+fn assert_batch_6(state: &GateState) -> Result<(), String> {
+    let fb = state.fb;
+
+    // (1) The emissive blocks + the atmosphere sky must still render — re-run
+    // the emissive + sky portions of the Batch-2 gate. (NOT the full
+    // `assert_batch_2` — its `solid_block_rect < 90` "near-black" check is
+    // exactly what Batch 6 *inverts*: the diffuse geometry is now GI-lit.)
+    let emissive = fb.region_mean(emissive_rect(fb));
+    let emissive_lum = Framebuffer::luminance(emissive);
+    if emissive_lum < 120.0 {
+        return Err(format!(
+            "Batch 6: emissive-block region too dark — luminance {emissive_lum:.1} \
+             (expected > 120, mean rgba {emissive:?}). The emissive blocks must still \
+             render with the `base/` TAA path + the reverted `taa_sample_accum` blit."
+        ));
+    }
+    let sky = fb.region_mean(sky_rect(fb));
+    let sky_lum = Framebuffer::luminance(sky);
+    if !(10.0..=230.0).contains(&sky_lum) {
+        return Err(format!(
+            "Batch 6: sky region luminance {sky_lum:.1} out of the [10, 230] band \
+             (mean rgba {sky:?}). The atmosphere sky must still be clean — the GI \
+             rewire must not have broken the first-hit / atmosphere image."
+        ));
+    }
+
+    // (2) The positive GI check: the dark diffuse geometry has BRIGHTENED.
+    let solid = fb.region_mean(solid_block_rect(fb));
+    let solid_lum = Framebuffer::luminance(solid);
+    if solid_lum < MIN_GI_BOUNCE_LUMINANCE {
+        return Err(format!(
+            "Batch 6: diffuse-geometry region too dark — luminance {solid_lum:.1} \
+             (expected >= {MIN_GI_BOUNCE_LUMINANCE} — the GI bounce should light it; \
+             it measured ~4 near-black through Batch 5, mean rgba {solid:?}). \
+             If it is still near-black the `taa_dist_min_max` wiring did not un-block \
+             the `renderSampleRefine → renderSpatialResampling` reservoir chain, or \
+             the final blit is not reading the GI-folded `taa_sample_accum`."
+        ));
+    }
+
+    Ok(())
+}
+
+/// The minimum `solid_block_rect` luminance for [`assert_batch_6`]'s positive
+/// "GI bounce is visible" check. The dark diffuse voxel geometry measured
+/// luminance ~4 (near-black) through Batch 5; Batch 6's GI bounce lights it.
+/// Set just below the measured GI-lit value (re-confirmed against the actual
+/// Batch-6 readback — the `e2e-render-test.md` rule, same discipline as
+/// `MIN_NON_BLACK_FRACTION_GI`).
+const MIN_GI_BOUNCE_LUMINANCE: f32 = 12.0;
+
 // --- Dispatch tables -------------------------------------------------------
 
 /// The expected render-graph spans for a given batch — the node-dispatch check
@@ -336,7 +411,9 @@ fn assert_batch_5(state: &GateState) -> Result<(), String> {
 /// separate node systems but share ONE span (`graph_b.rs SAMPLE_REFINE_SPAN` —
 /// `09-design-b.md` §4.7 "one span recommended"), so one new row entry covers
 /// all five. Batch 5 adds `naadf_spatial_resampling` + `naadf_denoise` (the two
-/// `renderDenoiseSplit` passes share one span). B6 adds the TAA-node spans.
+/// `renderDenoiseSplit` passes share one span). Batch 6 adds the `base/` TAA
+/// nodes: `naadf_taa_reproject` (the `ReprojectOld` pass, re-added to the
+/// chain) + `naadf_calc_new_taa_sample` (the new `CalcNewTaaSample` pass).
 pub fn expected_spans(batch: u32) -> &'static [&'static str] {
     match batch {
         0..=3 => &[
@@ -356,7 +433,7 @@ pub fn expected_spans(batch: u32) -> &'static [&'static str] {
             "naadf_final_blit",
         ],
         // B5: + `naadf_spatial_resampling` + `naadf_denoise` (the GI consumers).
-        _ => &[
+        5 => &[
             "naadf_atmosphere",
             "naadf_first_hit",
             "naadf_ray_queue",
@@ -364,6 +441,20 @@ pub fn expected_spans(batch: u32) -> &'static [&'static str] {
             "naadf_sample_refine",
             "naadf_spatial_resampling",
             "naadf_denoise",
+            "naadf_final_blit",
+        ],
+        // B6: + `naadf_taa_reproject` + `naadf_calc_new_taa_sample` (the `base/`
+        // TAA path rewired into the chain — the full Phase-B node set).
+        _ => &[
+            "naadf_atmosphere",
+            "naadf_first_hit",
+            "naadf_taa_reproject",
+            "naadf_ray_queue",
+            "naadf_global_illum",
+            "naadf_sample_refine",
+            "naadf_spatial_resampling",
+            "naadf_denoise",
+            "naadf_calc_new_taa_sample",
             "naadf_final_blit",
         ],
     }
@@ -390,7 +481,7 @@ pub fn batch_gate(batch: u32, state: &GateState) -> Result<(), String> {
         3 => assert_batch_3(state),
         4 => assert_batch_4(state),
         5 => assert_batch_5(state),
-        // B6+ : add `6 => assert_batch_6(state)`, etc.
-        _ => assert_batch_5(state),
+        // B6 — the Phase-B deliverable: the GI bounce is visible.
+        _ => assert_batch_6(state),
     }
 }
