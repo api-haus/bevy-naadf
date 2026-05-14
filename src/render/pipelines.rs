@@ -51,11 +51,15 @@ use bevy::render::renderer::RenderDevice;
 use bevy::render::view::ExtractedView;
 use bevy::shader::Shader;
 
-use crate::render::gpu_types::{GpuCamera, GpuRenderParams, GpuWorldMeta};
+use crate::render::gpu_types::{GpuCamera, GpuRenderParams, GpuTaaParams, GpuWorldMeta};
 
-/// Asset paths of the two Phase-A entry-point WGSL shaders.
+/// Asset paths of the Phase-A entry-point WGSL shaders + the Phase-A-2 TAA
+/// reproject shader.
 pub const FIRST_HIT_SHADER: &str = "shaders/naadf_first_hit.wgsl";
 pub const FINAL_BLIT_SHADER: &str = "shaders/naadf_final.wgsl";
+/// Asset path of the Phase-A-2 TAA reproject compute shader (`06-design-a2.md`
+/// §8.4) — port of `albedo/renderTaaSampleReverse.fx`.
+pub const TAA_REPROJECT_SHADER: &str = "shaders/taa.wgsl";
 
 /// Compute-shader workgroup size — `[numthreads(64,1,1)]` in the HLSL
 /// `albedo/renderFirstHit.fx` `calcFirstHit` (`03-design.md` §5.1).
@@ -74,13 +78,22 @@ pub struct NaadfPipelines {
     /// `taa_sample_accum`, `render_params`.
     pub blit_layout: BindGroupLayoutDescriptor,
     /// `@group(2)` for the first-hit pass — the `taa_samples` 16-ring write
-    /// (`06-design-a2.md` §5.2). One read-write storage binding. The first-hit
-    /// pipeline's *layout* is not extended to use it until Phase A-2 Batch 2
-    /// step 6; this layout is created in Batch 1 step 5 so `TaaGpu` can build
-    /// its `taa_first_hit_bind_group` field (`06-design-a2.md` §9.4).
+    /// (`06-design-a2.md` §5.2). One read-write storage binding. The layout
+    /// descriptor was created in Phase A-2 Batch 1 step 5 so `TaaGpu` could
+    /// build its `taa_first_hit_bind_group` field; Batch 2 step 6 extends the
+    /// first-hit pipeline's *layout* to actually bind this group.
     pub taa_layout: BindGroupLayoutDescriptor,
+    /// The TAA reproject pass's single bind group layout (`06-design-a2.md`
+    /// §5.3): `taa_params` (uniform), `camera_history` / `first_hit_data` /
+    /// `taa_samples` (read-only storage), `taa_sample_accum` (read-write
+    /// storage). The reproject pass does not traverse the voxel world, so it
+    /// binds no `@group(0)` world data — this is its only group.
+    pub taa_reproject_layout: BindGroupLayoutDescriptor,
     /// Cached id of the `naadf_first_hit` compute pipeline.
     pub first_hit_pipeline: CachedComputePipelineId,
+    /// Cached id of the `taa.wgsl` `reproject_old_samples` compute pipeline
+    /// (`06-design-a2.md` §8.4).
+    pub taa_reproject_pipeline: CachedComputePipelineId,
     /// Per-`TextureFormat` cache of the `naadf_final` fullscreen render
     /// pipeline (see the module doc — the colour-target format is per-view).
     pub blit_pipelines: HashMap<TextureFormat, CachedRenderPipelineId>,
@@ -108,6 +121,8 @@ impl FromWorld for NaadfPipelines {
             NonZeroU64::new(std::mem::size_of::<GpuRenderParams>() as u64).unwrap();
         let world_meta_size =
             NonZeroU64::new(std::mem::size_of::<GpuWorldMeta>() as u64).unwrap();
+        let taa_params_size =
+            NonZeroU64::new(std::mem::size_of::<GpuTaaParams>() as u64).unwrap();
 
         // --- @group(0): world data ------------------------------------------
         // chunks: texture_3d<u32>; blocks / voxels / voxel_types: runtime-sized
@@ -164,9 +179,9 @@ impl FromWorld for NaadfPipelines {
 
         // --- @group(2): the first-hit pass's TAA-sample-ring write ----------
         // One read-write storage binding — `taa_samples: array<vec2<u32>>`
-        // (`06-design-a2.md` §5.2). Created here in Batch 1 so `TaaGpu` can
-        // build its `taa_first_hit_bind_group`; the first-hit pipeline does
-        // not bind this group until Batch 2 step 6.
+        // (`06-design-a2.md` §5.2). The first-hit pipeline's layout below is
+        // extended to bind this group (Batch 2 step 6); `naadf_first_hit.wgsl`
+        // writes one ring slot when `FLAG_IS_TAA` is set.
         let taa_layout = BindGroupLayoutDescriptor::new(
             "naadf_taa_bind_group_layout",
             &BindGroupLayoutEntries::sequential(
@@ -177,14 +192,52 @@ impl FromWorld for NaadfPipelines {
             ),
         );
 
+        // --- the TAA reproject pass's bind group layout ---------------------
+        // `taa_params` uniform; `camera_history` / `first_hit_data` /
+        // `taa_samples` read-only storage; `taa_sample_accum` read-write
+        // storage (`06-design-a2.md` §5.3). The reproject pass binds no
+        // `@group(0)` world data — this is its single group.
+        let taa_reproject_layout = BindGroupLayoutDescriptor::new(
+            "naadf_taa_reproject_bind_group_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    uniform_buffer_sized(false, Some(taa_params_size)),
+                    storage_buffer_read_only_sized(false, None), // camera_history
+                    storage_buffer_read_only_sized(false, None), // first_hit_data
+                    storage_buffer_read_only_sized(false, None), // taa_samples
+                    storage_buffer_sized(false, None),           // taa_sample_accum, rw
+                ),
+            ),
+        );
+
         // --- compute pipeline (single, format-agnostic) ---------------------
         let first_hit_shader = asset_server.load(FIRST_HIT_SHADER);
         let first_hit_pipeline =
             pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
                 label: Some("naadf_first_hit_pipeline".into()),
-                layout: vec![world_layout.clone(), frame_layout.clone()],
+                // `@group(2)` is the TAA-sample-ring write (`06-design-a2.md`
+                // §6.2) — the first-hit pass writes one `taa_samples` slot when
+                // `FLAG_IS_TAA` is set. Always bound; the shader's `if` guards
+                // the write.
+                layout: vec![
+                    world_layout.clone(),
+                    frame_layout.clone(),
+                    taa_layout.clone(),
+                ],
                 shader: first_hit_shader,
                 entry_point: Some(Cow::from("calc_first_hit")),
+                ..default()
+            });
+
+        // --- the TAA reproject compute pipeline (single, format-agnostic) ---
+        let taa_reproject_shader = asset_server.load(TAA_REPROJECT_SHADER);
+        let taa_reproject_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some("naadf_taa_reproject_pipeline".into()),
+                layout: vec![taa_reproject_layout.clone()],
+                shader: taa_reproject_shader,
+                entry_point: Some(Cow::from("reproject_old_samples")),
                 ..default()
             });
 
@@ -203,7 +256,9 @@ impl FromWorld for NaadfPipelines {
             frame_layout,
             blit_layout,
             taa_layout,
+            taa_reproject_layout,
             first_hit_pipeline,
+            taa_reproject_pipeline,
             blit_pipelines: HashMap::default(),
             blit_vertex,
             blit_shader,

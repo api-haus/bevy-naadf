@@ -397,10 +397,12 @@ fn create_screen_buffers(render_device: &RenderDevice, pixel_count: u32) -> (Buf
         mapped_at_creation: false,
     });
     // `taa_sample_accum`: pixel_count × vec2<u32> (8 bytes each).
+    // TEMPORARY STEP-8 INSTRUMENTATION: `| COPY_SRC` added so the debug
+    // readback node can copy a pixel out — reverted before return.
     let taa_sample_accum = render_device.create_buffer(&BufferDescriptor {
         label: Some("naadf_taa_sample_accum"),
         size: (pixel_count as u64) * 8,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     (taa_samples, taa_sample_accum)

@@ -48,7 +48,7 @@ pub struct AppArgs {
 fn main() {
     let args = AppArgs {
         grid_preset: GridPreset::default(),
-        taa: false,
+        taa: true,
     };
 
     let mut app = App::new();

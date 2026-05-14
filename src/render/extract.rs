@@ -197,3 +197,26 @@ pub fn extract_camera_history(
     extracted.current_jitter = history.current_jitter;
     extracted.valid = true;
 }
+
+/// Render-world mirror of the `AppArgs.taa` runtime toggle
+/// (`06-design-a2.md` §6.1, §8.2). `AppArgs` is a main-world resource; the
+/// render-world prepare / graph systems need the flag to (a) set `FLAG_IS_TAA`
+/// in `GpuRenderParams` so the first-hit pass writes the `taa_samples` ring,
+/// and (b) gate the TAA reproject node's dispatch — when TAA is off the node
+/// early-returns, leaving `taa_sample_accum` bit-identical to Phase A.
+#[derive(Resource, Default, Clone, Copy)]
+pub struct ExtractedTaaConfig {
+    /// Whether long-term TAA is enabled (mirrors `AppArgs.taa`).
+    pub enabled: bool,
+}
+
+/// `ExtractSchedule` system: mirror `AppArgs.taa` into the render-world
+/// [`ExtractedTaaConfig`] (`06-design-a2.md` §8.2).
+pub fn extract_taa_config(
+    mut extracted: ResMut<ExtractedTaaConfig>,
+    args: Extract<Option<Res<crate::AppArgs>>>,
+) {
+    if let Some(args) = &*args {
+        extracted.enabled = args.taa;
+    }
+}

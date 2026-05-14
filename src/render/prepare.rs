@@ -31,7 +31,9 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 
 use crate::render::extract::{ExtractedCameraData, ExtractedCameraHistory, ExtractedWorld};
-use crate::render::gpu_types::{GpuCamera, GpuRenderParams, GpuVoxelType, GpuWorldMeta, FLAG_CHECK_SUN};
+use crate::render::gpu_types::{
+    GpuCamera, GpuRenderParams, GpuVoxelType, GpuWorldMeta, FLAG_CHECK_SUN, FLAG_IS_TAA,
+};
 use crate::render::pipelines::NaadfPipelines;
 use crate::render::taa::TaaGpu;
 use crate::world::buffer::{GrowableBuffer, GROWABLE_BUFFER_USAGES};
@@ -77,6 +79,12 @@ pub struct FrameGpu {
     /// The final-blit pass's own bind group (`first_hit_data`,
     /// `taa_sample_accum`, `render_params`).
     pub blit_bind_group: BindGroup,
+    /// The TAA reproject pass's single bind group (`06-design-a2.md` §5.3,
+    /// §5.5). Mixes `TaaGpu` resources (`taa_params`, `camera_history`,
+    /// `taa_samples`, `taa_sample_accum`) with `FrameGpu.first_hit_data`, so it
+    /// is built here in `prepare_frame_gpu` (after both `TaaGpu` and
+    /// `first_hit_data` exist). Consumed by `naadf_taa_reproject_node`.
+    pub taa_reproject_bind_group: BindGroup,
 }
 
 /// `RenderSystems::PrepareResources` system: create + upload the world GPU
@@ -249,6 +257,7 @@ pub fn prepare_frame_gpu(
     mut commands: Commands,
     extracted_camera: Res<ExtractedCameraData>,
     extracted_history: Res<ExtractedCameraHistory>,
+    extracted_taa: Res<crate::render::extract::ExtractedTaaConfig>,
     existing: Option<ResMut<FrameGpu>>,
     taa_gpu: Option<Res<TaaGpu>>,
     pipelines: Res<NaadfPipelines>,
@@ -303,11 +312,17 @@ pub fn prepare_frame_gpu(
         // not ported (`06-design-a2.md` §4.1, §13.3).
         rand_counter: extracted_history.frame_count,
         taa_index: extracted_history.taa_index,
-        // A-2 Batch 1: TAA logic is not wired yet (the TAA node + the first-hit
-        // ring write are Batch 2), so `FLAG_IS_TAA` stays clear here. When
-        // `AppArgs.taa` is off, `update_camera_history` keeps `current_jitter`
-        // zero, so `taa_jitter` below is zero — Phase A renders identically.
-        flags: FLAG_CHECK_SUN,
+        // `FLAG_IS_TAA` gates the first-hit pass's `taa_samples` ring write
+        // (`06-design-a2.md` §6.1) — set when `AppArgs.taa` is on (extracted
+        // into `ExtractedTaaConfig`). When TAA is off the flag is clear, the
+        // ring write is skipped, `update_camera_history` keeps `current_jitter`
+        // zero (so `taa_jitter` below is zero), and the reproject node
+        // early-returns — the result is bit-identical to Phase A.
+        flags: if extracted_taa.enabled {
+            FLAG_CHECK_SUN | FLAG_IS_TAA
+        } else {
+            FLAG_CHECK_SUN
+        },
         exposure: 1.5,
         _pad0: 0,
         sky_sun_dir,
@@ -391,33 +406,52 @@ pub fn prepare_frame_gpu(
     // the frame group / slot 1 of the blit group bind `taa_gpu.taa_sample_accum`
     // (the real `taaSampleAccum`, owned by `TaaGpu`) — Phase A bound the local
     // `shaded_color` stand-in here (`06-design-a2.md` §5.1, §5.4). `TaaGpu`'s
-    // `taa_sample_accum` resizes on the same `pixel_count` trigger as
-    // `first_hit_data`, so `needs_new_storage` covers both.
-    let (bind_group, blit_bind_group) = if needs_new_storage || existing.is_none() {
-        let bind_group = render_device.create_bind_group(
-            "naadf_frame_bind_group",
-            &pipeline_cache.get_bind_group_layout(&pipelines.frame_layout),
-            &BindGroupEntries::sequential((
-                camera_buf.as_entire_buffer_binding(),
-                render_params_buf.as_entire_buffer_binding(),
-                first_hit_data.as_entire_buffer_binding(),
-                taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
-            )),
-        );
-        let blit_bind_group = render_device.create_bind_group(
-            "naadf_blit_bind_group",
-            &pipeline_cache.get_bind_group_layout(&pipelines.blit_layout),
-            &BindGroupEntries::sequential((
-                first_hit_data.as_entire_buffer_binding(),
-                taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
-                render_params_buf.as_entire_buffer_binding(),
-            )),
-        );
-        (bind_group, blit_bind_group)
-    } else {
-        let frame = existing.as_ref().unwrap();
-        (frame.bind_group.clone(), frame.blit_bind_group.clone())
-    };
+    // `taa_sample_accum` / `taa_samples` resize on the same `pixel_count`
+    // trigger as `first_hit_data`, so `needs_new_storage` covers all of them.
+    // The TAA reproject bind group mixes `TaaGpu` (`taa_params` /
+    // `camera_history` / `taa_samples` / `taa_sample_accum`) with `FrameGpu`'s
+    // `first_hit_data`, so it is built here too (`06-design-a2.md` §5.5).
+    let (bind_group, blit_bind_group, taa_reproject_bind_group) =
+        if needs_new_storage || existing.is_none() {
+            let bind_group = render_device.create_bind_group(
+                "naadf_frame_bind_group",
+                &pipeline_cache.get_bind_group_layout(&pipelines.frame_layout),
+                &BindGroupEntries::sequential((
+                    camera_buf.as_entire_buffer_binding(),
+                    render_params_buf.as_entire_buffer_binding(),
+                    first_hit_data.as_entire_buffer_binding(),
+                    taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
+                )),
+            );
+            let blit_bind_group = render_device.create_bind_group(
+                "naadf_blit_bind_group",
+                &pipeline_cache.get_bind_group_layout(&pipelines.blit_layout),
+                &BindGroupEntries::sequential((
+                    first_hit_data.as_entire_buffer_binding(),
+                    taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
+                    render_params_buf.as_entire_buffer_binding(),
+                )),
+            );
+            let taa_reproject_bind_group = render_device.create_bind_group(
+                "naadf_taa_reproject_bind_group",
+                &pipeline_cache.get_bind_group_layout(&pipelines.taa_reproject_layout),
+                &BindGroupEntries::sequential((
+                    taa_gpu.taa_params.as_entire_buffer_binding(),
+                    taa_gpu.camera_history.as_entire_buffer_binding(),
+                    first_hit_data.as_entire_buffer_binding(),
+                    taa_gpu.taa_samples.as_entire_buffer_binding(),
+                    taa_gpu.taa_sample_accum.as_entire_buffer_binding(),
+                )),
+            );
+            (bind_group, blit_bind_group, taa_reproject_bind_group)
+        } else {
+            let frame = existing.as_ref().unwrap();
+            (
+                frame.bind_group.clone(),
+                frame.blit_bind_group.clone(),
+                frame.taa_reproject_bind_group.clone(),
+            )
+        };
 
     commands.insert_resource(FrameGpu {
         camera: camera_buf,
@@ -426,5 +460,6 @@ pub fn prepare_frame_gpu(
         pixel_count,
         bind_group,
         blit_bind_group,
+        taa_reproject_bind_group,
     });
 }

@@ -6,8 +6,11 @@
 // the G-buffer / shaded-colour writes.
 //
 // Divergences from the HLSL (per `03-design.md` §5.3 + `06-design-a2.md`):
-//   * The `taaSamples` ring write (HLSL `if (isTAA)`) is still omitted in
-//     Phase A-2 Batch 1 — it is added in Batch 2 step 6.
+//   * The `taaSamples` ring write (HLSL `if (isTAA)`) is ported in Phase A-2
+//     Batch 2 step 6, gated on `FLAG_IS_TAA` (`06-design-a2.md` §6.1). The HLSL
+//     calls `getSpecularNormals(firstHit)` — in A-2 that is always 0 (plane-0
+//     only, entity-free), so the port hardcodes `specular_normals = 0u` rather
+//     than porting that Phase-B helper.
 //   * The HLSL only writes `firstHitData` inside `if (isTAA)`; the port writes
 //     it unconditionally so the G-buffer plane 0 is always populated.
 //   * The HLSL's `taaSampleAccum` write is this pass's `taa_sample_accum`
@@ -20,12 +23,13 @@
 #import "shaders/render_pipeline_common.wgsl"::{
     GpuCamera, GpuRenderParams, VoxelType, decompress_voxel_type, get_ray_dir,
     compress_first_hit_data, HIT_NOTHING, HIT_UNDEFINED, ENTITY_FREE, SURFACE_EMISSIVE,
-    FLAG_SHOW_RAY_STEP, FLAG_CHECK_SUN,
+    FLAG_SHOW_RAY_STEP, FLAG_CHECK_SUN, FLAG_IS_TAA,
 }
 #import "shaders/ray_tracing.wgsl"::{
     RayResult, ray_aabb, shoot_ray, MAX_RAY_STEPS_PRIMARY, MAX_RAY_STEPS_SUN,
 }
 #import "shaders/world_data.wgsl"::{voxel_types, world_meta}
+#import "shaders/taa_common.wgsl"::{taa_compress_sample, TAA_SAMPLE_RING_DEPTH}
 
 // --- @group(1) — frame data -------------------------------------------------
 
@@ -39,6 +43,13 @@
 // and the write site below are unchanged (the stand-in was deliberately built
 // to the `taaSampleAccum` format), so this is a pure rename.
 @group(1) @binding(3) var<storage, read_write> taa_sample_accum: array<vec2<u32>>;
+
+// --- @group(2) — the TAA sample ring ----------------------------------------
+// The 16-deep `taaSamples` ring, slot-major (`06-design-a2.md` §2.1, §5.2).
+// Written here (one slot per pixel) when `FLAG_IS_TAA` is set; read by the TAA
+// reproject pass (`taa.wgsl`). Always bound — the `if` below guards the write,
+// so when TAA is off the buffer is simply never touched.
+@group(2) @binding(0) var<storage, read_write> taa_samples: array<vec2<u32>>;
 
 @compute @workgroup_size(64, 1, 1)
 fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -144,9 +155,36 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // --- G-buffer write ----------------------------------------------------
     // The HLSL only writes `firstHitData` inside `if (isTAA)`; Phase A writes
     // it unconditionally so plane 0 is always populated (`03-design.md` §5.3).
-    // The `taaSamples` ring write is omitted (Phase A is TAA-off — D4).
     first_hit_data[pixel_index] =
         compress_first_hit_data(distance_ray, norm_tangs, voxel_type_raw, entity);
+
+    // --- taa_samples ring write (HLSL `if (isTAA)` block) ------------------
+    // `renderFirstHit.fx:109-117` — when TAA is on, compress the shaded sample
+    // into the 64-bit format and write it into the ring slot `taaIndex % 16`
+    // (the §6 16-deep ring, NOT NAADF's 32). `getSpecularNormals(firstHit)` is
+    // always 0 in A-2 (plane-0-only, entity-free — `06-design-a2.md` §3.1,
+    // §6.1), so `specular_normals` is hardcoded rather than porting that
+    // Phase-B helper. `light` is the same shaded colour written to
+    // `taa_sample_accum` below; `taa_compress_sample` does the exponential
+    // colour compression internally.
+    if ((params.flags & FLAG_IS_TAA) != 0u) {
+        let specular_normals = 0u;
+        // dist for the sample: hit → distance_ray; miss (voxel_type_raw == 0)
+        // → 65520 (≈ f16 max), matching `renderFirstHit.fx:115`.
+        let sample_dist = select(distance_ray, 65520.0, voxel_type_raw == 0u);
+        let sample = taa_compress_sample(
+            sample_dist,
+            light,
+            norm_tangs.x & 0x7u, // plane-0 normal-tang code, low 3 bits
+            1u,                  // isDiffuse — A-2 is all-diffuse
+            specular_normals,
+            0u,                  // extraData — 0 in the albedo path
+            entity,
+        );
+        let slot = params.taa_index % TAA_SAMPLE_RING_DEPTH;
+        taa_samples[slot * (params.screen_width * params.screen_height) + pixel_index] =
+            sample;
+    }
 
     // --- taa_sample_accum write (HLSL `taaSampleAccum` write) --------------
     // `newColorComp.x = f16(1.0) | (f16(light.r) << 16)`

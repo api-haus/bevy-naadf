@@ -29,10 +29,12 @@ use bevy::render::{
 };
 
 use extract::{
-    extract_camera, extract_camera_history, extract_world, ExtractedCameraData,
-    ExtractedCameraHistory, ExtractedWorld,
+    extract_camera, extract_camera_history, extract_taa_config, extract_world,
+    ExtractedCameraData, ExtractedCameraHistory, ExtractedTaaConfig, ExtractedWorld,
 };
-use graph::{naadf_final_blit_node, naadf_first_hit_node};
+use graph::{naadf_final_blit_node, naadf_first_hit_node, naadf_taa_reproject_node};
+// TEMPORARY STEP-8 INSTRUMENTATION
+use graph::{taa_debug_copy_node, taa_debug_readback_system};
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
 use taa::prepare_taa;
@@ -50,13 +52,19 @@ impl Plugin for NaadfRenderPlugin {
             .init_resource::<ExtractedWorld>()
             .init_resource::<ExtractedCameraData>()
             .init_resource::<ExtractedCameraHistory>()
+            .init_resource::<ExtractedTaaConfig>()
             // Pipelines + bind-group layouts — `FromWorld`, built once in
             // `RenderStartup` (after the render device exists).
             .init_gpu_resource::<NaadfPipelines>()
             // Extract: main world -> render world mirror.
             .add_systems(
                 ExtractSchedule,
-                (extract_world, extract_camera, extract_camera_history),
+                (
+                    extract_world,
+                    extract_camera,
+                    extract_camera_history,
+                    extract_taa_config,
+                ),
             )
             // Prepare: create + upload GPU resources, build bind groups,
             // queue the per-target-format blit pipeline variant. `prepare_taa`
@@ -72,15 +80,28 @@ impl Plugin for NaadfRenderPlugin {
                 Render,
                 prepare_frame_gpu.in_set(RenderSystems::PrepareBindGroups),
             )
-            // Render graph: first-hit compute -> final-blit fullscreen, both
-            // in PostProcess (the first-hit pass raytraces independently of
-            // the main 3D pass) and before tonemapping so the HUD draws over.
+            // Render graph: first-hit compute -> TAA reproject compute ->
+            // final-blit fullscreen, all in PostProcess (the first-hit pass
+            // raytraces independently of the main 3D pass) and before
+            // tonemapping so the HUD draws over. The TAA node slots between
+            // first-hit and the blit (`06-design-a2.md` §8.2 — NAADF places
+            // TAA unusually early); `.chain()` gives the render-graph edges and
+            // wgpu's automatic buffer barriers serialise the shared-buffer
+            // accesses (`first_hit_data`, `taa_sample_accum`, `taa_samples`).
             .add_systems(
                 Core3d,
-                (naadf_first_hit_node, naadf_final_blit_node)
+                (
+                    naadf_first_hit_node,
+                    naadf_taa_reproject_node,
+                    // TEMPORARY STEP-8 INSTRUMENTATION
+                    taa_debug_copy_node,
+                    naadf_final_blit_node,
+                )
                     .chain()
                     .in_set(Core3dSystems::PostProcess)
                     .before(tonemapping),
-            );
+            )
+            // TEMPORARY STEP-8 INSTRUMENTATION — readback the accum buffer.
+            .add_systems(Render, taa_debug_readback_system.in_set(RenderSystems::Cleanup));
     }
 }
