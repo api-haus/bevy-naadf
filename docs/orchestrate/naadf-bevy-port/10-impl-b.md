@@ -739,3 +739,150 @@ fix change, the scrapped zoom edit dropped.
 
 All five e2e instrumentation passes were reverted; final `git status` is exactly
 `src/e2e/gates.rs` + `src/render/taa.rs`, no debug residue.
+
+---
+
+## e2e test-scene expansion (2026-05-14)
+
+The e2e harness's hard-coded test scene was expanded so the framed scene carries
+guaranteed non-black luminance pre-GI (more emissive content), and the e2e gates
+were recalibrated to the new scene. Background: pre-GI, voxel blocks render
+pitch-black except emissive blocks (white), and the atmosphere fades toward dark
+at the lower sky — the e2e luminance gate ("scene isn't mostly dead") worked
+against a single-emissive scene. The chosen fix (over tinting the sky, which
+would deviate the faithful NAADF port) is a larger voxel arrangement + several
+additional emissive blocks. **Test-scene + gates only — no renderer/atmosphere
+shader was touched.**
+
+### The test grid is SHARED with the production app
+
+`voxel::grid::setup_test_grid` is a `Startup` system added by `build_app`
+(`src/lib.rs:292`) for **both** the production `bevy-naadf` binary **and** the
+`e2e_render` harness — only the camera differs (`build_app` adds
+`camera::setup_camera` for production, `e2e::add_e2e_systems` swaps in the
+fixed-pose `setup_e2e_camera` for e2e). So expanding the grid enriches the live
+`cargo run` app as well as the e2e frame — acceptable and welcome per the task
+brief. The expansion was done in the shared builder (`src/voxel/grid.rs`); no
+e2e-specific scene was introduced.
+
+### The expanded scene (`src/voxel/grid.rs build_default_volume`)
+
+Still the 64×32×64-voxel volume, still fully deterministic (fixed positions,
+fixed emissive values, no RNG — the e2e harness depends on a bit-identical
+scene). Was: ground slab + 2 boxes + 1 sphere + 1 emissive box. Now:
+
+- **Ground** — the bottom-3-layer slab (unchanged).
+- **Four corner towers** (`TY_TOWER`, neutral grey) — varied heights 21..26,
+  framing the volume corners.
+- **Back wall + arch** (`TY_WALL`, sand diffuse) — a wall along the far +x edge
+  with a doorway arch carved back to empty; a big surface for GI bounce.
+- **Box A** (warm) + **Box B** (cool) — the two original diffuse boxes,
+  enlarged and repositioned.
+- **A row of three violet pillars** (`TY_PILLAR`) marching across the
+  mid-volume, varied heights.
+- **Two green diffuse spheres** (`TY_SPHERE`) resting on the ground.
+- **Five emissive blocks** distributed through the volume at varied positions /
+  heights — the guaranteed-non-black content pre-GI, and the GI bounce-light
+  sources once Batch 5 lands:
+  1. `TY_EMISSIVE` warm-white — `[28,23,30]..[34,28,36]`, near the volume centre
+     (the original single emissive block, kept).
+  2. `TY_EMISSIVE_COOL` cool-white — `[10,6,44]..[15,11,49]`, low / near corner.
+  3. `TY_EMISSIVE_AMBER` amber — `[46,24,46]..[51,29,51]`, high / far corner.
+  4. `TY_EMISSIVE_GREEN` green — `[44,14,14]..[49,19,19]`, mid-height +x/-z.
+  5. `TY_EMISSIVE_MAGENTA` magenta — `[20,5,50]..[25,10,55]`, low / near +z.
+
+The palette grew from 6 to 13 entries (`build_palette` — index 0 reserved empty,
++ `TY_TOWER`/`TY_WALL`/`TY_PILLAR` diffuse + four extra emissive colours). The
+`voxel_types` GPU buffer is a `GrowableBuffer`, so the larger palette needs no
+plumbing change; 13 ≪ `VOXEL_PAYLOAD_MASK` (0x7FFF). Construction grew from
+1536→1920 blocks / 2144→7232 voxel-u32s.
+
+Two unit tests added (`src/voxel/grid.rs`): `default_volume_has_five_emissive_blocks`
+(asserts one interior voxel of each of the five emissive blocks + that all five
+palette entries are `Emissive`) and `default_volume_arch_is_carved` (the wall is
+solid, the arch doorway is empty). The pre-existing `default_volume_has_ground_and_air`
+air-probe coordinate was moved well clear of the new geometry.
+
+### e2e camera re-framed (`src/e2e/gates.rs e2e_camera_transform`)
+
+At the prior pose `(112,52,117) looking_at (34,20,34)` the expanded scene sat
+small and far in the 256×256 frame. The camera was pulled **closer** along the
+same look axis — to `(86,42,90) looking_at (32,16,32)`, ~117→~83 units out,
+keeping the same ~16°-below-horizontal clean 3/4 pitch — so the expanded volume
+fills the frame with the atmosphere sky band still across the top.
+
+### Recalibrated B1–B3 gate rects (`src/e2e/gates.rs`, fractional 0..1 coords)
+
+Re-derived from a fresh readback PNG dump at the new pose + scene:
+
+| rect | new fractional | measured region-mean luminance | gate |
+|---|---|---|---|
+| `emissive_rect`    | `(0.45, 0.36)–(0.55, 0.45)` | ~234 | `> 120` |
+| `solid_block_rect` | `(0.42, 0.52)–(0.58, 0.66)` | ~4   | `< 90` |
+| `sky_rect`         | `(0.05, 0.04)–(0.45, 0.16)` | ~133 | `[10, 230]` and `> solid` |
+
+`emissive_rect` is the warm-white centre block's interior; `solid_block_rect` is
+the dark diffuse voxel geometry directly below it (near-black pre-GI, by
+design); `sky_rect` is the upper-left atmosphere band. All three clear their
+thresholds with generous margin. The B2 relative check (`sky_lum > solid_lum`,
+133 > 4) holds.
+
+### Recalibrated luminance liveness gate (`src/e2e/framebuffer.rs`)
+
+Measured pre-GI whole-frame **non-black fraction: 69.1%** at the new pose+scene
+(was ~41% with the old single-emissive scene) — materially higher thanks to the
+five distributed emissive blocks.
+
+- **`MIN_NON_BLACK_FRACTION_PRE_GI` (Batch 1–4 floor): 0.25 → 0.50.** A real
+  check ~19 pts below the measured 69.1% — trips if the sky/blit/first-hit node
+  silently drops a large part of the frame, not a rubber stamp.
+- **`MIN_NON_BLACK_FRACTION_GI` (Batch 5+ hard gate): 0.50 → 0.60.** With the
+  pre-GI fraction already at 69.1%, the GI-lit fraction will be ≥ that, so a
+  0.50 hard gate would no longer be a real check on the expanded scene. Set to
+  0.60 — above the user's verbatim "at least 50%" floor, a real check on the
+  GI-lit frame, with headroom for the Batch-5 agent to confirm against the
+  actual measured GI-lit fraction and nudge per the `e2e-render-test.md` rule.
+  The batch-aware structure (pre-GI floor for B1–B4, higher hard threshold from
+  B5) is unchanged.
+
+### Task 3 — NAADF horizon behaviour (record only, no fix)
+
+NAADF's atmosphere (`Content/shaders/render/common/atmosphere/atmosphereRaw.fxh`
+`addLightForDirection`, driven by `base/renderAtmosphere.fx precomputeAtmosphere`)
+**genuinely fades to dark for downward / low rays — it is not a missing horizon
+term.** Mechanism: for any direction `addLightForDirection` ray-marches in-scatter
+only while the ray's segment through the atmosphere shell is positive. For a
+downward ray `rayResultPlanet.y > 0` (it hits the planet), so the march length
+is clamped to `rayResultPlanet.x - rayResult.x` — the thin slice from where the
+ray enters the atmosphere down to the planet surface. That slice still
+in-scatters a small amount of light (so downward rays are dim, **not** pure
+black), but **the planet surface contributes nothing** — there is no ground
+albedo / horizon-colour term in the model at all. So the lower hemisphere
+correctly tends toward dark (only thin-slice atmosphere in-scatter), and our
+WGSL port (`src/assets/shaders/atmosphere.wgsl add_light_for_direction` — the
+same `ray_result.y = ray_result_planet.x - ray_result.x` clamp) reproduces this
+faithfully. No horizon colour is missing; nothing to change. (The faithful port
+stays as-is per the task constraint — this is a record only.)
+
+### Verification
+
+- `cargo build` — clean (pre-existing dead-code warnings only).
+- `cargo test` — **46 passed** (was 44; +2 new scene-construction tests —
+  `default_volume_has_five_emissive_blocks`, `default_volume_arch_is_carved`).
+  The `PipelineCache` scan, node-dispatch, degenerate-frame checks unaffected.
+- `cargo run --bin e2e_render` — exits **0**, all gates green at the expanded
+  scene: luminance gate `batch 3 — 69.1% non-black; threshold 50%`, then
+  `PASS (batch 3) — … per-batch region gate green, every pipeline created
+  cleanly, every expected render-graph node dispatched.` Screenshot written to
+  `target/e2e-screenshots/e2e_latest.png` every run.
+- **Visual assessment of `e2e_latest.png`:** the expanded scene renders
+  sensibly — three emissive blocks (warm-white centre, magenta lower-left, green
+  right) render bright/coloured, the warm block's dark cube edge is visible, the
+  dark diffuse voxel structure (towers, boxes, pillars) fills the mid/lower
+  frame near-black as expected pre-GI, the atmosphere sky band sits clean across
+  the top with no streaks/rings. (The amber + cool-white emissive blocks are
+  higher / partly occluded by geometry — three clearly-visible emissive blocks
+  is ample guaranteed-non-black content.) Used 4 of the 5 allotted
+  `cargo run --bin e2e_render` invocations.
+- No TEMP debug instrumentation added; the rect-derivation used an offline PNG
+  analysis script, not in-tree code.

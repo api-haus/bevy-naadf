@@ -1,13 +1,28 @@
 //! The hard-coded Phase-A test-grid builder (D2).
 //!
 //! `setup_test_grid` authors a dense voxel volume from simple primitives — a
-//! ground slab, a few axis-aligned boxes, a sphere, and one emissive box —
-//! builds the `VoxelTypes` palette, runs CPU-side AADF construction
-//! (`aadf::construct`), and fills the `WorldData` resource (`03-design.md`
-//! §6.1 step 1).
+//! ground slab, several axis-aligned boxes, pillars, two spheres, and **five
+//! emissive blocks** distributed through the volume — builds the `VoxelTypes`
+//! palette, runs CPU-side AADF construction (`aadf::construct`), and fills the
+//! `WorldData` resource (`03-design.md` §6.1 step 1).
 //!
 //! No `.vox` reader, no `WorldGenerator` port (D2) — this is the smallest
 //! content path that gets voxels on screen.
+//!
+//! **Shared scene (e2e + production).** `setup_test_grid` is a `Startup` system
+//! added by [`crate::build_app`] for **both** the production `bevy-naadf`
+//! binary and the `e2e_render` harness — only the camera differs (the e2e
+//! harness swaps in its own fixed-pose camera). The expanded scene therefore
+//! enriches both the live `cargo run` app and the e2e render-test frame.
+//!
+//! **Scene-expansion (2026-05-14, e2e test-scene expansion task).** The scene
+//! was expanded from "ground slab + 2 boxes + 1 sphere + 1 emissive box" to a
+//! larger arrangement with **five emissive blocks** spread through the volume,
+//! more solid geometry (corner towers, a pillar row, a wall, an arch, two
+//! spheres), so the framed scene carries substantial guaranteed-non-black
+//! content pre-GI (emissive blocks render white pre-GI) and is a richer GI
+//! bounce-light test scene once Batch 5 lands. Still fully deterministic — fixed
+//! positions, fixed emissive values, no RNG (the e2e harness depends on this).
 
 use bevy::prelude::*;
 
@@ -22,7 +37,23 @@ const TY_GROUND: VoxelTypeId = VoxelTypeId(1);
 const TY_BOX_A: VoxelTypeId = VoxelTypeId(2);
 const TY_BOX_B: VoxelTypeId = VoxelTypeId(3);
 const TY_SPHERE: VoxelTypeId = VoxelTypeId(4);
+/// The warm-white emissive type — the original single emissive block, kept.
 const TY_EMISSIVE: VoxelTypeId = VoxelTypeId(5);
+// Scene-expansion palette additions: more solid geometry colours + four extra
+// emissive colours, so the expanded scene has varied geometry for GI bounce and
+// several distinct emissive blocks (all render white-ish pre-GI; the colour
+// matters for GI bounce tint once Batch 5 lands).
+const TY_TOWER: VoxelTypeId = VoxelTypeId(6);
+const TY_WALL: VoxelTypeId = VoxelTypeId(7);
+const TY_PILLAR: VoxelTypeId = VoxelTypeId(8);
+/// Cool-white emissive (slightly blue).
+const TY_EMISSIVE_COOL: VoxelTypeId = VoxelTypeId(9);
+/// Warm amber emissive.
+const TY_EMISSIVE_AMBER: VoxelTypeId = VoxelTypeId(10);
+/// Green emissive.
+const TY_EMISSIVE_GREEN: VoxelTypeId = VoxelTypeId(11);
+/// Magenta/pink emissive.
+const TY_EMISSIVE_MAGENTA: VoxelTypeId = VoxelTypeId(12);
 
 /// World size for the Phase-A test grid: 4×2×4 chunks = 64×32×64 voxels
 /// (`03-design.md` §6.1 step 1).
@@ -108,8 +139,8 @@ fn build_palette() -> Vec<VoxelType> {
             color_base: Vec3::new(0.30, 0.70, 0.32),
             color_layered: Vec3::ZERO,
         },
-        // 5 — emissive box. `color_layered` doubles as emissive intensity
-        // (`02-research.md` §4.6); the contribution itself is Phase B.
+        // 5 — warm-white emissive box. `color_layered` doubles as emissive
+        // intensity (`02-research.md` §4.6); the contribution itself is Phase B.
         VoxelType {
             material_base: MaterialBase::Emissive,
             material_layer: MaterialLayer::None,
@@ -117,30 +148,142 @@ fn build_palette() -> Vec<VoxelType> {
             color_base: Vec3::new(1.0, 0.92, 0.78),
             color_layered: Vec3::new(8.0, 7.4, 6.2),
         },
+        // 6 — tower: a neutral light-grey diffuse (corner towers).
+        VoxelType {
+            material_base: MaterialBase::Diffuse,
+            material_layer: MaterialLayer::None,
+            roughness: 0.85,
+            color_base: Vec3::new(0.62, 0.60, 0.58),
+            color_layered: Vec3::ZERO,
+        },
+        // 7 — wall: a warm sand diffuse (the back wall + arch).
+        VoxelType {
+            material_base: MaterialBase::Diffuse,
+            material_layer: MaterialLayer::None,
+            roughness: 0.85,
+            color_base: Vec3::new(0.72, 0.62, 0.42),
+            color_layered: Vec3::ZERO,
+        },
+        // 8 — pillar: a violet diffuse (the pillar row).
+        VoxelType {
+            material_base: MaterialBase::Diffuse,
+            material_layer: MaterialLayer::None,
+            roughness: 0.8,
+            color_base: Vec3::new(0.45, 0.32, 0.62),
+            color_layered: Vec3::ZERO,
+        },
+        // 9 — cool-white emissive.
+        VoxelType {
+            material_base: MaterialBase::Emissive,
+            material_layer: MaterialLayer::None,
+            roughness: 1.0,
+            color_base: Vec3::new(0.82, 0.88, 1.0),
+            color_layered: Vec3::new(6.4, 6.9, 8.0),
+        },
+        // 10 — warm amber emissive.
+        VoxelType {
+            material_base: MaterialBase::Emissive,
+            material_layer: MaterialLayer::None,
+            roughness: 1.0,
+            color_base: Vec3::new(1.0, 0.66, 0.28),
+            color_layered: Vec3::new(8.0, 5.3, 2.2),
+        },
+        // 11 — green emissive.
+        VoxelType {
+            material_base: MaterialBase::Emissive,
+            material_layer: MaterialLayer::None,
+            roughness: 1.0,
+            color_base: Vec3::new(0.40, 1.0, 0.46),
+            color_layered: Vec3::new(3.2, 8.0, 3.7),
+        },
+        // 12 — magenta emissive.
+        VoxelType {
+            material_base: MaterialBase::Emissive,
+            material_layer: MaterialLayer::None,
+            roughness: 1.0,
+            color_base: Vec3::new(1.0, 0.42, 0.86),
+            color_layered: Vec3::new(8.0, 3.4, 6.9),
+        },
     ]
 }
 
-/// Build the default test volume: a ground slab, two axis-aligned boxes, a
-/// sphere, and one emissive box (`03-design.md` §6.1 step 1).
+/// Build the default test volume (`03-design.md` §6.1 step 1).
+///
+/// **Expanded scene (2026-05-14).** A larger, richer arrangement than the
+/// original "ground slab + 2 boxes + 1 sphere + 1 emissive box": a ground slab,
+/// four corner towers, a back wall with an arch cut through it, a row of
+/// pillars, two warm/cool diffuse boxes, two spheres, and **five emissive
+/// blocks** distributed through the volume at varied positions and heights.
+///
+/// Rationale: the emissive blocks render white-ish pre-GI, so spreading five of
+/// them through the framed volume guarantees substantial non-black content even
+/// before GI bounce lighting lands (Batch 5), and the extra diffuse geometry
+/// (towers, wall, pillars, spheres) gives varied surfaces for GI bounce light to
+/// fall on once Batch 5 is in. Fully deterministic — fixed positions, fixed
+/// emissive values, no RNG (the e2e harness depends on a bit-identical scene).
+///
+/// All coordinates are in voxels within the 64×32×64 volume.
 fn build_default_volume() -> DenseVolume {
     let mut v = DenseVolume::empty(GRID_SIZE_IN_CHUNKS);
     let size = v.size_in_voxels();
     let (sx, _sy, sz) = (size[0], size[1], size[2]);
 
+    // --- Ground + perimeter -------------------------------------------------
+
     // Ground slab — the bottom 3 voxel layers, full width/depth.
     fill_box(&mut v, [0, 0, 0], [sx - 1, 2, sz - 1], TY_GROUND);
 
-    // Box A — a tall warm box near one corner, sitting on the ground.
-    fill_box(&mut v, [8, 3, 8], [19, 18, 19], TY_BOX_A);
+    // Four corner towers — neutral grey, varied heights, framing the volume.
+    fill_box(&mut v, [2, 3, 2], [9, 26, 9], TY_TOWER);
+    fill_box(&mut v, [54, 3, 2], [61, 21, 9], TY_TOWER);
+    fill_box(&mut v, [2, 3, 54], [9, 18, 61], TY_TOWER);
+    fill_box(&mut v, [54, 3, 54], [61, 24, 61], TY_TOWER);
+
+    // Back wall along the far +x edge with an arch cut through it — sand
+    // diffuse, a big surface for GI bounce.
+    fill_box(&mut v, [56, 3, 14], [60, 22, 49], TY_WALL);
+    // Arch opening — carve a doorway back to empty.
+    fill_box(&mut v, [55, 3, 26], [61, 14, 37], VoxelTypeId::EMPTY);
+
+    // --- Mid-scene diffuse geometry ----------------------------------------
+
+    // Box A — a tall warm box, sitting on the ground.
+    fill_box(&mut v, [12, 3, 14], [23, 20, 25], TY_BOX_A);
 
     // Box B — a wider cool box on the far side.
-    fill_box(&mut v, [40, 3, 36], [55, 14, 51], TY_BOX_B);
+    fill_box(&mut v, [38, 3, 40], [52, 16, 55], TY_BOX_B);
 
-    // Sphere — green, resting on the ground roughly centre-ish.
-    fill_sphere(&mut v, [34, 11, 18], 8, TY_SPHERE);
+    // A row of three violet pillars marching across the mid-volume.
+    fill_box(&mut v, [26, 3, 8], [29, 17, 11], TY_PILLAR);
+    fill_box(&mut v, [34, 3, 8], [37, 19, 11], TY_PILLAR);
+    fill_box(&mut v, [42, 3, 8], [45, 15, 11], TY_PILLAR);
 
-    // Emissive box — a small bright cube floating above the scene.
-    fill_box(&mut v, [28, 24, 28], [33, 29, 33], TY_EMISSIVE);
+    // Two green diffuse spheres, resting on the ground.
+    fill_sphere(&mut v, [30, 11, 30], 8, TY_SPHERE);
+    fill_sphere(&mut v, [44, 9, 24], 6, TY_SPHERE);
+
+    // --- Five emissive blocks, distributed through the volume --------------
+    //
+    // These render white-ish pre-GI — the guaranteed-non-black content — and
+    // are the GI bounce-light sources once Batch 5 lands. Spread across the
+    // volume at varied positions and heights so several are in frame from any
+    // sensible 3/4 vantage.
+
+    // 1 — warm-white, a small bright cube floating near the volume centre
+    // (the original single emissive block, kept in roughly its old place).
+    fill_box(&mut v, [28, 23, 30], [34, 28, 36], TY_EMISSIVE);
+
+    // 2 — cool-white, low and toward the near corner.
+    fill_box(&mut v, [10, 6, 44], [15, 11, 49], TY_EMISSIVE_COOL);
+
+    // 3 — warm amber, high up near the far corner.
+    fill_box(&mut v, [46, 24, 46], [51, 29, 51], TY_EMISSIVE_AMBER);
+
+    // 4 — green, mid-height on the +x / -z side.
+    fill_box(&mut v, [44, 14, 14], [49, 19, 19], TY_EMISSIVE_GREEN);
+
+    // 5 — magenta, low and toward the near +z edge, in front of box B.
+    fill_box(&mut v, [20, 5, 50], [25, 10, 55], TY_EMISSIVE_MAGENTA);
 
     v
 }
@@ -205,8 +348,44 @@ mod tests {
         // Ground present at the bottom.
         assert_eq!(v.voxel_at([0, 0, 0]), TY_GROUND);
         assert_eq!(v.voxel_at([63, 2, 63]), TY_GROUND);
-        // Air above the ground in an empty region.
-        assert_eq!(v.voxel_at([2, 25, 2]), VoxelTypeId::EMPTY);
+        // Air above the scene in an empty region (well above all geometry).
+        assert_eq!(v.voxel_at([31, 31, 20]), VoxelTypeId::EMPTY);
+    }
+
+    #[test]
+    fn default_volume_has_five_emissive_blocks() {
+        let v = build_default_volume();
+        // One interior voxel from each of the five emissive blocks.
+        assert_eq!(v.voxel_at([31, 25, 33]), TY_EMISSIVE, "warm-white block");
+        assert_eq!(v.voxel_at([12, 8, 46]), TY_EMISSIVE_COOL, "cool-white block");
+        assert_eq!(v.voxel_at([48, 26, 48]), TY_EMISSIVE_AMBER, "amber block");
+        assert_eq!(v.voxel_at([46, 16, 16]), TY_EMISSIVE_GREEN, "green block");
+        assert_eq!(v.voxel_at([22, 7, 52]), TY_EMISSIVE_MAGENTA, "magenta block");
+        // Every one of the five emissive palette entries is Emissive.
+        let p = build_palette();
+        for ty in [
+            TY_EMISSIVE,
+            TY_EMISSIVE_COOL,
+            TY_EMISSIVE_AMBER,
+            TY_EMISSIVE_GREEN,
+            TY_EMISSIVE_MAGENTA,
+        ] {
+            assert_eq!(
+                p[ty.0 as usize].material_base,
+                MaterialBase::Emissive,
+                "palette entry {} must be Emissive",
+                ty.0,
+            );
+        }
+    }
+
+    #[test]
+    fn default_volume_arch_is_carved() {
+        let v = build_default_volume();
+        // The back wall is solid sand diffuse...
+        assert_eq!(v.voxel_at([58, 18, 18]), TY_WALL, "wall above the arch");
+        // ...with the arch doorway carved back to empty.
+        assert_eq!(v.voxel_at([58, 8, 31]), VoxelTypeId::EMPTY, "arch opening");
     }
 
     #[test]

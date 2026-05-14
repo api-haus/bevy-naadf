@@ -50,32 +50,43 @@ impl Rect {
 /// fully-unlit pre-GI geometry fall at or below it.
 pub const NON_BLACK_EPS: f32 = 2.0;
 
-/// The minimum non-black fraction for the **GI-lit** batches (Batch 5 onward) —
-/// the user's "at least 50%" target (`e2e-render-test.md` Implementation log —
-/// 2026-05-14 luminance-gate addition).
+/// The minimum non-black fraction for the **GI-lit** batches (Batch 5 onward).
 ///
 /// The user asked for "most of the pixels are not pitch black … at least 50%, i
-/// guess". That target describes the *GI-lit* scene: once `globalIllum`'s bounce
-/// light reaches the screen (Batch 5 — `10-impl-b.md`: "GI bounce becomes
-/// visible", the pre-GI-black geometry "measurably brighter"), the lower-frame
-/// voxel geometry is no longer pitch black and 50%+ of the frame is lit. So 50%
-/// is a **hard gate from Batch 5 on**.
-pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.50;
+/// guess" — 50% is the floor of that intent. That target describes the *GI-lit*
+/// scene: once `globalIllum`'s bounce light reaches the screen (Batch 5 —
+/// `10-impl-b.md`: "GI bounce becomes visible", the pre-GI-black geometry
+/// "measurably brighter"), the dark diffuse geometry is no longer pitch black.
+///
+/// **Recalibrated (2026-05-14, e2e test-scene expansion):** the test scene was
+/// expanded with five emissive blocks + more geometry, and the pre-GI non-black
+/// fraction at the re-framed e2e pose rose to **69.1%** (was ~41%) — so once GI
+/// lights the dark diffuse geometry the GI-lit fraction is ≥ that. A 0.50 hard
+/// gate would no longer be a real check on the expanded scene. This is set to
+/// **0.60** — above the user's 50% floor, a real check on the GI-lit frame,
+/// with headroom for the Batch-5 agent to confirm against the actual measured
+/// GI-lit fraction and nudge it to just below the measured value (the
+/// `e2e-render-test.md` rule).
+pub const MIN_NON_BLACK_FRACTION_GI: f32 = 0.60;
 
 /// The minimum non-black fraction for the **pre-GI** batches (Batch 1–4).
 ///
 /// Before GI bounce lands, the scene is *correctly* mostly dark: only the
-/// atmosphere-tinted sky and the emissive block are lit; the non-emissive voxel
-/// geometry filling the lower frame is pitch black by design (`10-impl-b.md`
-/// Batch 2: "pre-GI a non-emissive diffuse block should be near-black").
-/// Demanding 50% here would be a false failure. The measured Batch-3 non-black
-/// fraction at the fixed e2e pose is **43.4%** (the sky band + the emissive
-/// block + the lit ground edges); this floor is set to **0.25** — comfortably
-/// below the measured 43.4% so it is a real "the screen isn't dead, the sky and
-/// the emissive block are rendering" liveness check, not a rubber stamp, while
-/// still catching the failure where the blit/sky node silently produced almost
-/// nothing. When Batch 5 lands, [`MIN_NON_BLACK_FRACTION_GI`] takes over.
-pub const MIN_NON_BLACK_FRACTION_PRE_GI: f32 = 0.25;
+/// atmosphere-tinted sky and the emissive blocks are lit; the non-emissive
+/// diffuse voxel geometry is pitch black by design (`10-impl-b.md` Batch 2:
+/// "pre-GI a non-emissive diffuse block should be near-black"). Demanding the
+/// full GI-lit threshold here would be a false failure.
+///
+/// **Recalibrated (2026-05-14, e2e test-scene expansion):** the expanded scene
+/// (five emissive blocks distributed through the volume + the atmosphere-tinted
+/// sky band) measures **69.1% non-black** at the re-framed e2e pose pre-GI (was
+/// ~41% with the old single-emissive scene). This floor is set to **0.50** —
+/// comfortably below the measured 69.1% so it is a real "the screen isn't dead,
+/// the sky and the five emissive blocks are rendering" liveness check, not a
+/// rubber stamp, while still catching the failure where the blit/sky/first-hit
+/// node silently dropped a large part of the frame. When Batch 5 lands,
+/// [`MIN_NON_BLACK_FRACTION_GI`] takes over.
+pub const MIN_NON_BLACK_FRACTION_PRE_GI: f32 = 0.50;
 
 /// The batch at which the GI bounce lights the scene and the full
 /// [`MIN_NON_BLACK_FRACTION_GI`] (50%) liveness threshold becomes a hard gate

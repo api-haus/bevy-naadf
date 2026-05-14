@@ -28,26 +28,24 @@ use super::framebuffer::{Framebuffer, Rect};
 /// 256×256 1:1-aspect window it frames empty space below the horizon — nothing
 /// of the voxel grid is in view. This pose instead sits back-and-above the
 /// `GridPreset::Default` grid (64×32×64 voxels, 1 voxel = 1 world unit) and
-/// looks down at the scene centre, framing the emissive block, the warm solid
-/// box A, and a clear sky corner in non-overlapping screen regions. The gate
+/// looks down at the scene centre, framing several emissive blocks, the diffuse
+/// geometry, and a clear sky corner in non-overlapping screen regions. The gate
 /// rectangles below are derived from *this* pose; if it changes, re-derive
 /// them from a fresh `save_to_disk` dump.
 ///
-/// **Repositioned (2026-05-14):** the prior pose `(104, 34, 110)` sat at a
-/// grazing, near-horizontal angle on the voxel volume — at camera height
-/// y=34 it was only ~2 units above the volume top (y=32), and its look
-/// direction had only a ~9% downward component, so the upper-frame view rays
-/// skimmed just over the volume top and the readback showed hard-edged
-/// horizontal streak artifacts across the upper half (a known precision
-/// artifact at grazing angles / partially outside the volume). The camera was
-/// pulled **back and to the right** (world +X and +Z both increased, off the
-/// grazing line) **and raised** well clear of the volume top, with the target
-/// lifted toward the volume centre, so the view ray now pitches ~16° below
-/// horizontal — a clean 3/4 vantage that frames the 64×32×64 volume with the
-/// atmosphere-tinted sky band still across the top. Gate rects below were
-/// re-derived from a fresh `save_to_disk` dump at this pose.
+/// **History.** The original pose `(104, 34, 110)` sat at a grazing angle and
+/// showed streak artifacts; it was repositioned to `(112, 52, 117)` looking at
+/// `(34, 20, 34)` — a clean 3/4 vantage. **Re-framed again (2026-05-14, e2e
+/// test-scene expansion):** the test scene was expanded with a larger voxel
+/// arrangement + five emissive blocks, and at the `(112,52,117)` pose the
+/// expanded scene sat small and far in the frame. The camera was pulled
+/// **closer** along the same look axis — from ~117 units out to ~83 units —
+/// keeping the same ~16°-below-horizontal 3/4 pitch, so the expanded volume
+/// fills the 256×256 frame cleanly with the atmosphere-tinted sky band still
+/// across the top. Gate rects below were re-derived from a fresh `save_to_disk`
+/// dump at this pose.
 pub fn e2e_camera_transform() -> Transform {
-    Transform::from_xyz(112.0, 52.0, 117.0).looking_at(Vec3::new(34.0, 20.0, 34.0), Vec3::Y)
+    Transform::from_xyz(86.0, 42.0, 90.0).looking_at(Vec3::new(32.0, 16.0, 32.0), Vec3::Y)
 }
 
 /// The highest batch currently implemented — the `ASSERT` step runs this
@@ -61,41 +59,50 @@ pub const CURRENT_BATCH: u32 = 3;
 // Fractional (0..1) screen coords, keyed off the *actual* readback dimensions
 // (`Rect::from_fractional`) so a HiDPI scale-factor difference does not
 // silently misalign them (`e2e-render-test.md` §6.5, R5/R7). Derived from a
-// `save_to_disk` PNG dump of the first readback at the fixed pose above.
+// `save_to_disk` PNG dump of the readback at the fixed pose above.
 //
 // `GridPreset::Default` layout (`voxel/grid.rs build_default_volume`, 64×32×64
-// voxels): a ground slab (y 0..2), warm box A (8..19, 3..18, 8..19), cool box B
-// (40..55, 3..14, 36..51), green sphere (centre 34,11,18 r8), and exactly ONE
-// emissive box (28..33, 24..29, 28..33) floating above the scene — RNG-free,
-// deterministic constructors (re-confirmed against `build_default_volume`).
-// At the fixed pose above the readback shows: the emissive box bright-white
-// just above the screen centre, the dark voxel geometry (near-black pre-GI)
-// forming a diamond filling the lower-centre, and the atmosphere-tinted sky
-// band across the top.
-// Verified-by-dump measurements at the fixed (repositioned) pose: emissive-box
-// interior luminance ~240, solid-geometry luminance ~3, sky luminance ~45 —
+// voxels) — the **expanded scene** (2026-05-14): a ground slab (y 0..2), four
+// corner towers, a sand back wall with an arch carved through it, a row of
+// three violet pillars, warm box A + cool box B, two green spheres, and **FIVE
+// emissive blocks** distributed through the volume (warm-white near centre,
+// cool-white low-near, amber high-far, green mid +x/-z, magenta low near +z).
+// RNG-free, deterministic constructors (re-confirmed against
+// `build_default_volume`).
+//
+// At the fixed (re-framed, closer) pose the 256×256 readback shows: the
+// warm-white emissive block bright just above screen centre, the magenta
+// emissive block bright in the lower-left, the green emissive block bright on
+// the right, the dark diffuse voxel geometry (near-black pre-GI) filling the
+// mid/lower frame, and the atmosphere-tinted sky band across the top.
+//
+// Verified-by-dump region means at this pose: warm-white-emissive interior
+// luminance ~234, dark-diffuse-geometry luminance ~4, sky-band luminance ~133 —
 // well-separated, so the gate thresholds below have generous margin.
 
-/// The emissive-block screen region — the only lit thing pre-GI; should read
-/// near-white / high-luminance. The emissive box sits just above the screen
-/// centre at the fixed pose (the largest connected bright blob, px x≈117..138,
-/// y≈98..117 at 256×256); this rect is the box interior, kept inside its edges
-/// so a jittered edge pixel does not pull the region mean down.
+/// The emissive-block screen region — an emissive block is the only lit thing
+/// pre-GI; should read near-white / high-luminance. This rect is the interior
+/// of the warm-white emissive block (the connected bright blob just above
+/// screen centre, px x≈104..155, y≈78..134 at 256×256), kept inside its edges
+/// so a jittered edge pixel does not pull the region mean down. Measured
+/// luminance ~234 (gate `> 120`).
 fn emissive_rect(fb: &Framebuffer) -> Rect {
-    Rect::from_fractional(fb, 0.46, 0.40, 0.54, 0.46)
+    Rect::from_fractional(fb, 0.45, 0.36, 0.55, 0.45)
 }
 
-/// A non-emissive solid-block region (the dark voxel-geometry diamond in the
-/// lower-centre) — near-black pre-GI (no bounce light yet), measurably brighter
-/// once GI lands (B5).
+/// A non-emissive solid-block region — the dark diffuse voxel geometry directly
+/// below the warm-white emissive block — near-black pre-GI (no bounce light
+/// yet), measurably brighter once GI lands (B5). Measured luminance ~4
+/// (gate `< 90`).
 fn solid_block_rect(fb: &Framebuffer) -> Rect {
-    Rect::from_fractional(fb, 0.39, 0.59, 0.62, 0.78)
+    Rect::from_fractional(fb, 0.42, 0.52, 0.58, 0.66)
 }
 
 /// A sky region — an upper-left band that misses all geometry; shows the
-/// atmosphere tint, neither solid black nor blown-out white.
+/// atmosphere tint, neither solid black nor blown-out white. Measured luminance
+/// ~133 (gate `[10, 230]` and `> solid`).
 fn sky_rect(fb: &Framebuffer) -> Rect {
-    Rect::from_fractional(fb, 0.02, 0.03, 0.39, 0.17)
+    Rect::from_fractional(fb, 0.05, 0.04, 0.45, 0.16)
 }
 
 // --- Stability-hash baselines ----------------------------------------------
