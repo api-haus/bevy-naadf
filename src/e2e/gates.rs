@@ -46,21 +46,8 @@ use super::framebuffer::{Framebuffer, Rect};
 /// horizontal — a clean 3/4 vantage that frames the 64×32×64 volume with the
 /// atmosphere-tinted sky band still across the top. Gate rects below were
 /// re-derived from a fresh `save_to_disk` dump at this pose.
-///
-/// **Zoomed in (2026-05-14):** the prior pose `(112, 52, 117)` sat back far
-/// enough that the centred scene only filled the middle of the 256×256 frame,
-/// leaving a wide upper region where the out-of-volume streaking artifact (see
-/// `e2e-render-test.md` "Known deferred issue") had room to show. The camera
-/// was moved **in along the existing view direction** — same look-at target
-/// `(34, 20, 34)`, so the centred framing is preserved — to ~60% of the prior
-/// camera-to-target distance (~118 → ~71 world units). The lit emissive block +
-/// the voxel volume now substantially fill the frame and the streak-prone upper
-/// region is pushed toward the top edge. This is a **framing workaround only** —
-/// it shrinks the artifact's footprint, it does not fix it (the fix is deferred
-/// by user decision; see `e2e-render-test.md` "Known deferred issue"). Gate
-/// rects below were re-derived from a fresh `save_to_disk` dump at this pose.
 pub fn e2e_camera_transform() -> Transform {
-    Transform::from_xyz(80.8, 39.2, 83.8).looking_at(Vec3::new(34.0, 20.0, 34.0), Vec3::Y)
+    Transform::from_xyz(112.0, 52.0, 117.0).looking_at(Vec3::new(34.0, 20.0, 34.0), Vec3::Y)
 }
 
 /// The highest batch currently implemented — the `ASSERT` step runs this

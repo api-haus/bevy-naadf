@@ -12,7 +12,6 @@
 //! helpers; the `TaaGpu` render-world resource + the `prepare_taa` system are
 //! added in step 5 of `06-design-a2.md` §12.
 
-use bevy::camera_controller::free_camera::FreeCamera;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntries, Buffer, BufferDescriptor, BufferUsages,
@@ -160,8 +159,19 @@ pub fn rotation_only_view_proj(camera: &Camera, rotation: Quat) -> Mat4 {
 /// parent, so `Transform == GlobalTransform` for it, and `Transform` is the
 /// *current*-frame value in `Update` (`GlobalTransform` propagation runs in
 /// `PostUpdate`).
+///
+/// The camera is matched by `With<PositionSplit>` — the marker of *the NAADF
+/// render camera* — NOT `With<FreeCamera>`. `FreeCamera` is an input concern
+/// (the fly-camera plugin); the frame counter + camera-history ring are render
+/// concerns that must advance for *every* configuration of the render camera.
+/// The e2e harness spawns a fixed-pose camera **without** `FreeCamera`
+/// (`e2e/mod.rs setup_e2e_camera`); a `With<FreeCamera>` filter made `Single`
+/// match nothing there, so the system was silently skipped and `frame_count`
+/// stayed pinned at 0 — which froze the atmosphere precompute's
+/// `frameCount % 4` quarter-stride on a single quarter, leaving 3/4 of the
+/// octahedral buffer stale-zero (the out-of-volume streaking artifact).
 pub fn update_camera_history(
-    camera: Single<(&Camera, &Transform, &PositionSplit), With<FreeCamera>>,
+    camera: Single<(&Camera, &Transform, &PositionSplit), With<PositionSplit>>,
     args: Res<crate::AppArgs>,
     mut history: ResMut<CameraHistory>,
 ) {

@@ -611,3 +611,131 @@ Three blocking issues, all in new Batch-3 WGSL, all fixed:
   `render_pipeline_common.wgsl` (Batch 1) but neither Batch 2 nor Batch 3 calls
   it. B4's `sampleRefine` is its first consumer (`renderSampleRefine.fx` applies
   it to the first-hit G-buffer planes).
+
+---
+
+## Streaking artifact fix (2026-05-14)
+
+Diagnose-and-fix for the rendering artifact reported at the Phase-B review gate:
+**hard-edged horizontal streaks / a concentric-ring interference pattern wherever
+rays miss or exit the voxel volume — the region where the atmospheric sky should
+render.** Everpresent at every camera pose. The user confirmed it as a
+*resurgence* of the Phase-A "out-of-volume concentric-ring / streaking" artifact.
+
+**Verdict up front: fixed.** Root cause is NOT the Phase-A ray-AABB clip box —
+that fix (`05-review.md` — the `0.1`-voxel-inset `float3` bounding box) is fully
+intact in `prepare.rs` / `gpu_types.rs` / `world_data.wgsl` / `ray_tracing.wgsl`
+/ `naadf_first_hit.wgsl`. This is a *variant*: a different mechanism with the
+same visual signature (a regular interference pattern in the miss region), newly
+exposed by Phase B Batch 1's atmosphere subsystem.
+
+### Step zero — baseline restore
+
+`src/e2e/gates.rs` was restored to its committed `6e8f26e` state
+(`git checkout 6e8f26e -- src/e2e/gates.rs`), dropping the abandoned/scrapped
+`6ebd42c` "zoom e2e camera in" edit. `git status` after: only `gates.rs`
+modified — known-good e2e harness baseline.
+
+### Diagnosis chain
+
+**1. Observed.** `cargo run --bin e2e_render` → `Read` `e2e_latest.png`: the
+upper/sky region of the frame is filled with hard-edged, regular horizontal
+streaks and a concentric ring-like band lower down; the emissive cube and voxel
+geometry render correctly. Luminance gate: 41.1% non-black (a clean frame is
+~100%).
+
+**2. Located.** The Phase-A ray-AABB fix was verified intact across all five
+files it touched — *not* the regression. The artifact is in the **miss-ray
+path**: for a ray that misses the volume, `naadf_first_hit.wgsl` writes
+`final_color` purely from `apply_atmosphere(...)` reading the precomputed
+octahedral atmosphere buffer (`atmosphere_comp`). That buffer + the
+`atmosphere_oct_index` / `apply_atmosphere` sampler + the `naadf_atmosphere.wgsl`
+precompute are all **new in Phase B Batch 1** (the atmosphere subsystem).
+
+**3. Hypothesised + isolated (5 e2e runs, instrumentation reverted after each).**
+   - *Run 2* — replaced the miss-path `apply_atmosphere` (precomputed-buffer
+     read) with a direct `add_light_for_direction` ray-march: **sky rendered
+     clean, no streaks.** → the bug is in the precompute-buffer path, not the
+     shared atmosphere ray-march math.
+   - *Run 3* — made `naadf_atmosphere.wgsl` write a smooth `(tex_pos_norm.x,
+     tex_pos_norm.y, 0.5)` gradient instead of the atmosphere result:
+     **streaks persisted** even though the written data is perfectly smooth in
+     buffer-index space. → the precompute→buffer→apply *indexing/storage* is
+     broken, not the atmosphere computation.
+   - *Run 4* — visualised `atmosphere_oct_index`'s output (`comp_pos` + an
+     out-of-bounds flag) directly: **perfectly smooth, fully in-bounds.** → the
+     read index is correct; the buffer *content* at smoothly-adjacent indices is
+     not smooth, i.e. the precompute is not writing the slots the sampler reads.
+   - *Run 5* — `naadf_atmosphere.wgsl` writes a `b = 1.0` presence marker on
+     every slot it touches; `info!`-logged `frame_count` in `prepare_atmosphere`.
+     Result: **`frame_count` is pinned at `0` for the entire e2e run** (every
+     `prepare_atmosphere` call logged `frame_count=0`), and the presence marker
+     confirmed ~3/4 of the octahedral buffer is stale-zero, interleaved in a
+     regular pattern with the ~1/4 written slots.
+
+**4. Root cause (confirmed against NAADF source).**
+`base/renderAtmosphere.fx:12` — `precomputeAtmosphere` writes
+`ID = globalID.x * 4 + (frameCount % 4)`: it precomputes **one quarter of the
+octahedral buffer per frame**, cycling all four quarters as `frameCount`
+advances `0,1,2,3,0,…`. The port (`naadf_atmosphere.wgsl`) replicates this
+faithfully. But in the e2e harness `frameCount` never leaves `0`, so the
+precompute only ever writes the `id % 4 == 0` quarter — the other three
+quarters stay zero-cleared forever. The miss-path `apply_atmosphere` then reads
+a smoothly-sweeping `oct_index` that cycles 1-written / 3-stale-zero, and that
+aliases against the screen into the regular hard-edged streaks. Same *visual
+class* as the Phase-A `floor()`-knife-edge artifact (a regular interference
+pattern in the miss region), different mechanism — hence the user reading it as
+a "resurgence / variant".
+
+*Why `frameCount` is stuck:* `update_camera_history` (`src/render/taa.rs`) — the
+**only** writer that increments `CameraHistory.frame_count` — queried the camera
+as `Single<(&Camera, &Transform, &PositionSplit), With<FreeCamera>>`. The e2e
+harness deliberately spawns its fixed-pose camera **without** `FreeCamera`
+(`e2e/mod.rs setup_e2e_camera` — `FreeCameraPlugin` is omitted from the e2e
+config). A `Single` system param that matches no entity makes Bevy **silently
+skip the system** — so `frame_count` never advanced. This is a *pre-existing
+latent* bug (the `With<FreeCamera>` filter + the `FreeCamera`-less e2e camera
+both predate Phase B), but it was **harmless until Phase B Batch 1**: Batch 1's
+atmosphere precompute is the first subsystem whose *visible output* depends on
+`frameCount % 4` cycling. (`sync_position_split` has the identical
+`With<FreeCamera>` query and is *also* skipped in the e2e harness — but that one
+is genuinely harmless: the e2e camera seeds a correct `PositionSplit` at spawn
+and the pose is fixed.)
+
+### The fix
+
+**File: `src/render/taa.rs`** — `update_camera_history`'s camera query changed
+from `With<FreeCamera>` to `With<PositionSplit>`. `FreeCamera` is an *input*
+concern (the fly-camera plugin); the frame counter + camera-history ring are
+*render* concerns that must advance for every configuration of the NAADF render
+camera. `PositionSplit` is the component that marks "the NAADF render camera" —
+present on both the production fly-camera (`camera/mod.rs setup_camera`) and the
+e2e fixed-pose camera (`e2e/mod.rs setup_e2e_camera`). With the broader filter,
+`update_camera_history` runs in both configs and `frame_count` advances
+monotonically, so the atmosphere precompute cycles all four quarters and the
+octahedral buffer is fully populated. The now-unused `FreeCamera` import was
+removed; the doc comment records why the filter is `PositionSplit`, not
+`FreeCamera`. No NAADF-divergence — `frameCount` advancing every frame *is*
+NAADF's behaviour (`WorldRender.cs:86`); the port had simply gated its only
+incrementer behind a too-narrow camera filter.
+
+**File: `src/e2e/gates.rs`** — restored to `6e8f26e` (step zero above); not a
+fix change, the scrapped zoom edit dropped.
+
+### Verification
+
+- `cargo build` — clean.
+- `cargo test` — **44 passed** (4 suites), 0 failed — unchanged.
+- `cargo run --bin e2e_render` — exits **0**, all gates green; luminance gate
+  now **100.0%** non-black (was 41.1% with the artifact).
+- Visual assessment of the post-fix `target/e2e-screenshots/e2e_latest.png`:
+  the sky region renders as a **clean atmospheric gradient** — smooth blue at the
+  horizon fading to dark toward the top, **no hard-edged horizontal streaks, no
+  concentric rings**. The emissive cube reads bright-white, the voxel geometry
+  forms the expected dark diamond. The faint dark banding that was also visible
+  on the voxel geometry itself (the 4-plane first-hit's per-bounce
+  `apply_atmosphere` reads the same stale buffer) is likewise gone. Matches the
+  expected clean-sky render.
+
+All five e2e instrumentation passes were reverted; final `git status` is exactly
+`src/e2e/gates.rs` + `src/render/taa.rs`, no debug residue.
