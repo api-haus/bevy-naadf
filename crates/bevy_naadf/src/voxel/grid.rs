@@ -93,6 +93,7 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
             max: IVec3::new(size[0] as i32 - 1, size[1] as i32 - 1, size[2] as i32 - 1),
         },
         dirty: true,
+        pending_edits: Default::default(),
     });
 
     commands.insert_resource(VoxelTypes {

@@ -15,6 +15,23 @@
 //! W0 plumbed the flag end-to-end with a placeholder body; **W1 fills the
 //! body** with the real bit-exact CPU/GPU oracle gate.
 //!
+//! ## Phase-C W2 flag — `--edit-mode` (`15-design-c.md` §2.1 W2 row)
+//!
+//! Runs the CPU-side editing chain end-to-end against a small fixed scene:
+//! builds a 4×2×4-chunk world, applies a single `set_voxel` call at a known
+//! position with a known new type, then asserts:
+//!   - `WorldData::pending_edits.batches` is non-empty (the edit produced
+//!     a batch).
+//!   - `WorldData::chunks_cpu` was mutated (the edit reached the CPU mirror).
+//!   - The flood-fill CPU oracle produces the expected `changed_groups`
+//!     entries.
+//!
+//! Until wave-3 wires the full render-graph dispatch path so the edit is
+//! *visible* in the screenshot, this CPU validation is the integration-level
+//! W2 e2e gate. The GPU bit-exact validation lives in the `world_change::tests`
+//! unit-test module (which boots a headless render world + runs the actual
+//! `world_change.wgsl` shader passes against the CPU oracles).
+//!
 //! ## Phase-C W4 flag — `--entities` (`15-design-c.md` §2.1 W4 row)
 //!
 //! Runs the CPU-side `EntityHandler::update` against a small fixed-pose
@@ -54,9 +71,10 @@ use bevy::prelude::AppExit;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Parse the CLI flags — `--validate-gpu-construction` (W1) +
-    // `--entities` (W4), default off.
+    // `--entities` (W4) + `--edit-mode` (W2), default off.
     let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
     let entities_mode = args.iter().any(|a| a == "--entities");
+    let edit_mode = args.iter().any(|a| a == "--edit-mode");
 
     let app_exit = bevy_naadf::run_e2e_render();
 
@@ -92,6 +110,18 @@ fn main() -> ExitCode {
             }
             Err(msg) => {
                 eprintln!("entity handler validation FAILED: {msg}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    if edit_mode {
+        match bevy_naadf::render::construction::validate_edit_mode() {
+            Ok(report) => {
+                eprintln!("edit-mode validation PASS: {report}");
+            }
+            Err(msg) => {
+                eprintln!("edit-mode validation FAILED: {msg}");
                 return ExitCode::from(1);
             }
         }

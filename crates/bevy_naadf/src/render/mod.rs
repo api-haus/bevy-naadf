@@ -64,6 +64,12 @@ use graph_b::{
 // construction sub-module. Inserted before `naadf_atmosphere_node` in the
 // `Core3d` chain per `15-design-c.md` §3.
 use construction::bounds_calc::naadf_bounds_compute_node;
+// Phase-C W2 — the regime-3 world-change node, inserted between
+// `naadf_bounds_compute_node` (W3) and `naadf_entity_update_node` (W4) per
+// `15-design-c.md` §3. Body is gated on
+// `ConstructionEvents::has_pending_changes()` — a single bool check on
+// no-edit frames.
+use construction::world_change::naadf_world_change_node;
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
 use taa::{prepare_taa, TaaRingConfig};
@@ -259,6 +265,7 @@ impl Plugin for NaadfRenderPlugin {
                 Core3d,
                 (
                     naadf_bounds_compute_node,
+                    naadf_world_change_node,
                     naadf_entity_update_node,
                     naadf_atmosphere_node,
                     naadf_first_hit_node,

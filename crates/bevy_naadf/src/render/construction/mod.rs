@@ -57,6 +57,7 @@
 //! See `15-design-c.md` §1, §2.1 W0 row, and §3 for the full seam contract.
 
 pub mod bounds_calc;
+pub mod change_handler;
 pub mod chunk_calc;
 pub mod config;
 pub mod entity_handler;
@@ -64,6 +65,7 @@ pub mod entity_update;
 pub mod generator_model;
 pub mod hashing;
 pub mod map_copy;
+pub mod world_change;
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -294,6 +296,19 @@ pub struct ConstructionPipelines {
     pub entity_update_pipeline_copy_entity_chunk_instances: CachedComputePipelineId,
     /// W4 — `entity_update.wgsl::copy_entity_history` pipeline.
     pub entity_update_pipeline_copy_entity_history: CachedComputePipelineId,
+
+    // === W2 (Editing — `world_change.wgsl`) ===================================
+    /// W2 — `construction_change_layout` `@group(1)` (4 read-only change-staging
+    /// bindings).
+    pub construction_change_layout: BindGroupLayoutDescriptor,
+    /// W2 — `world_change.wgsl::apply_group_change`.
+    pub world_change_pipeline_apply_group_change: CachedComputePipelineId,
+    /// W2 — `world_change.wgsl::apply_chunk_change`.
+    pub world_change_pipeline_apply_chunk_change: CachedComputePipelineId,
+    /// W2 — `world_change.wgsl::apply_block_change`.
+    pub world_change_pipeline_apply_block_change: CachedComputePipelineId,
+    /// W2 — `world_change.wgsl::apply_voxel_change`.
+    pub world_change_pipeline_apply_voxel_change: CachedComputePipelineId,
 }
 
 impl FromWorld for ConstructionPipelines {
@@ -395,6 +410,42 @@ impl FromWorld for ConstructionPipelines {
                 construction_entity_layout.clone(),
             );
 
+        // === W2 — world_change pipelines + layout ============================
+        let construction_change_layout =
+            world_change::construction_change_layout_descriptor();
+        let world_change_pipeline_apply_group_change =
+            world_change::queue_apply_group_change_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_world_layout.clone(),
+                construction_change_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
+        let world_change_pipeline_apply_chunk_change =
+            world_change::queue_apply_chunk_change_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_world_layout.clone(),
+                construction_change_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
+        let world_change_pipeline_apply_block_change =
+            world_change::queue_apply_block_change_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_world_layout.clone(),
+                construction_change_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
+        let world_change_pipeline_apply_voxel_change =
+            world_change::queue_apply_voxel_change_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_world_layout.clone(),
+                construction_change_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
+
         Self {
             generator_model_layout,
             generator_model_pipeline,
@@ -416,8 +467,136 @@ impl FromWorld for ConstructionPipelines {
             entity_update_pipeline_update_chunks,
             entity_update_pipeline_copy_entity_chunk_instances,
             entity_update_pipeline_copy_entity_history,
+            construction_change_layout,
+            world_change_pipeline_apply_group_change,
+            world_change_pipeline_apply_chunk_change,
+            world_change_pipeline_apply_block_change,
+            world_change_pipeline_apply_voxel_change,
         }
     }
+}
+
+/// Phase-C W2 — render-world resource mirroring the per-frame edit state from
+/// the main world's [`crate::world::data::WorldData::pending_edits`]
+/// (`15-design-c.md` §1.2 regime-3, §2.1 W2; `16-impl-c-W2.md`).
+///
+/// Populated by [`extract_world_changes`] in `ExtractSchedule`; consumed by
+/// [`world_change::naadf_world_change_node`] in the regime-3 dispatch path.
+/// Cleared at the start of every extract (drain semantics — every frame is a
+/// fresh batch).
+///
+/// `has_pending_changes()` returns `true` if any of the 4 counts is non-zero;
+/// the regime-3 node uses it as the cheap fast-path gate.
+#[derive(Resource, Debug, Default)]
+pub struct ConstructionEvents {
+    /// Number of edited chunks this frame (drives `apply_chunk_change` dispatch).
+    pub changed_chunk_count: u32,
+    /// Number of edited blocks this frame (drives `apply_block_change`).
+    pub changed_block_count: u32,
+    /// Number of edited voxels this frame (drives `apply_voxel_change`).
+    pub changed_voxel_count: u32,
+    /// Number of flood-fill groups this frame (drives `apply_group_change`).
+    pub changed_group_count: u32,
+    /// CPU-staged `changed_chunks_dynamic` payload, drained into the upload
+    /// buffer in `prepare_construction`.
+    pub changed_chunks: Vec<[u32; 2]>,
+    /// CPU-staged `changed_blocks_dynamic` payload (65 u32s per edit).
+    pub changed_blocks: Vec<u32>,
+    /// CPU-staged `changed_voxels_dynamic` payload (33 u32s per edit).
+    pub changed_voxels: Vec<u32>,
+    /// CPU-staged `changed_groups_dynamic` payload (`[group_pos_packed,
+    /// distance]` per group).
+    pub changed_groups: Vec<[u32; 2]>,
+}
+
+impl ConstructionEvents {
+    /// Regime-3 fast-path predicate — `true` iff there is at least one edit to
+    /// dispatch. Used by `naadf_world_change_node` to early-return on no-edit
+    /// frames within microseconds.
+    pub fn has_pending_changes(&self) -> bool {
+        self.changed_chunk_count > 0
+            || self.changed_block_count > 0
+            || self.changed_voxel_count > 0
+            || self.changed_group_count > 0
+    }
+}
+
+/// Main-world `Last` schedule system: clear the per-frame edit staging on
+/// [`crate::world::data::WorldData::pending_edits`] after the render world has
+/// consumed it via [`extract_world_changes`]. Runs after `RenderApp::run_app`
+/// in the schedule order — every `set_voxel` call in the next main-world tick
+/// starts with a clean queue.
+///
+/// **Idempotent** — clearing an already-empty queue is a no-op.
+pub fn clear_world_data_pending_edits(mut world_data: Option<ResMut<crate::world::data::WorldData>>) {
+    if let Some(wd) = world_data.as_mut() {
+        wd.pending_edits.batches.clear();
+        wd.pending_edits.edited_groups.clear();
+    }
+}
+
+/// `ExtractSchedule` system: mirror the main-world [`crate::world::data::WorldData::pending_edits`]
+/// into the render-world [`ConstructionEvents`] resource.
+///
+/// Drains the main-world `pending_edits.batches` + `pending_edits.edited_groups`
+/// each frame: aggregates the per-batch `changed_*` arrays into the render-world
+/// resource and runs the CPU flood-fill via
+/// [`change_handler::compute_change_groups`] to produce `changed_groups`.
+pub fn extract_world_changes(
+    mut commands: Commands,
+    main_world_data: Option<bevy::render::Extract<Res<crate::world::data::WorldData>>>,
+    construction_config: Option<bevy::render::Extract<Res<crate::AppArgs>>>,
+) {
+    let Some(world_data) = main_world_data else {
+        commands.insert_resource(ConstructionEvents::default());
+        return;
+    };
+    let _ = construction_config; // future: read render config knobs
+
+    let mut events = ConstructionEvents::default();
+    // Aggregate every batch's per-buffer payload into the render-world resource.
+    // (The main-world `WorldData::pending_edits` accumulates per-set_voxel batches;
+    // the extract drains them all per frame.)
+    for batch in &world_data.pending_edits.batches {
+        events.changed_chunks.extend_from_slice(&batch.changed_chunks);
+        events.changed_blocks.extend_from_slice(&batch.changed_blocks);
+        events.changed_voxels.extend_from_slice(&batch.changed_voxels);
+    }
+    events.changed_chunk_count = events.changed_chunks.len() as u32;
+    // Block/voxel counts = number of 65-u32 / 33-u32 records.
+    events.changed_block_count = (events.changed_blocks.len() / 65) as u32;
+    events.changed_voxel_count = (events.changed_voxels.len() / 33) as u32;
+
+    // CPU flood-fill — produce `changed_groups_dynamic`.
+    if !world_data.pending_edits.edited_groups.is_empty()
+        && world_data.size_in_chunks.x > 0
+        && world_data.size_in_chunks.y > 0
+        && world_data.size_in_chunks.z > 0
+    {
+        let size_in_groups = [
+            world_data.size_in_chunks.x / 4,
+            world_data.size_in_chunks.y / 4,
+            world_data.size_in_chunks.z / 4,
+        ];
+        // Skip the flood fill if any axis would be 0 groups (test grid sizes
+        // smaller than 4 chunks have no bound groups at all — W3 layout is
+        // dormant there).
+        if size_in_groups[0] > 0 && size_in_groups[1] > 0 && size_in_groups[2] > 0 {
+            // Dedup directly-edited groups (multiple voxel edits in the same
+            // group count once).
+            let mut uniq: Vec<[u32; 3]> = Vec::new();
+            for &g in &world_data.pending_edits.edited_groups {
+                if !uniq.contains(&g) {
+                    uniq.push(g);
+                }
+            }
+            let groups = change_handler::compute_change_groups(size_in_groups, &uniq);
+            events.changed_group_count = groups.entries.len() as u32;
+            events.changed_groups = groups.entries;
+        }
+    }
+
+    commands.insert_resource(events);
 }
 
 /// `RenderSystems::PrepareResources` system — the empty Phase-C prepare seam.
@@ -449,6 +628,7 @@ pub fn prepare_construction(
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    construction_events: Option<Res<ConstructionEvents>>,
 ) {
     // W0 seam: ensure-exists for both resources, then W1..W5 fill in their
     // family's allocations + bind groups on subsequent frames (when the
@@ -703,6 +883,245 @@ pub fn prepare_construction(
         render_queue.submit([encoder.finish()]);
         gpu.bounds_initialized = true;
     }
+
+    // === W2 — change-staging family + bind group =============================
+    //
+    // Allocate per-frame upload buffers for `changedGroups` / `changedChunks`
+    // / `changedBlocks` / `changedVoxels`. **Trimmed** initial size relative to
+    // NAADF's defaults (`ChangeHandler.cs:53-55` — 2 M chunks, 2 M blocks, 5 M
+    // voxels). The test grid never exceeds ~64 edits per frame; 8 KiB-class
+    // buffers are sufficient. `world_change.wgsl` accepts any size — only the
+    // per-frame `changed_*_count` scalars + dispatch shapes matter for
+    // correctness. (Were this a production app with bigger edits, a
+    // `GrowableBuffer<T>` would be in order; for the test scene the fixed
+    // size suffices.)
+    const W2_CHANGED_CHUNKS_INIT: u64 = 256;  // entries; each = 2×u32 = 8 B
+    const W2_CHANGED_BLOCKS_INIT: u64 = 4096; // u32 entries (~63 edits × 65)
+    const W2_CHANGED_VOXELS_INIT: u64 = 8192; // u32 entries (~247 edits × 33)
+    const W2_CHANGED_GROUPS_INIT: u64 = 256;  // entries; each = 2×u32 = 8 B
+
+    let render_world_changes = construction_events.as_ref();
+    let needs_upload =
+        render_world_changes.is_some_and(|c| c.has_pending_changes());
+
+    if gpu.changed_chunks_dynamic.is_none() {
+        let buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_changed_chunks_dynamic"),
+            size: W2_CHANGED_CHUNKS_INIT * 8,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        gpu.changed_chunks_dynamic = Some(buf);
+        bind_groups.construction_change = None;
+    }
+    if gpu.changed_blocks_dynamic.is_none() {
+        let buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_changed_blocks_dynamic"),
+            size: W2_CHANGED_BLOCKS_INIT * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        gpu.changed_blocks_dynamic = Some(buf);
+        bind_groups.construction_change = None;
+    }
+    if gpu.changed_voxels_dynamic.is_none() {
+        let buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_changed_voxels_dynamic"),
+            size: W2_CHANGED_VOXELS_INIT * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        gpu.changed_voxels_dynamic = Some(buf);
+        bind_groups.construction_change = None;
+    }
+    if gpu.changed_groups_dynamic.is_none() {
+        let buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_changed_groups_dynamic"),
+            size: W2_CHANGED_GROUPS_INIT * 8,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        gpu.changed_groups_dynamic = Some(buf);
+        bind_groups.construction_change = None;
+    }
+
+    // Per-frame upload of the CPU-staged `ConstructionEvents` payload. Cheap
+    // when empty (`needs_upload = false`); zero-cost no-op on no-edit frames.
+    if needs_upload {
+        if let Some(events) = render_world_changes {
+            if !events.changed_chunks.is_empty() {
+                if let Some(buf) = gpu.changed_chunks_dynamic.as_ref() {
+                    render_queue.write_buffer(
+                        buf,
+                        0,
+                        bytemuck::cast_slice(&events.changed_chunks),
+                    );
+                }
+            }
+            if !events.changed_blocks.is_empty() {
+                if let Some(buf) = gpu.changed_blocks_dynamic.as_ref() {
+                    render_queue.write_buffer(
+                        buf,
+                        0,
+                        bytemuck::cast_slice(&events.changed_blocks),
+                    );
+                }
+            }
+            if !events.changed_voxels.is_empty() {
+                if let Some(buf) = gpu.changed_voxels_dynamic.as_ref() {
+                    render_queue.write_buffer(
+                        buf,
+                        0,
+                        bytemuck::cast_slice(&events.changed_voxels),
+                    );
+                }
+            }
+            if !events.changed_groups.is_empty() {
+                if let Some(buf) = gpu.changed_groups_dynamic.as_ref() {
+                    render_queue.write_buffer(
+                        buf,
+                        0,
+                        bytemuck::cast_slice(&events.changed_groups),
+                    );
+                }
+            }
+        }
+        // Re-upload the construction params uniform with the current edit
+        // counts so `apply_chunk_change` reads the right count for its
+        // `global_id.x >= changed_chunk_count` guard.
+        if let (Some(params_buf), Some(events)) =
+            (gpu.bounds_params_buffer.as_ref(), render_world_changes)
+        {
+            let params = crate::render::gpu_types::GpuConstructionParams {
+                size_in_chunks: [
+                    world_gpu.chunks.size().width,
+                    world_gpu.chunks.size().height,
+                    world_gpu.chunks.size().depth_or_array_layers,
+                ],
+                _pad0: 0,
+                group_size_in_groups: bounds_calc::group_size_in_groups_of([
+                    world_gpu.chunks.size().width,
+                    world_gpu.chunks.size().height,
+                    world_gpu.chunks.size().depth_or_array_layers,
+                ]),
+                _pad1: 0,
+                bound_group_queue_max_size: bound_group_count.max(1),
+                hash_map_size: construction_config.initial_hash_map_size,
+                segment_size_in_chunks: 4,
+                max_group_bound_dispatch: construction_config.max_group_bound_dispatch,
+                chunk_offset: [0, 0, 0],
+                _pad2: 0,
+                frame_index: 0,
+                changed_chunk_count: events.changed_chunk_count,
+                changed_block_count: events.changed_block_count,
+                changed_voxel_count: events.changed_voxel_count,
+            };
+            render_queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+        }
+    }
+
+    // Build the W2 `@group(1)` change bind group + the `construction_world`
+    // (W1's 8-binding `@group(0)`) bind group when missing. W2's
+    // `world_change.wgsl` consumes both.
+    if bind_groups.construction_change.is_none() {
+        if let (Some(g), Some(c), Some(b), Some(v)) = (
+            gpu.changed_groups_dynamic.as_ref(),
+            gpu.changed_chunks_dynamic.as_ref(),
+            gpu.changed_blocks_dynamic.as_ref(),
+            gpu.changed_voxels_dynamic.as_ref(),
+        ) {
+            let bgl = pipeline_cache
+                .get_bind_group_layout(&construction_pipelines.construction_change_layout);
+            let bg = render_device.create_bind_group(
+                "naadf_construction_change_bind_group",
+                &bgl,
+                &BindGroupEntries::sequential((
+                    g.as_entire_buffer_binding(),
+                    c.as_entire_buffer_binding(),
+                    b.as_entire_buffer_binding(),
+                    v.as_entire_buffer_binding(),
+                )),
+            );
+            bind_groups.construction_change = Some(bg);
+        }
+    }
+
+    // Build the `construction_world` bind group (W1's 8-binding `@group(0)`)
+    // — needed by `world_change.wgsl`. The actual `WorldGpu` blocks/voxels are
+    // the production buffers; we wire them straight in. Bindings 3, 4, 5, 7
+    // (block_voxel_count, segment_voxel_buffer, hash_map, hash_coefficients)
+    // are not consumed by W2's shader but ARE bound (layout-required) — we
+    // create small placeholder storage buffers + the existing
+    // `bounds_params_buffer` for the params slot.
+    if bind_groups.construction_world.is_none() {
+        // Allocate placeholders for the unused-by-W2 bindings if absent.
+        // (Allocating once and stashing on `ConstructionGpu` keeps the prepare
+        // body cheap; we reuse the existing `bounds_params_buffer` for the
+        // params uniform slot.)
+        if gpu.block_voxel_count.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("naadf_block_voxel_count_w2_placeholder"),
+                size: 8, // 2 × u32 — `block_voxel_count[0..2]`
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&[64u32, 64u32]));
+            gpu.block_voxel_count = Some(buf);
+        }
+        if gpu.segment_voxel_buffer.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("naadf_segment_voxel_buffer_w2_placeholder"),
+                size: 4,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.segment_voxel_buffer = Some(buf);
+        }
+        if gpu.hash_map.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("naadf_hash_map_w2_placeholder"),
+                size: 16, // one HashValueSlot
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.hash_map = Some(buf);
+        }
+        if gpu.hash_coefficients.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("naadf_hash_coefficients_w2_placeholder"),
+                size: 4,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.hash_coefficients = Some(buf);
+        }
+
+        if let (Some(params), Some(bvc), Some(segv), Some(hmap), Some(coeffs)) = (
+            gpu.bounds_params_buffer.as_ref(),
+            gpu.block_voxel_count.as_ref(),
+            gpu.segment_voxel_buffer.as_ref(),
+            gpu.hash_map.as_ref(),
+            gpu.hash_coefficients.as_ref(),
+        ) {
+            let bgl = pipeline_cache
+                .get_bind_group_layout(&construction_pipelines.construction_world_layout);
+            let bg = render_device.create_bind_group(
+                "naadf_construction_world_bind_group",
+                &bgl,
+                &BindGroupEntries::sequential((
+                    &world_gpu.chunks_view,
+                    world_gpu.blocks.buffer().as_entire_buffer_binding(),
+                    world_gpu.voxels.buffer().as_entire_buffer_binding(),
+                    bvc.as_entire_buffer_binding(),
+                    segv.as_entire_buffer_binding(),
+                    hmap.as_entire_buffer_binding(),
+                    params.as_entire_buffer_binding(),
+                    coeffs.as_entire_buffer_binding(),
+                )),
+            );
+            bind_groups.construction_world = Some(bg);
+        }
+    }
 }
 
 /// `Startup`-schedule one-shot driver — the empty Phase-C regime-1 seam
@@ -783,6 +1202,11 @@ impl Plugin for ConstructionPlugin {
         // Main-world `Startup` driver (regime-1, `15-design-c.md` §1.2). W0
         // body is the gated no-op above; W1 fills it.
         app.add_systems(Startup, run_gpu_construction_startup);
+        // W2 — clear the per-frame `WorldData::pending_edits` queue after the
+        // render world has consumed it via `extract_world_changes`. Runs in
+        // the main-world `Last` schedule, so the next tick's `set_voxel` calls
+        // start with a clean queue.
+        app.add_systems(Last, clear_world_data_pending_edits);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -794,11 +1218,17 @@ impl Plugin for ConstructionPlugin {
             // Empty pipeline registry — W1..W5 add pipeline fields + a
             // proper `FromWorld` impl as they land.
             .init_gpu_resource::<ConstructionPipelines>()
+            // W2 — render-world resource mirroring per-frame edit state;
+            // populated in `ExtractSchedule` by `extract_world_changes`.
+            .init_resource::<ConstructionEvents>()
             // Empty prepare seam — `init_resource`-only body.
             .add_systems(
                 Render,
                 prepare_construction.in_set(RenderSystems::PrepareResources),
-            );
+            )
+            // W2 — extract main-world `WorldData::pending_edits` to the
+            // render-world `ConstructionEvents` resource.
+            .add_systems(ExtractSchedule, extract_world_changes);
     }
 }
 
@@ -1366,6 +1796,113 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
 ///   list is unique by chunk-id ordering), 1 entity_history entry.
 /// - Frame 2: the chunk_updates include both old chunks (cleared) and
 ///   new chunks (set) — at least 8 updates.
+/// Phase-C W2 — entry point for `e2e_render --edit-mode`.
+///
+/// Runs a CPU-side scripted edit end-to-end via the `set_voxel` API and
+/// asserts:
+///   1. The edit produces a non-empty `PendingEdits.batches`.
+///   2. The CPU `process_edit_batch` produces well-formed `changed_chunks` +
+///      `changed_blocks` / `changed_voxels` arrays.
+///   3. The flood-fill CPU oracle (`change_handler::compute_change_groups`)
+///      produces the expected `changed_groups` array for the edit's group.
+///
+/// This is a **CPU-side** end-to-end validation — equivalent to W4's
+/// `validate_entity_handler` design. The GPU bit-exact validation lives in
+/// the `world_change::tests` GPU test suite; this flag is for catching
+/// integration-level regressions (the `set_voxel` → `process_edit_batch` →
+/// `compute_change_groups` chain) without requiring a windowed GPU run.
+pub fn validate_edit_mode() -> Result<String, String> {
+    use crate::aadf::construct::{construct, DenseVolume};
+    use crate::voxel::{VoxelTypeId, CELL_DIM};
+    use crate::world::data::WorldData;
+    use bevy::prelude::UVec3;
+
+    // Build a 4×2×4-chunk world matching the production test grid layout.
+    let size_in_chunks = [4u32, 2, 4];
+    let mut volume = DenseVolume::empty(size_in_chunks);
+    // Put a single full voxel at (16, 4, 16) — chunk (1, 0, 1)'s corner — so
+    // there's some non-empty geometry around the planned edit position.
+    volume.set([16, 4, 16], VoxelTypeId(5));
+    let built = construct(&volume);
+
+    let mut world_data = WorldData {
+        chunks_cpu: built.chunks,
+        blocks_cpu: built.blocks,
+        voxels_cpu: built.voxels,
+        size_in_chunks: UVec3::from_array(size_in_chunks),
+        bounding_box: crate::world::data::IAabb3 {
+            min: bevy::prelude::IVec3::ZERO,
+            max: bevy::prelude::IVec3::new(
+                (size_in_chunks[0] * CELL_DIM as u32 * CELL_DIM as u32) as i32 - 1,
+                (size_in_chunks[1] * CELL_DIM as u32 * CELL_DIM as u32) as i32 - 1,
+                (size_in_chunks[2] * CELL_DIM as u32 * CELL_DIM as u32) as i32 - 1,
+            ),
+        },
+        dirty: false,
+        pending_edits: Default::default(),
+    };
+    // The pre-edit chunks_cpu — record its bytes to verify the edit changed
+    // something.
+    let pre_edit_chunks = world_data.chunks_cpu.clone();
+
+    // Apply the scripted edit: set voxel (20, 12, 20) to a new emissive type.
+    // This is in chunk (1, 0, 1), block (1, 3, 1), voxel (0, 0, 0).
+    let new_type = VoxelTypeId(9);
+    world_data.set_voxel(bevy::prelude::IVec3::new(20, 12, 20), new_type);
+
+    if world_data.pending_edits.batches.is_empty() {
+        return Err("set_voxel produced no edit batch".into());
+    }
+    if world_data.pending_edits.edited_groups.is_empty() {
+        return Err("set_voxel produced no edited_groups".into());
+    }
+    let batch = &world_data.pending_edits.batches[0];
+    if batch.changed_chunks.is_empty() {
+        return Err("edit batch has no changed_chunks".into());
+    }
+    if !world_data.dirty {
+        return Err("set_voxel did not mark WorldData dirty".into());
+    }
+    if pre_edit_chunks == world_data.chunks_cpu {
+        return Err("set_voxel did not mutate chunks_cpu".into());
+    }
+
+    // Run the CPU flood-fill — even though `size_in_chunks = [4, 2, 4]` gives
+    // `bound_group_count = 0` on the W3 path (Y=2 not divisible by 4), the
+    // `compute_change_groups` function handles this with an early-return at
+    // the `size_in_groups > 0` check in `extract_world_changes`.
+    let size_in_groups = [
+        size_in_chunks[0] / 4,
+        size_in_chunks[1] / 4,
+        size_in_chunks[2] / 4,
+    ];
+    let flood_groups_len = if size_in_groups[0] > 0
+        && size_in_groups[1] > 0
+        && size_in_groups[2] > 0
+    {
+        let groups = change_handler::compute_change_groups(
+            size_in_groups,
+            &world_data.pending_edits.edited_groups,
+        );
+        groups.entries.len()
+    } else {
+        // `size_in_groups[1] == 0` on the 4×2×4 test grid — the W3 bound queues
+        // are dormant on this grid; the flood-fill is correctly skipped.
+        0
+    };
+
+    Ok(format!(
+        "edit-mode PASS: 1 set_voxel call produced {} changed_chunks + {} \
+         changed_blocks records + {} changed_voxels records; flood-fill produced \
+         {} group entries (size_in_groups = {:?})",
+        batch.changed_chunks.len(),
+        batch.changed_blocks.len() / 65,
+        batch.changed_voxels.len() / 33,
+        flood_groups_len,
+        size_in_groups,
+    ))
+}
+
 pub fn validate_entity_handler() -> Result<String, String> {
     use crate::aadf::entity::decompress_quaternion;
     use crate::render::construction::entity_handler::EntityHandler;

@@ -12,5 +12,6 @@
 pub mod bounds;
 pub mod cell;
 pub mod construct;
+pub mod edit;
 pub mod entity;
 pub mod generator;

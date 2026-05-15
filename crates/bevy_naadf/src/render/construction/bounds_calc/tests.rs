@@ -334,7 +334,8 @@ fn readback_chunks_texture(
     size: [u32; 3],
 ) -> Vec<u32> {
     let chunk_count = (size[0] * size[1] * size[2]) as u64;
-    let bytes_per_row = (size[0] * 4).max(256).next_multiple_of(256);
+    // W2 — chunks texture is `Rg32Uint` (8 B per texel); take `.x` only.
+    let bytes_per_row = (size[0] * 8).max(256).next_multiple_of(256);
     let rows_per_image = size[1];
     let staging_size = (bytes_per_row * size[1] * size[2]) as u64;
     let staging = device.create_buffer(&BufferDescriptor {
@@ -376,9 +377,18 @@ fn readback_chunks_texture(
     for z in 0..size[2] {
         for y in 0..size[1] {
             let row_offset = (z * rows_per_image + y) as usize * bytes_per_row as usize;
-            let row_bytes = &raw[row_offset..row_offset + (size[0] * 4) as usize];
-            let row_u32s: &[u32] = bytemuck::cast_slice(row_bytes);
-            out.extend_from_slice(row_u32s);
+            // Read `.x` only — each texel is 8 B (`[u32; 2]`), step by 8.
+            let row_bytes = &raw[row_offset..row_offset + (size[0] * 8) as usize];
+            for x in 0..size[0] as usize {
+                let off = x * 8;
+                let xv = u32::from_le_bytes([
+                    row_bytes[off + 0],
+                    row_bytes[off + 1],
+                    row_bytes[off + 2],
+                    row_bytes[off + 3],
+                ]);
+                out.push(xv);
+            }
         }
     }
     drop(raw);
@@ -477,13 +487,19 @@ fn build_w3_fixture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D3,
-        format: TextureFormat::R32Uint,
+        // W2 — matches production chunks texture format (`Rg32Uint`); the
+        // shader takes `.x` from the loaded vec4, writes preserve `.y`.
+        format: TextureFormat::Rg32Uint,
         usage: TextureUsages::TEXTURE_BINDING
             | TextureUsages::COPY_DST
             | TextureUsages::COPY_SRC
             | TextureUsages::STORAGE_BINDING,
         view_formats: &[],
     });
+    // Upload as `[u32; 2]` per chunk — `.x` = the `initial_chunks` value,
+    // `.y` = 0 (no entity pointers in the W3 fixture).
+    let paired_chunks: Vec<[u32; 2]> =
+        initial_chunks.iter().map(|&x| [x, 0u32]).collect();
     queue.write_texture(
         TexelCopyTextureInfo {
             texture: &chunks_texture,
@@ -491,10 +507,11 @@ fn build_w3_fixture(
             origin: Default::default(),
             aspect: Default::default(),
         },
-        bytemuck::cast_slice(initial_chunks),
+        bytemuck::cast_slice(&paired_chunks),
         TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(size_in_chunks[0] * 4),
+            // Rg32Uint = 8 B per texel.
+            bytes_per_row: Some(size_in_chunks[0] * 8),
             rows_per_image: Some(size_in_chunks[1]),
         },
         Extent3d {

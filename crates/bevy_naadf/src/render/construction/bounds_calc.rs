@@ -75,10 +75,12 @@ pub fn construction_bounds_world_layout_descriptor() -> BindGroupLayoutDescripto
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                // chunks_rw — `texture_storage_3d<r32uint, read_write>`.
-                // Forward-compat: `.x` selection in WGSL keeps the W4 widening
-                // to `Rg32Uint` a no-op (`15-design-c.md` §1.7).
-                texture_storage_3d(TextureFormat::R32Uint, StorageTextureAccess::ReadWrite),
+                // chunks_rw — `texture_storage_3d<rg32uint, read_write>` (W4
+                // widened the chunks texture to `Rg32Uint`; the W3 WGSL still
+                // takes `.x` from the loaded vec4<u32>, so the W4 flip is a
+                // no-op at the shader source level — only the binding-layout
+                // format declaration changes).
+                texture_storage_3d(TextureFormat::Rg32Uint, StorageTextureAccess::ReadWrite),
                 // params — uniform.
                 uniform_buffer_sized(false, Some(params_size)),
             ),
