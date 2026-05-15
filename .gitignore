@@ -18,3 +18,13 @@ node_modules/
 
 # Detached-process log from `just`/IDE launches
 nohup.out
+
+# Bevy processed-asset pipeline output (`cargo run --features asset_processor`).
+# `imported_assets/` is a regenerable cache; the AssetProcessor also writes
+# default `.meta` sidecars next to sources that lack one — for shaders that is
+# pure noise, and `sample.texarray.ron.meta` is regenerated from the registered
+# default processor. The intentional, hand-written `*.png.meta` sidecars under
+# src/assets/textures/ stay tracked.
+/crates/bevy_naadf/imported_assets
+/crates/bevy_naadf/src/assets/shaders/*.meta
+/crates/bevy_naadf/src/assets/textures/sample.texarray.ron.meta

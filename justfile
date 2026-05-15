@@ -28,6 +28,11 @@ build:
 run:
     cargo run -p bevy-naadf --release
 
+# Bake `*.texarray.ron` definitions → Basis `.basis` arrays under
+# `imported_assets/` (headless AssetProcessor; no GPU/DLSS needed). See README.
+bake:
+    cargo run -p bevy-naadf --bin bake --no-default-features --release
+
 # Run the workspace test suites.
 test:
     cargo test --workspace

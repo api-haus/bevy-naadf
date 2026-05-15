@@ -66,6 +66,31 @@ cargo run -p bevy-naadf --release   # or: just run
 The first build compiles all of Bevy and `dlss_wgpu`, so it takes a while. A successful
 build confirms the `dlss_wgpu` build script found `DLSS_SDK`, `VULKAN_SDK`, and `clang`.
 
+### Texture-array assets
+
+`crates/bevy_naadf/src/texture_array/` is a small Bevy asset pipeline that bakes
+`*.texarray.ron` definitions — at once a **channel combiner** and an **array packer** —
+into 2D-array textures bindable as `texture_2d_array` in WGSL (for the future terrain
+raymarching path). A definition names a pixel format and a list of layer *elements*; each
+element wires its four output channels to a source texture + channel, optionally inverted
+(see `crates/bevy_naadf/src/assets/textures/sample.texarray.ron`).
+
+The same definition drives two paths:
+
+- **Loaded** (default; the only path on wasm) — `TextureArrayLoader` is a normal asset
+  loader: `asset_server.load::<Image>("textures/foo.texarray.ron")` bakes it into an
+  *uncompressed* RGBA8 2D-array `Image` on load. This is what the production app uses.
+- **Processed** — `just bake` (`cargo run --bin bake`) runs a headless
+  `AssetMode::Processed` app whose `AssetProcessor` Basis-Universal-supercompresses each
+  array into a `.basis` file under `imported_assets/`; Bevy's runtime transcoder then
+  decodes it per-GPU at load. `AssetMode::Processed` is app-global, so it is confined to
+  the dedicated `bake` binary — the production app and the e2e harness stay `Unprocessed`.
+
+Basis is **native-only**: the `basis-universal` C++ encoder does not cross-compile to
+`wasm32-unknown-unknown`, so the web build always takes the loaded (uncompressed) path.
+Source textures referenced by a `*.texarray.ron` need a `Load`-action `.png.meta` sidecar
+(the baker needs raw pixels) — see the `crates/bevy_naadf/src/texture_array/` module docs.
+
 ### Web build (WebGPU, wasm32)
 
 `just web` builds the `bevy-naadf` binary for `wasm32-unknown-unknown` with
@@ -120,6 +145,8 @@ later without another restructure.
 | `crates/bevy_naadf/src/aadf/`     | The chunk/block/voxel cell encode/decode, CPU AADF construction + bounds |
 | `crates/bevy_naadf/src/world/`    | `WorldData` / `VoxelTypes` resources + the `GrowableBuffer` GPU wrapper  |
 | `crates/bevy_naadf/src/render/`   | Render-world extract/prepare, GPU types, pipelines, the render-graph nodes |
+| `crates/bevy_naadf/src/texture_array/` | `*.texarray.ron` channel-combiner / array-packer asset pipeline — loader + Basis `AssetProcessor` |
+| `crates/bevy_naadf/src/bin/bake.rs` | Headless `AssetMode::Processed` runner — `just bake` bakes `*.texarray.ron` → `.basis` arrays |
 | `crates/bevy_naadf/src/assets/shaders/` | The WGSL render shaders (ported from NAADF's HLSL `Content/shaders/`) |
 | `crates/bevy_naadf/src/hud.rs`    | Diagnostics overlay                                                     |
 | `crates/bevy_naadf/index.html` / `Trunk.toml` | The Trunk WebGPU (wasm32) web-build entry point             |
