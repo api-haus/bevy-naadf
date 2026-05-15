@@ -284,6 +284,8 @@ pub fn prepare_world_gpu(
 /// stand-in) moved into `TaaGpu` as the real `taa_sample_accum`; this system
 /// reads `TaaGpu` and binds `taa_gpu.taa_sample_accum` where it used to bind
 /// the local `shaded_color` (`06-design-a2.md` §5.5, §9.4).
+// Bevy systems legitimately exceed clippy's 7-argument ceiling.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_frame_gpu(
     mut commands: Commands,
     extracted_camera: Res<ExtractedCameraData>,
@@ -592,8 +594,9 @@ pub fn prepare_frame_gpu(
             taa_reproject_bind_group,
             calc_new_taa_sample_bind_group,
         )
-    } else {
-        let frame = existing.as_ref().unwrap();
+    } else if let Some(frame) = existing.as_ref() {
+        // The `else` of `needs_new_storage || existing.is_none()` — `existing`
+        // is necessarily `Some` here; reuse the cached bind groups.
         (
             frame.bind_group.clone(),
             frame.first_hit_atmosphere_bind_group.clone(),
@@ -601,6 +604,8 @@ pub fn prepare_frame_gpu(
             frame.taa_reproject_bind_group.clone(),
             frame.calc_new_taa_sample_bind_group.clone(),
         )
+    } else {
+        unreachable!("`needs_new_storage || existing.is_none()` was false → `existing` is `Some`")
     };
 
     // --- the mixed GI bind groups (`09-design-b.md` §10.3) ------------------

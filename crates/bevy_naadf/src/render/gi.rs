@@ -218,9 +218,9 @@ pub struct GiBindGroups {
 ///
 /// Runs alongside `prepare_world_gpu` / `prepare_taa` / `prepare_atmosphere` in
 /// `PrepareResources` — before `prepare_frame_gpu` (`PrepareBindGroups`), which
-/// builds the *mixed* GI bind groups (`GiBindGroups`) once `GiGpu` + `FrameGpu`
-/// + `TaaGpu` all exist. Skips silently until the camera + camera-history have
-/// been extracted.
+/// builds the *mixed* GI bind groups (`GiBindGroups`) once `GiGpu` +
+/// `FrameGpu` + `TaaGpu` all exist. Skips silently until the camera +
+/// camera-history have been extracted.
 pub fn prepare_gi(
     mut commands: Commands,
     extracted_camera: Res<ExtractedCameraData>,

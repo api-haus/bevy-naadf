@@ -12,6 +12,7 @@
 //! 2. add its row to [`expected_spans`] + [`batch_gate`] + [`hash_baseline`],
 //! 3. bump [`CURRENT_BATCH`],
 //! 4. if the batch intentionally changes the image, re-bless its hash baseline.
+//!
 //! The window-boot, bounded-frame driver, readback, and pipeline-error scan are
 //! batch-agnostic and written once.
 
@@ -243,10 +244,8 @@ pub fn region_luminance_report(fb: &Framebuffer) -> String {
 // — the B5-vs-B6 milestone moved the visible bounce to B6), so `assert_batch_5`
 // re-runs the B2 region gate as the primary "image unchanged" check; the
 // per-binary/GPU non-portability of a committed hash literal is unchanged.
-fn hash_baseline(batch: u32) -> Option<u64> {
-    match batch {
-        _ => None,
-    }
+fn hash_baseline(_batch: u32) -> Option<u64> {
+    None
 }
 
 // --- Per-batch gate state --------------------------------------------------
@@ -391,6 +390,7 @@ fn assert_batch_4(state: &GateState) -> Result<(), String> {
 ///   sun-shadowed / sun-averted; the whole-frame non-black fraction stays
 ///   bit-identical at 69.1%, and the screenshot is visually indistinguishable
 ///   from Batch 4).
+///
 /// So B5's image is stable like B3/B4 — the GI consumers run and write
 /// `final_color`, but no visually significant bounce lands until Batch 6
 /// populates the reservoir buffers. This gate is therefore the `assert_batch_2`

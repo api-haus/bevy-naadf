@@ -109,6 +109,9 @@ pub fn extract_world(
 /// `invViewProjTransform` (`Camera.cs:199` — `CreateLookAt(Vector3::ZERO, …)`):
 /// the camera world translation is *not* baked in; the ray origin is supplied
 /// separately via `PositionSplit`.
+// The `Extract<Query<…>>` filter tuple trips clippy's type-complexity lint —
+// unavoidable noise for a Bevy extract system.
+#[allow(clippy::type_complexity)]
 pub fn extract_camera(
     mut extracted: ResMut<ExtractedCameraData>,
     cameras: Extract<Query<(&Camera, &GlobalTransform, &PositionSplit), With<Camera3d>>>,
@@ -233,18 +236,12 @@ pub fn extract_taa_config(
 /// `naadf_denoise_node` (Batch 5) gates on `is_denoise`. Like A-2's
 /// `ExtractedTaaConfig` — a flat `Copy` mirror, re-copied each frame.
 #[derive(Resource, Clone, Copy)]
+#[derive(Default)]
 pub struct ExtractedGiConfig {
     /// The mirrored GI settings.
     pub settings: crate::GiSettings,
 }
 
-impl Default for ExtractedGiConfig {
-    fn default() -> Self {
-        Self {
-            settings: crate::GiSettings::default(),
-        }
-    }
-}
 
 /// `ExtractSchedule` system: mirror `AppArgs.gi` into the render-world
 /// [`ExtractedGiConfig`] (`09-design-b.md` §10.2).

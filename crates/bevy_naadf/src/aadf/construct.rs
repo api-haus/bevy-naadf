@@ -490,7 +490,7 @@ mod tests {
         // Voxel 0 is full of `ty`; voxel 1 is empty.
         assert_eq!(w.voxels.len(), CELL_CHILDREN / 2);
         // voxel_base is a u32-element offset; voxel index i → voxels[base + i/2].
-        let v0 = unpack_voxel(&w.voxels, voxel_base + 0);
+        let v0 = unpack_voxel(&w.voxels, voxel_base);
         let v1 = unpack_voxel(&w.voxels, voxel_base + 1);
         assert_eq!(VoxelCell::decode(v0), VoxelCell::Full(ty));
         // Voxel at local (1,0,0): empty, can expand +x to 3, +y/+z to 3,

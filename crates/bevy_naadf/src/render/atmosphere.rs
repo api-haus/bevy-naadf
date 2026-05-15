@@ -257,6 +257,8 @@ pub struct AtmosphereGpu {
 /// Batch 3's `prepare_gi` will share one extracted `sky_sun_dir` across the
 /// atmosphere + GI uniforms. For Batch 1 the atmosphere precomputes against
 /// this fixed sun; the rest of the pipeline is the unchanged A-2 path.
+// Bevy systems legitimately exceed clippy's 7-argument ceiling.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_atmosphere(
     mut commands: Commands,
     extracted_camera: Res<ExtractedCameraData>,

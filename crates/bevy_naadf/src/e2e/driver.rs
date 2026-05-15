@@ -99,6 +99,8 @@ pub struct E2eOutcome {
 /// phase's progress `t`, and keeps `PositionSplit` in step (the production
 /// `sync_position_split` also runs, but the driver writes both so the camera
 /// state is consistent within this very tick — no one-frame lag).
+// Bevy systems legitimately exceed clippy's 7-argument ceiling.
+#[allow(clippy::too_many_arguments)]
 pub fn e2e_driver(
     mut state: ResMut<E2eState>,
     mut outcome: ResMut<E2eOutcome>,

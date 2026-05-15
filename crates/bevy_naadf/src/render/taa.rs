@@ -271,6 +271,8 @@ const TAA_SAMPLE_AGE: u32 = TAA_SAMPLE_RING_DEPTH;
 /// Batch 2 reproject node. Batch 1 lands the buffers + the upload plumbing; the
 /// drop-in swap it *does* land this batch is `taa_sample_accum` replacing
 /// `shaded_color` as the blit source.
+// Bevy systems legitimately exceed clippy's 7-argument ceiling.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_taa(
     mut commands: Commands,
     extracted_camera: Res<ExtractedCameraData>,
@@ -383,9 +385,9 @@ pub fn prepare_taa(
         jitter: Vec2::ZERO,
         _pad1: Vec2::ZERO,
     }; CAMERA_HISTORY_DEPTH];
-    for i in 0..CAMERA_HISTORY_DEPTH {
+    for (i, slot) in history_slots.iter_mut().enumerate() {
         let rel = extracted_history.positions[i] - current_pos;
-        history_slots[i] = GpuCameraHistorySlot {
+        *slot = GpuCameraHistorySlot {
             view_proj: extracted_history.view_proj[i],
             // C# `taaSampleCamTransformInvers[i]` — `renderSampleRefine`'s
             // `camRotOld` (`09-design-b.md` §3.6). The reproject pass does not

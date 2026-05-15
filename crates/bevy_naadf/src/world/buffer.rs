@@ -228,7 +228,7 @@ mod tests {
     use bevy::asset::AssetPlugin;
     use bevy::image::ImagePlugin;
     use bevy::render::render_resource::{CommandEncoderDescriptor, MapMode, PollType};
-    use bevy::render::settings::{RenderCreation, WgpuSettings};
+    use bevy::render::settings::RenderCreation;
     use bevy::render::{RenderApp, RenderPlugin};
     use bevy::MinimalPlugins;
 
@@ -251,7 +251,7 @@ mod tests {
             .add_plugins(AssetPlugin::default())
             .add_plugins(ImagePlugin::default())
             .add_plugins(RenderPlugin {
-                render_creation: RenderCreation::Automatic(Box::new(WgpuSettings::default())),
+                render_creation: RenderCreation::Automatic(Box::default()),
                 synchronous_pipeline_compilation: true,
                 debug_flags: Default::default(),
             });

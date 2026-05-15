@@ -217,9 +217,9 @@ mod tests {
             0 - aadf.d[DIR_NEG_Z] as i32,
         ];
         let hi = [
-            0 + aadf.d[DIR_POS_X] as i32,
-            0 + aadf.d[DIR_POS_Y] as i32,
-            0 + aadf.d[DIR_POS_Z] as i32,
+            (aadf.d[DIR_POS_X] as i32),
+            (aadf.d[DIR_POS_Y] as i32),
+            (aadf.d[DIR_POS_Z] as i32),
         ];
         let contains = (lo[0]..=hi[0]).contains(&3)
             && (lo[1]..=hi[1]).contains(&3)

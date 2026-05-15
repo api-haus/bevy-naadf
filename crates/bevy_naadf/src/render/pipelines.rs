@@ -139,8 +139,9 @@ pub struct NaadfPipelines {
     /// frame; it binds no `@group(0)` world data.
     pub atmosphere_layout: BindGroupLayoutDescriptor,
     /// An entry-less bind-group layout — wgpu pipeline layouts are a `Vec`
-    /// indexed by group number, so a shader that uses `@group(0)` + `@group(1)`
-    /// + `@group(3)` (skipping `@group(2)`) needs a placeholder at index 2.
+    /// indexed by group number, so a shader that uses `@group(0)` +
+    /// `@group(1)` + `@group(3)` (skipping `@group(2)`) needs a placeholder at
+    /// index 2.
     /// `naadf_global_illum.wgsl` does exactly that (`09-design-b.md` §8.1 binds
     /// world `@group(0)`, GI `@group(1)`, atmosphere `@group(3)`).
     pub empty_layout: BindGroupLayoutDescriptor,
