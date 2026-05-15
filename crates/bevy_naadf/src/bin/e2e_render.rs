@@ -72,7 +72,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Parse the CLI flags — `--validate-gpu-construction` (W1) +
     // `--entities` (W4) + `--edit-mode` (W2) + `--resize-test`
-    // (taa-resize-blackness reproduction), default off.
+    // (resize-blackness reproduction — see
+    // `docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+    // `## GI-bounce-on-resize fix (2026-05-16)`), default off.
     let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
     let entities_mode = args.iter().any(|a| a == "--entities");
     let edit_mode = args.iter().any(|a| a == "--edit-mode");
@@ -86,18 +88,19 @@ fn main() -> ExitCode {
     // `ray_tracing.wgsl::shoot_ray`'s entity sub-traversal renders the
     // fixture into the framebuffer.
     //
-    // `--resize-test` (`docs/orchestrate/taa-resize-blackness/`) — sets
-    // `AppArgs.resize_test = true`. The e2e driver then runs the
-    // taa-resize-blackness reproduction phases instead of the standard
-    // Warmup→Motion→Settle→Shoot flow: it waits ~3 s, screenshots,
-    // programmatically resizes the primary window to 384×288, waits ~2 s,
-    // screenshots again, and compares `solid_block_rect` luma values
-    // between the two frames. On `main` (broken) the post-resize TAA + GI
-    // ring zero-clears collapse the shadow-band luma → test fails with
-    // exit code != 0. After Impl-B the rings are preserved across resize →
-    // test passes with exit code 0.
+    // `--resize-test` — sets `AppArgs.resize_test = true`. The e2e driver
+    // then runs the resize-blackness reproduction phases instead of the
+    // standard Warmup→Motion→Settle→Shoot flow: boot at 800×600, settle,
+    // screenshot, hyprctl-resize to 1920×1080, settle, screenshot,
+    // hyprctl-resize to 2000×1000, settle, screenshot, then compare
+    // full-frame luma ratios against an `E2E_RESIZE_MIN_LUMA_RATIO = 0.7`
+    // threshold. Reproduces the GI-bounce-on-resize bug (wgpu indirect
+    // dispatch limit overflow at viewport sizes ≥ 1920×1080); fixed by
+    // capping `padded_*_group_count` at 32 768 in `sample_refine.wgsl`.
+    // See `docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+    // `## GI-bounce-on-resize fix (2026-05-16)`.
     let app_exit = if resize_test {
-        // taa-resize-blackness: pre-launch — install a Hyprland windowrule so
+        // resize-blackness: pre-launch — install a Hyprland windowrule so
         // the e2e_render window starts ALREADY-FLOATING (no togglefloating
         // dance after the fact). Pixel-precise resize via
         // `hyprctl dispatch resizewindowpixel` only takes effect on floating

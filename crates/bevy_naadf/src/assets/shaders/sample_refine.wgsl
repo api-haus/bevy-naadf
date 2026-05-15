@@ -86,7 +86,8 @@
 // `next_pow2((pixel_count * 8 + 63) / 64) = 131 072` exceeds the limit;
 // at 800×600 it stays well under, which is why the bug only manifests
 // at higher resolutions / after a resize that grows the viewport
-// (`docs/orchestrate/taa-resize-blackness/03c-hypothesis-pivot.md`).
+// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+// `## GI-bounce-on-resize fix (2026-05-16)`).
 //
 // 32768 = half the wgpu-default limit — leaves comfortable headroom,
 // stays a power of two so the existing coprime shuffle stays correct,
@@ -98,8 +99,8 @@
 // :99-100`, `:117`, `:264`), which has the same latent overflow but
 // never triggered it because the C# build was used at preset
 // resolutions where `pixel_count * 8 / 64` stayed under 65 535
-// (`docs/orchestrate/taa-resize-blackness/00b-csharp-resize-research
-// .md`).
+// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+// `## GI-bounce-on-resize fix (2026-05-16) §Faithful-port deviation`).
 const MAX_INDIRECT_GROUPS: u32 = 32768u;
 
 fn capped_padded_groups(total: u32) -> u32 {

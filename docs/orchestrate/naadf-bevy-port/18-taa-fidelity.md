@@ -819,5 +819,101 @@ the same `current_jitter` value. No code change.
 - **Black-on-resize:** Fix #4 prevents the bogus-1×1 collapse; the legitimate
   resize-frame `taa_samples` re-zero (which causes ~ring-depth frames of
   dim/flickering recovery) is unchanged — NAADF does the same, the brief
-  accepts it.
+  accepts it. **2026-05-16 follow-up — GI-bounce-on-resize (see below):**
+  with Fix #4 in place the bogus-1×1 path no longer hides it, a second,
+  unrelated resize-blackness bug surfaced when the viewport grows past
+  ≈ 1080p — fixed by Fix #6 below.
 - **Diagnosis fix #6 (dead plumbing) deferred** as instructed.
+
+## GI-bounce-on-resize fix (2026-05-16)
+
+A second, structurally unrelated resize-blackness bug surfaced after
+Fix #4 closed the 1×1-collapse path: at higher viewport sizes (≥ 1920×1080)
+the **GI bounce light** disappears entirely after a resize, leaving every
+shadow region pitch black even though the direct-sun / emissive paths
+still render correctly. Found and fixed in commit landed on `main`
+2026-05-16; e2e repro is `cargo run --release --bin e2e_render --
+--resize-test`.
+
+### Root cause
+
+`compute_valid_history` (`sample_refine.wgsl`) writes the indirect
+dispatch counts for the two sample-refine consumers:
+
+```
+valid_dispatch[0]   = next_pow2((total_counts.x + 63) / 64)
+invalid_dispatch[0] = next_pow2((total_counts.y + 63) / 64)
+```
+
+`total_counts` is bounded by `max_size = pixel_count * {2, 8}` (the
+valid / invalid ring capacities — `WorldRenderBase.cs:161,163`). At
+1920×1080:
+
+- `total_counts.y ≤ pixel_count * 8 ≈ 16.6 M`
+- `next_pow2(16.6 M / 64) = next_pow2(259 200) = 131 072`
+
+wgpu's default `max_compute_workgroups_per_dimension` is **65 535**
+(WebGPU spec minimum, native wgpu default — `wgpu-types/src/lib.rs:815`).
+Bevy uses the default. wgpu's indirect-dispatch validation pass
+(`wgpu-core/src/indirect_validation/dispatch.rs:60-70`) overwrites the
+indirect args with `(0, 0, 0)` when any dimension exceeds the limit, so
+`count_invalid_data` silently no-ops on every frame at 1920×1080+. The
+buckets never get sample counts, the `< 12 ⇒ final_compressed_index = 0u`
+survival gate at `sample_refine.wgsl:706` trips for every bucket,
+`valid_samples_compressed` stays empty, `spatial_resampling` finds no
+reservoirs, the GI bounce light disappears.
+
+At 800×600 the unclamped count is `next_pow2(30 000) = 32 768` — well
+under the limit — which is why the bug only manifests at higher
+resolutions (e.g. after a resize that grows the viewport, hence the
+"resize-blackness" framing). The bug is **structural to the viewport
+size**, not to the resize event itself; a fresh boot at 1920×1080 would
+hit it identically.
+
+### Fix
+
+`crates/bevy_naadf/src/assets/shaders/sample_refine.wgsl` — added
+`MAX_INDIRECT_GROUPS = 32768u` + a `capped_padded_groups(total)` helper
+returning `min(next_pow2((total + 63) / 64), MAX_INDIRECT_GROUPS)`.
+Applied at three sites:
+
+- `compute_valid_history` — writes both `valid_dispatch[0]` and
+  `invalid_dispatch[0]`.
+- `count_valid_data_and_refine` — recomputes the shuffle modulus.
+- `count_invalid_data` — recomputes the shuffle modulus.
+
+Applying the same cap to producer and both consumers keeps the
+`find_coprime(padded_*_group_count, ...)` shuffle a permutation of the
+capped range (`shuffle_group` is `(coprime * gId + offset) % num_groups`,
+which requires producer and consumer to use the same `num_groups`).
+
+At the worst-case 1920×1080 invalid path, 32 768 × 64 = 2 097 152
+samples per dispatch still distributes to ≈ 65 samples per 8×8 bucket
+— well above the 12-sample survival gate.
+
+### Faithful-port deviation
+
+This is a **deliberate divergence** from C# NAADF
+(`renderSampleRefine.fx:96-100, 117, 264`), which has the same latent
+overflow but never triggered it because the C# build was used at preset
+resolutions where the unclamped count stayed under 65 535 (confirmed by
+static reading of `WorldRenderBase.CreateScreenTextures` — no resize
+event handling differs the math; the C# `globalIlumSampleCounts` /
+`taaSamples` rings get re-zeroed on every resize, identical to the
+port). Required for wgpu-correctness; no run-time effect at C#-era
+resolutions; preserves bit-exact bucket distribution at all resolutions
+where the unclamped count would have stayed in range.
+
+### Verification
+
+`cargo run --release --bin e2e_render -- --resize-test`:
+
+|                  | initial 800×600 | resize_a 1920×1080  | resize_b 2000×1000  |
+|------------------|-----------------|---------------------|---------------------|
+| before (`main`)  | luma 199.34     | 100.06 (ratio 0.50) | 95.10 (ratio 0.48)  |
+| after fix        | luma 199.38     | 191.74 (ratio 0.96) | 191.85 (ratio 0.96) |
+
+Pass threshold 0.70. Post-resize region luma `solid (GI-lit diffuse)`
+recovered from 16.7 to 189.1 — the back wall / ground / sphere shadow
+faces are once again GI-lit at high resolution, matching the initial
+800×600 lighting quality.

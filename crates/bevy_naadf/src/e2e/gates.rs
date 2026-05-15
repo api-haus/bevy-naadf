@@ -128,8 +128,9 @@ pub fn e2e_motion_start_transform() -> Transform {
     Transform::from_xyz(-28.0, 70.0, 96.0).looking_at(E2E_LOOK_TARGET, Vec3::Y)
 }
 
-/// Camera pose for the **TAA-resize-blackness reproduction test**
-/// (`docs/orchestrate/taa-resize-blackness/`).
+/// Camera pose for the **resize-blackness reproduction test**
+/// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+/// `## GI-bounce-on-resize fix (2026-05-16)`).
 ///
 /// **Why a different pose from [`e2e_camera_transform`]?** The standard
 /// readback pose `(86, 42, 90)` was tuned for the GI-lit Batch-6 region gate:

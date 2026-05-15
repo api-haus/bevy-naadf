@@ -130,7 +130,9 @@ pub const E2E_SCREENSHOT_LATEST: &str = "e2e_latest.png";
 /// framebuffer produced — the render path never delivered a frame").
 pub const E2E_DRAIN_FRAMES: u32 = 8;
 
-// --- Resize-test constants (`docs/orchestrate/taa-resize-blackness/`) ------
+// --- Resize-test constants
+// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+//  `## GI-bounce-on-resize fix (2026-05-16)`) -----------------------------
 //
 // Three-step resize: boot at 800×600, resize to 1920×1080, resize to 2000×1000.
 // Each step waits 5 wall-clock seconds before screenshotting. The bounded

@@ -225,17 +225,20 @@ pub struct AppArgs {
     /// branch, surfacing in the framebuffer as an extra hit on top of the
     /// world geometry.
     pub spawn_test_entity: bool,
-    /// When `true`, the e2e driver runs the **TAA/GI resize-blackness
-    /// reproduction test** instead of the standard WARMUP→MOTION→SETTLE→SHOOT
-    /// flow (`docs/orchestrate/taa-resize-blackness/`).
+    /// When `true`, the e2e driver runs the **resize-blackness reproduction
+    /// test** instead of the standard WARMUP→MOTION→SETTLE→SHOOT flow.
     ///
-    /// The resize test is the load-bearing failing reproduction for the
-    /// "shadows go pitch black for a fraction of a second to ~1–2 s after a
-    /// window resize" bug. It (a) lets the rings converge, (b) takes a
-    /// pre-resize screenshot, (c) programmatically resizes the primary
-    /// window, (d) takes a post-resize screenshot inside the drain window,
-    /// (e) compares luma values and panics if the post-resize luma collapses
-    /// (the symptom). See [`crate::e2e::driver`].
+    /// Permanent regression coverage for the GI-bounce-on-resize fix
+    /// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+    /// `## GI-bounce-on-resize fix (2026-05-16)`). Boots at 800×600,
+    /// settles, screenshots, hyprctl-resizes to 1920×1080, settles,
+    /// screenshots, hyprctl-resizes to 2000×1000, settles, screenshots,
+    /// then compares full-frame luma ratios against
+    /// `E2E_RESIZE_MIN_LUMA_RATIO = 0.7`. Without the
+    /// `MAX_INDIRECT_GROUPS` cap in `sample_refine.wgsl`, wgpu's
+    /// indirect-validation pass zeros the `count_invalid_data` dispatch at
+    /// the larger viewports → GI bounce disappears → ratio collapses to
+    /// ~0.5. See [`crate::e2e::driver`].
     pub resize_test: bool,
 }
 
@@ -295,7 +298,7 @@ impl WindowConfig {
             )),
             // Production e2e config — non-resizable for determinism (every
             // `pixel_count`-sized buffer identical run-to-run). The
-            // taa-resize-blackness reproduction test forks into
+            // resize-blackness reproduction test forks into
             // [`WindowConfig::e2e_resize_test`] (resizable: true) instead.
             resizable: false,
             title: "bevy-naadf e2e_render",
@@ -303,8 +306,9 @@ impl WindowConfig {
         }
     }
 
-    /// The e2e window for the taa-resize-blackness reproduction test
-    /// (`docs/orchestrate/taa-resize-blackness/`).
+    /// The e2e window for the resize-blackness reproduction test
+    /// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+    /// `## GI-bounce-on-resize fix (2026-05-16)`).
     ///
     /// Same 256×256 starting size as [`WindowConfig::e2e`] but with
     /// `resizable: true` — must be true for hyprctl-driven resize to
@@ -613,7 +617,7 @@ pub fn run_e2e_render() -> AppExit {
 /// `main` toggle `entities_enabled = true` + `spawn_test_entity = true` for
 /// the fixture-entity render path.
 pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
-    // taa-resize-blackness reproduction: swap in the resize-test window
+    // resize-blackness reproduction: swap in the resize-test window
     // config so the surface is advertised as resizable to the compositor —
     // a hard prerequisite for hyprctl-driven resize to propagate through
     // winit. All non-`--resize-test` runs keep `AppConfig::e2e()` unchanged.

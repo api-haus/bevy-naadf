@@ -74,7 +74,9 @@ pub enum E2ePhase {
     Drain,
     /// Build the framebuffer, run the gates, write `AppExit`.
     Assert,
-    // --- Resize-test phases (`docs/orchestrate/taa-resize-blackness/`) -----
+    // --- Resize-test phases
+    // (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+    //  `## GI-bounce-on-resize fix (2026-05-16)`) ---------------------------
     //
     // Selected when `AppArgs.resize_test == true`. The Warmup branch routes
     // straight into LaunchSettle on tick 0 instead of the production
@@ -140,7 +142,8 @@ pub struct E2eOutcome {
 }
 
 /// Stash for the three framebuffers captured by the resize-test
-/// (`docs/orchestrate/taa-resize-blackness/`).
+/// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+/// `## GI-bounce-on-resize fix (2026-05-16)`).
 ///
 /// The driver's `DrainInitial` / `DrainA` / `DrainB` phases each consume the
 /// shared [`E2eScreenshot`] resource — decode the `Image` to a CPU-side
@@ -225,7 +228,9 @@ fn dispatch_hyprctl_resize(label: &str, width: u32, height: u32) {
 /// binary name when no `Window.name` is set in [`crate::WindowConfig`]. The
 /// e2e binary is named `e2e_render` (see `crates/bevy_naadf/src/bin/e2e_render.rs`),
 /// so the default `app_id` is `e2e_render`. This per the dispatch brief's
-/// directive (`docs/orchestrate/taa-resize-blackness/`).
+/// directive (resize-blackness e2e: see
+/// `docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
+/// `## GI-bounce-on-resize fix (2026-05-16)`).
 ///
 /// The selector is returned without its leading `,` separator. The caller
 /// prepends `,` when building the full hyprctl dispatch argument
@@ -348,7 +353,8 @@ pub fn e2e_driver(
         if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
             let err = "resize-test requires Hyprland — HYPRLAND_INSTANCE_SIGNATURE \
                        env var is not set. Aborting (the test mechanism is hyprctl-driven; \
-                       see docs/orchestrate/taa-resize-blackness/).".to_string();
+                       see docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md \
+                       `## GI-bounce-on-resize fix (2026-05-16)`).".to_string();
             eprintln!("e2e_render: FAIL — {err}");
             outcome.gate_result = Some(Err(err));
             exit.write(AppExit::error());
@@ -798,16 +804,19 @@ fn run_resize_test_assertions(state: &mut ResizeTestState) -> Result<(), String>
     let fail_b = ratio_b < E2E_RESIZE_MIN_LUMA_RATIO;
     if fail_a || fail_b {
         return Err(format!(
-            "resize-test: TAA/GI ring drain detected after window resize.\n  \
+            "resize-test: GI bounce light went black after window resize.\n  \
              initial  ({}x{}) full-frame luma = {luma_initial:.2}\n  \
              resize_a ({}x{}) full-frame luma = {luma_a:.2}, ratio = {ratio_a:.4} [{}]\n  \
              resize_b ({}x{}) full-frame luma = {luma_b:.2}, ratio = {ratio_b:.4} [{}]\n  \
              threshold                          = {E2E_RESIZE_MIN_LUMA_RATIO:.2}\n  \
              screenshots saved to: {} + {} + {}\n  \
-             This is the bug `docs/orchestrate/taa-resize-blackness/` reproduces — the\n  \
-             post-resize TAA `taa_samples` ring + GI `sample_counts` accumulator are\n  \
-             zero-cleared by `prepare_taa` / `prepare_gi`, and the multi-frame drain\n  \
-             collapses the shadow-band luma until the rings refill.",
+             Regression of the GI-bounce-on-resize fix — see\n  \
+             `docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`\n  \
+             `## GI-bounce-on-resize fix (2026-05-16)`. The fix caps\n  \
+             `sample_refine.wgsl` padded dispatch groups at 32 768 so wgpu's\n  \
+             indirect-validation pass does not zero the dispatch args at\n  \
+             viewports ≥ 1920×1080; if this gate trips again, that cap is\n  \
+             the first thing to check.",
             initial.width(), initial.height(),
             after_a.width(), after_a.height(),
             if fail_a { "FAIL" } else { "pass" },

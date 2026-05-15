@@ -78,6 +78,22 @@ luminance **~4 → 242** — "barely resolves" decisively gone. User assessment:
 [...] cant tell without directly comparing same vox scenes, so its a good sign." Branch
 `fix/taa-fidelity` + worktree `.claude/worktrees/taa-fidelity` kept for reference.
 
+**GI-bounce-on-resize follow-up COMPLETE (2026-05-16).** With Fix #4 in place a second,
+unrelated resize-blackness bug surfaced at viewport sizes ≥ 1920×1080 — GI bounce light
+disappears entirely after the resize, direct-sun / emissive paths still render. Diagnosed
++ fixed in one pass against the `--resize-test` e2e harness; see `18-taa-fidelity.md`
+`## GI-bounce-on-resize fix (2026-05-16)`. Root cause: `compute_valid_history`'s indirect
+dispatch arg `next_pow2((pixel_count * 8 + 63) / 64)` reaches 131 072 at 1920×1080,
+exceeding wgpu's default `max_compute_workgroups_per_dimension = 65 535`. wgpu's
+indirect-validation pass zeros the dispatch args → `count_invalid_data` no-ops → buckets
+stay empty → `spatial_resampling` produces no GI bounce. Bug is **structural to the
+viewport size**, not the resize event itself (a fresh 1920×1080 boot hits it identically).
+Fix: cap padded dispatch groups at `MAX_INDIRECT_GROUPS = 32 768` in `sample_refine.wgsl`
+at producer + both consumers (deliberate divergence from C# NAADF, which has the same
+latent overflow but was used at preset resolutions under the limit). E2e
+`cargo run --release --bin e2e_render -- --resize-test` flips ratio 0.50/0.48 (FAIL) →
+0.96/0.96 (PASS) at 1920×1080 / 2000×1000.
+
 **Phase C in flight (2026-05-15) — team-based parallel execution per `15-design-c.md`:**
 - Design: COMPLETE → `15-design-c.md` (~83 KB / 1292 lines; 7 workstreams in 3 waves; seam under `render/construction/`).
 - **Wave 1a COMPLETE:** W0 seam (`c10b6bd`) + W6 O(3·d·n) AADF rewrite (`7f2630b`, 16.3× speedup) merged at `564a1f4`.
