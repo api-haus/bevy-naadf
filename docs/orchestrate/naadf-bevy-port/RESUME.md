@@ -82,8 +82,9 @@ luminance **~4 → 242** — "barely resolves" decisively gone. User assessment:
 - Design: COMPLETE → `15-design-c.md` (~83 KB / 1292 lines; 7 workstreams in 3 waves; seam under `render/construction/`).
 - **Wave 1a COMPLETE:** W0 seam (`c10b6bd`) + W6 O(3·d·n) AADF rewrite (`7f2630b`, 16.3× speedup) merged at `564a1f4`.
 - **Wave 1b COMPLETE:** W5 worldgen (`912c984`) merged at `912c984` — GPU/CPU bit-exact 8192 u32s byte-equal; 66 tests pass.
-- **Wave 2 — foundational dispatched:** W1 GPU Algorithm 1 (`chunkCalc.fx` + `mapCopy.fx` + `BlockHashingHandler` + startup regime-1 driver). The largest Phase-C workstream.
-- **Pending:** wave 2 = (W1 merge) → W3 ‖ W4 → W2; wave 3 = final integration agent.
+- **Wave 2 — foundational COMPLETE:** W1 GPU Algorithm 1 (`53a4c8f`) merged. 76 tests (+10); 388-byte GPU/CPU byte-equal on minimal scene; design's §1.6 Assumption #7 (CPU-HashMap vs GPU-open-addressing pointer divergence) confirmed and handled — full-scene byte-equality deferred to consumer workstreams. `gpu_construction_enabled` is now default `true`.
+- **Wave 2 — fan-out dispatched in parallel:** W3 (background AADF queue) + W4 (dynamic entities + chunks-format widening). W4 owns the `R32Uint`→`Rg32Uint` flip + the `.x` sweep in its atomic merge. Sequencing: W3 merges first, then W4 (per `15-design-c.md` §2.2).
+- **Pending:** wave 2 = (W3+W4 merge) → W2 editing; wave 3 = final integration agent + Phase-C review.
 
 **Key architectural finding from W6 (carries into W1):** the paper §3.3 O(3·d·n) merge
 algorithm and the old per-cell slice-empty algorithm produce *different (both valid)* empty
