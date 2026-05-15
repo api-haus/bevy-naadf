@@ -69,3 +69,19 @@ I deliberately did **not** flip `resizable: true` myself — that change is outs
 **Test scaffolding compiles cleanly.** The new code path is fully gated by `AppArgs.resize_test == false` (default), so all existing batch gates and CI runs are unaffected.
 
 **Choice of phase-routing.** I implemented the resize-test as a parallel state machine (immediate route from Warmup → ResizePre) rather than threading the existing Warmup→Motion→Settle. The architect's design (02-design.md §A.1) had it as a phase between Motion and Settle. The user's spec ("the test establishes a window, waits 3 seconds, screenshots, …") matches the parallel-machine reading more naturally — the 3-second pre-resize wait IS the warmup; there is no separate motion phase. The existing Warmup/Motion/Settle/Shoot/Assert flow runs unchanged when `--resize-test` is not passed. Architect's pose choice (the readback pose, where `solid_block_rect` is calibrated) is preserved.
+
+## Resize unblock (resizable flag flip)
+- File touched: `crates/bevy_naadf/src/lib.rs:290` (`WindowConfig::e2e()`)
+- Before: `resizable: false`
+- After: `resizable: true`
+- Smoke run: `cargo run --bin e2e_render -- --resize-test`
+  - Exit code: 0
+  - Framebuffer dimensions (pre): 1103x709
+  - Framebuffer dimensions (post): 1103x709
+  - Pre luma (solid_block_rect): 240.57
+  - Post luma (solid_block_rect): 240.54
+  - Ratio: 0.9999
+  - Full-frame pre / post: 119.83 / 119.61
+  - Panic / pass message: `e2e_render: resize-test PASS — pre/post luma ratio above threshold 0.5 after 180 pre-frames + window resize to 384x288 + 120 post-frames.`
+- Resize log emitted by test: `e2e_render: resize-test triggered window resize to 384x288 (was 256x256)`
+- Conclusion: resize still not propagating — both framebuffers are 1103x709 (window manager appears to have given the window a desktop-default size and ignored both the requested 256x256 boot resolution and the programmatic 384x288 resize; readback dims match neither). The flag flip alone is insufficient; user needs to make the next call.

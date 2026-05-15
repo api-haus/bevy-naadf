@@ -287,7 +287,8 @@ impl WindowConfig {
                 crate::e2e::E2E_WIDTH as f32,
                 crate::e2e::E2E_HEIGHT as f32,
             )),
-            resizable: false,
+            // resizable: true required for --resize-test mode to propagate programmatic Window::resolution changes (test-only e2e mode)
+            resizable: true,
             title: "bevy-naadf e2e_render",
         }
     }
