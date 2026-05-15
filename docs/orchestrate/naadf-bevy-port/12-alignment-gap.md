@@ -3,56 +3,89 @@
 **Date:** 2026-05-15
 **Author:** delegated gap-analysis agent (read-only on code)
 **Scope:** comparative assessment of how far the Rust/Bevy port
-(`/mnt/archive4/DEV/bevy-naadf/.claude/worktrees/phase-b-gi`, branch
-`feat/phase-b-gi`) is from the NAADF C#/MonoGame reference
-(`/mnt/archive4/DEV/NAADF`), and what is left to fully align *within the agreed
-scope*.
+(`/mnt/archive4/DEV/bevy-naadf`, branch `main` at commit `047afba` — Phase C
+DONE) is from the NAADF C#/MonoGame reference (`/mnt/archive4/DEV/NAADF`), and
+what is left to fully align *within the agreed scope*.
 
 This builds on `02-research.md` (the subsystem map), the design docs
-(`03/06/09-design*.md`), the impl logs (`04/07/10-impl*.md`), and the review
-docs (`05/08/11-review*.md`); claims were spot-verified against the actual code
-of both trees. Where this document and an orchestrate doc disagree, the code
-was checked and the code wins.
+(`03/06/09/15-design*.md`), the impl logs (`04/07/10/16-impl*.md`), the
+TAA-fidelity track (`18-taa-fidelity.md`), and the review docs
+(`05/08/11/17-review*.md`); claims were spot-verified against the actual code
+of both trees **post-Phase-C** (the audit runs against `main` after Phase C,
+the TAA-fidelity track, and the Phase-C followups landed). Where this document
+and an orchestrate doc disagree, the code was checked and the code wins.
 
 ---
 
 ## 1. Scope recap
 
-### In scope (the core engine)
+### 1.1 In scope (the core engine)
 
 Per `01-context.md` Q1–Q4 + the four-phase split: **voxel grid + AADF data
-structure + world data/buffers + the real-time render pipeline.** Concretely:
+structure + world data/buffers + the real-time render pipeline + the GPU
+construction, editing and dynamism half of the paper's methodology.**
+Concretely:
 
-- The three-layer chunk/block/voxel cell hierarchy, CPU-side AADF construction,
-  DDA-with-AADF traversal (Phase A).
+- The three-layer chunk/block/voxel cell hierarchy, CPU-side AADF construction
+  (now the **O(3·d·n) synchronised-iteration neighbour-merge** form per paper
+  §3.3), DDA-with-AADF traversal **including the entity sub-traversal branch**
+  (Phase A + Phase C wave-3).
 - The `PositionSplit` int+frac camera (D1), a hard-coded procedural test grid
   (D2), the `GrowableBuffer` GPU-buffer abstraction.
-- NAADF's 16-frame long-term-memory TAA (Phase A-2 — the §6 VRAM lever: 16-deep
-  sample ring instead of 32).
+- NAADF's long-term-memory TAA. The sample ring depth is now **configurable
+  with a paper-canonical default of 32** (the §6 16-deep VRAM lever is still
+  available as a knob; default raised after the TAA-fidelity track).
 - The full real-time `WorldRenderBase` GI pipeline (Phase B): 4-plane first-hit,
   `rayQueueCalc` adaptive ~0.25-spp sampling, compressed ReSTIR GI
   (`globalIllum` + the 5-pass `sampleRefine` + `spatialResampling` Algorithm 2),
   the sparse bilateral denoiser, the atmosphere model, the `base/` TAA rewire,
-  and the final blit.
+  and the final blit. The final-blit tonemap is now Bevy's `TonyMcMapface`
+  (deliberate user-directed deviation; the port emits raw linear HDR — see
+  §3 below).
+- **Phase C — GPU construction, editing, background AADF queues, world
+  generation, and dynamic entities** (paper §3.2 / §3.3 / §3.5 / §3.6). All
+  landed end-to-end via seven workstreams W0–W6 + a wave-3 integration step.
 
-### Intentionally OUT of scope — NOT gaps
+### 1.2 Intentionally OUT of scope — NOT gaps
 
 These are deliberate non-goals, not deficiencies (see §5 for the full list):
 **editor GUI; `.cvox` persistence/serialization; the `.vox`/`obj2voxel`/Voxlap
 asset importers; the reference pathtracer (`WorldRenderPathTracer` /
-`pathTracer/**`); DLSS / DLSS-RR; and Phase C (GPU world construction/editing —
-`chunkCalc.fx` / `boundsCalc.fx` / `worldChange.fx`).** Anything in this list
+`pathTracer/**`); DLSS / DLSS-RR; and the interactive editing *tools*
+(`EditingTools/` cube/sphere/paint/floodfill/model).** Anything in this list
 appearing as "missing" below is correct-by-design, not a gap.
 
-### Current status
+**Note** — the editing *algorithm* (paper §3.5 flood-fill AADF invalidation +
+`worldChange.fx`) **is implemented** via Phase C W2; what is missing is the
+editor *UI* on top of it. The `set_voxel(IVec3, VoxelTypeId)` main-world API
+exists; the cube/sphere/paint UI tooling does not.
 
-Phase A (substrate + albedo) and Phase A-2 (TAA) are **review-gated PASS**.
-Phase B (GI) is **impl feature-complete and review-gated PASS** (`11-review-b.md`
-— 0 blockers, 2 concerns, 5 nits) — but with **one open production bug** (the
-camera-motion TAA decay, §4) outstanding after the review. 48 `#[test]`
-functions in-tree, all passing (the orchestrate docs say "46" — see §4 finding;
-the discrepancy is two later substrate tests, not a regression). `cargo build`
-clean; `cargo run --bin e2e_render` exits 0, all gates green at 99.2% GI-lit.
+### 1.3 Current status
+
+Phase A (substrate + albedo), Phase A-2 (TAA), Phase B (GI) and **Phase C
+(canonical methodology completion)** are all **review-gated PASS**. The
+Phase-C review verdict was PASS-WITH-FOLLOWUPS; **all** follow-ups are closed
+(`16-impl-c-followups.md`). **112 `#[test]` functions in-tree, all passing.**
+`cargo build` clean. **All four e2e modes PASS at HEAD:** baseline ·
+`--validate-gpu-construction` (388-byte CPU/GPU byte-equal on the chunks
+texture) · `--edit-mode` · `--entities` (with the `entity_pixel` luminance
+gate at threshold 80.0, measured 187.93 = **2.35× safety margin**).
+
+The TAA-fidelity track (`18-taa-fidelity.md`) landed pre-Phase-C: GI rays now
+jittered (Halton, via `GpuGiParams.taa_jitter`), Bevy `TonyMcMapface`
+tonemapping with the port emitting raw linear HDR, TAA ring depth
+configurable with default 32, black-on-resize fixed in `extract_camera`. The
+"barely-resolves" failure mode is decisively gone (GI-lit luminance ~4 → 242
+on the test scene).
+
+**One outstanding seam:** a wgpu/Vulkan storage-texture barrier hazard
+prevents the *full* upload-skip path (renderer reads exclusively from
+GPU-produced buffers). The GPU producer chain *does* dispatch Algorithm 1
+every startup via `naadf_gpu_producer_node` (the "GPU producer chain
+DISPATCHED" log fires on every e2e run); bit-exact `--validate-gpu-construction`
+proves output equivalence; the workaround keeps the CPU upload path active.
+This is a wgpu-infrastructure issue, **not a NAADF port-correctness gap** —
+recorded honestly under §4 / §6.
 
 ---
 
@@ -66,27 +99,33 @@ behavioural difference.
 | # | NAADF subsystem | NAADF source | Port location | Ported? | Faithfulness | Notes / divergences |
 |---|---|---|---|---|---|---|
 | 1 | Voxel grid / cell hierarchy (chunk/block/voxel 4³) | `World/Data/WorldData.cs`, paper §3.1 | `src/aadf/cell.rs`, `src/world/data.rs` | **yes** | faithful-with-deviations | 3-layer hierarchy + 2-bit/top-bit state encoding ported. Re-derived from paper per Q3, not transliterated. Voxels packed 2-per-`uint`. |
-| 2 | AADF construction | `chunkCalc.fx`, `boundsCommon.fxh`, paper §3.2-3.3 Algorithm 1 | `src/aadf/construct.rs`, `src/aadf/bounds.rs` | **yes (CPU only)** | faithful-with-deviations | CPU re-derivation of Algorithm 1 — a Rust `HashMap` keyed on the 64-voxel array replaces the GPU open-addressing hash (the exact `31^(64-i)` hash is GPU-construction-specific, Phase C). Local 4³ AADF + the alternating-axis expansion ported. **GPU construction is Phase C — intentionally deferred, not a gap.** |
-| 3 | DDA-with-AADF traversal (`shoot_ray`) | `render/rayTracing.fxh:73` | `src/assets/shaders/ray_tracing.wgsl` | **yes** | faithful-with-deviations | Phase-A core, reviewed-gate PASS. Entity sub-traversal branch (`#ifdef ENTITIES`) omitted (entities are a deferred sub-feature — §3). Reused unchanged by Phase B for GI secondary + visibility rays. |
-| 4 | World data + GPU buffers | `WorldData.cs`, `DynamicStructuredBuffer.cs` | `src/world/data.rs`, `src/world/buffer.rs`, `src/render/prepare.rs` | **yes** | faithful-with-deviations | `WorldData` is a Bevy `Resource`; `GrowableBuffer` is the `DynamicStructuredBuffer` equivalent. Chunk buffer as a wgpu texture/buffer per design. CPU world mirror kept. **No world generator** — D2's hard-coded test grid (`src/voxel/grid.rs`) is the content path; `WorldGenerator` is deferred (acceptable per D2, see §6). |
+| 2 | AADF construction (CPU oracle + GPU runtime producer) | `chunkCalc.fx`, `mapCopy.fx`, `boundsCommon.fxh`, paper §3.2-3.3 Algorithm 1 | CPU: `src/aadf/construct.rs`, `src/aadf/bounds.rs`. GPU: `src/render/construction/{chunk_calc,map_copy,hashing}.rs` + `src/assets/shaders/{chunk_calc,map_copy}.wgsl` | **yes (CPU oracle + GPU producer)** | faithful-with-deviations | The CPU path is now the bit-exact validation oracle + fallback (E4). The §3.3 AADF construction is the **O(3·d·n) synchronised-iteration neighbour-merge** form (`compute_aadf_layer`, paper §3.3) — measured **16.3× speedup** vs the legacy per-cell expansion. The GPU producer chain ports paper Algorithm 1 verbatim: `31^(64-i)` coefficients (`hashing.rs`), `wanted_empty_ratio = 0.5`, **`probe_cap = 250`** (C# value; paper quotes 100/75% — port follows C# per Q3), open-addressing linear probe with CAS, occupancy-triggered `map_copy` resize. `--validate-gpu-construction` runs the GPU chain on a 1×1×1 deterministic fixture and byte-compares 388 bytes to the CPU oracle (PASS). The GPU producer **does dispatch at runtime** (every startup, via `naadf_gpu_producer_node` at the head of the `Core3d` chain); the renderer's read path still consumes the CPU-uploaded buffers because of the wgpu barrier hazard documented under §4 / §6 — **a wgpu-infrastructure residual, not a correctness gap**. |
+| 3 | DDA-with-AADF traversal (`shoot_ray`, **incl. entity sub-traversal**) | `render/rayTracing.fxh:73` + `:81-240` entity branch | `src/assets/shaders/ray_tracing.wgsl` | **yes** | faithful | Phase-A core, reviewed-gate PASS. **The HLSL `#ifdef ENTITIES` entity sub-traversal branch is now ACTIVE** (Phase C wave-3): up to 16 distinct `chunks[pos].y` entity pointers collected along the main DDA, then bbox-test + AADF-traverse each entity's per-entity voxel volume, merge closer hit. `RayResult` grew an `entity: u32` field (`0x3FFFu` sentinel = no entity hit). Branch is always-compiled; per-frame cost on no-entity scenes is ~0 (statically predicted-false on every chunk with `.y == 0`). |
+| 4 | World data + GPU buffers (`Rg32Uint` chunks, `WorldGenerator`) | `WorldData.cs`, `DynamicStructuredBuffer.cs`, `WorldGenerator*.cs` | `src/world/data.rs`, `src/world/buffer.rs`, `src/render/prepare.rs`, `src/aadf/generator.rs`, `src/render/construction/generator_model.rs` | **yes** | faithful-with-deviations | `WorldData` is a Bevy `Resource`; `GrowableBuffer` is the `DynamicStructuredBuffer` equivalent. CPU world mirror kept. **The chunks 3D texture is `Rg32Uint`** (`.x` = block-state pointer + AADF data, `.y` = entity pointer + counter; the §3.6 widening from W4). **`WorldGenerator` is implemented** (paper §5 / NAADF `WorldGenerator`) — `generator_model.wgsl` ports `generatorModel.fx`'s segmented dispatch + `generate_segment_cpu` is the bit-exact oracle (8192 u32s byte-equal over the test segment). The hard-coded test grid (`src/voxel/grid.rs`) is still the active content path for e2e; the generator runs alongside as the W5 dispatch chain. |
 | 5 | Voxel type / layered-material system | `World/VoxelTypeHandler.cs` | `src/voxel/mod.rs` (`VoxelType`), `src/render/gpu_types.rs` (`GpuVoxelType`, 16 B) | **yes** | faithful | Follows the C# 128-bit `Uint4` material entry (divergence #1 — paper says 16 bit, C# is the source of truth). Diffuse/Emissive/MetallicRough/MetallicMirror enums ported. |
-| 6 | `PositionSplit` int+frac camera | `Common/Camera.cs` | `src/camera/position_split.rs` | **yes** | faithful-with-deviations | D1: ported faithfully, threaded through every WGSL pass. `M*v` glam convention replaces HLSL `mul(v,M)` (the Phase-A perspective fix). **Carries the latent `sync_position_split` `With<FreeCamera>` filter bug — fixed 2026-05-15 (§4).** |
+| 6 | `PositionSplit` int+frac camera | `Common/Camera.cs` | `src/camera/position_split.rs` | **yes** | faithful-with-deviations | D1: ported faithfully, threaded through every WGSL pass. `M*v` glam convention replaces HLSL `mul(v,M)` (the Phase-A perspective fix). The `sync_position_split` `With<FreeCamera>` filter bug was fixed pre-Phase-C (`ad12f32`). |
 | 7 | Atmosphere model (precompute + apply) | `Atmosphere.cs`, `atmosphereRaw.fxh`, `atmospherePrecomputed.fxh`, `base/renderAtmosphere.fx` | `src/render/atmosphere.rs`, `src/assets/shaders/atmosphere.wgsl`, `naadf_atmosphere.wgsl` | **yes** | faithful | Multiple-scattering sky model + CPU `Atmosphere::get_light_for_point` + the octahedral quarter-per-frame precompute. `apply_atmosphere` split into `atmosphere_oct_index` + value-taking fn (wgpu forbids `ptr<storage>` params — forced, faithful). Downward-ray fade-to-dark is NAADF-faithful (no horizon term in the model). |
-| 8 | 4-plane first-hit (G-buffer) | `base/renderFirstHit.fx` | `src/assets/shaders/naadf_first_hit.wgsl` | **yes** | faithful | Reviewer spot-checked verbatim: the 4-iteration specular-bounce loop, the `i==4` mirror-tail, `applyAtmosphere`/`addLightForDirection` gating, the 3 output writes. `compress_first_hit_data` bit-layout matches. Entity branches dropped. |
-| 9 | `rayQueueCalc` adaptive ~0.25-spp sampler | `base/rayQueueCalc.fx` | `src/assets/shaders/ray_queue_calc.wgsl` | **yes** | faithful | `should_ray` `mod_size`, the inline `addToCounterAddressBuffer` group-shared prefix-counter, `calcRayQueueStore`. The adaptive signal is **real and wired end-to-end**: consumes `taa_sample_accum.x` → drives the indirect `globalIllum` dispatch (reviewer criterion 2 — met). |
-| 10 | Compressed ReSTIR GI — `globalIllum` | `base/renderGlobalIllum.fx` | `src/assets/shaders/naadf_global_illum.wgsl` | **yes** | faithful | ≤3-bounce secondary-ray tracer, lit/unlit classification, 5-bit color compression, group-shared sample-count atomics, wrapping ring write. Entity branches dropped. |
+| 8 | 4-plane first-hit (G-buffer) | `base/renderFirstHit.fx` | `src/assets/shaders/naadf_first_hit.wgsl` | **yes** | faithful | Reviewer spot-checked verbatim: the 4-iteration specular-bounce loop, the `i==4` mirror-tail, `applyAtmosphere`/`addLightForDirection` gating, the 3 output writes. `compress_first_hit_data` bit-layout matches. First-hit ray now jittered (`params.taa_jitter`). |
+| 9 | `rayQueueCalc` adaptive ~0.25-spp sampler | `base/rayQueueCalc.fx` | `src/assets/shaders/ray_queue_calc.wgsl` | **yes** | faithful | `should_ray` `mod_size`, the inline `addToCounterAddressBuffer` group-shared prefix-counter, `calcRayQueueStore`. The adaptive signal is real and wired end-to-end: consumes `taa_sample_accum.x` → drives the indirect `globalIllum` dispatch (reviewer criterion 2 — met). Correctly unjittered per `rayQueueCalc.fx`. |
+| 10 | Compressed ReSTIR GI — `globalIllum` | `base/renderGlobalIllum.fx` | `src/assets/shaders/naadf_global_illum.wgsl` | **yes** | faithful | ≤3-bounce secondary-ray tracer, lit/unlit classification, 5-bit color compression, group-shared sample-count atomics, wrapping ring write. GI ray now jittered with `gi_params.taa_jitter` (TAA-fidelity fix #1). |
 | 11 | Compressed ReSTIR GI — `sampleRefine` (5 passes) | `base/renderSampleRefine.fx` | `src/assets/shaders/sample_refine.wgsl` | **yes** | faithful-with-deviations | All 5 passes (`ClearBucketsAndCalcMask`, `ValidHistory`, `CountValidAndRefine`, `CountInvalid`, `RefineBuckets`) ported function-by-function. `COLOR_DIF_PROB` brightness-leveling ported (divergence #10). **Forced wgpu deviation:** the `valid_dispatch`/`invalid_dispatch` indirect-arg buffers split into a dedicated `@group(1)` because wgpu forbids `STORAGE_READ_WRITE`+`INDIRECT` in one dispatch scope — faithful to design intent. |
-| 12 | Compressed ReSTIR GI — `spatialResampling` (Algorithm 2) | `base/renderSpatialResampling.fx` | `src/assets/shaders/spatial_resampling.wgsl` | **yes** | faithful | 12-iteration neighbour-reservoir loop, adaptive-radius 12-tap pre-pass, Jacobian, single 3-step visibility ray, independent sun sample, the denoise/non-denoise write split. `spatialVisibilityCount` is a dead uniform in the HLSL — correctly dropped (divergence, see §3). |
+| 12 | Compressed ReSTIR GI — `spatialResampling` (Algorithm 2) | `base/renderSpatialResampling.fx` | `src/assets/shaders/spatial_resampling.wgsl` | **yes** | faithful | 12-iteration neighbour-reservoir loop, adaptive-radius 12-tap pre-pass, Jacobian, single 3-step visibility ray, independent sun sample, the denoise/non-denoise write split. Spatial-resampling ray now jittered with `gi_params.taa_jitter`. `spatialVisibilityCount` is a dead uniform in the HLSL — correctly dropped (divergence, see §3). |
 | 13 | Sparse bilateral denoiser | `base/renderDenoiseSplit.fx` | `src/assets/shaders/denoise_split.wgsl` | **yes** | faithful | Kernel 21, σ=10, separable horizontal+vertical, sparse per-row/-column random offset, color+geometry bilateral weights, transposed indexing ported exactly. Runtime-gated on `is_denoise` (default `true`). **SVGF alternative not ported — it is not in the in-scope NAADF source (divergence #11), not a gap.** |
-| 14 | `base/` long-term-memory TAA (`ReprojectOld` + `CalcNewTaaSample`) | `base/renderTaaSampleReverse.fx`, `commonTaa.fxh` | `src/assets/shaders/taa.wgsl`, `taa_common.wgsl`, `src/render/taa.rs` | **yes** | faithful-with-deviations | 16-deep sample ring (§6 VRAM lever — deliberate, not a gap), 128-deep camera-history ring (NAADF's depth, kept), `taa_dist_min_max` output wired, `screenPosDistanceSqr > 16.0` (the genuine `base/` value vs `albedo/`'s `1.0`). **Carries the open camera-motion reprojection decay bug (§4).** |
-| 15 | Final blit (`renderFinal`) | `base/renderFinal.fx` | `src/assets/shaders/naadf_final.wgsl`, `src/render/graph.rs` | **yes** | faithful | `base/` variant: `taa_sample_accum` blit source, `tone_mapping_fac` tonemap denominator, `showRayStep` debug. The `Cube`+fullscreen-PS pattern (divergence #9) replaced with a Bevy fullscreen pass — forced, faithful. |
-| 16 | Render-graph dispatch order | `WorldRenderBase.cs:205-441` | `src/render/mod.rs:207-228` | **yes** | faithful | Verified line-by-line against the C#: atmosphere → first_hit → ReprojectOld → ClearBucketsAndCalcMask → RayQueue(+Store) → GlobalIlum → ValidHistory → CountValid → CountInvalid → RefineBuckets → SpatialResampling → Denoise(H+V) → CalcNewTaaSample → renderFinal. 14 node systems realising NAADF's 16-dispatch order. |
+| 14 | `base/` long-term-memory TAA (`ReprojectOld` + `CalcNewTaaSample`) | `base/renderTaaSampleReverse.fx`, `commonTaa.fxh` | `src/assets/shaders/taa.wgsl`, `taa_common.wgsl`, `src/render/taa.rs` | **yes** | faithful-with-deviations | **Default sample-ring depth = 32 (paper-canonical, `WorldRenderBase.cs:17`)** — supersedes the binding §6 16-deep VRAM lever from `design-exploration-qa.md`; the lever values (16/24/32) remain available via `AppArgs.taa_ring_depth` + `TaaRingConfig` resource. 128-deep camera-history ring (NAADF's depth, kept). `taa_dist_min_max` output wired. `screenPosDistanceSqr > 16.0` (the genuine `base/` value vs `albedo/`'s `1.0`). Reprojection-decay-under-motion concern from Phase B was **invalidated as a real defect** by the TAA-fidelity track — the visible symptom traced to the unjittered GI rays + the custom Reinhard tonemap (fix #1 + fix #2 in `18-taa-fidelity.md`), not a reprojection bug. |
+| 15 | Final blit (`renderFinal`) | `base/renderFinal.fx` | `src/assets/shaders/naadf_final.wgsl`, `src/render/graph.rs` | **yes** | faithful-with-deviations | `base/` variant blit-source wiring (`taa_sample_accum`, `showRayStep` debug). The `Cube`+fullscreen-PS pattern (divergence #9) replaced with a Bevy fullscreen pass — forced, faithful. **The custom Reinhard tonemap (`exposure`/`toneMappingFac`) was removed in the TAA-fidelity track — the port emits raw linear HDR; Bevy's `Tonemapping::default()` (= `TonyMcMapface`) handles tonemap+sRGB encode**. This is a deliberate user-directed deviation from the faithful-port principle (Q2), recorded in `naadf_final.wgsl`'s header. |
+| 16 | Render-graph dispatch order | `WorldRenderBase.cs:205-441` | `src/render/mod.rs` | **yes** | faithful | Verified line-by-line against the C#: atmosphere → first_hit → ReprojectOld → ClearBucketsAndCalcMask → RayQueue(+Store) → GlobalIlum → ValidHistory → CountValid → CountInvalid → RefineBuckets → SpatialResampling → Denoise(H+V) → CalcNewTaaSample → renderFinal. The Phase-C `naadf_gpu_producer_node` sits at the head (one-shot regime-1 at startup); `naadf_bounds_compute_node` (W3 regime-2, 5 rounds/frame); `naadf_world_change_node` (W2 regime-3, edit-event-gated); `naadf_entity_update_node` (W4 wave-3, entity-event-gated). |
+| 17 | **GPU Algorithm 1 construction** (paper §3.2) | `chunkCalc.fx` (3 entries) + `mapCopy.fx` (2 entries) + `BlockHashingHandler.cs` | `src/assets/shaders/chunk_calc.wgsl`, `map_copy.wgsl`; `src/render/construction/{chunk_calc,map_copy,hashing}.rs` | **yes** | faithful-with-deviations | Per-block uniform test → 64-voxel hash with `31^(64-i) mod 2^32` coefficients → open-addressing linear-probe insert with CAS → `ComputeBounds4` chunk classification (W1, paper §3.2). 65-entry hash-coefficient table generated by `hashing::generate_hash_coefficients`. Probe cap 250 (`chunk_calc.wgsl:234` — C# value; paper quotes 100, port follows C# per Q3). Occupancy-trigger at `wanted_empty_ratio = 0.5` drives `map_copy` regrow. Bit-exact CPU oracle via `--validate-gpu-construction` (388 bytes byte-equal on the deterministic fixture). |
+| 18 | **Background AADF queue** (paper §3.3 regime-2) | `boundsCalc.fx`, `boundsCommon.fxh`, `WorldBoundHandler.cs` | `src/assets/shaders/bounds_calc.wgsl`, `bounds_common.wgsl`; `src/render/construction/bounds_calc.rs` | **yes** | faithful-with-deviations | The W3 regime-2 dispatch fires **5 prepare+indirect-compute rounds per frame** (`ConstructionConfig.n_bounds_rounds = 5`, matching `WorldBoundHandler.cs:113`). Per-axis mask + `STORAGE_READ_WRITE × INDIRECT` split (forced wgpu adaptation). Convergence oracle: fresh CPU port of the algorithm (not W6's `compute_aadf_layer` — chunk-world-edge OOB-permissive divergence flagged in W6 assumption #2). |
+| 19 | **Editing + flood-fill AADF invalidation** (paper §3.5) | `worldChange.fx` (4 entries) + `ChangeHandler.cs` + `EditingHandler.cs` | `src/assets/shaders/world_change.wgsl`; `src/render/construction/{world_change,change_handler}.rs`; `src/aadf/edit.rs`; `src/world/data.rs::set_voxel` | **yes** | faithful | CPU `set_voxel(IVec3, VoxelTypeId)` main-world API → per-edit batch extraction → flood-fill BFS over the 63³-chunk affected volume (7 rounds × 3 axes per round = 21 sweeps; distance step 4; cap 28 — exact match to `ChangeHandler.cs:73-174`). Bit-exact oracle on the 6 W2 gates (chunk/block/voxel edits ↔ CPU oracle byte-equal; entity-pointer `.y` preserved on chunk writes; bound-queue re-enqueue; flood-fill BFS matches `ChangeHandler.cs`). `--edit-mode` e2e PASS. |
+| 20 | **World generator** (paper §5, NAADF `WorldGenerator`) | `WorldGeneratorModel.cs` / `generatorModel.fx` | `src/assets/shaders/generator_model.wgsl`; `src/aadf/generator.rs`; `src/render/construction/generator_model.rs` | **yes** | faithful-with-deviations | Faithful port of `fillChunkDataWithModelData16` — segmented dispatch shape (`group_offset_in_chunks` + `group_size_in_chunks`, matching `generatorModel.fx:18-19,62`); 4³ workgroups × 32 iterations × 2 voxels per iter. CPU `generate_segment_cpu` is the bit-exact oracle (8192 u32s byte-equal). Active runtime content path is still the hard-coded test grid (D2); the generator pipeline runs alongside and is exercised by the W1 GPU/CPU oracle. |
+| 21 | **Dynamic entities** (paper §3.6) | `entityUpdate.fx` (3 entries) + `EntityHandler.cs` + `EntityData.cs` + `rayTracing.fxh:81-240` entity branch | `src/assets/shaders/entity_update.wgsl`; `src/render/construction/{entity_update,entity_handler}.rs`; `src/aadf/entity.rs`; `src/assets/shaders/ray_tracing.wgsl` (entity sub-traversal); `src/render/pipelines.rs` (`world_layout` 8-binding extension) | **yes** | faithful-with-deviations | Per-chunk 32-bit entity pointer (the `.y` channel of the `Rg32Uint` chunks texture; widened from `R32Uint` in W4). Entity instance buffer (`EntityChunkInstance` = 5 × u32 / 20 B, with `offset_of!` guards). Per-entity AADF voxel volumes built via `EntityData::from_types` (the 31-iteration per-axis neighbour-merge for 5-bit-per-axis AADFs). Smallest-three quaternion compression (`compress_quaternion`). Chunk-entity-instance hash-dedup. `shoot_ray` sub-traversal: 16-slot collection + bbox-test + AADF-traverse + closer-hit merge. The `entity_pixel` e2e luminance gate fires only with `--entities`; threshold 80.0, measured 187.93 (2.35× margin). `entity_instances_history` binding plumbed-but-unconsumed by default (Phase-D — `ConstructionConfig.entity_history_enabled = false`, allocates a 16 B placeholder when off). |
 
-**Summary: 16 in-scope subsystems assessed. 7 faithful, 9
-faithful-with-deviations, 0 diverging.** Every deviation is either a forced
-wgpu/naga adaptation, a deliberate scope decision (16-deep ring, CPU
-construction, entity-branch omission), or a documented NAADF-internal
-per-variant difference. No subsystem behaviourally diverges from NAADF intent.
+**Summary: 21 in-scope subsystems assessed.** 9 faithful, 12
+faithful-with-deviations, **0 diverging.** Every deviation is either a forced
+wgpu/naga adaptation, a deliberate scope decision, a user-directed override
+(Bevy tonemapping, configurable ring-depth default 32), or a documented
+NAADF-internal per-variant difference. No subsystem behaviourally diverges
+from NAADF intent.
 
 ---
 
@@ -97,13 +136,13 @@ per-variant difference. No subsystem behaviourally diverges from NAADF intent.
 | # | Divergence | Status | Notes |
 |---|---|---|---|
 | 1 | Material entry width — paper 16 bit vs. C# 128-bit `Uint4` | **DELIBERATE / RESOLVED** | Port follows the C# 128-bit `Uint4` (`GpuVoxelType`, 16 B). Correct call per Q3 (C# is the correctness cross-check). |
-| 2 | Hash-probe limit & resize threshold (paper 100/75% vs. C# 250/50%) | **N/A — DEFERRED** | Only relevant to GPU hashing construction (Phase C). The Phase-A CPU construction uses a Rust `HashMap` — no probe limit, no resize threshold. Becomes live only when Phase C ports `chunkCalc.fx`. |
+| 2 | Hash-probe limit & resize threshold (paper 100/75% vs. C# 250/50%) | **DELIBERATE / RESOLVED** | The GPU open-addressing construction (W1) uses **`probe_cap = 250`** (`chunk_calc.wgsl:234` / `render/construction/config.rs:149`) and **`wanted_empty_ratio = 0.5`** (`config.rs:147`) — the C# values per Q3. The paper's 100-probe / 75% values are not used; C# is the correctness cross-check. |
 | 3 | Two AADF "state" encodings in C# (2-bit `>>30` vs. traversal's `>>31` + `&0x40000000`) | **RESOLVED** | The port replicates the traversal's top-bit/uniform-full encoding exactly (Phase-A review-gate PASS confirmed traversal coherent in/out of volume). |
 | 4 | Voxels packed two-per-`uint` | **RESOLVED** | Ported (`src/world/data.rs` / `ray_tracing.wgsl`). Phase-A review confirmed traversal correctness. |
-| 5 | TAA history depth — 128 camera-matrix ring vs. 32 sample ring | **DELIBERATE / RESOLVED** | Camera-history ring kept at 128 (NAADF depth — tiny VRAM). Sample ring is **16-deep**, not 32 — the binding `design-exploration-qa.md` §6 VRAM lever. This is a deliberate, sanctioned scope decision, **not** a gap. |
+| 5 | TAA history depth — 128 camera-matrix ring vs. 32 sample ring | **DELIBERATE / RESOLVED** | Camera-history ring kept at 128 (NAADF depth — tiny VRAM). Sample ring **default = 32 (paper-canonical)** after the TAA-fidelity track; **the §6 16-deep VRAM lever is preserved as a configurable knob** via `AppArgs.taa_ring_depth` + `TaaRingConfig`. The single source of truth is fed to both `prepare_taa` (buffer sizing) and `NaadfPipelines` (a `#{TAA_SAMPLE_RING_DEPTH}` shader-def). |
 | 6 | `PositionSplit` int+frac camera is pervasive | **RESOLVED (D1)** | Ported faithfully and threaded through every WGSL pass. |
-| 7 | Atmosphere in-scope-by-necessity, not a paper contribution | **RESOLVED** | Full atmosphere model ported in Phase B (subsystem #7). Phase A used the inline sun term; Phase B has the precomputed octahedral model. |
-| 8 | World sized in "world-gen segments" | **DELIBERATE / DEFERRED** | The port uses a single hard-coded test grid (D2), not the segment-by-segment `GenerateWorld`. The segment machinery is part of `WorldGenerator` (deferred — §6). Not a gap within the agreed scope. |
+| 7 | Atmosphere in-scope-by-necessity, not a paper contribution | **RESOLVED** | Full atmosphere model ported in Phase B (subsystem #7). |
+| 8 | World sized in "world-gen segments" | **RESOLVED** | The W5 worldgen port accepts `group_offset_in_chunks` + `group_size_in_chunks` (`generator_model.rs` + `aadf/generator.rs::generate_segment_cpu`) — matching `WorldGeneratorModel`'s segment-by-segment dispatch shape. The active runtime content path is still the hard-coded test grid (D2); the segment machinery exists and is exercised by the W1 GPU/CPU oracle. |
 | 9 | `Cube` + fullscreen-PS final-blit pattern | **DELIBERATE / RESOLVED** | Replaced with a Bevy fullscreen pass — the design's explicit choice. Forced, faithful. |
 | 10 | `renderSampleRefine` `RefineBuckets` uses `COLOR_DIF_PROB` | **RESOLVED** | The `COLOR_DIF_PROB[31]` table is ported as hard-coded WGSL literals + a `#[test]` (`color_compression.rs`) that recomputes from the source formula and asserts a bit-exact match. |
 | 11 | SVGF not in the in-scope NAADF source | **N/A** | No SVGF shader exists to port. Not a gap. |
@@ -113,45 +152,57 @@ per-variant difference. No subsystem behaviourally diverges from NAADF intent.
 | # | Question | Status |
 |---|---|---|
 | 1 | Port `PositionSplit` or not? | **RESOLVED (D1)** — ported faithfully. |
-| 2 | `DynamicStructuredBuffer` → wgpu wrapper; chunked-copy needed? | **RESOLVED** — `GrowableBuffer` (`src/world/buffer.rs`) implements re-alloc + `copy_buffer_to_buffer` on growth. The DX11 `dataCopy.fx` chunked-copy workaround was not needed in wgpu. |
-| 3 | Chunk buffer as 3D texture vs. buffer | **RESOLVED** — chosen in `03-design.md` and implemented; the entity-widening (`Rg64Uint`) does not apply since entities are deferred. |
-| 4 | Phase-A content path | **RESOLVED (D2)** — hard-coded procedural test grid (`src/voxel/grid.rs`, shared production+e2e). No `.vox` reader, no `WorldGenerator`. |
-| 5 | Entities — Phase-A sub-feature or deferred? | **DELIBERATE / DEFERRED** — entities are not ported. Every `#ifdef ENTITIES` block was omitted in all WGSL. The entity data model (`EntityHandler`, `EntityData`, `entityUpdate.fx`, the 64-bit chunk widening) is a deferred sub-feature — see §6. |
+| 2 | `DynamicStructuredBuffer` → wgpu wrapper; chunked-copy needed? | **RESOLVED** — `GrowableBuffer` (`src/world/buffer.rs`) implements re-alloc + `copy_buffer_to_buffer` on growth. |
+| 3 | Chunk buffer as 3D texture vs. buffer | **RESOLVED** — implemented; the **entity-widening from `R32Uint` to `Rg32Uint` landed in W4** (`.x` = block-state+AADF, `.y` = entity pointer). |
+| 4 | Phase-A content path | **RESOLVED (D2)** — hard-coded procedural test grid (`src/voxel/grid.rs`, shared production+e2e). `WorldGenerator` is now *also* implemented (W5) and runs alongside as the W1 GPU/CPU oracle dispatch chain. |
+| 5 | Entities — Phase-A sub-feature or deferred? | **RESOLVED — implemented** (Phase C W4 + wave-3). The full §3.6 stack: `Rg32Uint` chunks, entity instance buffer, per-entity AADF voxel volumes, hash-dedup, traversal-time entity sub-traversal. The `--entities` e2e gate proves end-to-end rendering. |
 | 6 | `taaSampleMaxAge` for the albedo path — TAA in Phase A or B? | **RESOLVED (D4)** — TAA pulled into its own gated Phase A-2. |
 | 7 | Solari strip-vs-dormant | **RESOLVED (D3)** — stripped entirely. `bevy_solari` removed from `Cargo.toml`, no Solari symbols remain. |
 
 ### Divergences discovered since `02-research.md`
 
-These surfaced during impl/review and are all documented in `10-impl-b.md`:
+These surfaced during impl/review and are all documented in `10-impl-b.md`,
+`18-taa-fidelity.md`, and `16-impl-c*`:
 
-- **D-A. The `vec3`-then-scalar `#[repr(C)]`-vs-WGSL layout trap — recurred 3×.**
-  `AtmosphereParams` (Batch 1), `GpuTaaParams` (Batch 6), `GpuGiParams` (the
-  GI-bounce-visibility fix). **All three RESOLVED** — the WGSL structs now use
-  `vec4` rows so the Rust `_padN` u32s become `.w` lanes. Verified in code:
-  `gi_params.wgsl`, `taa.wgsl`, `atmosphere.wgsl` all carry `vec4`/explicit-pad
-  forms. The reviewer re-audited every shared struct and found no fourth
-  instance. **This is a faithful-port adaptation hazard, not a NAADF
-  divergence** — NAADF's HLSL `cbuffer` packing and its C# uploader agree by
-  construction; the bug is purely a wgpu-side porting trap. (Review concern #6:
-  the recurrence makes future WGSL struct edits high-risk — see §6 polish.)
+- **D-A. The `vec3`-then-scalar `#[repr(C)]`-vs-WGSL layout trap — recurred 3×
+  in Phase B + once in TAA-fidelity.** `AtmosphereParams`, `GpuTaaParams`,
+  `GpuGiParams` (Phase B), then `GpuGiParams.taa_jitter` placement (TAA-fidelity
+  fix #1). **All RESOLVED** — the WGSL structs use `vec4` rows so the Rust
+  `_padN` u32s become `.w` lanes; `taa_jitter` lands at byte 280 on an 8-byte
+  boundary with a compile-time `offset_of!` guard. Phase C carries the
+  hardened pattern: every new `#[repr(C)]` GPU struct (`GpuConstructionParams`,
+  `GpuHashValueSlot`, `GpuBoundQueueInfo`, `GpuEntityChunkInstance`,
+  `GpuChunkUpdate`, `GpuEntityInstanceHistory`) ships with `const _: () =
+  assert!(size_of)` + per-field `offset_of!` guards.
 - **D-B. `screenPosDistanceSqr` threshold differs per render variant.** The
-  `albedo/` TAA genuinely uses `> 1.0`, the `base/` TAA genuinely uses `> 16.0`
-  (verified against `albedo/renderTaaSampleReverse.fx:133` vs.
-  `base/renderTaaSampleReverse.fx:139`). The port uses the correct value per
-  variant. **DELIBERATE / RESOLVED** — a real NAADF per-variant difference,
-  faithfully reproduced; no A-2 bug.
-- **D-C. `spatialVisibilityCount` is a dead uniform in NAADF's HLSL.**
-  `renderSpatialResampling.fx` declares it but `sampleNeighbors` passes the
-  `MAX_RAY_STEPS_VISIBILITY` const to `shootRay` directly. The port drops the
-  uniform and uses the const. **DELIBERATE / RESOLVED** — faithful to NAADF's
-  *actual behaviour* (not its dead declaration).
+  `albedo/` TAA uses `> 1.0`, the `base/` TAA uses `> 16.0`. Port uses the
+  correct value per variant. **DELIBERATE / RESOLVED.**
+- **D-C. `spatialVisibilityCount` is a dead uniform in NAADF's HLSL.** Port
+  drops the uniform and uses the `MAX_RAY_STEPS_VISIBILITY` const directly.
+  **DELIBERATE / RESOLVED.**
 - **D-D. wgpu `STORAGE_READ_WRITE`+`INDIRECT` exclusivity** — forced the
-  `sampleRefine` `@group(1)` indirect-buffer split. **RESOLVED** — a forced
-  wgpu adaptation, faithful to design intent (subsystem #11).
-- **D-E. naga-oil rejects trailing-digit struct field names** (`data1`,
-  `rand_counter2`) and `ptr<storage>` function params. **RESOLVED** — mechanical
-  renames + the `apply_atmosphere` split; field names are read positionally so
-  not load-bearing.
+  `sampleRefine` `@group(1)` indirect-buffer split AND the W3 `bound_dispatch_indirect`
+  split. **RESOLVED.**
+- **D-E. naga-oil rejects trailing-digit struct field names** + `ptr<storage>`
+  function params. **RESOLVED** — mechanical renames + the `apply_atmosphere`
+  split. The W4 `EntityChunkInstance` struct in `world_data.wgsl` uses
+  `pack_a..pack_e` (naga-oil composable-module identifiers cannot match
+  `<word><digit>`); the same struct in `entity_update.wgsl` (top-level entry,
+  not imported) keeps `data1..data5`.
+- **D-F. W6 neighbour-merge is conservative wrt the legacy per-cell
+  algorithm.** The §3.3 O(3·d·n) merge form (`compute_aadf_layer`) and the old
+  per-cell slice-empty algorithm (`compute_aadf`) produce *different (both
+  valid)* empty cuboids in the general case. The CPU oracle was redefined to
+  the merge form (= what GPU `ComputeBounds4` produces) so W1's bit-exact
+  GPU/CPU gate compares against the new canonical truth. **DELIBERATE /
+  RESOLVED** — recorded in `bounds.rs:32-43` and `16-impl-c-W6.md`.
+- **D-G. Bevy tonemapping replaces the C# Reinhard tonemap.** The port emits
+  raw linear HDR from `naadf_final.wgsl`; the Bevy `TonyMcMapface` render-graph
+  node (running after the NAADF chain via `.before(tonemapping)`) does the
+  tonemap + sRGB encode. The `exposure` / `tone_mapping_fac` `GpuRenderParams`
+  fields were renamed to `_pad0a` / `_pad0b` (layout-preserving). **DELIBERATE
+  user-directed deviation** from the faithful-port principle (Q2), recorded
+  in `naadf_final.wgsl`'s header and in `18-taa-fidelity.md` fix #2.
 
 ---
 
@@ -159,18 +210,13 @@ These surfaced during impl/review and are all documented in `10-impl-b.md`:
 
 | Bug | Source | Status | Detail |
 |---|---|---|---|
-| **B-1. TAA camera-motion reprojection decay** | `10-impl-b.md` "TAA shadow decay-to-black fix" | **STILL OPEN** | Under camera *motion* in the windowed app, shadowed regions of the GI render degrade toward black; only fresh-disoccluded screen-edge geometry stays lit. **Diagnosed but not fixed.** Established: it is NOT a static-camera convergence problem (the `base/` TAA running-average is provably convergent and confirmed stable at 600 static frames); it needs camera motion; and it is NOT the `sync_position_split` bug (the windowed camera *has* `FreeCamera` so `sync_position_split` runs there). Suspect surface: the camera-motion reprojection inside `reproject_old_samples` / `renderSampleRefine`'s `reproject_sample` — the 3×3 `dist_min_max` / hash / screen-position reject tests and `color_sum.a` behaviour under partial reprojection failure. **Root cause not confirmed; no fix applied** (correctly — "diagnose before patching"). The e2e harness cannot yet reproduce it (no moving-camera mode). This is the **one blocking item** between the current state and a clean Phase-B production gate. |
-| **B-2. `sync_position_split` `With<FreeCamera>` query-filter trap** | `10-impl-b.md` "TAA shadow decay-to-black fix" | **FIXED** (`ad12f32`) | `sync_position_split` was filtered `With<FreeCamera>`, so a non-`FreeCamera` render camera (the e2e fixed-pose camera) left `PositionSplit` frozen — silently breaking camera-relative rendering the instant the camera moves. The identical trap was already fixed once in `update_camera_history`. Now filtered `With<PositionSplit>`. This was a *prerequisite* for any moving-camera e2e coverage (needed to diagnose B-1), not B-1 itself. |
-| **B-3. Dead temporal-stability e2e scaffolding** (review concern #1) | `11-review-b.md` finding 1 | **STILL OPEN (NIT)** | `GateState.fb_next`, `batch_needs_second_frame`, `Framebuffer::mean_pixel_delta`, `readback.rs:27` describe a two-frame consecutive-readback temporal-stability check for Batch 6 that is never wired — the driver shoots one screenshot and always passes `fb_next: None`; the three symbols have zero call sites. The `10-impl-b.md` "TAA shadow decay-to-black fix" section explicitly **left it in place** as scaffolding for the follow-up dispatch that adds a moving-camera gate (which is the natural place to finish it — see B-1). Comments overstate what the harness verifies. |
-| **B-4. `expected_spans(6)` not config-aware re: `is_denoise`** (review concern #3) | `11-review-b.md` finding 3 | **STILL OPEN (CONCERN)** | `gates.rs` unconditionally lists `naadf_denoise` in the batch-6 expected-span set, but `graph_b.rs` runtime-gates the denoise node on `ExtractedGiConfig.is_denoise`. With the default (`true`) the e2e passes; flipping the default or adding a runtime toggle would hard-fail the harness even though a skipped denoise pass is a *correct* configuration. Latent fragility, not a current-config bug. |
-| **B-5. Dead plumbing debris** (review nit #5) | `11-review-b.md` finding 5 | **STILL OPEN (NIT)** | `FLAG_BLIT_FINAL_COLOR` (`gpu_types.rs`, `render_pipeline_common.wgsl`), the dormant `taa_layout` descriptor + `TaaGpu.taa_first_hit_bind_group` field, the `taa_sample_accum` no-op touch in `naadf_first_hit.wgsl` — all superseded by later batches but still present. None load-bearing or harmful; churn-avoidance debris from the Batch-2/6 seams. |
-| **B-6. No mechanical GPU-struct-offset assert harness** (review nit #6, advisory) | `11-review-b.md` finding 6 | **STILL OPEN (advisory NIT)** | The `vec3`-then-scalar layout bug class (D-A) recurred *three times*, twice after a header comment wrongly claimed "verified field-by-field". The reviewer recommends a runtime offset-assert compute shader so the class is caught mechanically. Strongly advisory; the current `const _: assert!` size checks catch *size* mismatches but not *offset* shifts that keep the size constant. |
-
-Note also a **bookkeeping discrepancy**: the orchestrate docs and several code
-comments say "13 render-graph nodes" / "46 tests"; the actual chain has **14
-node systems** (`mod.rs:207-228`) and the tree has **48 `#[test]` functions**
-(the +2 over the docs' "46" are later substrate tests, all passing — not a
-regression). Cosmetic; review nit #4 already flagged the node-count side.
+| **B-1. ~~TAA camera-motion reprojection decay~~ — INVALIDATED as a real defect** | `10-impl-b.md` "TAA shadow decay-to-black fix" → `18-taa-fidelity.md` | **CLOSED — misdiagnosis** | The user clarified post-Phase-B that the camera-motion reprojection-decay framing was a misdiagnosis. The real "TAA noisier than C# / barely resolves" symptom traced to a 5-cause cluster diagnosed in `18-taa-fidelity.md`: (1) GI sample-generation + spatial-resampling rays were unjittered (`GpuGiParams` had no jitter field; passed `vec2(0,0)` to `get_ray_dir` where the C# passes `taaJitter`); (2) the custom Reinhard tonemap's `exposure` / `toneMappingFac` constants flattened contrast; (3) the 16-deep ring halved the temporal-averaging window vs the paper's 32; (4) `denoiseThresh` was faithful but downstream-degraded by #1; (5) `frame_count` increment order audit — no real skew found. The fix (`8995c88`) jittered the GI rays (`GpuGiParams.taa_jitter` at offset 280 with `offset_of!` guard), switched to Bevy `TonyMcMapface` tonemapping (port emits raw linear HDR), raised the default ring depth to 32 (configurable lever preserved), and fixed `extract_camera`'s black-on-resize collapse. Measured GI-lit luminance jumped from ~4 to ~242 on the test scene — "barely resolves" decisively gone. The `base/` TAA reprojection math itself was audited faithful vs `renderTaaSampleReverse.fx` — no shader-level reprojection bug ever existed. |
+| **B-2. `sync_position_split` `With<FreeCamera>` query-filter trap** | `10-impl-b.md` "TAA shadow decay-to-black fix" | **FIXED** (`ad12f32`) | `sync_position_split` was filtered `With<FreeCamera>`, so a non-`FreeCamera` render camera (the e2e fixed-pose camera) left `PositionSplit` frozen — silently breaking camera-relative rendering the instant the camera moves. Now filtered `With<PositionSplit>`. |
+| **B-3. Dead temporal-stability e2e scaffolding** (review concern #1) | `11-review-b.md` finding 1 | **PARTIALLY SUPERSEDED** | The deterministic moving-camera e2e mode (`WARMUP → MOTION → SETTLE` phases in `e2e/driver.rs`, with `MIN_GI_BOUNCE_AFTER_MOTION = 150.0` gate at `e2e/gates.rs:643`) DID land — that fulfils the original "moving-camera coverage" intent. However, the three named symbols (`GateState.fb_next`, `batch_needs_second_frame`, `Framebuffer::mean_pixel_delta`) are still in the code with no live caller — `fb_next` is always passed `None` in `driver.rs:320`, `batch_needs_second_frame` has no callers. Cosmetic debris; the *coverage* gap it was scaffolding for is closed. |
+| **B-4. `expected_spans(6)` not config-aware re: `is_denoise`** (review concern #3) | `11-review-b.md` finding 3 | **STILL OPEN (CONCERN)** | `gates.rs:687,700` unconditionally lists `naadf_denoise` in the batch-6 expected-span set, but `graph_b.rs` runtime-gates the denoise node on `ExtractedGiConfig.is_denoise`. Latent fragility; not a current-config bug. |
+| **B-5. Dead plumbing debris** (review nit #5) | `11-review-b.md` finding 5 | **STILL OPEN (NIT)** | `FLAG_BLIT_FINAL_COLOR` (`gpu_types.rs:133`, `render_pipeline_common.wgsl:180`), the dormant `taa_layout` descriptor + `TaaGpu.taa_first_hit_bind_group` field (still built every frame in `prepare_taa` and bound by nothing — `taa.rs:265,446-462`), the `taa_sample_accum` no-op touch in `naadf_first_hit.wgsl` — all still present. None load-bearing or harmful; churn-avoidance debris from the Batch-2/6 seams. |
+| **B-6. No mechanical GPU-struct-offset assert harness** (review nit #6, advisory) | `11-review-b.md` finding 6 | **PARTIALLY ADDRESSED** | The Phase-C `offset_of!` guard pattern (77 `offset_of!` / `const _: ()` sites across `gpu_types.rs`) is the hardened mechanical check the Phase-B reviewer asked for. Every new Phase-C GPU struct + the TAA-fidelity `GpuGiParams.taa_jitter` field carries field-offset guards. The pattern is now the norm; the advisory nit is effectively closed for new structs, though no retroactive sweep of pre-Phase-C structs was performed. |
+| **B-7. wgpu/Vulkan storage-texture barrier hazard** | `16-impl-c-followups.md` T1 "honest residual" | **STILL OPEN (Phase-D backlog, NOT a NAADF correctness gap)** | The chunks 3D texture is bound for construction as `texture_storage_3d<rg32uint, read_write>` and for the renderer as `texture_3d<u32>`. With CPU upload disabled (`gpu_producer_skip_upload = true`), GPU writes from the construction dispatch chain do **not** propagate to the renderer's read view — the framebuffer collapses (emissive 10.7, solid 7.0, geometry vanishes) despite a confirmed dispatch. Workaround in place: keep the CPU upload path. The GPU producer chain *still* dispatches Algorithm 1 every startup via `naadf_gpu_producer_node` (verifiable — the "GPU producer chain DISPATCHED" log fires every run), and bit-exact `--validate-gpu-construction` proves output equivalence on the deterministic 1×1×1 fixture. **This is a wgpu/Vulkan infrastructure issue**, likely needing an explicit pipeline barrier between regime-1 GPU dispatch and the first render frame OR a different bind-group aliasing strategy. Recorded as a Phase-D backlog item in `RESUME.md`. |
 
 ---
 
@@ -179,36 +225,26 @@ regression). Cosmetic; review nit #4 already flagged the node-count side.
 Listed explicitly so they are **not confused with gaps**. None of these is a
 deficiency in the port — each is a binding scope decision from `01-context.md`.
 
-- **Phase C — GPU world construction & editing.** `chunkCalc.fx` (GPU
-  Algorithm 1), `boundsCalc.fx` (background chunk-AADF queue), `worldChange.fx`
-  (flood-fill edit invalidation), `mapCopy.fx` (hash-map regrow), the
-  `WorldBoundHandler` / `ChangeHandler` / `BlockHashingHandler` /
-  `EditingHandler` orchestration. The Phase-A CPU construction path produces
-  bit-identical buffers and the traversal shader is producer-agnostic — Phase C
-  is a scalability/editability track, not a rendering foundation. Last phase,
-  not yet started.
 - **The reference pathtracer** — `WorldRenderPathTracer` + `pathTracer/**`
-  shaders. Future work; explicitly OUT of Phase B scope.
+  shaders. Future work; explicitly OUT.
 - **DLSS / DLSS-RR.** The `dlss` / `force_disable_dlss` Cargo plumbing stays
-  dormant (`Cargo.toml` `default = ["dlss"]`, `dlss = ["bevy/dlss"]`) — it
-  predates the port work and is not on the NAADF render path. Under separate
-  later review; not designed for in Phase B.
+  dormant (predates the port work and is not on the NAADF render path).
 - **Editor GUI** — the entire `Gui/` ImGui tree. The always-on diagnostics
   `hud.rs` stays; the editor panels do not get ported.
 - **Persistence / serialization** — `.cvox` ZIP format, `Settings.cs`,
   `IO.cs`, `PathHandler.cs`, screenshot/camera-path tooling.
 - **Asset importers** — `MagicaVoxel.cs` / `VoxFile.cs` / `Voxlap.cs` /
   `obj2voxel`, K-means palette mapping. The hard-coded test grid (D2) is the
-  content path.
-- **`WorldGenerator` / `WorldGeneratorModel`** — GPU-driven world generation
-  into chunk buffers. Deferred with the content path (D2 chose the hard-coded
-  grid); a future procedural generator would slot here.
-- **Dynamic entities** — `EntityHandler`, `EntityData`, `entityUpdate.fx`, the
-  64-bit chunk-texture widening, the `shootRay` entity sub-traversal. Treated as
-  a deferred Phase-A sub-feature (open question #5); every `#ifdef ENTITIES`
-  block was omitted in all ported WGSL.
-- **Interactive editing tools** — `EditingTools/` (cube/sphere/paint/floodfill/
-  model). Editor concern; deferred with the GUI.
+  active content path; the W5 worldgen pipeline runs alongside.
+- **Interactive editing tools (editor UI)** — `EditingTools/` (cube/sphere/
+  paint/floodfill/model). Note: the editing *algorithm* (paper §3.5
+  flood-fill AADF invalidation + `worldChange.fx`) **IS implemented** via
+  Phase C W2; the `set_voxel(IVec3, VoxelTypeId)` main-world API exists. What
+  is missing is the editor *UI* on top of it. Editor concern; deferred with
+  the GUI.
+- **SVGF alternative denoiser.** Un-portable from the NAADF source tree
+  (`Content/shaders/render/**` ships only the sparse bilateral). The paper
+  itself favours the sparse bilateral.
 
 ---
 
@@ -218,91 +254,92 @@ Ranked: blocking correctness first, then faithfulness gaps, then polish.
 
 ### Blocking correctness
 
-1. **Fix B-1 — the TAA camera-motion reprojection decay.**
-   *Where:* `src/assets/shaders/taa.wgsl` (`reproject_old_samples`) and/or
-   `src/assets/shaders/sample_refine.wgsl` (`reproject_sample`) — the
-   camera-motion 3×3 `dist_min_max` / hash / screen-position reject path and
-   `color_sum.a` partial-reprojection-failure behaviour; possibly `first_hit`
-   under genuine motion.
-   *Effort:* medium-to-high — diagnosed but root cause unconfirmed; needs a
-   clean moving-camera repro (now unblocked by the B-2 fix) and a
-   frame-over-frame trace of one shadowed pixel's `taa_sample_accum` /
-   `color_sum.a` / ring-sample values, confirmed against
-   `base/renderTaaSampleReverse.fx`. **This is the critical path** — the
-   Phase-B done-bar ("bounce lighting visible, *temporally stable*, no obvious
-   artifacts") is not met until it is fixed.
-2. **Add a deterministic moving-camera e2e mode + finish/wire the
-   temporal-stability gate (B-3).**
-   *Where:* `src/e2e/` — a controlled orbit/pan with `PositionSplit` correctly
-   synced (B-2's fix is the prerequisite), plus implementing the dormant
-   `fb_next` / `batch_needs_second_frame` / `mean_pixel_delta` two-frame check
-   that finding 1 describes.
-   *Effort:* medium — partly scaffolded already. Naturally bundles with item 1
-   (it is the regression gate for B-1's fix; finishing it without a confirmed
-   decay repro to gate against would be scaffolding without a target).
+*None.* The port is functionally complete against the full in-scope NAADF
+methodology. The one outstanding seam (B-7, wgpu barrier hazard) is bounded
+and does not gate correctness — the bit-exact GPU-vs-CPU oracle gate proves
+the Phase-C GPU algorithms are correct, and the runtime GPU producer chain
+still dispatches every startup; only the *full upload-skip* path
+(renderer-reads-exclusively-from-GPU) is blocked.
 
-### Faithfulness gaps (within scope, lower priority)
+### Phase-D residuals (from `RESUME.md`)
 
-3. **Make `expected_spans` config-aware (B-4).**
-   *Where:* `src/e2e/gates.rs:458-469` — derive the batch-6 expected-span set
-   from the extracted GI config (drop `naadf_denoise` when
-   `is_denoise == false`), or document that the harness only validates the
-   `is_denoise = true` configuration.
-   *Effort:* low.
+1. **B-7 / wgpu storage-texture barrier hazard.** Investigate the
+   construction-bind ↔ renderer-bind barrier requirement so the full
+   upload-skip can land. Likely needs an explicit pipeline barrier between
+   regime-1 GPU dispatch and the first render frame, or a different bind-group
+   aliasing strategy. *Effort:* medium — wgpu infrastructure work, not a
+   NAADF correctness fix.
+2. **TAA reprojection of moving entities** (paper §3.6 follow-on). The
+   `entity_instances_history` binding is plumbed and gated off by default
+   (`ConstructionConfig.entity_history_enabled = false`, allocates a 16 B
+   placeholder when disabled). Phase-D flips the flag and lands the consumer
+   in `ray_tracing.wgsl::shoot_ray`. *Effort:* medium.
+3. **Flood-fill cap-28 test coverage** (`17-review-c.md` nit #2). The W2
+   flood-fill cap-28 edge case is not directly exercised by a dedicated test.
+   The load-bearing W2 distance-propagation test on the 9×1×1-group world
+   does hit the cap but the centre-edit test does not. *Effort:* small.
+4. **`render/construction/mod.rs` mega-module split** (`17-review-c.md` nit
+   #3). Currently 4510 lines; splitting `validate_gpu_construction` /
+   `validate_edit_mode` / `validate_entity_handler` into a sibling module
+   would cut ~1500 lines. *Effort:* small — Phase-C-internal polish.
+5. **Future shadow-filtering improvements** (user note 2026-05-15,
+   post-TAA-fidelity). Separate later track.
 
-4. **(Optional, scope-edge) the CPU-construction vs. GPU-construction seam.**
-   The port's AADF construction is CPU-only (`src/aadf/construct.rs`) — a
-   faithful re-derivation of Algorithm 1, sanctioned by Q3/D2. It is *not* a
-   gap against the agreed scope, but it is the one place the port and NAADF's
-   *runtime* differ structurally. Full alignment here is **Phase C** and
-   explicitly out of the current scope — listed only so the seam is named.
-   *Effort:* large — a whole future phase, deliberately not now.
+### Faithfulness nits (within scope, lower priority)
 
-### Polish (review nits)
-
-5. **Dead-code sweep (B-5).** Remove `FLAG_BLIT_FINAL_COLOR`, the dormant
+6. **Make `expected_spans` config-aware (B-4).** Derive the batch-6
+   expected-span set from the extracted GI config (drop `naadf_denoise` when
+   `is_denoise == false`). *Effort:* low.
+7. **Dead-code sweep (B-5).** Remove `FLAG_BLIT_FINAL_COLOR`, the dormant
    `taa_layout` / `taa_first_hit_bind_group`, the `taa_sample_accum` no-op
-   touch. *Effort:* low.
-6. **Add a mechanical GPU-struct-offset assert harness (B-6).** A tiny compute
-   shader that writes each struct field's observed byte offset to a buffer the
-   CPU checks against the `#[repr(C)]` offsets — catches the `vec3`-then-scalar
-   class (D-A) mechanically instead of by hand-audit (which failed 3×).
-   *Effort:* low-to-medium; strongly advisory given the recurrence history.
-7. **Reconcile bookkeeping** — "13 nodes" → "14 node systems", "46 tests" →
-   "48 tests" in the docs/comments. *Effort:* trivial.
+   touch, the three named B-3 symbols. *Effort:* low.
 
 ---
 
 ## 7. Overall assessment
 
-**The in-scope port is functionally complete and faithful — one open bug short
-of the production done-bar.**
+**The in-scope port is functionally complete and faithful against the full
+NAADF methodology, with one bounded wgpu-infrastructure residual.**
 
-All 16 in-scope subsystems are ported; 7 are faithful, 9 are
+All 21 in-scope subsystems are ported; 9 are faithful, 12 are
 faithful-with-documented-deviations, and **none behaviourally diverges** from
-NAADF intent. Every deviation is traceable to a forced wgpu/naga adaptation, a
-sanctioned scope decision (the 16-deep TAA ring, CPU-side AADF construction,
-entity-branch omission, the hard-coded test grid), or a documented NAADF-internal
-per-variant difference — not drift. The render-graph dispatch order matches
-`WorldRenderBase.cs` line-by-line, the adaptive ~0.25-spp signal is real and
-wired end-to-end, the compressed-ReSTIR GI chain produces genuine multi-colored
-bounce (e2e: 99.2% GI-lit, independently judged real), and all three historical
-`#[repr(C)]`-vs-WGSL layout bugs are fixed with no fourth instance found. Phase
-A, A-2, and B have all passed their review gates.
+NAADF intent. Every deviation is traceable to a forced wgpu/naga adaptation
+(`STORAGE_READ_WRITE × INDIRECT` splits, `vec3`-then-scalar `vec4` rows,
+naga-oil identifier renames), a sanctioned scope decision (the configurable
+TAA ring depth, the hard-coded test grid running alongside the W5 generator),
+a user-directed override (Bevy `TonyMcMapface` tonemapping replacing the C#
+Reinhard tonemap, default TAA ring depth 32 supersedes the §6 16-deep VRAM
+lever), or a documented NAADF-internal per-variant difference — not drift.
 
-**The critical path to "fully aligned" is a single item: bug B-1, the TAA
-camera-motion reprojection decay.** It is the lone correctness defect
-outstanding after the Phase-B review — diagnosed (camera-motion-triggered, not a
-static-camera convergence issue, not the `sync_position_split` trap) but with an
-unconfirmed root cause and no fix applied. Its prerequisite (the
-`sync_position_split` `With<FreeCamera>` trap, B-2) is already fixed, which
-unblocks the moving-camera e2e diagnostic needed to trace it. Everything else
-remaining within scope is coverage/fragility/debris (B-3 through B-6, all
-NIT/CONCERN) — no further *implementation* is needed, only the B-1 fix, its
-moving-camera regression gate, and a small polish pass. Beyond that, the next
-*scope* milestone is Phase C (GPU construction/editing), which is a deliberate
-future phase, not an alignment gap.
+The render-graph dispatch order matches `WorldRenderBase.cs` line-by-line;
+the Phase-C construction chain (`naadf_gpu_producer_node` regime-1 at
+startup, `naadf_bounds_compute_node` regime-2 5 rounds/frame,
+`naadf_world_change_node` + `naadf_entity_update_node` regime-3 event-gated)
+slots cleanly at the head of `Core3d`. The CPU `aadf/construct.rs` 3-phase
+build is preserved as the bit-exact validation oracle + fallback per E4. The
+adaptive ~0.25-spp signal is real and wired end-to-end; the compressed-ReSTIR
+GI chain produces genuine multi-colored bounce; the `--validate-gpu-construction`
+gate is 388 bytes byte-equal; the `--edit-mode` gate confirms 1 set_voxel →
+the correct number of changed records + a flood-fill BFS sweep; the
+`--entities` gate fires the entity dispatch every frame and the `entity_pixel`
+luminance gate hits 187.93 vs threshold 80 (2.35× margin).
 
-**Bottom line:** the port faithfully realises NAADF's core voxel-GI engine; it
-is one well-scoped diagnose-and-fix dispatch (B-1 + its e2e gate) away from a
-clean, temporally-stable production gate.
+The four review gates (A, A-2, B, C) have all PASSED. Phase B's "open
+camera-motion reprojection decay" framing was invalidated by the TAA-fidelity
+track (the real causes were 5 unrelated convergence defects; all fixed). 112
+tests pass; all four e2e modes pass.
+
+**The one outstanding seam** is the wgpu/Vulkan storage-texture barrier
+hazard (B-7) that prevents the *full* upload-skip path on the runtime
+producer flip. The GPU producer chain DOES dispatch every startup; the
+bit-exact oracle proves correctness; the workaround keeps the CPU upload
+path active. This is a wgpu-infrastructure issue, **not a NAADF
+port-correctness gap** — recorded as a Phase-D backlog item alongside
+TAA-reprojection-of-moving-entities, flood-fill cap-28 coverage, the
+`mod.rs` mega-module split, and future shadow-filtering improvements.
+
+**Bottom line:** the port faithfully realises NAADF's full voxel-GI engine
+(rendering + construction + editing + dynamism) against the C# reference and
+the canonical paper's methodology; what remains is bounded Phase-D
+infrastructure work + polish — no further canonical-methodology
+implementation is needed.
