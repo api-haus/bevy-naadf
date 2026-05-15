@@ -60,11 +60,23 @@ shell you run `cargo` from.
 ## Build & run
 
 ```sh
-cargo run --release
+cargo run -p bevy-naadf --release   # or: just run
 ```
 
 The first build compiles all of Bevy and `dlss_wgpu`, so it takes a while. A successful
 build confirms the `dlss_wgpu` build script found `DLSS_SDK`, `VULKAN_SDK`, and `clang`.
+
+### Web build (WebGPU, wasm32)
+
+`just web` builds the `bevy-naadf` binary for `wasm32-unknown-unknown` with
+`--no-default-features --features webgpu` (the `dlss` feature has no web build), serves it
+with [Trunk](https://trunkrs.dev/), and opens it in Chrome. `just web-build-release`
+produces the optimised `crates/bevy_naadf/dist/` bundle without serving. The Playwright
+smoke test under `e2e/` (`just install-e2e` then `just test-wasm-full`) loads that bundle
+headless and asserts it boots without panics. `.github/workflows/deploy-cloudflare.yml`
+builds the release bundle and deploys it to Cloudflare Pages, with the large wasm binary
+served from R2 via the `workers/r2-proxy/` worker (which stamps the CORS / CORP headers
+the cross-origin-isolated page needs).
 
 ## Controls
 
@@ -93,18 +105,32 @@ render-node GPU timings (`first-hit`, `final-blit`).
 
 ## Project layout
 
-| Path                    | Responsibility                                                          |
-| ----------------------- | ----------------------------------------------------------------------- |
-| `src/main.rs`           | App wiring: plugins, `DlssProjectId`, CLI args, system scheduling        |
-| `src/camera/`           | Free-fly camera spawn + the int+frac `PositionSplit` camera-relative type |
-| `src/voxel/`            | Voxel-type / material system + the hard-coded Phase-A test-grid builder  |
-| `src/aadf/`             | The chunk/block/voxel cell encode/decode, CPU AADF construction + bounds |
-| `src/world/`            | `WorldData` / `VoxelTypes` resources + the `GrowableBuffer` GPU wrapper  |
-| `src/render/`           | Render-world extract/prepare, GPU types, pipelines, the render-graph nodes |
-| `src/assets/shaders/`   | The WGSL render shaders (ported from NAADF's HLSL `Content/shaders/`)    |
-| `src/hud.rs`            | Diagnostics overlay                                                     |
-| `.envrc.example`        | Template for the gitignored `.envrc` (`DLSS_SDK`, `VULKAN_SDK`)          |
-| `.cargo/config.toml`    | `mold` linker config — no machine-specific paths                        |
+This is a Cargo workspace. `crates/bevy_naadf` is the renderer; `crates/voxel_noise` is a
+[FastNoise2](https://github.com/Auburn/FastNoise2) wrapper carried over from
+`bevy_voxel_world` — a native Rust API plus a C-ABI surface that builds to
+`wasm32-unknown-emscripten` for an in-browser JS bridge. The noise crate is **not yet
+wired into the renderer** — it is staged here so the 3D noise generation can be added
+later without another restructure.
+
+| Path                              | Responsibility                                                          |
+| --------------------------------- | ----------------------------------------------------------------------- |
+| `crates/bevy_naadf/src/main.rs`   | App wiring: plugins, `DlssProjectId`, CLI args, system scheduling        |
+| `crates/bevy_naadf/src/camera/`   | Free-fly camera spawn + the int+frac `PositionSplit` camera-relative type |
+| `crates/bevy_naadf/src/voxel/`    | Voxel-type / material system + the hard-coded Phase-A test-grid builder  |
+| `crates/bevy_naadf/src/aadf/`     | The chunk/block/voxel cell encode/decode, CPU AADF construction + bounds |
+| `crates/bevy_naadf/src/world/`    | `WorldData` / `VoxelTypes` resources + the `GrowableBuffer` GPU wrapper  |
+| `crates/bevy_naadf/src/render/`   | Render-world extract/prepare, GPU types, pipelines, the render-graph nodes |
+| `crates/bevy_naadf/src/assets/shaders/` | The WGSL render shaders (ported from NAADF's HLSL `Content/shaders/`) |
+| `crates/bevy_naadf/src/hud.rs`    | Diagnostics overlay                                                     |
+| `crates/bevy_naadf/index.html` / `Trunk.toml` | The Trunk WebGPU (wasm32) web-build entry point             |
+| `crates/bevy_naadf/{_headers,sw.js,init.js.template}` | Cloudflare Pages headers + caching SW + the CI wasm loader |
+| `crates/voxel_noise/`             | FastNoise2 wrapper — native API (`src/native.rs`, `src/presets.rs`) + the Emscripten C-ABI module (`Makefile`, `js/`) |
+| `e2e/`                            | Playwright smoke test for the web build (`serve.mjs` + `tests/`)        |
+| `workers/r2-proxy/`               | Cloudflare Worker — serves the R2-hosted wasm with CORS / CORP headers  |
+| `scripts/`                        | `patch-wasm-loading.sh` (CI R2 loader injection) + `lint/wasm-compat.sh` |
+| `.github/workflows/`              | `deploy-cloudflare.yml` — builds both crates + deploys to Pages         |
+| `.envrc.example`                  | Template for the gitignored `.envrc` (`DLSS_SDK`, `VULKAN_SDK`)          |
+| `.cargo/config.toml`              | `mold` linker config — no machine-specific paths                        |
 
 ## Roadmap
 

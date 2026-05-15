@@ -1,8 +1,20 @@
-# Build artifacts
+# Cargo build artifacts (workspace-wide target dir)
 /target
 
-# Trunk WebGPU (wasm32) build output
-/dist
+# Trunk WebGPU (wasm32) build output for the bevy_naadf crate
+/crates/bevy_naadf/dist
+/crates/bevy_naadf/.stage
+
+# voxel_noise Emscripten (wasm32) build output
+/crates/voxel_noise/dist
+
+# Node / Playwright — the e2e harness and the cloudflare worker
+node_modules/
+/e2e/test-results
+/e2e/playwright-report
 
 # Local environment — machine-specific paths (see .envrc.example)
 .envrc
+
+# Detached-process log from `just`/IDE launches
+nohup.out

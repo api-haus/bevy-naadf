@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>bevy-naadf — WebGPU</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }
+      /* The Bevy window binds to this canvas (see `build_app`, wasm32 block);
+         `fit_canvas_to_parent` keeps it sized to <body>. */
+      #bevy {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+
+      /* Loading overlay — sits above the canvas until the wasm app boots.
+         `TrunkApplicationStarted` (fired by Trunk's loader in dev, and by the
+         CI-patched `init.js` in production) adds `.hidden`. The e2e smoke test
+         waits for `#loading.hidden` as its "app booted" signal. */
+      #loading {
+        position: fixed;
+        inset: 0;
+        z-index: 1000;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #000;
+      }
+      #loading.hidden {
+        display: none;
+      }
+      #progress-bar {
+        width: min(300px, 80vw);
+        height: 4px;
+        background: #1a1a1a;
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      #progress-fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #4ade80, #22d3ee);
+        transition: width 0.15s ease-out;
+      }
+      #progress-fill.indeterminate {
+        width: 30%;
+        animation: indeterminate 1.5s ease-in-out infinite;
+      }
+      @keyframes indeterminate {
+        0% {
+          transform: translateX(-100%);
+        }
+        100% {
+          transform: translateX(400%);
+        }
+      }
+      #progress-text {
+        color: #8892b0;
+        margin-top: 12px;
+        font-family: ui-monospace, monospace;
+        font-size: 14px;
+      }
+    </style>
+
+    <!-- The wasm binary. Trunk compiles `--bin bevy-naadf` for
+         wasm32-unknown-unknown with `--no-default-features` (drops `dlss`,
+         which has no web build) and `--features webgpu` (selects the WebGPU
+         wgpu backend over Bevy's default webgl2). `data-wasm-opt="0"` keeps
+         `trunk serve` fast; the deploy CI flips it to `"s"` for the release
+         artifact (see `.github/workflows/deploy-cloudflare.yml`). -->
+    <link
+      data-trunk
+      rel="rust"
+      data-bin="bevy-naadf"
+      data-cargo-no-default-features
+      data-cargo-features="webgpu"
+      data-wasm-opt="0"
+    />
+
+    <!-- The NAADF WGSL shaders are loaded at runtime by the Bevy asset server
+         from `src/assets/` (AssetPlugin.file_path). Copy that tree into dist so
+         the dev server serves it at the same path the asset server fetches. -->
+    <link
+      data-trunk
+      rel="copy-dir"
+      href="src/assets"
+      data-target-path="src/assets"
+    />
+
+    <!-- Cloudflare Pages COOP/COEP headers + cache rules (`_headers`), and the
+         caching service worker (`sw.js`). Both land in dist as-is; `sw.js` is
+         only registered by the production `init.js` (the CI-patched loader). -->
+    <link data-trunk rel="copy-file" href="_headers" />
+    <link data-trunk rel="copy-file" href="sw.js" />
+  </head>
+  <body>
+    <div id="loading">
+      <div id="progress-bar">
+        <div id="progress-fill" class="indeterminate"></div>
+      </div>
+      <div id="progress-text">Loading…</div>
+    </div>
+    <canvas id="bevy"></canvas>
+    <script>
+      // Progress-bar API — driven by the production `init.js` while it streams
+      // the wasm binary from R2. In dev (`trunk serve`) the bar just stays
+      // indeterminate until `TrunkApplicationStarted`.
+      window.updateLoadingProgress = (loaded, total) => {
+        const fill = document.getElementById("progress-fill");
+        fill.classList.remove("indeterminate");
+        const pct = Math.round((loaded / total) * 100);
+        fill.style.width = pct + "%";
+        document.getElementById("progress-text").textContent = pct + "%";
+      };
+      window.hideLoading = () =>
+        document.getElementById("loading").classList.add("hidden");
+      // Trunk's loader (dev) and the patched `init.js` (production) both
+      // dispatch this once the wasm app has started.
+      window.addEventListener("TrunkApplicationStarted", window.hideLoading);
+    </script>
+  </body>
+</html>

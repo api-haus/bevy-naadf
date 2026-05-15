@@ -1,0 +1,13 @@
+# Cloudflare Worker that proxies the bevy-naadf R2 bucket.
+#
+# The deploy CI uploads the (large) wasm binary to R2 to dodge the Cloudflare
+# Pages 25 MB asset limit; this worker serves it back with the CORS + CORP
+# headers the cross-origin-isolated page needs. Deployed name doubles as the
+# `*.workers.dev` subdomain: https://bevy-naadf-assets.<account>.workers.dev/
+name = "bevy-naadf-assets"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "bevy-naadf-assets"

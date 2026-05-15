@@ -1,0 +1,170 @@
+name: Deploy to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # Verify the FastNoise2 harness compiles — both the native API (unit tests)
+  # and the wasm32-unknown-emscripten C-ABI module the JS bridge will load.
+  # NOTE: voxel_noise is not yet wired into the renderer, so this job only
+  # proves the crate builds; its `dist/` output is not consumed by `deploy`.
+  voxel-noise:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write # sccache GHA cache
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        # clang + mold: the workspace `.cargo/config.toml` host linker.
+        # cmake: fastnoise2-sys builds the FastNoise2 C++ from source.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold cmake
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.74
+          actions-cache-folder: emsdk-cache
+
+      - name: Cache Emscripten
+        uses: actions/cache@v4
+        with:
+          path: ~/.emscripten_cache
+          key: emscripten-${{ runner.os }}-3.1.74
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-emscripten
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Cache voxel_noise Emscripten build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/wasm32-unknown-emscripten
+            crates/voxel_noise/dist
+          key: voxel-noise-emscripten-${{ hashFiles('Cargo.lock', 'crates/voxel_noise/src/**') }}
+          restore-keys: |
+            voxel-noise-emscripten-
+
+      - name: Clean stale CMake cache
+        # fastnoise2-sys's CMake configure step is not relocation-safe across
+        # cache restores — drop the previous build tree before rebuilding.
+        run: rm -rf target/wasm32-unknown-emscripten/release/build/fastnoise2-sys-*/out/build
+
+      - name: Build voxel_noise (Emscripten)
+        working-directory: crates/voxel_noise
+        run: make build
+
+      - name: Test voxel_noise (native)
+        run: cargo test -p voxel_noise
+
+      - name: Show sccache stats
+        run: sccache --show-stats
+
+  # Build the bevy-naadf WebGPU (wasm32-unknown-unknown) bundle with Trunk,
+  # push the large wasm to R2, and deploy the rest to Cloudflare Pages.
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write # sccache GHA cache
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      BINARYEN_CORES: "1" # prevent wasm-opt SIGSEGV from a race condition
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        # clang + mold: the workspace `.cargo/config.toml` host linker, used
+        # for build scripts / proc-macros even when the target is wasm32.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Cache WASM target
+        uses: actions/cache@v4
+        with:
+          path: target/wasm32-unknown-unknown
+          key: wasm-target-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            wasm-target-${{ hashFiles('Cargo.lock') }}-
+            wasm-target-
+
+      - name: Cache Trunk
+        id: cache-trunk
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/trunk
+          key: trunk-${{ runner.os }}-latest
+
+      - name: Install Trunk
+        if: steps.cache-trunk.outputs.cache-hit != 'true'
+        run: |
+          TRUNK_VERSION=$(curl -sL https://api.github.com/repos/trunk-rs/trunk/releases/latest | jq -r '.tag_name')
+          curl -sL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" | tar xz
+          sudo mv trunk /usr/local/bin/
+
+      - name: Configure wasm-opt for production
+        # The committed index.html keeps `data-wasm-opt="0"` for a fast
+        # `trunk serve`; the release artifact wants size optimisation.
+        run: sed -i 's/data-wasm-opt="0"/data-wasm-opt="s"/' crates/bevy_naadf/index.html
+
+      - name: Build WASM with Trunk
+        working-directory: crates/bevy_naadf
+        run: trunk build --release
+
+      - name: Show sccache stats
+        run: sccache --show-stats
+
+      # Upload the large WASM binary to R2 (bypasses the Pages 25 MB limit).
+      - name: Upload WASM to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          WASM_FILE=$(ls crates/bevy_naadf/dist/*_bg.wasm)
+          npx wrangler r2 object put bevy-naadf-assets/bevy-naadf.wasm --file "$WASM_FILE" --remote
+
+      - name: Patch WASM loading with progress bar
+        env:
+          COMMIT_HASH: ${{ github.sha }}
+          R2_WASM_URL: https://bevy-naadf-assets.yura415.workers.dev/bevy-naadf.wasm
+        run: ./scripts/patch-wasm-loading.sh crates/bevy_naadf/dist
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy crates/bevy_naadf/dist --project-name=bevy-naadf --commit-dirty=true

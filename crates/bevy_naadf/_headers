@@ -1,0 +1,19 @@
+# Cloudflare Pages headers for the bevy-naadf web build.
+#
+# COOP/COEP are not strictly required by the single-threaded WebGPU build, but
+# they are kept on so the page is cross-origin-isolated — the cross-origin R2
+# wasm fetch then relies on the r2-proxy worker stamping
+# `Cross-Origin-Resource-Policy: cross-origin` (see `workers/r2-proxy/`).
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+# Trunk content-hashes the JS/wasm filenames — safe to cache forever.
+/*.js
+  Cache-Control: public, max-age=31536000, immutable
+/*.wasm
+  Cache-Control: public, max-age=31536000, immutable
+
+# The NAADF WGSL shaders are copied verbatim (no content hash) — short cache.
+/src/assets/*
+  Cache-Control: public, max-age=3600, stale-while-revalidate=86400
