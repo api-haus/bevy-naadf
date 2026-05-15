@@ -22,8 +22,8 @@ Fix the bug where **shadow regions render pitch black** after the window is resi
 - **review** — `delegate-reviewer`. Fresh-eyes review against `04-review.md` criteria.
 
 ## Phase checklist
-- [ ] Phase 1 — Audit (`00-reuse-audit.md`)
-- [ ] Phase 2 — Write `01-context.md` from audit + Q&A answers
+- [x] Phase 1 — Audit (`00-reuse-audit.md`) — auditor `a438446f25a5a8ecf`, checkpoint `2b1d2cf`
+- [x] Phase 2 — Write `01-context.md` + `04-review.md` from audit + Q&A answers
 - [ ] Phase 3 — Design (`02-design.md`)
 - [ ] **HARD GATE** — user confirms design
 - [ ] Phase 4 — Impl-A: write failing test (`03a-impl-test.md`)
