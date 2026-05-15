@@ -23,14 +23,14 @@ Fix the bug where **shadow regions render pitch black** after the window is resi
 
 ## Phase checklist
 - [x] Phase 1 — Audit (`00-reuse-audit.md`) — auditor `a438446f25a5a8ecf`, checkpoint `2b1d2cf`
+- [x] Phase 1b — C# research (`00b-csharp-resize-research.md`) — confirms C# reallocates everything and has the same latent bug
 - [x] Phase 2 — Write `01-context.md` + `04-review.md` from audit + Q&A answers
-- [ ] Phase 3 — Design (`02-design.md`)
-- [ ] **HARD GATE** — user confirms design
-- [ ] Phase 4 — Impl-A: write failing test (`03a-impl-test.md`)
-- [ ] **HARD GATE** — user confirms test fails as expected
-- [ ] Phase 5 — Impl-B: write fix (`03b-impl-fix.md`)
-- [ ] **HARD GATE** — user confirms test passes
-- [ ] Phase 6 — Review (`05-review.md`)
+- [x] Phase 3 — Design (`02-design.md`) — architect proposed preserve-sample_counts; superseded by user direction
+- [x] Phase 4 — Impl-A: failing repro test (`03a-impl-test.md`) — `e2e_render --resize-test`, three captures, hyprctl-driven Wayland resize, full-frame luma gate. **Confirmed FAIL** at ratios 0.50 / 0.48 (threshold 0.70). Bug reproduces.
+- [x] Phase 5 — Impl-B attempt 1: reallocate-all-on-resize, preserve-nothing (`03b-impl-fix.md`, `03b-realloc-inventory.md`) — **disproved the ring-drain hypothesis.** Luma ratios byte-identical pre/post. Reverted per user; documented in `03c-hypothesis-pivot.md`.
+- [x] Phase 5b — Hypothesis pivot (`03c-hypothesis-pivot.md`) — new working theory: fixed per-frame ray/sample budget doesn't scale with `pixel_count`. Not ring drain.
+- [ ] Phase 6 — Impl-B attempt 2: TBD (pending user direction — investigate the budget-scaling hypothesis, or close session).
+- [ ] Phase 7 — Review (`05-review.md`)
 - [ ] Final hard gate — user signs off
 
 ## Files

@@ -244,3 +244,6 @@ rings) was the divergence. This fix:
 
 The faithful-port rule (`bevy-naadf-faithful-port-rule.md`) is RESPECTED:
 this fix converges with C#, not diverges from it.
+
+## Wrap-up (per user directive: revert + document)
+Production-code changes from this attempt have been reverted (see `03c-hypothesis-pivot.md`). The reallocate-everything direction is closed. The repro test remains as the failing oracle for whatever the real fix turns out to be.

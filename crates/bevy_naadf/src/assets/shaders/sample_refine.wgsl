@@ -74,6 +74,38 @@
 #import "shaders/color_compression.wgsl"::COLOR_DIF_PROB
 #import "shaders/common.wgsl"::{find_coprime, next_pow2};
 
+// Cap the indirect dispatch group count so we stay well within wgpu's
+// `max_compute_workgroups_per_dimension` (WebGPU spec minimum / native
+// wgpu default = 65535). When the indirect dispatch args exceed that
+// limit, wgpu's indirect-validation compute pass overwrites the args
+// with `(0,0,0)` (`wgpu-core/src/indirect_validation/dispatch.rs`), so
+// `count_valid_data_and_refine` / `count_invalid_data` silently no-op —
+// bucket counts stay empty, `valid_samples_compressed` stays empty,
+// `spatial_resampling` finds no reservoirs, and the GI bounce light
+// disappears. At 1920×1080 (pixel_count ≈ 2.07 M) the unclamped
+// `next_pow2((pixel_count * 8 + 63) / 64) = 131 072` exceeds the limit;
+// at 800×600 it stays well under, which is why the bug only manifests
+// at higher resolutions / after a resize that grows the viewport
+// (`docs/orchestrate/taa-resize-blackness/03c-hypothesis-pivot.md`).
+//
+// 32768 = half the wgpu-default limit — leaves comfortable headroom,
+// stays a power of two so the existing coprime shuffle stays correct,
+// and on the worst case (`pixel_count * 8` invalid samples = 16.6 M at
+// 1920×1080) still processes 32768 × 64 = 2.1 M samples per pass which
+// distributes to ≈ 65 samples / 8×8 bucket — well above the 12-sample
+// `< 12 ⇒ final_compressed_index = 0u` survival gate at line 706.
+// This is a deliberate divergence from C# NAADF (`renderSampleRefine.fx
+// :99-100`, `:117`, `:264`), which has the same latent overflow but
+// never triggered it because the C# build was used at preset
+// resolutions where `pixel_count * 8 / 64` stayed under 65 535
+// (`docs/orchestrate/taa-resize-blackness/00b-csharp-resize-research
+// .md`).
+const MAX_INDIRECT_GROUPS: u32 = 32768u;
+
+fn capped_padded_groups(total: u32) -> u32 {
+    return min(next_pow2((total + 63u) / 64u), MAX_INDIRECT_GROUPS);
+}
+
 // --- @group(0) — the shared sample-refine bindings --------------------------
 
 @group(0) @binding(0) var<uniform> gi_params: GpuGiParams;
@@ -249,10 +281,15 @@ fn compute_valid_history() {
     sample_counts[0] = cur_sample_indices;
     sample_counts[1] = total_counts;
 
-    let valid_group_count = (total_counts.x + 63u) / 64u;
-    let invalid_group_count = (total_counts.y + 63u) / 64u;
-    let padded_valid_group_count = next_pow2(valid_group_count);
-    let padded_invalid_group_count = next_pow2(invalid_group_count);
+    // Cap the indirect dispatch group count at `MAX_INDIRECT_GROUPS` so
+    // wgpu's indirect-validation pass does not zero the dispatch args on
+    // high-resolution viewports — see the `MAX_INDIRECT_GROUPS` doc
+    // above. The consumer passes (`count_valid_data_and_refine` /
+    // `count_invalid_data`) apply the same cap when they recompute the
+    // shuffle modulus, so the coprime walk stays a permutation of the
+    // capped group range.
+    let padded_valid_group_count = capped_padded_groups(total_counts.x);
+    let padded_invalid_group_count = capped_padded_groups(total_counts.y);
     sample_counts[2] = vec2<u32>(
         find_coprime(padded_valid_group_count, gi_params.rand_counter),
         find_coprime(padded_invalid_group_count, gi_params.rand_counter_b),
@@ -451,7 +488,11 @@ fn count_valid_data_and_refine(
     let max_size = gi_params.valid_sample_storage_count
         * gi_params.screen_width * gi_params.screen_height;
 
-    let padded_group_count = next_pow2((total_count + 63u) / 64u);
+    // Same cap as in `compute_valid_history` — see `MAX_INDIRECT_GROUPS`
+    // doc. Coprime in `sample_counts[2].x` was found against the capped
+    // count, so the modulus here must match exactly for the shuffle to
+    // remain a permutation.
+    let padded_group_count = capped_padded_groups(total_count);
     let shuffled_group = shuffle_group(
         workgroup_id.x, padded_group_count, group_shuffle_coprime, gi_params.rand_counter,
     );
@@ -566,7 +607,11 @@ fn count_invalid_data(
     let max_size = gi_params.invalid_sample_storage_count
         * gi_params.screen_width * gi_params.screen_height;
 
-    let padded_group_count = next_pow2((total_count + 63u) / 64u);
+    // Same cap as in `compute_valid_history` — see `MAX_INDIRECT_GROUPS`
+    // doc. Without it, at 1920×1080 the unclamped `next_pow2` here can
+    // reach 131 072 and wgpu's indirect validation zeros the dispatch,
+    // dropping every invalid-sample bucket count for the frame.
+    let padded_group_count = capped_padded_groups(total_count);
     let shuffled_group = shuffle_group(
         workgroup_id.x, padded_group_count, group_shuffle_coprime, gi_params.rand_counter,
     );
