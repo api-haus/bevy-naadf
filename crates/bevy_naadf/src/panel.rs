@@ -84,10 +84,13 @@ use crate::render::taa::CAMERA_HISTORY_DEPTH;
 const DRAG_THRESHOLD_PX: f32 = 2.0;
 
 /// Drag sensitivity reference width in **logical pixels** — one full traversal
-/// of this width spans the knob's full `[min..max]` range
+/// of this width spans **1/8 of** the knob's `[min..max]` range (8× the
+/// original 320 px, so 1 px ≤ 0.004 of the normalised range at base
+/// sensitivity). Multiple drag strokes are needed to sweep the full range, but
+/// 0.01-level control is comfortable at slow motion.
 /// (`25-design-panel-mouse.md` §4.1). Scaled by `Window::scale_factor()` to
 /// match physical-pixel motion on hi-DPI displays (§IR.3.B).
-const DRAG_FULL_RANGE_PX: f32 = 320.0;
+const DRAG_FULL_RANGE_PX: f32 = 2560.0;
 
 /// Shift-modifier multiplier on drag sensitivity — matches the keyboard
 /// `Shift+←/→` fine-grain semantics (4× more pixels for the same delta).

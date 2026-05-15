@@ -76,7 +76,7 @@ The system chain in `lib.rs` is now `toggle_panel → adjust_panel → mouse_int
 
 ### Rationale (cross-link: `25-design-panel-mouse.md` §4)
 
-- **320 px** ≈ the panel's value-column width on a 360-px-wide panel with 10-px padding on each side and a ~30-px label gutter. Dragging from "near the left edge of the value column" to "near the right" sweeps the full range.
+- **2560 px** (8× the original 320 px) — a full panel-wide drag (~320 logical px) sweeps 1/8 of `[min..max]`; slow motion (5–10 px/s) gives ~0.01-unit control. Multiple strokes cover the full range. Shift = 4× finer (32× finer than the original).
 - **Uniform sensitivity across knobs** — every slider feels the same; no per-knob tuning needed. Predictable.
 - **Per-frame integration (no captured `v0`)** — drag math reads the current value each frame and adds this-frame's delta. Composes cleanly with mid-drag keyboard `R` resets (which would clobber a captured-`v0` design). Documented as a design-review fix in `25-design-panel-mouse.md` §IR.1.3.
 - **U32 fractional accumulator** — slow drags on narrow-range integer knobs (e.g. `bounce_count` 1..3) still advance; sub-step fractions are carried in the `Dragging::frac_accum` field between frames.

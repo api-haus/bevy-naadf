@@ -109,7 +109,7 @@ Drag is a global mode (only one row can be dragged at a time, and the bool-vs-sl
 
 ### §4.1 Choice
 
-**Each pixel of horizontal cursor motion = `(max - min) / drag_full_range_px` units of value change**, where `drag_full_range_px = 320.0` (the panel is 360 px wide minus 20 px row padding ≈ the value column's pixel width). A full panel-wide drag covers the full `[min..max]` range.
+**Each pixel of horizontal cursor motion = `(max - min) / drag_full_range_px` units of value change**, where `drag_full_range_px = 2560.0` (8× the original 320 px). A full panel-wide drag (~320 px) sweeps **1/8 of** the `[min..max]` range; multiple strokes traverse the full range. At slow motion (5–10 px/s) this gives ~0.01-unit control. Shift held = 4× finer (32× finer than the original default).
 
 For integer knobs (`U32`): the running float-accumulated value is rounded on commit each frame. The drag math keeps the accumulator at f64 precision in the `PanelDrag` resource (sub-step `f64 fractional_accumulator`) so a slow drag past one-step boundaries actually moves (without f64 accumulation, a single 1-px move on a u32 with range 1..3 would map to ~0.006 — rounding to 0 — and the drag would never advance).
 
