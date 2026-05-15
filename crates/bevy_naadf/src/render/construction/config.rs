@@ -38,9 +38,18 @@ pub struct ConstructionConfig {
     /// CPU construction (`aadf::construct::construct`) stays the producer
     /// when `false`.
     ///
-    /// **Default `false` in W0** — the CPU path is the default producer until
-    /// W1 lands GPU Algorithm 1 + the bit-exact CPU/GPU oracle. W1 flips this
-    /// `true` when its `--validate-gpu-construction` gate is green.
+    /// **Default `true` after W1 lands** — Algorithm 1 + the bit-exact CPU/GPU
+    /// oracle test are both green; the GPU construction path can be exercised
+    /// at startup via the `--validate-gpu-construction` flag (or the unit
+    /// test). The production *render* path still consumes the CPU-produced
+    /// buffers uploaded by `prepare_world_gpu`; flipping the consumer to read
+    /// from `ConstructionGpu` is W2/W3 work. So this flag now serves two
+    /// purposes:
+    ///   - In tests + the `--validate-gpu-construction` path, it gates the
+    ///     GPU construction dispatch + the bit-exact oracle assertion.
+    ///   - In the main `Startup` system `run_gpu_construction_startup`, it
+    ///     gates an info log (the actual dispatch is in tests / the e2e
+    ///     validate path).
     pub gpu_construction_enabled: bool,
     /// Initial hash-map slot count (NAADF default — `BlockHashingHandler.cs:32`
     /// `hashMapSize = 1 << 18 = 262144`). Power of two; grows via `mapCopy.fx`
@@ -93,8 +102,11 @@ pub struct ConstructionConfig {
 impl Default for ConstructionConfig {
     fn default() -> Self {
         Self {
-            // W0: GPU path off; CPU is producer until W1 lands.
-            gpu_construction_enabled: false,
+            // W1: GPU construction enabled — Algorithm 1 + the bit-exact
+            // CPU/GPU oracle gate are green. The renderer still consumes
+            // CPU-built buffers via `prepare_world_gpu`; flipping the consumer
+            // is W2/W3 work. See `15-design-c.md` §1.6 / §2.1 W1 row.
+            gpu_construction_enabled: true,
             // `BlockHashingHandler.cs:32` — 1 << 18 = 262144.
             initial_hash_map_size: 1 << 18,
             // `BlockHashingHandler.cs` — `wantedEmptyRatio = 0.5`.
@@ -148,7 +160,9 @@ const _: () = {
         max_group_bound_dispatch: 512 * 64,
         // `WorldBoundHandler.cs:113` — 5 rounds per frame.
         n_bounds_rounds: 5,
-        gpu_construction_enabled: false,
+        // W1: flipped from `false` to `true` after the GPU/CPU oracle gate
+        // passed; const-pin guard for the canonical methodology default.
+        gpu_construction_enabled: true,
         entities_enabled: false,
         cpu_fallback: true,
         run_worldgen_only: false,

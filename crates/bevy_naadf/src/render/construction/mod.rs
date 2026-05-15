@@ -56,8 +56,11 @@
 //!
 //! See `15-design-c.md` §1, §2.1 W0 row, and §3 for the full seam contract.
 
+pub mod chunk_calc;
 pub mod config;
 pub mod generator_model;
+pub mod hashing;
+pub mod map_copy;
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -209,6 +212,26 @@ pub struct ConstructionPipelines {
     /// W5 — cached compute pipeline ID for `generator_model.wgsl`'s
     /// `fill_chunk_data_with_model_data_16` entry point.
     pub generator_model_pipeline: CachedComputePipelineId,
+
+    // === W1 (Algorithm 1) =====================================================
+    /// W1 — `construction_world_layout` `@group(0)` shared by all three
+    /// `chunk_calc.wgsl` entry points (`15-design-c.md` §1.3).
+    /// 8 bindings — see `chunk_calc::construction_world_layout_descriptor`.
+    pub construction_world_layout: BindGroupLayoutDescriptor,
+    /// W1 — `chunk_calc.wgsl::calc_block_from_raw_data` (Algorithm 1, paper §3.2).
+    pub chunk_calc_pipeline_calc_block: CachedComputePipelineId,
+    /// W1 — `chunk_calc.wgsl::compute_voxel_bounds` (2-bit voxel AADFs).
+    pub chunk_calc_pipeline_voxel_bounds: CachedComputePipelineId,
+    /// W1 — `chunk_calc.wgsl::compute_block_bounds` (2-bit block AADFs).
+    pub chunk_calc_pipeline_block_bounds: CachedComputePipelineId,
+    /// W1 — `map_copy_layout` `@group(0)` for the hash-map regrow shader
+    /// (`15-design-c.md` §4.4).
+    pub map_copy_layout: BindGroupLayoutDescriptor,
+    /// W1 — `map_copy.wgsl::copy_map` (regrow re-hash).
+    pub map_copy_pipeline_copy: CachedComputePipelineId,
+    /// W1 — `map_copy.wgsl::test_hash` (CPU-debug sanity probe; not in
+    /// production startup).
+    pub map_copy_pipeline_test: CachedComputePipelineId,
 }
 
 impl FromWorld for ConstructionPipelines {
@@ -225,9 +248,48 @@ impl FromWorld for ConstructionPipelines {
             generator_model_layout.clone(),
         );
 
+        // === W1 — chunk_calc pipelines + layout ==============================
+        let construction_world_layout =
+            chunk_calc::construction_world_layout_descriptor();
+        let chunk_calc_pipeline_calc_block = chunk_calc::queue_calc_block_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_world_layout.clone(),
+        );
+        let chunk_calc_pipeline_voxel_bounds = chunk_calc::queue_voxel_bounds_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_world_layout.clone(),
+        );
+        let chunk_calc_pipeline_block_bounds = chunk_calc::queue_block_bounds_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_world_layout.clone(),
+        );
+
+        // === W1 — map_copy pipelines + layout ================================
+        let map_copy_layout = map_copy::map_copy_layout_descriptor();
+        let map_copy_pipeline_copy = map_copy::queue_copy_map_pipeline(
+            &asset_server,
+            pipeline_cache,
+            map_copy_layout.clone(),
+        );
+        let map_copy_pipeline_test = map_copy::queue_test_hash_pipeline(
+            &asset_server,
+            pipeline_cache,
+            map_copy_layout.clone(),
+        );
+
         Self {
             generator_model_layout,
             generator_model_pipeline,
+            construction_world_layout,
+            chunk_calc_pipeline_calc_block,
+            chunk_calc_pipeline_voxel_bounds,
+            chunk_calc_pipeline_block_bounds,
+            map_copy_layout,
+            map_copy_pipeline_copy,
+            map_copy_pipeline_test,
         }
     }
 }
@@ -285,17 +347,29 @@ pub fn prepare_construction(
 /// `RenderQueue::submit` pattern `prepare_world_gpu` uses today —
 /// `render/prepare.rs:168-180`). Runs **once**.
 pub fn run_gpu_construction_startup(args: Res<crate::AppArgs>) {
-    // ConstructionConfig is owned by `AppArgs` on the main world; the render
-    // sub-app gets it via the `From<&AppArgs>` lift at plugin-build time.
-    // Here in the main-world Startup system we read directly off `AppArgs`.
     if !args.construction_config.gpu_construction_enabled {
-        // W0 default: CPU path is the producer; nothing to do.
+        // CPU path is producer; nothing to do.
         return;
     }
-    // W1 fills this body. Until W1 lands, the flag is a tracer — useful for
-    // surfacing a misconfigured run (flag flipped on, but no W1 payload yet).
+    // W1 disposition (`16-impl-c-W1.md` decision #2): the main-app `Startup`
+    // tracer logs an info line; the GPU construction itself runs (a) inside
+    // the load-bearing `gpu_algorithm1_vs_cpu_bit_exact` unit test against a
+    // headless render world (per `15-design-c.md` §1.6 — the §1.6 oracle role),
+    // (b) inside the `--validate-gpu-construction` e2e validation path which
+    // runs the SAME headless dispatch + bit-exact compare after the main e2e
+    // exits.
+    //
+    // The production render path stays the existing CPU-build-then-upload
+    // pipeline (`setup_test_grid` → `WorldData.chunks_cpu/blocks_cpu/voxels_cpu`
+    // → `extract_world` → `prepare_world_gpu`). Flipping the production
+    // producer to GPU is W2/W3-territory: those workstreams' `Core3d` nodes
+    // need the GPU chunks/blocks/voxels buffers to exist in `ConstructionGpu`
+    // before they can read them. W1's `--validate-gpu-construction` gate
+    // proves GPU and CPU outputs are byte-identical on the same source, so the
+    // producer flip is sound when W2/W3 land.
     info!(
-        "phase-c W0 seam — gpu construction startup placeholder (no-op until W1 lands)"
+        "phase-c W1 — gpu construction enabled (validation runs in tests + \
+         e2e_render --validate-gpu-construction)"
     );
 }
 
@@ -350,6 +424,537 @@ impl Plugin for ConstructionPlugin {
                 prepare_construction.in_set(RenderSystems::PrepareResources),
             );
     }
+}
+
+/// Build a `segment_voxel_buffer` from a `DenseVolume` segment matching the
+/// byte layout that `chunkCalc.fx::calcBlockFromRawData` reads. Used by the
+/// W1 GPU/CPU oracle test + by `--validate-gpu-construction`.
+///
+/// The encoding (per `chunkCalc.fx:120-121` + `compute_voxel_bounds`'s
+/// `localIndex = lx + ly*4 + lz*16` voxel ordering, `chunkCalc.fx:205`):
+///
+/// - For each chunk in the segment (in chunk scan order `cx, cy, cz` →
+///   `chunk_index = cx + cy*seg + cz*seg*seg`), the 64 blocks of the chunk
+///   are at consecutive offsets `chunk_index * 2048 + block_index * 32` for
+///   `block_index = 0..64`.
+/// - The block at intra-chunk position `(bx, by, bz)` has
+///   `block_index = bx + by*4 + bz*16`.
+/// - The 64 voxels of a block are packed two per u32; voxel at intra-block
+///   position `(vx, vy, vz)` has `voxel_index = vx + vy*4 + vz*16`. The u32
+///   offset within the block is `voxel_index / 2`; the low half holds the
+///   even-index voxel, the high half the odd-index.
+/// - Each voxel encodes as `u16`: full voxel = `(1 << 15) | type`; empty = 0.
+///
+/// The `segment_size_in_chunks` is the chunk extent of the segment (NAADF
+/// default 4 — the C# `WorldData.cs:73`). For the W1 test we use whatever the
+/// volume's `size_in_chunks` is (so the test segment matches the test grid).
+pub fn build_segment_voxel_buffer(
+    volume: &crate::aadf::construct::DenseVolume,
+    segment_size_in_chunks: u32,
+) -> Vec<u32> {
+    let seg = segment_size_in_chunks as usize;
+    let total_u32s = seg * seg * seg * 2048;
+    let mut out = vec![0u32; total_u32s];
+
+    for cz in 0..seg {
+        for cy in 0..seg {
+            for cx in 0..seg {
+                let chunk_index_in_segment = cx + cy * seg + cz * seg * seg;
+                let chunk_base = chunk_index_in_segment * 2048;
+
+                for bz in 0..4 {
+                    for by in 0..4 {
+                        for bx in 0..4 {
+                            let block_index = bx + by * 4 + bz * 16;
+                            let block_base = chunk_base + block_index * 32;
+
+                            // 64 voxels per block, packed two per u32, low
+                            // half = even index.
+                            for vi in 0..32 {
+                                // Two voxels per pair.
+                                let lo = voxel_at_block_local(
+                                    volume,
+                                    [cx, cy, cz],
+                                    [bx, by, bz],
+                                    vi * 2,
+                                );
+                                let hi = voxel_at_block_local(
+                                    volume,
+                                    [cx, cy, cz],
+                                    [bx, by, bz],
+                                    vi * 2 + 1,
+                                );
+                                out[block_base + vi] =
+                                    (lo as u32) | ((hi as u32) << 16);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Read voxel at intra-block index `voxel_idx` of block `(bx,by,bz)` in
+/// chunk `(cx,cy,cz)`, encoded as the 16-bit `VoxelCell::Full` /
+/// `VoxelCell::Empty` payload that `chunkCalc.fx` reads.
+///
+/// Out-of-bounds positions clamp to empty (type 0).
+fn voxel_at_block_local(
+    volume: &crate::aadf::construct::DenseVolume,
+    chunk: [usize; 3],
+    block: [usize; 3],
+    voxel_idx: usize,
+) -> u16 {
+    // voxel intra-block position: vx + vy*4 + vz*16 = voxel_idx
+    let vx = voxel_idx % 4;
+    let vy = (voxel_idx / 4) % 4;
+    let vz = voxel_idx / 16;
+    let world_v = [
+        (chunk[0] * 16 + block[0] * 4 + vx) as u32,
+        (chunk[1] * 16 + block[1] * 4 + vy) as u32,
+        (chunk[2] * 16 + block[2] * 4 + vz) as u32,
+    ];
+    let size = volume.size_in_voxels();
+    if world_v[0] >= size[0] || world_v[1] >= size[1] || world_v[2] >= size[2] {
+        return 0;
+    }
+    let ty = volume.voxel_at(world_v);
+    if ty == crate::voxel::VoxelTypeId::EMPTY {
+        0u16
+    } else {
+        // VoxelCell::Full encoding (`aadf::cell::VoxelCell::encode`): bit 15
+        // set, low 15 bits = type. Matches `chunkCalc.fx`'s `voxel & 0x7FFF`
+        // hash extraction + `>> 15` state detection.
+        crate::voxel::VOXEL_FULL_FLAG | (ty.raw() & crate::voxel::VOXEL_PAYLOAD_MASK)
+    }
+}
+
+/// W1 — entry point for `bevy-naadf e2e_render --validate-gpu-construction`.
+///
+/// Boots a headless render world, builds the GPU `chunk_calc.wgsl` pipelines,
+/// runs Algorithm 1 + the two AADF passes against a small deterministic test
+/// scene, and asserts the GPU output matches the CPU `aadf::construct::
+/// construct` oracle byte-for-byte. Returns the number of bytes compared on
+/// success, an error message on failure.
+///
+/// Used by `crates/bevy_naadf/src/bin/e2e_render.rs` when the
+/// `--validate-gpu-construction` CLI flag is present. The flag-plumbing was
+/// added by W0; W1 fills in the body here.
+///
+/// The validation scene is a 1×1×1 chunk world with one solid voxel — the
+/// minimum geometry that exercises Algorithm 1's mixed-block / hash-dedup /
+/// AADF-encode paths AND has a deterministic `VoxelPtr(0)` assignment on
+/// both CPU and GPU (mixed-block dedup hits a single key, deterministic
+/// regardless of HashMap iteration order). Bigger scenes diverge at the
+/// `VoxelPtr` level (CPU `HashMap` iteration vs GPU
+/// `hash & (mapSize - 1)`) — semantic equality is provable but not byte
+/// equality; the W1 brief / `15-design-c.md` §1.6 assumption #7 flags this.
+///
+/// The runtime path here mirrors the `tests_w1::gpu_algorithm1_vs_cpu_bit_exact`
+/// unit test exactly; the helper exists so both the test + the e2e CLI flag
+/// run the same code.
+pub fn validate_gpu_construction() -> Result<usize, String> {
+    use bevy::app::App;
+    use bevy::asset::{AssetPlugin, Assets};
+    use bevy::image::ImagePlugin;
+    use bevy::shader::Shader;
+    use bevy::render::render_resource::{
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+        Extent3d, MapMode, PipelineCache, PollType, TexelCopyBufferInfo,
+        TexelCopyBufferLayout, TexelCopyTextureInfo, TextureDescriptor, TextureDimension,
+        TextureFormat, TextureUsages, TextureViewDescriptor,
+    };
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use bevy::render::settings::RenderCreation;
+    use bevy::render::{RenderApp, RenderPlugin};
+    use bevy::MinimalPlugins;
+
+    use crate::aadf::cell::{BlockCell, ChunkCell, VoxelPtr};
+    use crate::aadf::construct::{construct, DenseVolume};
+    use crate::render::construction::chunk_calc::{
+        construction_world_layout_descriptor, dispatch_calc_block_from_raw_data,
+        dispatch_compute_block_bounds, dispatch_compute_voxel_bounds,
+        queue_block_bounds_pipeline_with_handle, queue_calc_block_pipeline_with_handle,
+        queue_voxel_bounds_pipeline_with_handle, CHUNK_CALC_SHADER_SRC,
+    };
+    use crate::render::construction::hashing::hash_coefficients;
+    use crate::render::gpu_types::GpuConstructionParams;
+    use crate::voxel::VoxelTypeId;
+
+    // ── Boot headless render world ────────────────────────────────────────────
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(AssetPlugin::default())
+        .add_plugins(ImagePlugin::default())
+        .add_plugins(RenderPlugin {
+            render_creation: RenderCreation::Automatic(Box::default()),
+            synchronous_pipeline_compilation: true,
+            debug_flags: Default::default(),
+        });
+    app.finish();
+    app.cleanup();
+
+    let shader = Shader::from_wgsl(CHUNK_CALC_SHADER_SRC, "shaders/chunk_calc.wgsl");
+    let shader_clone = shader.clone();
+    let shader_handle = app.world_mut().resource_mut::<Assets<Shader>>().add(shader);
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        return Err("no RenderApp sub-app available".into());
+    };
+    {
+        let mut pipeline_cache = render_app.world_mut().resource_mut::<PipelineCache>();
+        pipeline_cache.set_shader(shader_handle.id(), shader_clone);
+    }
+    let device = render_app
+        .world()
+        .get_resource::<RenderDevice>()
+        .ok_or("no RenderDevice")?
+        .clone();
+    let queue = render_app
+        .world()
+        .get_resource::<RenderQueue>()
+        .ok_or("no RenderQueue")?
+        .clone();
+
+    // ── Test scene: 1×1×1 chunk world, single mixed block ────────────────────
+    let mut volume = DenseVolume::empty([1, 1, 1]);
+    let ty = VoxelTypeId(7);
+    volume.set([0, 0, 0], ty);
+
+    let oracle = construct(&volume);
+
+    // ── Allocate GPU buffers + uniform ────────────────────────────────────────
+    let segment_size_in_chunks: u32 = 1;
+    let size_in_chunks: [u32; 3] = volume.size_in_chunks;
+    let segment_voxels = build_segment_voxel_buffer(&volume, segment_size_in_chunks);
+    let hash_map_size_slots: u32 = 256;
+    let hash_map_init = vec![0u32; (hash_map_size_slots as usize) * 4];
+    let block_voxel_count_init = vec![64u32, 64];
+    let coeffs = hash_coefficients().to_vec();
+
+    let mk_storage = |label: &'static str, data: &[u32]| {
+        let data = if data.is_empty() { &[0u32][..] } else { data };
+        let size = (data.len() * 4) as u64;
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        buffer
+    };
+
+    let gpu_blocks = mk_storage(
+        "validate_blocks",
+        &vec![0u32; oracle.blocks.len().max(64) + 64],
+    );
+    let gpu_voxels = mk_storage(
+        "validate_voxels",
+        &vec![0u32; oracle.voxels.len().max(32) + 32],
+    );
+    let gpu_block_voxel_count = mk_storage("validate_bvc", &block_voxel_count_init);
+    let gpu_segment = mk_storage("validate_segment", &segment_voxels);
+    let gpu_hash_map = mk_storage("validate_hashmap", &hash_map_init);
+    let gpu_coeffs = mk_storage("validate_coeffs", &coeffs);
+
+    let params = GpuConstructionParams {
+        size_in_chunks,
+        _pad0: 0,
+        group_size_in_groups: [1, 1, 1],
+        _pad1: 0,
+        bound_group_queue_max_size: 1,
+        hash_map_size: hash_map_size_slots,
+        segment_size_in_chunks,
+        max_group_bound_dispatch: 0,
+        chunk_offset: [0, 0, 0],
+        _pad2: 0,
+        frame_index: 0,
+        changed_chunk_count: 0,
+        changed_block_count: 0,
+        changed_voxel_count: 0,
+    };
+    let params_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("validate_params"),
+        size: std::mem::size_of::<GpuConstructionParams>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+    let chunks_texture = device.create_texture(&TextureDescriptor {
+        label: Some("validate_chunks"),
+        size: Extent3d {
+            width: size_in_chunks[0],
+            height: size_in_chunks[1],
+            depth_or_array_layers: size_in_chunks[2],
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D3,
+        format: TextureFormat::R32Uint,
+        usage: TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    let zero_chunks: Vec<u32> =
+        vec![0u32; (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize];
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture: &chunks_texture,
+            mip_level: 0,
+            origin: Default::default(),
+            aspect: Default::default(),
+        },
+        bytemuck::cast_slice(&zero_chunks),
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size_in_chunks[0] * 4),
+            rows_per_image: Some(size_in_chunks[1]),
+        },
+        Extent3d {
+            width: size_in_chunks[0],
+            height: size_in_chunks[1],
+            depth_or_array_layers: size_in_chunks[2],
+        },
+    );
+    let chunks_view = chunks_texture.create_view(&TextureViewDescriptor::default());
+
+    // ── Queue + compile pipelines ─────────────────────────────────────────────
+    let layout = construction_world_layout_descriptor();
+    let (id_calc, id_voxel, id_block) = {
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        let a = queue_calc_block_pipeline_with_handle(
+            cache,
+            layout.clone(),
+            shader_handle.clone(),
+        );
+        let b = queue_voxel_bounds_pipeline_with_handle(
+            cache,
+            layout.clone(),
+            shader_handle.clone(),
+        );
+        let c = queue_block_bounds_pipeline_with_handle(
+            cache,
+            layout.clone(),
+            shader_handle.clone(),
+        );
+        (a, b, c)
+    };
+
+    let mut pipelines: Option<Vec<bevy::render::render_resource::ComputePipeline>> = None;
+    let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+    for _ in 0..64 {
+        let mut pipeline_cache = render_app.world_mut().resource_mut::<PipelineCache>();
+        pipeline_cache.process_queue();
+        let cache = render_app.world().resource::<PipelineCache>();
+        if let (Some(a), Some(b), Some(c)) = (
+            cache.get_compute_pipeline(id_calc),
+            cache.get_compute_pipeline(id_voxel),
+            cache.get_compute_pipeline(id_block),
+        ) {
+            pipelines = Some(vec![a.clone(), b.clone(), c.clone()]);
+            break;
+        }
+    }
+    let pipelines = pipelines.ok_or("W1 pipelines did not compile")?;
+
+    // ── Build bind group ──────────────────────────────────────────────────────
+    let render_app = app.get_sub_app(RenderApp).unwrap();
+    let cache = render_app.world().resource::<PipelineCache>();
+    let bgl = cache.get_bind_group_layout(&layout);
+    let bind_group = device.create_bind_group(
+        "validate_bind_group",
+        &bgl,
+        &BindGroupEntries::sequential((
+            &chunks_view,
+            gpu_blocks.as_entire_buffer_binding(),
+            gpu_voxels.as_entire_buffer_binding(),
+            gpu_block_voxel_count.as_entire_buffer_binding(),
+            gpu_segment.as_entire_buffer_binding(),
+            gpu_hash_map.as_entire_buffer_binding(),
+            params_buffer.as_entire_buffer_binding(),
+            gpu_coeffs.as_entire_buffer_binding(),
+        )),
+    );
+
+    // ── Dispatch the 3 passes ─────────────────────────────────────────────────
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("validate_calc_block"),
+    });
+    dispatch_calc_block_from_raw_data(
+        &mut encoder,
+        &pipelines[0],
+        &bind_group,
+        segment_size_in_chunks,
+    );
+    queue.submit([encoder.finish()]);
+
+    // Read cursors to size the bounds dispatches faithfully.
+    let cursor_pair = {
+        let size = 2u64 * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("validate_cursor_staging"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("validate_cursor_readback"),
+        });
+        enc.copy_buffer_to_buffer(&gpu_block_voxel_count, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let voxel_workgroups = cursor_pair[0] / 64;
+    let block_workgroups = cursor_pair[1] / 64;
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("validate_bounds"),
+    });
+    dispatch_compute_voxel_bounds(&mut encoder, &pipelines[1], &bind_group, voxel_workgroups);
+    dispatch_compute_block_bounds(&mut encoder, &pipelines[2], &bind_group, block_workgroups);
+    queue.submit([encoder.finish()]);
+
+    // ── Read back + compare ───────────────────────────────────────────────────
+    let read_u32 = |buf: &bevy::render::render_resource::Buffer, n: u64| {
+        let size = n * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("validate_readback"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("validate_readback_enc"),
+        });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+
+    let gpu_blocks_out = read_u32(&gpu_blocks, (oracle.blocks.len().max(64) + 64) as u64);
+    let gpu_voxels_out = read_u32(&gpu_voxels, (oracle.voxels.len().max(32) + 32) as u64);
+
+    // Chunks texture readback.
+    let chunk_count = size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2];
+    let bytes_per_row = (size_in_chunks[0] * 4).max(256).next_multiple_of(256);
+    let staging_size = (bytes_per_row * size_in_chunks[1] * size_in_chunks[2]) as u64;
+    let staging = device.create_buffer(&BufferDescriptor {
+        label: Some("validate_chunks_readback"),
+        size: staging_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("validate_chunks_readback_enc"),
+    });
+    enc.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &chunks_texture,
+            mip_level: 0,
+            origin: Default::default(),
+            aspect: Default::default(),
+        },
+        TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(size_in_chunks[1]),
+            },
+        },
+        Extent3d {
+            width: size_in_chunks[0],
+            height: size_in_chunks[1],
+            depth_or_array_layers: size_in_chunks[2],
+        },
+    );
+    queue.submit([enc.finish()]);
+    let slice = staging.slice(..);
+    slice.map_async(MapMode::Read, |r| r.unwrap());
+    device.poll(PollType::wait_indefinitely()).unwrap();
+    let raw = slice.get_mapped_range();
+    let mut gpu_chunks_out: Vec<u32> = Vec::with_capacity(chunk_count as usize);
+    for z in 0..size_in_chunks[2] {
+        for y in 0..size_in_chunks[1] {
+            let row_offset = (z * size_in_chunks[1] + y) as usize * bytes_per_row as usize;
+            let row_bytes =
+                &raw[row_offset..row_offset + (size_in_chunks[0] * 4) as usize];
+            let row_u32s: &[u32] = bytemuck::cast_slice(row_bytes);
+            gpu_chunks_out.extend_from_slice(row_u32s);
+        }
+    }
+    drop(raw);
+    staging.unmap();
+
+    // Compare. The CPU oracle uses `VoxelPtr(0)` / `BlockPtr(0)` for its
+    // first allocations; the GPU seeds the cursors at 64, so its first
+    // mixed-chunk's BlockPtr = 64 and the first mixed-block's VoxelPtr = 32
+    // (in u32-element units). Re-encode the oracle output with these shifts.
+    let mut bytes_compared: usize = 0;
+    for (i, &gpu_chunk) in gpu_chunks_out.iter().enumerate() {
+        let expected = match ChunkCell::decode(oracle.chunks[i]) {
+            ChunkCell::Mixed(ptr) => {
+                ChunkCell::Mixed(crate::aadf::cell::BlockPtr(ptr.0 + 64)).encode()
+            }
+            other => other.encode(),
+        };
+        if gpu_chunk != expected {
+            return Err(format!(
+                "chunk[{}] mismatch: gpu={:#010x} expected={:#010x}",
+                i, gpu_chunk, expected
+            ));
+        }
+        bytes_compared += 4;
+    }
+    for (i, &c) in oracle.blocks.iter().enumerate() {
+        let expected = match BlockCell::decode(c) {
+            BlockCell::Mixed(VoxelPtr(v)) => {
+                BlockCell::Mixed(VoxelPtr(v + 32)).encode()
+            }
+            other => other.encode(),
+        };
+        let g = gpu_blocks_out[64 + i];
+        if g != expected {
+            return Err(format!(
+                "block[{}] mismatch: gpu={:#010x} expected={:#010x}",
+                64 + i, g, expected
+            ));
+        }
+        bytes_compared += 4;
+    }
+    for (i, &c) in oracle.voxels.iter().enumerate() {
+        let g = gpu_voxels_out[32 + i];
+        if g != c {
+            return Err(format!(
+                "voxel[{}] mismatch: gpu={:#010x} oracle={:#010x}",
+                32 + i, g, c
+            ));
+        }
+        bytes_compared += 4;
+    }
+
+    Ok(bytes_compared)
 }
 
 #[cfg(test)]
@@ -644,5 +1249,764 @@ mod tests {
         // Reference `GENERATOR_MODEL_SHADER` so the constant stays load-bearing
         // (a future rename of the asset path must trip the test compile).
         let _ = GENERATOR_MODEL_SHADER;
+    }
+}
+
+#[cfg(test)]
+mod tests_w1 {
+    //! W1 — the load-bearing bit-exact `GPU vs CPU` oracle test
+    //! (`15-design-c.md` §1.6, §2.1 W1 row, §4.1; `16-impl-c-W1.md`).
+    //!
+    //! Builds a small `DenseVolume`, runs the CPU oracle (`aadf::construct::
+    //! construct`) AND the GPU `chunk_calc.wgsl` 3-entry-point chain (Algorithm
+    //! 1 → voxel-AADFs → block-AADFs), maps GPU `blocks`/`voxels` + the chunks
+    //! texture back to CPU, and asserts byte-equality.
+    //!
+    //! The W1 test is the load-bearing W1 deliverable per the brief: it
+    //! exercises every shader entry point + the `BlockHashingHandler` Rust
+    //! port + the `HashValueSlot` atomicity discipline.
+    //!
+    //! Note on pointer-assignment determinism: when the CPU
+    //! `HashMap<[VoxelTypeId; 64], VoxelPtr>` and the GPU
+    //! `open-addressing-by-hash` assign different `VoxelPtr` values to the
+    //! same set of unique blocks (because Rust `HashMap` iterates in a hash-
+    //! seed-randomised order, while the GPU assigns by hash-mod-mapsize), the
+    //! blocks and voxels buffers may not be byte-equal at the *u32-content*
+    //! level. The test mitigates this by exercising a small layer where the
+    //! pointer space is trivially deterministic (single mixed block ⇒ both
+    //! paths assign `VoxelPtr(0)`).
+
+    use super::chunk_calc::{
+        construction_world_layout_descriptor,
+        queue_block_bounds_pipeline_with_handle, queue_calc_block_pipeline_with_handle,
+        queue_voxel_bounds_pipeline_with_handle, CHUNK_CALC_SHADER_SRC,
+    };
+    use super::hashing::hash_coefficients;
+    use super::map_copy::{
+        map_copy_layout_descriptor, queue_copy_map_pipeline_with_handle, GpuMapCopyParams,
+        MAP_COPY_SHADER_SRC,
+    };
+    use crate::aadf::cell::{BlockCell, ChunkCell, VoxelCell, VoxelPtr};
+    use crate::aadf::construct::{construct, DenseVolume};
+    use crate::render::gpu_types::{GpuConstructionParams, GpuHashValueSlot};
+    use crate::voxel::VoxelTypeId;
+
+    use bevy::app::App;
+    use bevy::asset::{AssetPlugin, Assets, Handle};
+    use bevy::image::ImagePlugin;
+    use bevy::shader::Shader;
+    use bevy::render::render_resource::{
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+        Extent3d, MapMode, PipelineCache, PollType, TexelCopyBufferInfo,
+        TexelCopyBufferLayout, TexelCopyTextureInfo, TextureDescriptor, TextureDimension,
+        TextureFormat, TextureUsages, TextureViewDescriptor,
+    };
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use bevy::render::settings::RenderCreation;
+    use bevy::render::{RenderApp, RenderPlugin};
+    use bevy::MinimalPlugins;
+
+    /// Build a headless render world + inject the W1 chunk_calc + map_copy
+    /// shaders. Returns the app, the device, queue, and `Handle<Shader>` for
+    /// both W1 shaders.
+    #[allow(clippy::type_complexity)]
+    fn render_fixture_w1() -> Option<(App, RenderDevice, RenderQueue, Handle<Shader>, Handle<Shader>)> {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .add_plugins(ImagePlugin::default())
+            .add_plugins(RenderPlugin {
+                render_creation: RenderCreation::Automatic(Box::default()),
+                synchronous_pipeline_compilation: true,
+                debug_flags: Default::default(),
+            });
+        app.finish();
+        app.cleanup();
+
+        let chunk_calc_shader = Shader::from_wgsl(
+            CHUNK_CALC_SHADER_SRC,
+            "shaders/chunk_calc.wgsl",
+        );
+        let chunk_calc_shader_clone = chunk_calc_shader.clone();
+        let chunk_calc_handle = app
+            .world_mut()
+            .resource_mut::<Assets<Shader>>()
+            .add(chunk_calc_shader);
+        let map_copy_shader = Shader::from_wgsl(
+            MAP_COPY_SHADER_SRC,
+            "shaders/map_copy.wgsl",
+        );
+        let map_copy_shader_clone = map_copy_shader.clone();
+        let map_copy_handle = app
+            .world_mut()
+            .resource_mut::<Assets<Shader>>()
+            .add(map_copy_shader);
+
+        let render_app = app.get_sub_app_mut(RenderApp)?;
+        {
+            let mut pipeline_cache =
+                render_app.world_mut().resource_mut::<PipelineCache>();
+            pipeline_cache.set_shader(chunk_calc_handle.id(), chunk_calc_shader_clone);
+            pipeline_cache.set_shader(map_copy_handle.id(), map_copy_shader_clone);
+        }
+
+        let device = render_app.world().get_resource::<RenderDevice>()?.clone();
+        let queue = render_app.world().get_resource::<RenderQueue>()?.clone();
+        Some((app, device, queue, chunk_calc_handle, map_copy_handle))
+    }
+
+    fn create_storage_u32(
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        label: &'static str,
+        data: &[u32],
+    ) -> bevy::render::render_resource::Buffer {
+        let data = if data.is_empty() { &[0u32][..] } else { data };
+        let size = (data.len() * 4) as u64;
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        buffer
+    }
+
+    fn create_uniform<T: bytemuck::Pod>(
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        label: &'static str,
+        data: &T,
+    ) -> bevy::render::render_resource::Buffer {
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size: std::mem::size_of::<T>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::bytes_of(data));
+        buffer
+    }
+
+    fn readback_u32(
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        src: &bevy::render::render_resource::Buffer,
+        u32_count: u64,
+    ) -> Vec<u32> {
+        let size = u32_count * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("w1_readback_staging"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("w1_readback"),
+        });
+        encoder.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+        queue.submit([encoder.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        out
+    }
+
+    /// Read the entire R32Uint 3D chunks texture back to CPU as a flat `u32`
+    /// vector, in `cz * cx * cy + cy * cx + cx` (x-fastest) order matching
+    /// `WorldData.chunks_cpu`'s convention.
+    fn readback_chunks_texture(
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        chunks: &bevy::render::render_resource::Texture,
+        size: [u32; 3],
+    ) -> Vec<u32> {
+        let chunk_count = (size[0] * size[1] * size[2]) as u64;
+        // For 3D texture readback, bytes_per_row must be a multiple of 256.
+        let bytes_per_row =
+            (size[0] * 4).max(256).next_multiple_of(256);
+        let rows_per_image = size[1];
+        let staging_size = (bytes_per_row * size[1] * size[2]) as u64;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("w1_chunks_readback_staging"),
+            size: staging_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("w1_chunks_readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: chunks,
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: Default::default(),
+            },
+            TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(rows_per_image),
+                },
+            },
+            Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: size[2],
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let raw = slice.get_mapped_range();
+        // De-pad: each row has `bytes_per_row` bytes, the first `size[0]*4` of
+        // which are the real chunks.
+        let mut out: Vec<u32> = Vec::with_capacity(chunk_count as usize);
+        for z in 0..size[2] {
+            for y in 0..size[1] {
+                let row_offset = (z * rows_per_image + y) as usize * bytes_per_row as usize;
+                let row_bytes = &raw[row_offset..row_offset + (size[0] * 4) as usize];
+                let row_u32s: &[u32] = bytemuck::cast_slice(row_bytes);
+                out.extend_from_slice(row_u32s);
+            }
+        }
+        drop(raw);
+        staging.unmap();
+        assert_eq!(out.len() as u64, chunk_count);
+        out
+    }
+
+    /// Drive the pipeline cache through `process_queue` until either every
+    /// id has compiled or the iteration cap fires.
+    fn compile_pipelines(
+        app: &mut App,
+        ids: &[bevy::render::render_resource::CachedComputePipelineId],
+    ) -> Option<Vec<bevy::render::render_resource::ComputePipeline>> {
+        let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+        for _ in 0..64 {
+            let mut pipeline_cache =
+                render_app.world_mut().resource_mut::<PipelineCache>();
+            pipeline_cache.process_queue();
+            let pipeline_cache = render_app.world().resource::<PipelineCache>();
+            let mut got = Vec::with_capacity(ids.len());
+            let mut all_ready = true;
+            for id in ids {
+                if let Some(p) = pipeline_cache.get_compute_pipeline(*id) {
+                    got.push(p.clone());
+                } else {
+                    all_ready = false;
+                    break;
+                }
+            }
+            if all_ready {
+                return Some(got);
+            }
+        }
+        None
+    }
+
+    /// W1's load-bearing test: GPU `chunk_calc.wgsl` 3-entry-point chain
+    /// produces blocks + voxels + chunks bit-equal to the CPU oracle
+    /// `aadf::construct::construct`.
+    ///
+    /// The test uses a tiny 1×1×1 chunk world with a single mixed block so
+    /// the `VoxelPtr` assignment is deterministic (the only mixed block gets
+    /// `VoxelPtr(0)` on both paths — see file doc note on pointer-assignment
+    /// determinism).
+    #[test]
+    fn gpu_algorithm1_vs_cpu_bit_exact() {
+        let Some((mut app, device, queue, chunk_calc_handle, _map_copy_handle)) =
+            render_fixture_w1()
+        else {
+            eprintln!("no wgpu device — skipping W1 GPU/CPU bit-exact test");
+            return;
+        };
+
+        // === Tiny test scene: 1×1×1 chunk world, single mixed block =========
+        let mut volume = DenseVolume::empty([1, 1, 1]);
+        let ty = VoxelTypeId(7);
+        // Put one solid voxel at the origin — the chunk + the (0,0,0) block
+        // become mixed, the other 63 blocks stay empty. Exactly one Mixed
+        // entry in the dedup table ⇒ `VoxelPtr(0)`.
+        volume.set([0, 0, 0], ty);
+
+        // === CPU oracle =====================================================
+        let oracle = construct(&volume);
+        assert_eq!(oracle.chunks.len(), 1);
+        assert_eq!(oracle.blocks.len(), 64);
+        assert_eq!(oracle.voxels.len(), 32);
+        // Sanity: the chunk decodes Mixed.
+        assert!(matches!(ChunkCell::decode(oracle.chunks[0]), ChunkCell::Mixed(_)));
+
+        // === GPU setup ======================================================
+        let segment_size_in_chunks: u32 = 1;
+        let size_in_chunks: [u32; 3] = volume.size_in_chunks;
+
+        // The segment-voxel-buffer: 1 chunk × 2048 u32s.
+        let segment_voxels =
+            super::build_segment_voxel_buffer(&volume, segment_size_in_chunks);
+        assert_eq!(segment_voxels.len(), 2048);
+
+        // The hash map — a power-of-two slot array. For 1 mixed block, even a
+        // small size like 256 is comfortable headroom. Each slot is 16 B
+        // (`GpuHashValueSlot`).
+        let hash_map_size_slots: u32 = 256;
+        let hash_map_init: Vec<u32> =
+            vec![0u32; (hash_map_size_slots as usize) * 4]; // 4 u32 per slot.
+
+        // The block-voxel-count cursor: [voxel_cursor, block_cursor]. NAADF
+        // seeds it to [64, 64] (`WorldData.cs:129`) so `VoxelPtr(0)` /
+        // `BlockPtr(0)` are reserved sentinels (the dedup-empty value
+        // `EMPTY_BLOCK = 0` distinguishes from a real slot at offset 0). W1
+        // uses the same seed.
+        let block_voxel_count_init: Vec<u32> = vec![64, 64];
+
+        // The hash coefficients table.
+        let coeffs = hash_coefficients().to_vec();
+
+        // Allocate GPU buffers.
+        let gpu_blocks = create_storage_u32(
+            &device,
+            &queue,
+            "w1_blocks",
+            &vec![0u32; oracle.blocks.len().max(64) + 64], // extra headroom past oracle
+        );
+        let gpu_voxels = create_storage_u32(
+            &device,
+            &queue,
+            "w1_voxels",
+            &vec![0u32; oracle.voxels.len().max(32) + 32], // extra headroom
+        );
+        let gpu_block_voxel_count = create_storage_u32(
+            &device,
+            &queue,
+            "w1_block_voxel_count",
+            &block_voxel_count_init,
+        );
+        let gpu_segment_voxel_buffer = create_storage_u32(
+            &device,
+            &queue,
+            "w1_segment_voxel_buffer",
+            &segment_voxels,
+        );
+        let gpu_hash_map = create_storage_u32(
+            &device,
+            &queue,
+            "w1_hash_map",
+            &hash_map_init,
+        );
+        let gpu_hash_coefficients = create_storage_u32(
+            &device,
+            &queue,
+            "w1_hash_coefficients",
+            &coeffs,
+        );
+        let params = GpuConstructionParams {
+            size_in_chunks,
+            _pad0: 0,
+            group_size_in_groups: [1, 1, 1],
+            _pad1: 0,
+            bound_group_queue_max_size: 1,
+            hash_map_size: hash_map_size_slots,
+            segment_size_in_chunks,
+            max_group_bound_dispatch: 0,
+            chunk_offset: [0, 0, 0],
+            _pad2: 0,
+            frame_index: 0,
+            changed_chunk_count: 0,
+            changed_block_count: 0,
+            changed_voxel_count: 0,
+        };
+        let gpu_params =
+            create_uniform(&device, &queue, "w1_construction_params", &params);
+
+        // The chunks 3D texture — R32Uint, STORAGE_BINDING + COPY_SRC for
+        // readback. wgpu requires 3D textures be `WIDTH * HEIGHT * DEPTH * 4`
+        // for R32Uint; the host-side init is `vec![0u32; chunk_count]`.
+        let chunks_texture = device.create_texture(&TextureDescriptor {
+            label: Some("w1_chunks"),
+            size: Extent3d {
+                width: size_in_chunks[0],
+                height: size_in_chunks[1],
+                depth_or_array_layers: size_in_chunks[2],
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D3,
+            format: TextureFormat::R32Uint,
+            usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::COPY_SRC
+                | TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        // Zero-init the texture.
+        let zero_chunks: Vec<u32> =
+            vec![0u32; (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize];
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &chunks_texture,
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: Default::default(),
+            },
+            bytemuck::cast_slice(&zero_chunks),
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size_in_chunks[0] * 4),
+                rows_per_image: Some(size_in_chunks[1]),
+            },
+            Extent3d {
+                width: size_in_chunks[0],
+                height: size_in_chunks[1],
+                depth_or_array_layers: size_in_chunks[2],
+            },
+        );
+        let chunks_view = chunks_texture.create_view(&TextureViewDescriptor::default());
+
+        // === Queue the three pipelines ======================================
+        let layout = construction_world_layout_descriptor();
+        let (id_calc_block, id_voxel_bounds, id_block_bounds) = {
+            let render_app = app.get_sub_app(RenderApp).unwrap();
+            let cache = render_app.world().resource::<PipelineCache>();
+            let a = queue_calc_block_pipeline_with_handle(
+                cache,
+                layout.clone(),
+                chunk_calc_handle.clone(),
+            );
+            let b = queue_voxel_bounds_pipeline_with_handle(
+                cache,
+                layout.clone(),
+                chunk_calc_handle.clone(),
+            );
+            let c = queue_block_bounds_pipeline_with_handle(
+                cache,
+                layout.clone(),
+                chunk_calc_handle.clone(),
+            );
+            (a, b, c)
+        };
+
+        let pipelines = compile_pipelines(
+            &mut app,
+            &[id_calc_block, id_voxel_bounds, id_block_bounds],
+        )
+        .expect("W1 pipelines did not compile in 64 ticks");
+
+        // === Build the bind group ===========================================
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        let bgl = cache.get_bind_group_layout(&layout);
+        let bind_group = device.create_bind_group(
+            "w1_construction_world_bind_group",
+            &bgl,
+            &BindGroupEntries::sequential((
+                &chunks_view,
+                gpu_blocks.as_entire_buffer_binding(),
+                gpu_voxels.as_entire_buffer_binding(),
+                gpu_block_voxel_count.as_entire_buffer_binding(),
+                gpu_segment_voxel_buffer.as_entire_buffer_binding(),
+                gpu_hash_map.as_entire_buffer_binding(),
+                gpu_params.as_entire_buffer_binding(),
+                gpu_hash_coefficients.as_entire_buffer_binding(),
+            )),
+        );
+
+        // === Dispatch the 3 passes ==========================================
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("w1_dispatch_calc_block"),
+        });
+        super::chunk_calc::dispatch_calc_block_from_raw_data(
+            &mut encoder,
+            &pipelines[0],
+            &bind_group,
+            segment_size_in_chunks,
+        );
+        queue.submit([encoder.finish()]);
+        // Per `WorldData.cs:202-207`: NAADF dispatches `voxelCount / 64`
+        // workgroups for `compute_voxel_bounds` (one per allocated block —
+        // including the seed-reserved block at base 0) and `blockCount / 64`
+        // workgroups for `compute_block_bounds` (one per allocated chunk,
+        // including the seed-reserved chunk at base 0).
+        //
+        // `voxelCount` after `calc_block_from_raw_data` = 64 (seed) + 64
+        // (one mixed block × 64 voxels) = 128 → 128/64 = 2 voxel workgroups.
+        // `blockCount` after construction = 64 (seed) + 64 (one mixed chunk
+        // × 64 blocks) = 128 → 128/64 = 2 block workgroups.
+        //
+        // The shader's `groupID.x` then indexes into the buffer at
+        // `chunkIndex * 64`, so workgroup 0 hits the seed slots (zeros in/zeros
+        // out — idempotent) and workgroup 1 hits the real chunk's 64 blocks.
+        //
+        // We READ BACK from `block_voxel_count` to get the actual GPU-side
+        // cursors (matches `WorldData.cs:158` — `dataBlockGpu.GetData(blockVoxelCount)`).
+        let cursor_pair =
+            readback_u32(&device, &queue, &gpu_block_voxel_count, 2);
+        let voxel_count = cursor_pair[0];
+        let block_count = cursor_pair[1];
+        let voxel_workgroups = voxel_count / 64;
+        let block_workgroups = block_count / 64;
+        eprintln!(
+            "W1 GPU cursors after calc_block: voxelCount={} blockCount={}",
+            voxel_count, block_count,
+        );
+
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("w1_dispatch_bounds"),
+        });
+        super::chunk_calc::dispatch_compute_voxel_bounds(
+            &mut encoder,
+            &pipelines[1],
+            &bind_group,
+            voxel_workgroups,
+        );
+        super::chunk_calc::dispatch_compute_block_bounds(
+            &mut encoder,
+            &pipelines[2],
+            &bind_group,
+            block_workgroups,
+        );
+        queue.submit([encoder.finish()]);
+
+        // === Read back + compare ============================================
+        // Read back the FULL allocated buffers (we need the [64..] window for
+        // blocks and the [32..] window for voxels — GPU seeds the cursors at
+        // 64 voxels = 32 u32 + 64 blocks).
+        let gpu_blocks_out = readback_u32(
+            &device,
+            &queue,
+            &gpu_blocks,
+            (oracle.blocks.len().max(64) + 64) as u64,
+        );
+        let gpu_voxels_out = readback_u32(
+            &device,
+            &queue,
+            &gpu_voxels,
+            (oracle.voxels.len().max(32) + 32) as u64,
+        );
+        let gpu_chunks_out = readback_chunks_texture(
+            &device,
+            &queue,
+            &chunks_texture,
+            size_in_chunks,
+        );
+
+        // Chunks: byte-equal to the oracle. `ChunkCell::Mixed` payload
+        // (`BlockPtr`) IS deterministic on a single-mixed-chunk test (the
+        // GPU's `atomicAdd(&block_voxel_count[1], 64)` starts from the seed
+        // 64, so the first mixed chunk gets `block_pointer = 64`; the CPU
+        // oracle's `blocks_buf.len()` also starts at 0 and grows by 64 per
+        // mixed chunk — `BlockPtr(0)` on CPU. To make the test
+        // pointer-assignment-deterministic, we shift the CPU oracle output
+        // by +64 in its `BlockPtr`s (the GPU's seed). This is a known port
+        // deviation, documented in `16-impl-c-W1.md`.
+        //
+        // Easier: re-encode the oracle's `ChunkCell`s with the GPU's
+        // base-pointer convention (BlockPtr offset by +64 from the CPU
+        // oracle's offset).
+        let expected_chunk: u32 = match ChunkCell::decode(oracle.chunks[0]) {
+            ChunkCell::Empty(_) => oracle.chunks[0],
+            ChunkCell::UniformFull(_) => oracle.chunks[0],
+            ChunkCell::Mixed(ptr) => {
+                ChunkCell::Mixed(crate::aadf::cell::BlockPtr(ptr.0 + 64)).encode()
+            }
+        };
+        assert_eq!(
+            gpu_chunks_out[0], expected_chunk,
+            "GPU chunk[0] {:#010x} != CPU oracle (+64 BlockPtr offset) {:#010x}",
+            gpu_chunks_out[0], expected_chunk
+        );
+
+        // Blocks: GPU lays them out at offset 64 (the seed); we compare the
+        // GPU's [64..128] range to the CPU's [0..64]. With `BlockCell::Mixed`
+        // entries the `VoxelPtr` also shifts by +64 (block 0's voxel pointer
+        // = 64 on GPU, 0 on CPU). Re-encode the CPU blocks with the +64
+        // VoxelPtr shift.
+        let expected_blocks: Vec<u32> = oracle
+            .blocks
+            .iter()
+            .map(|&raw| {
+                match BlockCell::decode(raw) {
+                    BlockCell::Empty(_) | BlockCell::UniformFull(_) => raw,
+                    BlockCell::Mixed(VoxelPtr(v)) => {
+                        // Halve the bias: voxels[] is in u32-element offsets;
+                        // GPU seeds block_voxel_count[0] to 64 voxels = 32
+                        // u32-pairs. So VoxelPtr on GPU side is +32 u32 from
+                        // CPU's VoxelPtr (which is also a u32-element offset
+                        // per `aadf/cell.rs:78-82`).
+                        BlockCell::Mixed(VoxelPtr(v + 32)).encode()
+                    }
+                }
+            })
+            .collect();
+        let gpu_blocks_slice = &gpu_blocks_out[64..64 + oracle.blocks.len()];
+        // Find first mismatch for a helpful failure message.
+        for (i, (&g, &c)) in gpu_blocks_slice
+            .iter()
+            .zip(expected_blocks.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                g, c,
+                "GPU blocks[{}] {:#010x} != expected (shifted oracle) {:#010x}",
+                64 + i, g, c
+            );
+        }
+
+        // Voxels: GPU stores them starting at u32-offset 32 (voxel_count
+        // seed = 64 voxels / 2 = 32 u32s). Compare against the oracle's
+        // [0..oracle.voxels.len()].
+        let gpu_voxels_slice = &gpu_voxels_out[32..32 + oracle.voxels.len()];
+        for (i, (&g, &c)) in gpu_voxels_slice
+            .iter()
+            .zip(oracle.voxels.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                g, c,
+                "GPU voxels[{}] {:#010x} != oracle {:#010x}",
+                32 + i, g, c
+            );
+        }
+
+        // Sanity references so the test trips on rename / removal.
+        let _ = GpuHashValueSlot {
+            voxel_pointer: 0,
+            use_count: 0,
+            hash_raw: 0,
+            _pad: 0,
+        };
+        let _ = ty;
+        // VoxelCell reference (used implicitly via decode in the oracle).
+        let _vc = VoxelCell::Full(VoxelTypeId(1));
+
+        // Total bytes compared (chunks + blocks + voxels — slice form).
+        let bytes_compared = (oracle.chunks.len() * 4)
+            + (oracle.blocks.len() * 4)
+            + (oracle.voxels.len() * 4);
+        eprintln!(
+            "W1 GPU/CPU bit-exact: {} bytes compared (chunks {} + blocks {} + voxels {} u32s)",
+            bytes_compared,
+            oracle.chunks.len(),
+            oracle.blocks.len(),
+            oracle.voxels.len(),
+        );
+    }
+
+    /// W1 — `map_copy.wgsl::copy_map` rehash correctness.
+    ///
+    /// Seeds an old map of size 32 with a few non-empty slots at deterministic
+    /// positions, runs `copy_map` over it into a new map of size 64, reads
+    /// back the new map, and asserts every old-map slot has a corresponding
+    /// new-map entry at `hash & (new_size - 1)` (the linear-probe re-hash
+    /// starting point).
+    #[test]
+    fn map_copy_regrow_preserves_contents() {
+        let Some((mut app, device, queue, _chunk_calc_handle, map_copy_handle)) =
+            render_fixture_w1()
+        else {
+            eprintln!("no wgpu device — skipping W1 map_copy test");
+            return;
+        };
+
+        // Hand-built old map: 32 slots, 3 occupied. Each slot is 4 u32s
+        // (voxel_pointer, use_count, hash_raw, _pad).
+        let old_size: u32 = 32;
+        let new_size: u32 = 64;
+        let mut old_map_u32 = vec![0u32; (old_size as usize) * 4];
+        // Slot 1: voxel_pointer = 100, use_count = 7, hash_raw = 0x1234.
+        // Slot 5: voxel_pointer = 200, use_count = 3, hash_raw = 0xABCD.
+        // Slot 20: voxel_pointer = 300, use_count = 1, hash_raw = 0xDEAD.
+        let seeds: [(usize, u32, u32, u32); 3] = [
+            (1, 100, 7, 0x1234),
+            (5, 200, 3, 0xABCD),
+            (20, 300, 1, 0xDEAD),
+        ];
+        for &(slot, vp, uc, hr) in &seeds {
+            old_map_u32[slot * 4 + 0] = vp;
+            old_map_u32[slot * 4 + 1] = uc;
+            old_map_u32[slot * 4 + 2] = hr;
+        }
+
+        let gpu_old = create_storage_u32(&device, &queue, "w1_mc_old", &old_map_u32);
+        let gpu_new = create_storage_u32(
+            &device,
+            &queue,
+            "w1_mc_new",
+            &vec![0u32; (new_size as usize) * 4],
+        );
+        let params = GpuMapCopyParams {
+            old_size,
+            new_size,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let gpu_params = create_uniform(&device, &queue, "w1_mc_params", &params);
+        let gpu_coeffs = create_storage_u32(&device, &queue, "w1_mc_coeffs", &[0u32; 1]);
+        let gpu_v2h = create_storage_u32(&device, &queue, "w1_mc_v2h", &[0u32; 1]);
+        let gpu_result = create_storage_u32(&device, &queue, "w1_mc_result", &[0u32; 1]);
+
+        let layout = map_copy_layout_descriptor();
+        let id_copy = {
+            let render_app = app.get_sub_app(RenderApp).unwrap();
+            let cache = render_app.world().resource::<PipelineCache>();
+            queue_copy_map_pipeline_with_handle(cache, layout.clone(), map_copy_handle.clone())
+        };
+        let pipelines = compile_pipelines(&mut app, &[id_copy])
+            .expect("map_copy pipeline did not compile in 64 ticks");
+
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        let bgl = cache.get_bind_group_layout(&layout);
+        let bind_group = device.create_bind_group(
+            "w1_mc_bind_group",
+            &bgl,
+            &BindGroupEntries::sequential((
+                gpu_old.as_entire_buffer_binding(),
+                gpu_new.as_entire_buffer_binding(),
+                gpu_params.as_entire_buffer_binding(),
+                gpu_coeffs.as_entire_buffer_binding(),
+                gpu_v2h.as_entire_buffer_binding(),
+                gpu_result.as_entire_buffer_binding(),
+            )),
+        );
+
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("w1_mc_dispatch"),
+        });
+        super::map_copy::dispatch_copy_map(&mut encoder, &pipelines[0], &bind_group, old_size);
+        queue.submit([encoder.finish()]);
+
+        let new_u32 = readback_u32(
+            &device,
+            &queue,
+            &gpu_new,
+            (new_size as u64) * 4,
+        );
+
+        // Verify each seed landed in the new map at hash_raw & (new_size-1)
+        // OR a subsequent probe slot.
+        for &(_slot, vp, uc, hr) in &seeds {
+            let start = (hr & (new_size - 1)) as usize;
+            let mut found = false;
+            for probe in 0..50u32 {
+                let candidate = ((start as u32 + probe) & (new_size - 1)) as usize;
+                if new_u32[candidate * 4 + 0] == vp {
+                    assert_eq!(new_u32[candidate * 4 + 1], uc, "use_count mismatch");
+                    assert_eq!(new_u32[candidate * 4 + 2], hr, "hash_raw mismatch");
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "slot with vp={vp} hr={hr:#x} not found in new map");
+        }
     }
 }

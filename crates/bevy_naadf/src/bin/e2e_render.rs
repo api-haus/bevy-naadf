@@ -6,56 +6,73 @@
 //! gates + the `PipelineCache` error scan + the node-dispatch check, and exit
 //! 0 on success / non-zero on failure.
 //!
-//! `fn main() -> AppExit` works because `AppExit: Termination` — the process
-//! exit code *is* the test result, no glue. The window appears for well under
-//! a second and closes itself; the impl agent runs this once, reads the exit
-//! code + stderr, and is done — no loop.
+//! `fn main() -> ExitCode` folds the e2e's `AppExit` + the optional Phase-C
+//! validation result into a single explicit numeric exit code (W0 switched
+//! away from `AppExit: Termination` so this binary has one mapping site).
 //!
-//! ## Phase-C flag — `--validate-gpu-construction` (`15-design-c.md` §1.6, W0)
+//! ## Phase-C flag — `--validate-gpu-construction` (`15-design-c.md` §1.6, W1)
 //!
-//! W0 plumbs the flag end-to-end so W1 has a stable CLI surface to point its
-//! bit-exact CPU/GPU oracle at. **W0 body — placeholder.** When the flag is
-//! set, after the normal e2e completes the binary prints a placeholder log
-//! line and exits with the same status the e2e produced. W1 replaces the
-//! placeholder with the real GPU-vs-CPU buffer-byte-equality assertion (the
-//! oracle from `aadf::construct::construct` on `GridPreset::Default` vs. the
-//! GPU `blocks` / `voxels` / chunks-texture readback).
+//! W0 plumbed the flag end-to-end with a placeholder body; **W1 fills the
+//! body** with the real bit-exact CPU/GPU oracle gate.
+//!
+//! When the flag is set, after the normal e2e exits, the binary runs
+//! `bevy_naadf::render::construction::validate_gpu_construction` which boots a
+//! headless render world, runs `chunk_calc.wgsl`'s 3 production entry points
+//! (Algorithm 1, voxel-bound, block-bound) against a deterministic 1×1×1
+//! chunk world with a single mixed block, then maps the GPU `blocks` /
+//! `voxels` / chunks-texture buffers back to CPU and asserts byte-equality
+//! with the CPU oracle `aadf::construct::construct`. On success the binary
+//! prints `GPU construction byte-equal to CPU oracle: N bytes compared`; on
+//! failure it prints the mismatch + exits non-zero.
+//!
+//! The validation scene is intentionally small (the 1×1×1 single-voxel case
+//! exercises every shader code-path with deterministic `VoxelPtr(0)` /
+//! `BlockPtr(0)` assignment) — `15-design-c.md` §1.6 assumption #7 flags that
+//! on larger scenes CPU `HashMap` iteration order diverges from GPU
+//! open-addressing-by-hash, breaking byte-equality even though semantic
+//! equality holds. W1's gate proves the algorithm is correct on the
+//! deterministic case; semantic-equality validation on `GridPreset::Default`
+//! is a W2/W3 follow-up.
 //!
 //! See `docs/orchestrate/naadf-bevy-port/e2e-render-test.md` for the full
-//! design.
+//! e2e design + `16-impl-c-W1.md` for W1's validation specifics.
 
 use std::process::ExitCode;
 
 use bevy::prelude::AppExit;
 
 fn main() -> ExitCode {
-    // Parse the W0 CLI flag — `--validate-gpu-construction`, default off.
-    // No argument-value pairs; the flag is a presence-only switch. Kept
-    // hand-rolled (no `clap`/`argh` dep added by W0) so the surface is the
-    // smallest possible — W1 / W2 / W4 each add their own flags in their
-    // workstream, and the impl logs document each new flag at its merge.
+    // Parse the CLI flag — `--validate-gpu-construction`, default off.
     let validate_gpu_construction = std::env::args()
         .skip(1)
         .any(|a| a == "--validate-gpu-construction");
 
     let app_exit = bevy_naadf::run_e2e_render();
 
-    // W0 — placeholder validation. The flag's *plumbing* is load-bearing for
-    // W1's bit-exact oracle; the validation **body** is W1's responsibility.
-    // We run the placeholder unconditionally on the flag (success path or
-    // not) so the flag is verified end-to-end in W0's gate, then fold the
-    // e2e's `AppExit` into the exit code (validation cannot *succeed* the
-    // run when the e2e fails; it can only *fail* a successful e2e — and W0's
-    // placeholder doesn't fail).
+    let e2e_code = match app_exit {
+        AppExit::Success => 0u8,
+        AppExit::Error(code) => code.get(),
+    };
+
     if validate_gpu_construction {
-        eprintln!(
-            "phase-c W0 seam — gpu construction validation placeholder \
-             (no-op until W1 lands)"
-        );
+        match bevy_naadf::render::construction::validate_gpu_construction() {
+            Ok(bytes_compared) => {
+                eprintln!(
+                    "GPU construction byte-equal to CPU oracle: {bytes_compared} bytes compared"
+                );
+                if e2e_code != 0 {
+                    eprintln!(
+                        "(e2e itself returned non-zero exit {e2e_code}; validation succeeded \
+                         but the e2e failure is the load-bearing failure)"
+                    );
+                }
+            }
+            Err(msg) => {
+                eprintln!("GPU construction validation FAILED: {msg}");
+                return ExitCode::from(1);
+            }
+        }
     }
 
-    match app_exit {
-        AppExit::Success => ExitCode::SUCCESS,
-        AppExit::Error(code) => ExitCode::from(code.get()),
-    }
+    ExitCode::from(e2e_code)
 }

@@ -569,6 +569,42 @@ pub struct GpuConstructionParams {
     pub changed_voxel_count: u32,
 }
 
+// === Phase C W1 — `GpuHashValueSlot` (`15-design-c.md` §5.2, W1) =============
+
+/// Rust mirror of `chunk_calc.wgsl::HashValueSlot` (the per-slot hash-table
+/// record) (`15-design-c.md` §5.2 + W1's atomicity discipline).
+///
+/// Three semantically-distinct fields packed into 16 bytes:
+///   - `voxel_pointer` (u32) — the open-addressing CAS target. WGSL declares
+///     it `atomic<u32>`. Plain `u32` on the Rust mirror (Rust never accesses
+///     it atomically — only uploads `0` once at allocation time + reads it
+///     back via buffer mapping).
+///   - `use_count` (u32) — the `atomicAdd` slot-occupancy counter.
+///   - `hash_raw` (u32) — the slot's stored hash. Plain non-atomic (written
+///     after the slot is CAS-claimed, single-writer at write time).
+///   - `_pad` (u32) — explicit padding so `array<HashValueSlot>` stride is 16
+///     bytes (matches WGSL's storage-buffer array element alignment for a
+///     12-byte struct of 3 × u32). **This is the documented `vec3<u32>`
+///     storage-buffer alignment deviation** (`12-alignment-gap.md` §3
+///     D-A class) — the C# struct is 12 B; the WGSL stride is 16 B; the
+///     Rust mirror declares the pad explicitly to match.
+///
+/// W1 ports this single struct; W2 / W3 do not extend it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GpuHashValueSlot {
+    pub voxel_pointer: u32,
+    pub use_count: u32,
+    pub hash_raw: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GpuHashValueSlot>() == 16);
+const _: () = assert!(std::mem::offset_of!(GpuHashValueSlot, voxel_pointer) == 0);
+const _: () = assert!(std::mem::offset_of!(GpuHashValueSlot, use_count) == 4);
+const _: () = assert!(std::mem::offset_of!(GpuHashValueSlot, hash_raw) == 8);
+const _: () = assert!(std::mem::offset_of!(GpuHashValueSlot, _pad) == 12);
+
 /// IEEE-754 half-float bit pattern of `x` (the C# `f32tof16`).
 ///
 /// A straightforward round-to-nearest-even f32 → f16 conversion, sufficient
@@ -755,5 +791,19 @@ mod tests {
             std::mem::offset_of!(GpuConstructionParams, chunk_offset) % 16,
             0
         );
+    }
+
+    /// Phase-C W1 — runtime mirror of the `GpuHashValueSlot` layout guards
+    /// (`15-design-c.md` §5.2). 16 B = 4 × u32, the `_pad` field documents the
+    /// WGSL `array<HashValueSlot>` 16-byte stride explicitly so the Rust
+    /// upload matches the WGSL read byte-for-byte.
+    #[test]
+    fn hash_value_slot_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<GpuHashValueSlot>(), 16);
+        assert_eq!(offset_of!(GpuHashValueSlot, voxel_pointer), 0);
+        assert_eq!(offset_of!(GpuHashValueSlot, use_count), 4);
+        assert_eq!(offset_of!(GpuHashValueSlot, hash_raw), 8);
+        assert_eq!(offset_of!(GpuHashValueSlot, _pad), 12);
     }
 }
