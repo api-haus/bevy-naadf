@@ -182,6 +182,34 @@ pub fn dispatch_calc_block_from_raw_data(
     );
 }
 
+/// Phase-C followup #1 — dispatch `calc_block_from_raw_data` over a
+/// non-cubic world extent. Used by the runtime GPU producer in
+/// `prepare_construction` for worlds whose chunk extent is not a perfect
+/// cube (e.g. the bevy-naadf 4×2×4 test grid). The shader still uses
+/// `params.segment_size_in_chunks` as its X/Y stride (kept at the cubic
+/// max), so the segment_voxel_buffer's indexing remains
+/// `chunk_index_in_segment = gx + gy*seg + gz*seg*seg` — the dispatch is
+/// just bounded to the actual world shape so out-of-bounds `textureStore`
+/// writes never happen.
+pub fn dispatch_calc_block_from_raw_data_world_sized(
+    encoder: &mut CommandEncoder,
+    pipeline: &bevy::render::render_resource::ComputePipeline,
+    bind_group: &bevy::render::render_resource::BindGroup,
+    world_size_in_chunks: [u32; 3],
+) {
+    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+        label: Some("naadf_chunk_calc_calc_block_pass_world_sized"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.dispatch_workgroups(
+        world_size_in_chunks[0],
+        world_size_in_chunks[1],
+        world_size_in_chunks[2],
+    );
+}
+
 /// Dispatch `compute_voxel_bounds` over `block_count` blocks (one workgroup
 /// per block, 64 threads/group = 64 voxels per block).
 pub fn dispatch_compute_voxel_bounds(

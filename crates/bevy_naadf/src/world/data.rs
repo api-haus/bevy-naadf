@@ -41,6 +41,13 @@ pub struct WorldData {
     /// Phase-C W2 — per-frame edit batches awaiting extract into the render
     /// world. Drained by `extract_world_changes`.
     pub pending_edits: PendingEdits,
+    /// Phase-C followup #1 — the *dense* pre-construction voxel-type stream
+    /// (`size_in_voxels.x * y * z` u16s, `x + y * sx + z * sx * sy` indexing).
+    /// Kept so the runtime GPU producer can rebuild `segment_voxel_buffer`
+    /// without re-running CPU construction. Empty when the world was not
+    /// authored from a `DenseVolume` (e.g. legacy code paths); the GPU
+    /// dispatch falls back to its existing producer chain in that case.
+    pub dense_voxel_types: Vec<u16>,
 }
 
 impl Default for WorldData {
@@ -54,6 +61,7 @@ impl Default for WorldData {
             bounding_box: IAabb3::default(),
             dirty: false,
             pending_edits: PendingEdits::default(),
+            dense_voxel_types: Vec::new(),
         }
     }
 }

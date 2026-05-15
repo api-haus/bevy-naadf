@@ -83,6 +83,12 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
         size[2],
     );
 
+    // Phase-C followup #1 — preserve the dense voxel-type stream so the
+    // runtime GPU construction dispatch can rebuild `segment_voxel_buffer`
+    // without going through a CPU `construct()` re-run. Each `VoxelTypeId`
+    // is a `u16`; total ~ size_in_voxels.x*y*z * 2 bytes.
+    let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
+
     commands.insert_resource(WorldData {
         chunks_cpu: world.chunks,
         blocks_cpu: world.blocks,
@@ -94,6 +100,7 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
         },
         dirty: true,
         pending_edits: Default::default(),
+        dense_voxel_types,
     });
 
     commands.insert_resource(VoxelTypes {

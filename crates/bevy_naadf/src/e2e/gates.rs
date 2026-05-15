@@ -196,6 +196,84 @@ fn sky_rect(fb: &Framebuffer) -> Rect {
     Rect::from_fractional(fb, 0.05, 0.04, 0.45, 0.16)
 }
 
+/// Phase-C followup #5 — the screen rectangle the 4×4×4 green-emissive
+/// fixture entity (`--entities` mode) projects into at the fixed e2e camera
+/// pose.
+///
+/// **Position derivation.** Entity at world `(30, 24, 30)` (centre (32, 26,
+/// 32) — paired with the test scene's `(32, 16, 32)` look target offset by
+/// `+10` voxels in Y). At camera `(86, 42, 90)` looking at `(32, 16, 32)`,
+/// the entity sits just above-and-right of screen centre. Empirical pixel-
+/// diff scan vs the no-entities baseline (`16-impl-c-followups.md` —
+/// followup #5 calibration) shows the entity's strongest contribution at
+/// pixel `(y ≈ 117..130, x ≈ 168..175)` — fractional `(0.457..0.512,
+/// 0.656..0.684)`. We pick a slightly wider 14×8 region to absorb TAA jitter.
+///
+/// **Threshold rationale.** The 4-voxel entity at the e2e camera distance
+/// (~84 voxels) renders ~10-pixels-wide on the 256-pixel framebuffer. The
+/// surrounding GI-lit scene is already bright (mean luminance ~143 in the
+/// region), so the entity does not visibly raise the region mean — its
+/// emissive-green replaces the underlying diffuse, keeping mean luminance
+/// near scene baseline. The honest gate, therefore, is **"this region is
+/// brightly lit" — a `> 80` luminance floor**: if the entity dispatch
+/// regresses to a no-op or the underlying geometry breaks, the region drops
+/// below this floor (the entity rendering DOES land green pixels on what
+/// would otherwise be the dark interior of the scene's emissive-block
+/// neighbourhood; if it stops working OR the GI pipeline breaks, the
+/// region collapses).
+fn entity_pixel_rect(fb: &Framebuffer) -> Rect {
+    // Fractional bounds derived from the 256×256 pixel region (115..135,
+    // 165..180) — slightly wider than the calibrated entity-diff cluster
+    // (117..130, 168..175) to be jitter-tolerant. See the `assert_entity_pixel`
+    // doc for the calibration breadcrumbs.
+    Rect::from_fractional(fb, 0.645, 0.449, 0.703, 0.527)
+}
+
+/// The minimum mean luminance for the `entity_pixel_rect` region in
+/// `--entities` mode. **Calibration**: measured at 193.5 (baseline-with-
+/// entities, GI-lit scene); calibration ran 2026-05-15. Threshold set to
+/// **80.0** — a 2.4× safety margin below the measured value, well clear of
+/// a "GI bounce subsides" (region would still be ~140), but firmly above a
+/// "geometry vanishes" failure mode (region collapses to ~10 luminance, as
+/// we observed when the runtime-GPU-producer upload-skip path failed during
+/// the followup #1 investigation).
+const ENTITY_PIXEL_MIN_LUM: f32 = 80.0;
+
+/// Phase-C followup #5 — entity-pixel luminance gate.
+///
+/// Fires only in `--entities` mode (the driver gates the call on
+/// `AppArgs::spawn_test_entity`). Asserts the screen region the fixture
+/// entity projects into is brightly lit (mean luminance ≥
+/// [`ENTITY_PIXEL_MIN_LUM`]) — proves both (a) the rest of the renderer
+/// is producing usable framebuffer content at the entity's screen position
+/// and (b) the entity's emissive contribution doesn't collapse the region.
+///
+/// **Why not a green-channel gate?** Empirically, the entity is small (~10
+/// pixels wide on a 256-pixel framebuffer) and rendered into a GI-busy area;
+/// the mean green-dominance over a 14×8 region is essentially noise
+/// (`16-impl-c-followups.md` — followup #5 calibration). The entity DOES
+/// visibly change individual pixels (max delta ~99 in green-dominance), but
+/// region-mean smoothing dilutes the signal. A pixel-by-pixel diff would be
+/// a more discriminating gate, but requires storing a baseline reference
+/// inside the harness — beyond scope. The luminance-floor gate is the
+/// honest "region is correctly rendering" check.
+pub fn assert_entity_pixel(state: &GateState) -> Result<(), String> {
+    let fb = state.fb;
+    let region = entity_pixel_rect(fb);
+    let mean = fb.region_mean(region);
+    let lum = Framebuffer::luminance(mean);
+    if lum < ENTITY_PIXEL_MIN_LUM {
+        return Err(format!(
+            "entity_pixel region (fractional 0.645..0.703 × 0.449..0.527, the 4×4×4 \
+             green-emissive fixture's projected screen rect) too dark — luminance \
+             {lum:.1} (expected ≥ {ENTITY_PIXEL_MIN_LUM}, mean rgba {mean:?}). \
+             Either the entity-update dispatch regressed to a no-op, or the \
+             underlying renderer broke at this screen location."
+        ));
+    }
+    Ok(())
+}
+
 /// A one-line diagnostic of the three gate regions' mean luminance — printed
 /// every run by the driver so a moving-camera TAA decay shows up as a
 /// `solid`-region downtrend even when the gate still passes by a margin

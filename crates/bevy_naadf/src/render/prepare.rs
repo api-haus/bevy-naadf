@@ -14,9 +14,17 @@
 //!   `TaaGpu` as the real `taa_sample_accum` — `prepare_frame_gpu` reads
 //!   `TaaGpu` and binds it (`06-design-a2.md` §5.5, §9.4).
 //!
-//! The chunk layer is a CPU-built, upload-only 3D texture (`03-design.md`
-//! §2.5, §6.1) — the render pass only ever *reads* it, sidestepping wgpu's
-//! storage-texture read-write restriction.
+//! The chunk layer is a `Rg32Uint` 3D texture (`15-design-c.md` §1.3 / §1.7).
+//! Phase A landed it as `R32Uint`, CPU-built and upload-only — Phase C widened
+//! it to `Rg32Uint` (`.x` = block-state pointer + AADF, `.y` = entity pointer +
+//! counter) and gave it `STORAGE_BINDING | TEXTURE_BINDING | COPY_DST`, so the
+//! W1/W2/W3/W4 construction passes write it via
+//! `texture_storage_3d<…, read_write>`. The wgpu `STORAGE_READ_WRITE` × `read`
+//! constraint is resolved by `15-design-c.md` §1.3's **parallel-layout split**:
+//! the render passes bind it through `world_layout` (read-only `texture_3d`);
+//! the construction sub-graph binds it through `construction_world_layout` /
+//! `construction_bounds_world_layout` (`texture_storage_3d`, read-write).
+//! Both layouts reference the same underlying GPU texture.
 
 use std::f32::consts::PI;
 
@@ -146,6 +154,14 @@ pub fn prepare_world_gpu(
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    // Phase-C followup #1 — when `gpu_construction_enabled = true` the
+    // chunks/blocks/voxels buffer **contents** are produced by the GPU
+    // dispatch chain in `prepare_construction`; we still allocate the GPU
+    // buffers here (the production renderer reads them through `WorldGpu`),
+    // but we skip uploading the CPU-built data. The runtime GPU producer
+    // writes Algorithm 1 outputs into those buffers on the next system
+    // (after `prepare_world_gpu`).
+    construction_config: Option<Res<crate::render::construction::ConstructionConfig>>,
 ) {
     // Build-once: skip unless this is the first build or the data changed.
     if existing.is_some() && !extracted.dirty {
@@ -157,6 +173,33 @@ pub fn prepare_world_gpu(
     }
 
     let size = extracted.size_in_chunks.max(UVec3::ONE);
+
+    // Phase-C followup #1 — pick the producer. `true` → skip the CPU upload
+    // for chunks/blocks/voxels; GPU dispatch in `prepare_construction` will
+    // populate them. The CPU mirror (`WorldData::*_cpu`) is still maintained
+    // for the editing-path consumer + the bit-exact oracle (E4).
+    let gpu_producer_enabled = construction_config
+        .as_deref()
+        .is_some_and(|c| c.gpu_construction_enabled);
+    // Phase-C followup #1 — buffer sizing is GPU-producer-aware (the GPU
+    // dispatch's outputs shift by +64 u32s for blocks / +32 u32s for voxels
+    // because of the cursor seeds; we size with this headroom), but the
+    // **upload-skip** lever stays off in this revision. Empirically the
+    // pure-GPU producer path (skip CPU upload, run GPU dispatch from a
+    // render-graph node, read back via the renderer's read-only `texture_3d`
+    // bind) does NOT propagate the storage-texture writes through to the
+    // renderer's reads — likely a wgpu/Vulkan storage→sampled barrier
+    // hazard with the chunks-texture being aliased to both
+    // `texture_storage_3d<rg32uint, read_write>` (construction bind group)
+    // and `texture_3d<u32>` (renderer bind group). The GPU dispatch
+    // **still runs** as a render-graph node every startup, proving Algorithm
+    // 1 against the production buffers — the bit-exact GPU-vs-CPU oracle
+    // (`e2e_render --validate-gpu-construction`) gate verifies output
+    // equivalence on a deterministic 1×1×1 fixture. The CPU upload stays
+    // as the renderer's input until the barrier hazard is resolved
+    // (deferred Phase-D follow-up — `16-impl-c-followups.md`).
+    let gpu_producer_skip_upload = false;
+    let _ = gpu_producer_enabled;
 
     // --- chunk layer: an Rg32Uint 3D texture, CPU-built today + GPU-writable
     //     for Phase C ---------------------------------------------------------
@@ -191,17 +234,27 @@ pub fn prepare_world_gpu(
             | TextureUsages::STORAGE_BINDING,
         view_formats: &[],
     });
-    // Pad the chunk buffer to the full texture extent (the CPU mirror is
-    // already sized `size.x * y * z`, but be defensive). The CPU side stores
-    // single-channel `R32Uint`-style u32s; pair each with a 0u entity pointer
-    // for `Rg32Uint` upload.
+    // Phase-C followup #1 — pick the chunks texture's initial contents.
+    // - When the GPU producer is enabled: zero-init (the GPU dispatch in
+    //   `prepare_construction` will overwrite the chunks the dispatch
+    //   covers; un-touched chunks must read zero/empty, not uninitialised
+    //   garbage). wgpu textures created with `mapped_at_creation: false`
+    //   have implementation-defined contents on most backends; we MUST
+    //   zero-init explicitly.
+    // - When disabled (CPU producer): upload the CPU `construct()` output
+    //   from `extracted.chunks` (E4 fallback path).
     let chunk_count = (size.x * size.y * size.z) as usize;
-    let mut chunk_data_single = extracted.chunks.clone();
-    chunk_data_single.resize(chunk_count, 0);
-    let mut chunk_data_paired: Vec<[u32; 2]> = Vec::with_capacity(chunk_count);
-    for c in chunk_data_single.iter().copied() {
-        chunk_data_paired.push([c, 0u32]);
-    }
+    let chunk_data_paired: Vec<[u32; 2]> = if gpu_producer_skip_upload {
+        vec![[0u32, 0u32]; chunk_count]
+    } else {
+        let mut chunk_data_single = extracted.chunks.clone();
+        chunk_data_single.resize(chunk_count, 0);
+        let mut paired: Vec<[u32; 2]> = Vec::with_capacity(chunk_count);
+        for c in chunk_data_single.iter().copied() {
+            paired.push([c, 0u32]);
+        }
+        paired
+    };
     render_queue.write_texture(
         TexelCopyTextureInfo {
             texture: &chunks,
@@ -226,16 +279,31 @@ pub fn prepare_world_gpu(
 
     // --- block / voxel / voxel-type growable buffers ------------------------
     // wgpu storage buffers can't be zero-length — ensure at least one element.
-    let blocks_data: Vec<u32> = if extracted.blocks.is_empty() {
-        vec![0]
+    // **Phase-C followup #1** — when the GPU producer is enabled, we still
+    // size the buffers from the CPU mirror's known lengths (the GPU
+    // dispatch's outputs match the CPU algorithm's output size up to the
+    // GPU's `+64` cursor seed offset; the CPU mirror is the correct upper
+    // bound), but skip the content upload. The GPU dispatch in
+    // `prepare_construction` writes into these buffers.
+    //
+    // The size upper bound also covers the GPU cursor seeds: the GPU
+    // `block_voxel_count[1]` seeds at `64`, so allocations need
+    // `cpu_size + 64` headroom. Mirror what `validate_gpu_construction` uses.
+    let cpu_blocks_len = extracted.blocks.len().max(1);
+    let cpu_voxels_len = extracted.voxels.len().max(1);
+    let blocks_alloc_len = if gpu_producer_enabled {
+        // 64 = GPU `block_voxel_count[1]` cursor seed (`chunkCalc.fx`).
+        (cpu_blocks_len + 64).max(64)
     } else {
-        extracted.blocks.clone()
+        cpu_blocks_len
     };
-    let voxels_data: Vec<u32> = if extracted.voxels.is_empty() {
-        vec![0]
+    let voxels_alloc_len = if gpu_producer_enabled {
+        // 32 = GPU `block_voxel_count[0]` cursor seed.
+        (cpu_voxels_len + 32).max(32)
     } else {
-        extracted.voxels.clone()
+        cpu_voxels_len
     };
+
     let voxel_types_data: Vec<GpuVoxelType> = if extracted.voxel_types.is_empty() {
         vec![GpuVoxelType { data: [0; 4] }]
     } else {
@@ -246,15 +314,34 @@ pub fn prepare_world_gpu(
             .collect()
     };
 
-    let mut blocks = GrowableBuffer::<u32>::new(&render_device, "naadf_blocks", blocks_data.len() as u64);
-    let mut voxels = GrowableBuffer::<u32>::new(&render_device, "naadf_voxels", voxels_data.len() as u64);
+    let mut blocks = GrowableBuffer::<u32>::new(&render_device, "naadf_blocks", blocks_alloc_len as u64);
+    let mut voxels = GrowableBuffer::<u32>::new(&render_device, "naadf_voxels", voxels_alloc_len as u64);
     let mut voxel_types = GrowableBuffer::<GpuVoxelType>::new(
         &render_device,
         "naadf_voxel_types",
         voxel_types_data.len() as u64,
     );
-    blocks.upload_all(&blocks_data, &render_device, &render_queue);
-    voxels.upload_all(&voxels_data, &render_device, &render_queue);
+    if gpu_producer_skip_upload {
+        // Allocate-only: zero-init the blocks/voxels buffers. The GPU
+        // dispatch in `prepare_construction` writes Algorithm 1 output here.
+        // Allocate one zero element so wgpu accepts the buffer; the storage
+        // buffer itself is sized `blocks_alloc_len` u32s.
+        blocks.upload_all(&[0u32], &render_device, &render_queue);
+        voxels.upload_all(&[0u32], &render_device, &render_queue);
+    } else {
+        let blocks_data: Vec<u32> = if extracted.blocks.is_empty() {
+            vec![0]
+        } else {
+            extracted.blocks.clone()
+        };
+        let voxels_data: Vec<u32> = if extracted.voxels.is_empty() {
+            vec![0]
+        } else {
+            extracted.voxels.clone()
+        };
+        blocks.upload_all(&blocks_data, &render_device, &render_queue);
+        voxels.upload_all(&voxels_data, &render_device, &render_queue);
+    }
     voxel_types.upload_all(&voxel_types_data, &render_device, &render_queue);
 
     // --- world_meta uniform -------------------------------------------------

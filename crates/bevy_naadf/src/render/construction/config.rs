@@ -107,6 +107,30 @@ pub struct ConstructionConfig {
     /// default suitable for the bevy-naadf test scenes; a runtime knob can
     /// flip it.
     pub max_entity_instances: u32,
+    /// Phase-C followup #4 — gate the `entity_instances_history` GPU
+    /// allocation + the per-frame `copy_entity_history` dispatch + the
+    /// prefix-sum population.
+    ///
+    /// The history-ring buffer (`world_data.wgsl:114` — `@group(0)
+    /// @binding(7)`) is sized `max_entity_instances * taa_ring_depth * 16 B`
+    /// (the C# `EntityHandler.cs:149` allocates 2_000_000 entries — ~128 MiB
+    /// on the C# default). The `world_data.wgsl` layout binds it
+    /// unconditionally, but `shoot_ray` does NOT consume it: the C# uses it
+    /// for TAA reprojection of moving entities (paper §3.6), which is a
+    /// Phase-D follow-up.
+    ///
+    /// When `false` (the default): `prepare_construction` allocates a 1-vec4
+    /// placeholder for the binding (keeps the bind-group layout satisfied
+    /// without paying the real cost), skips the
+    /// `copy_entity_history` dispatch, and skips the per-frame history
+    /// prefix-sum population on the CPU.
+    ///
+    /// When `true`: the C# behaviour — full allocation + per-frame dispatch.
+    /// Enable when wiring up the Phase-D TAA-reprojection-of-moving-entities
+    /// consumer.
+    ///
+    /// Default `false`.
+    pub entity_history_enabled: bool,
 }
 
 impl Default for ConstructionConfig {
@@ -140,6 +164,14 @@ impl Default for ConstructionConfig {
             // history-ring layout matches byte-for-byte when an extracted
             // entity buffer is uploaded.
             max_entity_instances: DEFAULT_MAX_ENTITY_INSTANCES,
+            // Phase-C followup #4 — off by default. The `world_data.wgsl`
+            // `entity_instances_history` binding's GPU consumer is
+            // Phase-D scope (TAA reprojection of moving entities); the
+            // production renderer's `shoot_ray` never reads it. Disable
+            // the per-frame `copy_entity_history` dispatch + the
+            // `max_entity_instances * taa_ring_depth * 16 B` allocation
+            // by default, keep the layout-binding placeholder.
+            entity_history_enabled: false,
         }
     }
 }
@@ -189,6 +221,8 @@ const _: () = {
         run_worldgen_only: false,
         // W4: `WorldRender.cs:88` per-frame entity-instance cap.
         max_entity_instances: DEFAULT_MAX_ENTITY_INSTANCES,
+        // Phase-C followup #4 — history binding disabled by default.
+        entity_history_enabled: false,
     };
     // Compile-time-only sanity probe — referenced once so the const isn't
     // dead. `ConstructionConfig` is `Copy`, so this is a no-op at runtime.

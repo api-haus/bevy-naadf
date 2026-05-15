@@ -64,6 +64,13 @@ use graph_b::{
 // construction sub-module. Inserted before `naadf_atmosphere_node` in the
 // `Core3d` chain per `15-design-c.md` §3.
 use construction::bounds_calc::naadf_bounds_compute_node;
+// Phase-C followup #1 — the runtime GPU producer node. One-shot dispatch
+// of the chunk_calc chain against the production `WorldGpu` buffers,
+// gated by `gpu_construction_enabled` + dependencies-ready. Inserted at
+// the head of the construction-node sequence so its writes precede every
+// downstream consumer (bounds-init seed, change-staging, entity update,
+// atmosphere, first-hit).
+use construction::naadf_gpu_producer_node;
 // Phase-C W2 — the regime-3 world-change node, inserted between
 // `naadf_bounds_compute_node` (W3) and `naadf_entity_update_node` (W4) per
 // `15-design-c.md` §3. Body is gated on
@@ -264,6 +271,12 @@ impl Plugin for NaadfRenderPlugin {
             .add_systems(
                 Core3d,
                 (
+                    // Phase-C followup #1 — runtime GPU producer: one-shot
+                    // dispatch of chunk_calc chain to populate the production
+                    // `WorldGpu::chunks/blocks/voxels` from `dense_voxel_types`
+                    // via Algorithm 1. Sits at the head so all downstream
+                    // construction + render nodes read GPU-produced data.
+                    naadf_gpu_producer_node,
                     naadf_bounds_compute_node,
                     naadf_world_change_node,
                     naadf_entity_update_node,

@@ -30,6 +30,7 @@ pub const CHUNK_DIM_VOXELS: usize = CELL_DIM * CELL_DIM;
 
 /// A dense voxel volume — the input to construction. Authored by
 /// `voxel::grid` (D2). Sized in whole chunks.
+#[derive(Clone)]
 pub struct DenseVolume {
     /// World size in chunks, `[x, y, z]`.
     pub size_in_chunks: [u32; 3],
@@ -215,7 +216,15 @@ pub fn construct(volume: &DenseVolume) -> ConstructedWorld {
 
     // Chunk AADFs — one O(3·d·n) synchronised pass over the whole chunk layer
     // (`15-design-c.md` §2.1 W6 / paper §3.3). Replaces the previous per-cell
-    // `compute_aadf` loop; emits identical `Aadf6` values.
+    // `compute_aadf` loop. **Strictly conservative wrt the per-cell oracle** —
+    // the merge form's AADF values are `≤` the per-cell form's in every
+    // direction; not bit-identical in general (see `aadf/bounds.rs:32-43` —
+    // when a neighbour's cuboid was blocked further out by an orthogonal
+    // obstacle, the merge cannot certify a slice empty even when the per-cell
+    // slice-empty test would). Both algorithms produce *correct* AADFs (every
+    // resulting cuboid is provably empty); the merge just may produce tighter
+    // cuboids. This matches paper §3.3 ("Changing the axis order during
+    // construction may result in different cuboid regions, but this is rare").
     let chunk_is_empty_at = |c: [i32; 3]| -> bool {
         let idx = c[0] as usize + c[1] as usize * cx + c[2] as usize * cx * cy;
         matches!(chunk_class[idx], ChunkClass::Empty)

@@ -111,4 +111,14 @@ struct EntityChunkInstance {
 // Currently unused by the renderer-side `shoot_ray` traversal (the C# uses it
 // for TAA reprojection of moving entities — Phase-C wave-3 lands the layout
 // binding; the consumer is a Phase-D / paper-gap follow-up).
+//
+// Phase-C followup #4 — the allocation backing this binding is gated by
+// `ConstructionConfig.entity_history_enabled` (default `false`). When `false`,
+// `prepare_construction` allocates a 16 B (1-vec4) placeholder so the
+// bind-group layout is satisfied without paying the
+// `max_entity_instances * taa_ring_depth * 16 B` price; the
+// `copy_entity_history` GPU dispatch is skipped. The shader treats this
+// binding as read-only and never indexes into it (the entity sub-traversal
+// branch does not consume the history) — the placeholder is bind-only,
+// never read, never written.
 @group(0) @binding(7) var<storage, read> entity_instances_history: array<vec4<u32>>;

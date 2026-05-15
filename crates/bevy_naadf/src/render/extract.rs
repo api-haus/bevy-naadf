@@ -43,6 +43,11 @@ pub struct ExtractedWorld {
     /// Set when the contents changed this frame and the GPU needs a re-upload.
     /// `prepare_world_gpu` clears it after uploading.
     pub dirty: bool,
+    /// Phase-C followup #1 — dense pre-construction voxel-type stream
+    /// (`size_in_voxels.x*y*z` u16s). Used by the runtime GPU producer dispatch
+    /// to build `segment_voxel_buffer` without re-running CPU construction.
+    /// Empty if the source `WorldData` does not carry it.
+    pub dense_voxel_types: Vec<u16>,
 }
 
 /// Render-world mirror of the camera's render-relevant state (`03-design.md`
@@ -96,6 +101,7 @@ pub fn extract_world(
     extracted.voxel_types.clone_from(&voxel_types.types);
     extracted.size_in_chunks = world_data.size_in_chunks;
     extracted.bounding_box = world_data.bounding_box;
+    extracted.dense_voxel_types.clone_from(&world_data.dense_voxel_types);
     extracted.dirty = true;
 }
 

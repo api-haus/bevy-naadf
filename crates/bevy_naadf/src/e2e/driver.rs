@@ -101,6 +101,10 @@ pub struct E2eOutcome {
 /// state is consistent within this very tick — no one-frame lag).
 // Bevy systems legitimately exceed clippy's 7-argument ceiling.
 #[allow(clippy::too_many_arguments)]
+// Bevy systems legitimately exceed clippy's 7-argument ceiling — Phase-C
+// followup #5 adds one read-only `AppArgs` parameter for the entity-pixel
+// gate.
+#[allow(clippy::too_many_arguments)]
 pub fn e2e_driver(
     mut state: ResMut<E2eState>,
     mut outcome: ResMut<E2eOutcome>,
@@ -110,6 +114,7 @@ pub fn e2e_driver(
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
+    app_args: Option<Res<crate::AppArgs>>,
 ) {
     match state.phase {
         E2ePhase::Warmup => {
@@ -207,8 +212,14 @@ pub fn e2e_driver(
             }
         }
         E2ePhase::Assert => {
+            // Phase-C followup #5 — surface `--entities` mode to the
+            // assertions so the entity-pixel luminance gate fires only when
+            // a fixture entity was spawned (the gate baseline is
+            // entity-mode-specific).
+            let entities_mode =
+                app_args.as_deref().is_some_and(|a| a.spawn_test_entity);
             let result =
-                run_assertions(screenshot.as_mut(), &diagnostics, &pipeline_scan);
+                run_assertions(screenshot.as_mut(), &diagnostics, &pipeline_scan, entities_mode);
             match &result {
                 Ok(()) => {
                     println!(
@@ -270,6 +281,7 @@ fn run_assertions(
     screenshot: &mut E2eScreenshot,
     diagnostics: &DiagnosticsStore,
     pipeline_scan: &PipelineScanResult,
+    entities_mode: bool,
 ) -> Result<(), String> {
     let mut failures: Vec<String> = Vec::new();
 
@@ -309,6 +321,13 @@ fn run_assertions(
                 };
                 if let Err(msg) = batch_gate(CURRENT_BATCH, &state) {
                     failures.push(format!("region gate:\n  {msg}"));
+                }
+                // (4b) Phase-C followup #5 — entity-pixel gate. Fires only
+                // in `--entities` mode (where the fixture entity is spawned).
+                if entities_mode {
+                    if let Err(msg) = super::gates::assert_entity_pixel(&state) {
+                        failures.push(format!("entity_pixel gate:\n  {msg}"));
+                    }
                 }
             }
             Err(msg) => failures.push(format!("framebuffer decode:\n  {msg}")),

@@ -42,9 +42,8 @@
 // helpers are duplicated identically in `world_change.wgsl` when W2 lands.
 // `bounds_common.wgsl` ships as the canonical reference + the W3
 // `bounds_calc.wgsl` future reuse site (§4.2). Edits to the algorithm MUST
-// land in all copies — the const guard test
-// `bounds_common_inline_matches_ref` (in `render::construction::chunk_calc`)
-// pins this.
+// land in all copies — the test `bounds_common_inline_matches_ref` (in
+// `render::construction::shader_drift_guard`) pins this.
 
 // ─── Bindings ─────────────────────────────────────────────────────────────────
 //

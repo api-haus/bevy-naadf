@@ -372,11 +372,23 @@ pub fn naadf_entity_update_node(
         entity_bg,
         entity_chunk_instance_count,
     );
-    dispatch_copy_entity_history(
-        encoder,
-        p_copy_hist,
-        &entity_world_bg,
-        entity_bg,
-        entity_instance_count,
-    );
+    // Phase-C followup #4 — gate the `copy_entity_history` dispatch behind
+    // `entity_history_enabled`. The history binding's GPU consumer
+    // (TAA reprojection of moving entities — paper §3.6) is a Phase-D
+    // follow-up; until that lands, dispatching this pass writes a placeholder
+    // 16 B buffer for no consumer, costing per-frame GPU time for zero
+    // visible effect.
+    if config.entity_history_enabled {
+        dispatch_copy_entity_history(
+            encoder,
+            p_copy_hist,
+            &entity_world_bg,
+            entity_bg,
+            entity_instance_count,
+        );
+    } else {
+        // Silence unused-binding warnings when the dispatch is skipped.
+        let _ = p_copy_hist;
+        let _ = entity_instance_count;
+    }
 }
