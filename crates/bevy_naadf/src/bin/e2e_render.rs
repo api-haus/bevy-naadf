@@ -71,10 +71,12 @@ use bevy::prelude::AppExit;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Parse the CLI flags — `--validate-gpu-construction` (W1) +
-    // `--entities` (W4) + `--edit-mode` (W2), default off.
+    // `--entities` (W4) + `--edit-mode` (W2) + `--resize-test`
+    // (taa-resize-blackness reproduction), default off.
     let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
     let entities_mode = args.iter().any(|a| a == "--entities");
     let edit_mode = args.iter().any(|a| a == "--edit-mode");
+    let resize_test = args.iter().any(|a| a == "--resize-test");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -83,7 +85,22 @@ fn main() -> ExitCode {
     // render pipeline then dispatches `entity_update.wgsl` per-frame and
     // `ray_tracing.wgsl::shoot_ray`'s entity sub-traversal renders the
     // fixture into the framebuffer.
-    let app_exit = if entities_mode {
+    //
+    // `--resize-test` (`docs/orchestrate/taa-resize-blackness/`) — sets
+    // `AppArgs.resize_test = true`. The e2e driver then runs the
+    // taa-resize-blackness reproduction phases instead of the standard
+    // Warmup→Motion→Settle→Shoot flow: it waits ~3 s, screenshots,
+    // programmatically resizes the primary window to 384×288, waits ~2 s,
+    // screenshots again, and compares `solid_block_rect` luma values
+    // between the two frames. On `main` (broken) the post-resize TAA + GI
+    // ring zero-clears collapse the shadow-band luma → test fails with
+    // exit code != 0. After Impl-B the rings are preserved across resize →
+    // test passes with exit code 0.
+    let app_exit = if resize_test {
+        let mut app_args = bevy_naadf::AppArgs::default();
+        app_args.resize_test = true;
+        bevy_naadf::run_e2e_render_with_args(app_args)
+    } else if entities_mode {
         let mut app_args = bevy_naadf::AppArgs::default();
         app_args.construction_config.entities_enabled = true;
         app_args.spawn_test_entity = true;

@@ -36,20 +36,24 @@
 
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 
 use std::path::Path;
 
 use crate::camera::PositionSplit;
 
 use super::checks::{assert_nodes_dispatched, pipeline_scan_result, PipelineScanResult};
-use super::framebuffer::Framebuffer;
+use super::framebuffer::{Framebuffer, Rect};
 use super::gates::{
-    batch_gate, e2e_orbit_camera_transform, expected_spans, GateState, CURRENT_BATCH,
+    batch_gate, e2e_orbit_camera_transform, expected_spans, region_luminance_report, GateState,
+    CURRENT_BATCH,
 };
 use super::readback::{shoot_primary_window, E2eScreenshot};
 use super::{
-    E2E_DRAIN_FRAMES, E2E_MOTION_FRAMES, E2E_SCREENSHOT_DIR, E2E_SCREENSHOT_LATEST,
-    E2E_SETTLE_FRAMES, E2E_WARMUP_FRAMES,
+    E2E_DRAIN_FRAMES, E2E_MOTION_FRAMES, E2E_RESIZE_HEIGHT, E2E_RESIZE_MIN_LUMA_RATIO,
+    E2E_RESIZE_POST_FRAMES, E2E_RESIZE_POST_PNG, E2E_RESIZE_PRE_FRAMES, E2E_RESIZE_PRE_PNG,
+    E2E_RESIZE_WIDTH, E2E_SCREENSHOT_DIR, E2E_SCREENSHOT_LATEST, E2E_SETTLE_FRAMES,
+    E2E_WARMUP_FRAMES,
 };
 
 /// The driver's state-machine phase.
@@ -71,6 +75,40 @@ pub enum E2ePhase {
     Drain,
     /// Build the framebuffer, run the gates, write `AppExit`.
     Assert,
+    // --- Resize-test phases (`docs/orchestrate/taa-resize-blackness/`) -----
+    //
+    // Selected when `AppArgs.resize_test == true`. The Warmup branch routes
+    // straight into ResizePre on tick 0 instead of the production
+    // Warmup→Motion→Settle→Shoot→Drain→Assert flow. The camera is pinned at
+    // the fixed readback pose (the same pose Batch-6's `solid_block_rect`
+    // discriminator is calibrated against) for the entire test.
+    /// Render frames the driver counts before triggering the resize — user's
+    /// "waits 3 seconds" leg. Long enough that the TAA + GI rings have
+    /// meaningfully filled before the buffer-recreation zero-clear hits.
+    ResizePre,
+    /// Spawn `Screenshot::primary_window()` for the **pre-resize** capture.
+    ResizeShootPre,
+    /// Wait (bounded) for the pre-resize capture to deliver, then stash its
+    /// framebuffer into `ResizeTestState.pre`.
+    ResizeDrainPre,
+    /// One-shot: programmatically resize the primary window from the e2e
+    /// default (256×256) to the resize-test target (`E2E_RESIZE_WIDTH` ×
+    /// `E2E_RESIZE_HEIGHT`). The next frame `extract_camera` sees the new
+    /// viewport and the next `prepare_taa` / `prepare_gi` re-allocate +
+    /// zero-clear the rings.
+    ResizeDoIt,
+    /// Render frames the driver counts after the resize, before the
+    /// post-resize screenshot — user's "waits 2 seconds" leg. Inside the
+    /// user-observed recovery window (fractions-of-a-second to ~1-2 s).
+    ResizePost,
+    /// Spawn `Screenshot::primary_window()` for the **post-resize** capture.
+    ResizeShootPost,
+    /// Wait (bounded) for the post-resize capture to deliver, then stash its
+    /// framebuffer into `ResizeTestState.post`.
+    ResizeDrainPost,
+    /// Compare the pre/post luma values, panic (and write `AppExit::error()`)
+    /// on collapse.
+    ResizeAssert,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -92,6 +130,20 @@ pub struct E2eOutcome {
     pub gate_result: Option<Result<(), String>>,
 }
 
+/// Stash for the two framebuffers captured by the resize-test
+/// (`docs/orchestrate/taa-resize-blackness/`).
+///
+/// The driver's `ResizeDrainPre` / `ResizeDrainPost` phases each consume the
+/// shared [`E2eScreenshot`] resource — decode the `Image` to a CPU-side
+/// [`Framebuffer`], dump the resource back to `None`, and stash the decoded
+/// frame here. The `ResizeAssert` phase then compares luma values between
+/// `pre` and `post`.
+#[derive(Resource, Default)]
+pub struct ResizeTestState {
+    pub pre: Option<Framebuffer>,
+    pub post: Option<Framebuffer>,
+}
+
 /// The `Update` driver system — advances the state machine one step per tick.
 ///
 /// Also drives the deterministic camera motion: during [`E2ePhase::Motion`] it
@@ -109,13 +161,26 @@ pub fn e2e_driver(
     mut state: ResMut<E2eState>,
     mut outcome: ResMut<E2eOutcome>,
     mut screenshot: ResMut<E2eScreenshot>,
+    mut resize_test: ResMut<ResizeTestState>,
     diagnostics: Res<DiagnosticsStore>,
     pipeline_scan: Res<PipelineScanResult>,
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
+    mut window: Single<&mut Window, With<PrimaryWindow>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
     app_args: Option<Res<crate::AppArgs>>,
 ) {
+    // Resize-test fast-path: at the very first Warmup tick, if --resize-test
+    // is set, branch into the resize-test state machine entirely (skips the
+    // standard Warmup→Motion→Settle→Shoot→Drain→Assert flow). All assertions
+    // are inside the resize-test phases — the standard run_assertions /
+    // batch_gate path does NOT run for resize-test runs.
+    let resize_test_mode = app_args.as_deref().is_some_and(|a| a.resize_test);
+    if resize_test_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+        state.phase = E2ePhase::ResizePre;
+        state.phase_ticks = 0;
+    }
+
     match state.phase {
         E2ePhase::Warmup => {
             state.phase_ticks += 1;
@@ -239,11 +304,294 @@ pub fn e2e_driver(
             outcome.gate_result = Some(result);
             state.phase = E2ePhase::Done;
         }
+        // ---- Resize-test phases ------------------------------------------
+        E2ePhase::ResizePre => {
+            // Pin the camera at the readback pose — the same pose Batch-6
+            // gates' `solid_block_rect` discriminator is calibrated for. The
+            // 3-second wait lets GI converge and `taa_samples` / `sample_counts`
+            // accumulate, so the post-resize zero-clear of those rings will
+            // produce an observable luma collapse.
+            let pose = e2e_orbit_camera_transform(1.0);
+            let (transform, position_split) = &mut *camera;
+            **transform = pose;
+            **position_split = PositionSplit::from_world(pose.translation);
+            state.phase_ticks += 1;
+            if state.phase_ticks >= E2E_RESIZE_PRE_FRAMES {
+                // Drop any stale screenshot stash and request the pre-resize
+                // capture.
+                screenshot.0 = None;
+                state.phase = E2ePhase::ResizeShootPre;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::ResizeShootPre => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::ResizeDrainPre;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::ResizeDrainPre => {
+            // Keep the camera pinned while we wait — the screenshot is
+            // async and may take a frame or two.
+            let pose = e2e_orbit_camera_transform(1.0);
+            let (transform, position_split) = &mut *camera;
+            **transform = pose;
+            **position_split = PositionSplit::from_world(pose.translation);
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        resize_test.pre = Some(fb);
+                        state.phase = E2ePhase::ResizeDoIt;
+                        state.phase_ticks = 0;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "resize-test: pre-resize framebuffer decode failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks >= E2E_DRAIN_FRAMES {
+                let err = format!(
+                    "resize-test: pre-resize screenshot never delivered within \
+                     {E2E_DRAIN_FRAMES} drain frames"
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::ResizeDoIt => {
+            // One-shot: mutate the primary window's physical resolution.
+            // `bevy_winit`'s `changed_windows` system sees the change in the
+            // same frame's `Last` schedule and forwards it to the underlying
+            // winit window; the OS WindowResized event fires, the next
+            // `extract_camera` reads the new viewport, and `prepare_taa` /
+            // `prepare_gi` see `pixel_count != old_pixel_count` and hit the
+            // ring-recreation zero-clear codepath — the bug.
+            window
+                .resolution
+                .set_physical_resolution(E2E_RESIZE_WIDTH, E2E_RESIZE_HEIGHT);
+            println!(
+                "e2e_render: resize-test triggered window resize to {E2E_RESIZE_WIDTH}x\
+                 {E2E_RESIZE_HEIGHT} (was 256x256)"
+            );
+            // Keep the camera pinned and advance immediately.
+            let pose = e2e_orbit_camera_transform(1.0);
+            let (transform, position_split) = &mut *camera;
+            **transform = pose;
+            **position_split = PositionSplit::from_world(pose.translation);
+            state.phase = E2ePhase::ResizePost;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::ResizePost => {
+            // The user-observed recovery window is "fractions of a second to
+            // ~1-2 seconds". `E2E_RESIZE_POST_FRAMES` ≈ 2 s at 60 fps, so on
+            // current `main` the screenshot may catch the symptom mid-drain
+            // (TAA ring is 32 deep, GI sample_counts is 128 frames). The
+            // luma gate then trips. Once Impl-B's fix lands, the rings are
+            // preserved across resize and the post-resize luma matches pre.
+            let pose = e2e_orbit_camera_transform(1.0);
+            let (transform, position_split) = &mut *camera;
+            **transform = pose;
+            **position_split = PositionSplit::from_world(pose.translation);
+            state.phase_ticks += 1;
+            if state.phase_ticks >= E2E_RESIZE_POST_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::ResizeShootPost;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::ResizeShootPost => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::ResizeDrainPost;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::ResizeDrainPost => {
+            let pose = e2e_orbit_camera_transform(1.0);
+            let (transform, position_split) = &mut *camera;
+            **transform = pose;
+            **position_split = PositionSplit::from_world(pose.translation);
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        resize_test.post = Some(fb);
+                        state.phase = E2ePhase::ResizeAssert;
+                        state.phase_ticks = 0;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "resize-test: post-resize framebuffer decode failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks >= E2E_DRAIN_FRAMES {
+                let err = format!(
+                    "resize-test: post-resize screenshot never delivered within \
+                     {E2E_DRAIN_FRAMES} drain frames"
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::ResizeAssert => {
+            let result = run_resize_test_assertions(resize_test.as_mut());
+            match &result {
+                Ok(()) => {
+                    println!(
+                        "e2e_render: resize-test PASS — pre/post luma ratio above threshold \
+                         {E2E_RESIZE_MIN_LUMA_RATIO} after {E2E_RESIZE_PRE_FRAMES} pre-frames \
+                         + window resize to {E2E_RESIZE_WIDTH}x{E2E_RESIZE_HEIGHT} + \
+                         {E2E_RESIZE_POST_FRAMES} post-frames."
+                    );
+                    exit.write(AppExit::Success);
+                }
+                Err(msg) => {
+                    eprintln!("e2e_render: FAIL —\n{msg}");
+                    exit.write(AppExit::error());
+                }
+            }
+            outcome.gate_result = Some(result);
+            state.phase = E2ePhase::Done;
+        }
         E2ePhase::Done => {
             // `AppExit` is written; the winit runner sees `should_exit()` and
             // exits the event loop. Nothing more to do.
         }
     }
+}
+
+/// Run the resize-test luma comparison + save both PNGs.
+///
+/// The user's verbatim spec is: "the test establishes a window, waits 3
+/// seconds, screenshots, resizes window, waits 2 seconds, screenshots it,
+/// compares luma values." That is what this function does, evaluated *after*
+/// the driver has finished both captures.
+///
+/// Discriminator choice: the `solid_block_rect` region from `gates.rs:188`
+/// — the dark diffuse voxel geometry directly below the warm-white emissive
+/// block — is the targeted bug discriminator: healthy steady-state ~242,
+/// broken (post-resize black-shadow drain) ~4. The full-frame mean luma is
+/// also computed as a sanity check (it moves a lot less but should never
+/// catastrophically collapse).
+///
+/// Pass/fail criterion: post-resize `solid_block_rect` luma divided by the
+/// pre-resize value must be ≥ [`E2E_RESIZE_MIN_LUMA_RATIO`] (0.5). Healthy
+/// ratio ≈ 1.0; broken ratio ≈ 0.017; 0.5 cleanly separates them with
+/// massive headroom on both sides.
+fn run_resize_test_assertions(state: &mut ResizeTestState) -> Result<(), String> {
+    let pre = state.pre.take().ok_or_else(|| {
+        "resize-test: ResizeAssert reached with no pre-resize framebuffer (driver bug)".to_string()
+    })?;
+    let post = state.post.take().ok_or_else(|| {
+        "resize-test: ResizeAssert reached with no post-resize framebuffer (driver bug)".to_string()
+    })?;
+
+    // Save both PNGs unconditionally so the user can visually inspect.
+    let pre_path = Path::new(E2E_SCREENSHOT_DIR).join(E2E_RESIZE_PRE_PNG);
+    let post_path = Path::new(E2E_SCREENSHOT_DIR).join(E2E_RESIZE_POST_PNG);
+    let _ = pre
+        .save_png(&pre_path)
+        .map_err(|e| eprintln!("e2e_render: resize-test: pre PNG save failed: {e}"));
+    let _ = post
+        .save_png(&post_path)
+        .map_err(|e| eprintln!("e2e_render: resize-test: post PNG save failed: {e}"));
+    // Also keep the standard `e2e_latest.png` slot populated (with the
+    // post-resize frame) so the established harness path is consistent.
+    let _ = post
+        .save_png(Path::new(E2E_SCREENSHOT_DIR).join(E2E_SCREENSHOT_LATEST))
+        .map_err(|e| eprintln!("e2e_render: resize-test: latest PNG save failed: {e}"));
+
+    println!(
+        "e2e_render: resize-test pre  {}x{} -> saved {}",
+        pre.width(),
+        pre.height(),
+        pre_path.display()
+    );
+    println!(
+        "e2e_render: resize-test post {}x{} -> saved {}",
+        post.width(),
+        post.height(),
+        post_path.display()
+    );
+
+    // The targeted discriminator: `solid_block_rect`-shaped fractional rect
+    // (gates.rs:188-190 — `Rect::from_fractional(fb, 0.42, 0.52, 0.58, 0.66)`).
+    // The rect is fractional, so it transparently follows the new
+    // resolution after the resize.
+    let solid_pre = pre.region_luminance(Rect::from_fractional(&pre, 0.42, 0.52, 0.58, 0.66));
+    let solid_post = post.region_luminance(Rect::from_fractional(&post, 0.42, 0.52, 0.58, 0.66));
+
+    // Sanity-check: full-frame mean luma.
+    let full_pre = pre.region_luminance(Rect {
+        x0: 0,
+        y0: 0,
+        x1: pre.width(),
+        y1: pre.height(),
+    });
+    let full_post = post.region_luminance(Rect {
+        x0: 0,
+        y0: 0,
+        x1: post.width(),
+        y1: post.height(),
+    });
+
+    // Per-frame diagnostic reports (reuse the standard helper).
+    println!("e2e_render: resize-test pre  {}", region_luminance_report(&pre));
+    println!("e2e_render: resize-test post {}", region_luminance_report(&post));
+
+    let ratio = if solid_pre > 1.0e-3 {
+        solid_post / solid_pre
+    } else {
+        // Pre-resize luma was already near zero → there's no rings-fill
+        // collapse to detect; this is a setup failure, not the bug we're
+        // hunting. Treat as fail with a clear message.
+        return Err(format!(
+            "resize-test: pre-resize `solid_block_rect` luminance is essentially zero \
+             ({solid_pre:.3}); the harness never converged the GI bounce before the resize. \
+             Bump E2E_RESIZE_PRE_FRAMES or investigate. Full-frame pre luma = {full_pre:.1}, \
+             full-frame post luma = {full_post:.1}."
+        ));
+    };
+
+    println!(
+        "e2e_render: resize-test luma — solid pre {:.2}, solid post {:.2}, ratio {:.4} \
+         (threshold {:.2}); full-frame pre {:.2}, full-frame post {:.2}",
+        solid_pre, solid_post, ratio, E2E_RESIZE_MIN_LUMA_RATIO, full_pre, full_post
+    );
+
+    if ratio < E2E_RESIZE_MIN_LUMA_RATIO {
+        return Err(format!(
+            "resize-test: TAA/GI ring drain detected after window resize.\n  \
+             pre-resize  `solid_block_rect` luma = {solid_pre:.2}\n  \
+             post-resize `solid_block_rect` luma = {solid_post:.2}\n  \
+             ratio (post/pre)                     = {ratio:.4}\n  \
+             threshold                            = {:.2}\n  \
+             full-frame  pre luma  = {full_pre:.2}\n  \
+             full-frame  post luma = {full_post:.2}\n  \
+             screenshots saved to: {} + {}\n  \
+             This is the bug `docs/orchestrate/taa-resize-blackness/` reproduces — the\n  \
+             post-resize TAA `taa_samples` ring + GI `sample_counts` accumulator are\n  \
+             zero-cleared by `prepare_taa` / `prepare_gi`, and the multi-frame drain\n  \
+             collapses the shadow-band luma until the rings refill.",
+            E2E_RESIZE_MIN_LUMA_RATIO,
+            pre_path.display(),
+            post_path.display(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Run **every check** at the `ASSERT` step and fold them into one `Result`

@@ -225,6 +225,18 @@ pub struct AppArgs {
     /// branch, surfacing in the framebuffer as an extra hit on top of the
     /// world geometry.
     pub spawn_test_entity: bool,
+    /// When `true`, the e2e driver runs the **TAA/GI resize-blackness
+    /// reproduction test** instead of the standard WARMUP→MOTION→SETTLE→SHOOT
+    /// flow (`docs/orchestrate/taa-resize-blackness/`).
+    ///
+    /// The resize test is the load-bearing failing reproduction for the
+    /// "shadows go pitch black for a fraction of a second to ~1–2 s after a
+    /// window resize" bug. It (a) lets the rings converge, (b) takes a
+    /// pre-resize screenshot, (c) programmatically resizes the primary
+    /// window, (d) takes a post-resize screenshot inside the drain window,
+    /// (e) compares luma values and panics if the post-resize luma collapses
+    /// (the symptom). See [`crate::e2e::driver`].
+    pub resize_test: bool,
 }
 
 impl Default for AppArgs {
@@ -236,6 +248,7 @@ impl Default for AppArgs {
             gi: GiSettings::default(),
             construction_config: render::construction::ConstructionConfig::default(),
             spawn_test_entity: false,
+            resize_test: false,
         }
     }
 }

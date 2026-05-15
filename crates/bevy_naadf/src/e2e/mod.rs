@@ -130,6 +130,52 @@ pub const E2E_SCREENSHOT_LATEST: &str = "e2e_latest.png";
 /// framebuffer produced — the render path never delivered a frame").
 pub const E2E_DRAIN_FRAMES: u32 = 8;
 
+// --- Resize-test constants (`docs/orchestrate/taa-resize-blackness/`) ------
+//
+// The resize-test wait spans are specified by the user in WALL-CLOCK seconds:
+// "establishes a window, waits 3 seconds, screenshots, resizes window, waits
+// 2 seconds, screenshots, compares luma values". The bounded e2e driver has
+// no wall clock; it only counts `Update` ticks. With vsync the present mode
+// defaults to FIFO, so on a 60 Hz display the harness ticks at ~60 fps and
+// the conversion below gives the user's spec exactly. On other refresh rates
+// the constants approximate the spec rather than match it (note for the
+// orchestrator: if you see the test pass on `main` because the post-resize
+// wait already cleared the drain window on a 144 Hz monitor, bump the divisor).
+
+/// Render frames the driver counts before triggering the resize — the user's
+/// "waits 3 seconds" leg of the resize-test spec. At 60 fps ≈ 3.0 s. Long
+/// enough that the TAA 32-deep ring and the GI 128-frame `sample_counts`
+/// accumulator are meaningfully filled before they get zero-cleared.
+pub const E2E_RESIZE_PRE_FRAMES: u32 = 180;
+
+/// Render frames the driver counts after triggering the resize, before the
+/// post-resize screenshot — the user's "waits 2 seconds" leg of the spec. At
+/// 60 fps ≈ 2.0 s. This is inside the user-observed recovery window
+/// ("fractions of a second to ~1–2 seconds"), so a buggy run can still show
+/// the symptom; on a fully-recovered run the post-resize luma should match
+/// the pre-resize luma to within a small multiplier.
+pub const E2E_RESIZE_POST_FRAMES: u32 = 120;
+
+/// Post-resize physical resolution — picks an aspect-changing target so the
+/// resize exercises the GI/TAA pixel-count buffer-recreation path AND a
+/// non-trivial aspect ratio change (256×256 → 384×288 is 1:1 → 4:3, +50%
+/// width / +12.5% height; matches `02-design.md` §A.3).
+pub const E2E_RESIZE_WIDTH: u32 = 384;
+/// Post-resize physical height — see [`E2E_RESIZE_WIDTH`].
+pub const E2E_RESIZE_HEIGHT: u32 = 288;
+
+/// The minimum post/pre luma ratio at which the resize-test passes. Healthy
+/// shadow-band luma is ~242 on both screenshots (ratio ≈ 1.0); the broken
+/// regime collapses post-resize to ~4 (ratio ≈ 0.017). 0.5 is the threshold:
+/// well above the broken regime, well below a steady-state healthy run, so
+/// the gate has massive headroom in both directions.
+pub const E2E_RESIZE_MIN_LUMA_RATIO: f32 = 0.5;
+
+/// Filenames for the two screenshots saved by the resize-test (alongside
+/// [`E2E_SCREENSHOT_LATEST`] inside [`E2E_SCREENSHOT_DIR`]).
+pub const E2E_RESIZE_PRE_PNG: &str = "resize_pre.png";
+pub const E2E_RESIZE_POST_PNG: &str = "resize_post.png";
+
 // --- App wiring -----------------------------------------------------------
 
 /// Wire the e2e-specific systems + resources into the app (called by
@@ -163,6 +209,7 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<readback::E2eScreenshot>()
         .init_resource::<driver::E2eState>()
         .init_resource::<driver::E2eOutcome>()
+        .init_resource::<driver::ResizeTestState>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
         // camera `Transform` + `PositionSplit` during the `MOTION` / `SETTLE`
