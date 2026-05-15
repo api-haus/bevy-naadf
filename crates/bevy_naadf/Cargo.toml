@@ -4,15 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "Bevy 0.19 + Solari raytracing + DLSS Ray Reconstruction — foundation for the NAADF port"
 license = "MIT"
-# The crate ships two binaries (`bevy-naadf`, `e2e_render`); `cargo run` /
-# `just run` resolve to the production app unless `--bin e2e_render` is given.
+# The crate ships three binaries (`bevy-naadf`, `e2e_render`, `bake`); `cargo run`
+# / `just run` resolve to the production app unless another `--bin` is given.
 default-run = "bevy-naadf"
 
 # The crate is a library (`src/lib.rs` — the shared `build_app` app-wiring path)
-# plus two thin binaries over it: `bevy-naadf` (the production app, `src/main.rs`)
-# and `e2e_render` (the bounded windowed render-test harness, `src/bin/e2e_render.rs`
-# — auto-discovered, listed explicitly for clarity). All the unit tests live in
-# the library; `cargo test` runs them. See `docs/orchestrate/naadf-bevy-port/
+# plus three thin binaries over it: `bevy-naadf` (the production app,
+# `src/main.rs`), `e2e_render` (the bounded windowed render-test harness,
+# `src/bin/e2e_render.rs`), and `bake` (the headless asset-processor runner,
+# `src/bin/bake.rs` — see `src/texture_array/`). All the unit tests live in the
+# library; `cargo test` runs them. See `docs/orchestrate/naadf-bevy-port/
 # e2e-render-test.md` §9.
 [lib]
 name = "bevy_naadf"
@@ -26,9 +27,16 @@ path = "src/main.rs"
 name = "e2e_render"
 path = "src/bin/e2e_render.rs"
 
+[[bin]]
+name = "bake"
+path = "src/bin/bake.rs"
+
 [dependencies]
 # free_camera = the prebuilt fly-camera from bevy_camera_controller (off by default).
-# The `dlss` feature is forwarded from this crate's own `[features]` below.
+# The `dlss` feature is forwarded from this crate's own `[features]` below;
+# `basis-universal` (Bevy's runtime Basis transcoder) is added native-only in the
+# `[target.'cfg(not(wasm32))']` section below — its C++ cannot cross-compile to
+# the `wasm32-unknown-unknown` web target.
 bevy = { version = "=0.19.0-rc.1", features = [
     "free_camera",
 ] }
@@ -37,10 +45,14 @@ bevy = { version = "=0.19.0-rc.1", features = [
 # match across the crate boundary.
 bytemuck = { version = "=1.25.0", features = ["derive"] }
 # image = PNG encoding for the e2e harness's persistent screenshot-to-disk
-# (`src/e2e/framebuffer.rs` `Framebuffer::save_png`). Pinned to the exact version
-# Bevy 0.19-rc.1 already pulls in transitively (so there is no second copy of the
-# crate); only the `png` codec is enabled.
-image = { version = "=0.25.10", default-features = false, features = ["png"] }
+# (`src/e2e/framebuffer.rs` `Framebuffer::save_png`) plus PNG/JPEG *decoding* for
+# the texture-array loader's source maps (`src/texture_array/loader.rs`). Pinned
+# to the exact version Bevy 0.19-rc.1 already pulls in transitively (so there is
+# no second copy of the crate).
+image = { version = "=0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+] }
 # bevy-instamat = the InstaMAT integration crate — DEFAULT FEATURES ONLY. The
 # `instamat` feature is NEVER enabled here: that is the structural hard gate.
 # `bevy-naadf` pulls in `bevy-instamat`'s feature-free surface (the `material.ron`
@@ -48,6 +60,40 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 # No `features = [...]` — `bevy-instamat` has no `default` feature set, so the
 # `instamat` feature stays opt-in and uncompiled in the game build.
 bevy-instamat = { path = "../bevy-instamat" }
+# ron = the `*.texarray.ron` texture-array definition format
+# (`src/texture_array/def.rs`). Bevy already pulls `ron` transitively at this
+# minor version.
+ron = "0.12"
+# serde = derive `Deserialize` for the `*.texarray.ron` definition types
+# (`src/texture_array/def.rs`). thiserror = the loader/saver error enums
+# (`src/texture_array/{loader,saver}.rs`). Both are already in Bevy's tree at
+# these majors, so neither adds a second copy.
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+# Native-only support for the texture-array Basis pipeline (`src/texture_array/`,
+# `src/bin/bake.rs`):
+#   * `bevy/asset_processor` — gates Bevy's `AssetProcessor` itself; without it
+#     `AssetMode::Processed` only *reads* a pre-built `imported_assets/`, it
+#     never runs the processor. The `bake` binary needs it; the production app
+#     stays `Unprocessed` and just ignores the extra (unused) processor code.
+#   * `bevy/basis-universal` — Bevy's runtime transcoder, so `ImageLoader` can
+#     decode the baked `.basis` files and transcode them per-GPU at load.
+#   * `basis-universal` — the encoder half, used by the processor's saver
+#     (`src/texture_array/saver.rs`); version tracks the `0.3` Bevy 0.19 uses.
+# Native-only on purpose: `basis-universal-sys` compiles the encoder C++
+# unconditionally, and that does not cross-compile to bare
+# `wasm32-unknown-unknown` (no C sysroot for `<stdlib.h>`). The web build
+# therefore drops Basis entirely and loads `*.texarray.ron` uncompressed through
+# `TextureArrayLoader` — see `src/texture_array/`. A single compressed artifact
+# for both targets would need either a wasm C sysroot or a `bevy_voxel_world`
+# style dual-format (BC7 + ETC2) pre-transcoding baker.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "=0.19.0-rc.1", features = [
+    "asset_processor",
+    "basis-universal",
+] }
+basis-universal = "0.3"
 
 [features]
 default = ["dlss"]
@@ -63,6 +109,10 @@ force_disable_dlss = ["bevy/force_disable_dlss"]
 # wins). Build with `--no-default-features --features webgpu` — `dlss` has no
 # web build, so the web pipeline drops it (see `index.html` / `just web`).
 webgpu = ["bevy/webgpu"]
+
+# The texture-array Basis pipeline needs no cargo feature: `AssetMode::Processed`
+# lives entirely in the dedicated `bake` binary (`src/bin/bake.rs`), so the
+# production app / e2e harness / wasm build are unaffected by it.
 
 # NOTE: the `[profile.*]` fast-iteration tweaks live in the workspace-root
 # `Cargo.toml` — Cargo only honours profile overrides in the root manifest.

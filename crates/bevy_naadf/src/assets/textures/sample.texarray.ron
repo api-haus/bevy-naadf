@@ -1,0 +1,33 @@
+// Sample texture-array definition — see the `crate::texture_array` module docs.
+//
+// Two layers (elements) assembled from two source maps:
+//   * sample_color.png  — a colourful plasma map (distinct R/G/B per texel)
+//   * sample_height.png — a white→black gradient (a "height"/data map)
+//
+// Layer 1 reuses the same sources as layer 0 but inverts the height channel,
+// so a single bake exercises channel-combine, cross-texture sourcing, the
+// `invert` flag, and multi-layer stacking all at once.
+//
+// Load it like any image: `asset_server.load::<Image>("textures/sample.texarray.ron")`.
+// For the `bake` binary the source PNGs need the `Load`-action `.png.meta`
+// sidecars next to them (already provided) so the baker sees raw pixels rather
+// than Basis-compressed bytes.
+(
+    format: Rgba8UnormSrgb,
+    elements: [
+        // layer 0 — colour RGB, with the height map packed into alpha
+        (
+            r: (input: "textures/sample_color.png",  channel: R),
+            g: (input: "textures/sample_color.png",  channel: G),
+            b: (input: "textures/sample_color.png",  channel: B),
+            a: (input: "textures/sample_height.png", channel: R),
+        ),
+        // layer 1 — same colour, height inverted (e.g. depth-authored map)
+        (
+            r: (input: "textures/sample_color.png",  channel: R),
+            g: (input: "textures/sample_color.png",  channel: G),
+            b: (input: "textures/sample_color.png",  channel: B),
+            a: (input: "textures/sample_height.png", channel: R, invert: true),
+        ),
+    ],
+)

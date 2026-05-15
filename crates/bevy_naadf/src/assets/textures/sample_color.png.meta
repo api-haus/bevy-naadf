@@ -1,0 +1,16 @@
+// `Load`-action sidecar: opts this texture out of the default PNG→Basis
+// processor so the texture-array baker sees raw pixels. Inert in the default
+// (unprocessed) build; only consulted by the `bake` binary.
+// See `crate::texture_array`.
+(
+    meta_format_version: "1.0",
+    asset: Load(
+        loader: "bevy_image::image_loader::ImageLoader",
+        settings: (
+            format: FromExtension,
+            is_srgb: true,
+            sampler: Default,
+            asset_usage: ("MAIN_WORLD | RENDER_WORLD"),
+        ),
+    ),
+)

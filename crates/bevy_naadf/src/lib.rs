@@ -15,6 +15,7 @@ pub mod camera;
 pub mod e2e;
 pub mod hud;
 pub mod render;
+pub mod texture_array;
 pub mod voxel;
 pub mod world;
 
@@ -272,6 +273,12 @@ pub fn build_app(cfg: AppConfig) -> App {
                     // boot path stays byte-identical.
                     #[cfg(target_arch = "wasm32")]
                     meta_check: bevy::asset::AssetMetaCheck::Never,
+                    // Stays `AssetMode::Unprocessed` for the production app and
+                    // the e2e harness: a Bevy `AssetProcessor` is app-global and
+                    // racing it against the render pipeline's shader loads is
+                    // fragile. The texture-array Basis pipeline runs out-of-band
+                    // in the dedicated `bake` binary instead (`src/bin/bake.rs`,
+                    // `just bake`) — see `crate::texture_array`.
                     ..default()
                 })
                 .set(RenderPlugin {
@@ -297,6 +304,11 @@ pub fn build_app(cfg: AppConfig) -> App {
             // the `instamat` feature OFF — zero FFI / libloading / image-baker
             // code enters this build.
             bevy_instamat::BakedMaterialPlugin,
+            // Registers the `*.texarray.ron` asset loader. The plugin also wires
+            // the native Basis `AssetProcessor`, but that only activates when an
+            // `AssetProcessor` resource exists — i.e. in the `bake` binary's
+            // `AssetMode::Processed` app, not here. See `crate::texture_array`.
+            texture_array::TextureArrayPlugin,
         ));
 
     // The fly camera + runtime DLSS toggle — production only. The e2e config
