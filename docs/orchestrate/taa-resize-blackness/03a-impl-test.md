@@ -252,3 +252,14 @@ zero-cleared, so no luma collapse to detect). This mirrors the prior
 `set_physical_resolution`-Wayland-ignored failure mode — the surface
 reconfig was again silently skipped, this time because of a class
 selector mismatch rather than a resizable-flag issue.
+
+## Smoke re-run after Window.name = "e2e_render" fix
+- Build: success (`Finished 'release' profile in 8.75s`)
+- Exit code: 0
+- Framebuffer dims pre / post: 921×709 / 1458×288
+- togglefloating exit: 0 stdout: `ok`
+- resizewindowpixel exit: 0 stdout: (empty — no "resizeWindow: no window" error)
+- Pre solid luma / post solid luma / ratio: 241.00 / 229.00 / 0.9502 (threshold 0.50)
+- Pre / post full-frame luma: 136.48 / 63.13
+- Pass/fail verbatim: `e2e_render: resize-test PASS — pre/post luma ratio above threshold 0.5 after 300 pre-frames + togglefloating + 300 float-settle frames + window resize to 384x288 + 300 post-frames.`
+- Conclusion: resize propagated and bug reproduces
