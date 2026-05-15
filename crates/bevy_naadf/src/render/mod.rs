@@ -60,6 +60,10 @@ use graph_b::{
     naadf_sample_refine_count_valid_node, naadf_sample_refine_valid_history_node,
     naadf_spatial_resampling_node,
 };
+// Phase-C W3 — the regime-2 background AADF queue node lives in the
+// construction sub-module. Inserted before `naadf_atmosphere_node` in the
+// `Core3d` chain per `15-design-c.md` §3.
+use construction::bounds_calc::naadf_bounds_compute_node;
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
 use taa::{prepare_taa, TaaRingConfig};
@@ -226,25 +230,21 @@ impl Plugin for NaadfRenderPlugin {
             // (the refine buffers are correct-but-empty pre-B6), but the
             // spatial pass's sun sample is independent — direct-sun bounce
             // light on diffuse surfaces lands at end-of-B5.
-            // Phase-C construction nodes — TODO, NOT inserted by W0
-            // (`15-design-c.md` §3). The three construction nodes that
-            // belong here belong to W2 / W3 / W4 — each one lands in its own
-            // workstream merge so the integration step touches `.chain()`
-            // once per workstream rather than all at once:
+            // Phase-C construction nodes — `15-design-c.md` §3.
             //   * `naadf_bounds_compute_node` — W3 (regime-2, background
-            //     AADF queue, 5 prepare+indirect-compute rounds per frame).
+            //     AADF queue, `n_bounds_rounds` × {prepare + indirect compute}
+            //     per frame). LANDED HERE in W3.
             //   * `naadf_world_change_node`   — W2 (regime-3, gated on
-            //     `ConstructionEvents::has_pending_changes()`).
+            //     `ConstructionEvents::has_pending_changes()`). TODO W2.
             //   * `naadf_entity_update_node`  — W4 (regime-3, gated on
-            //     `ConstructionConfig.entities_enabled`).
-            // Insertion order: the three live **before** `naadf_atmosphere_node`
-            // (the first existing node) so atmosphere / first-hit / GI see
-            // the up-to-date chunk state. W0 leaves this comment as the load-
-            // bearing handoff to W2/W3/W4 — see `15-design-c.md §3` for the
-            // diagram.
+            //     `ConstructionConfig.entities_enabled`). TODO W4.
+            // Insertion order: construction nodes live **before**
+            // `naadf_atmosphere_node` (the first existing node) so
+            // atmosphere / first-hit / GI see the up-to-date chunk state.
             .add_systems(
                 Core3d,
                 (
+                    naadf_bounds_compute_node,
                     naadf_atmosphere_node,
                     naadf_first_hit_node,
                     naadf_taa_reproject_node,

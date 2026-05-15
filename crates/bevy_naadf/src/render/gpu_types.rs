@@ -605,6 +605,28 @@ const _: () = assert!(std::mem::offset_of!(GpuHashValueSlot, use_count) == 4);
 const _: () = assert!(std::mem::offset_of!(GpuHashValueSlot, hash_raw) == 8);
 const _: () = assert!(std::mem::offset_of!(GpuHashValueSlot, _pad) == 12);
 
+// === Phase C W3 — `GpuBoundQueueInfo` (`15-design-c.md` §5.3, W3) ============
+
+/// Rust mirror of `bounds_calc.wgsl::BoundQueueInfo` (the per-queue head/size
+/// record) (`15-design-c.md` §5.3, `boundsCalc.fx:13-17`).
+///
+/// Two `u32` fields, total 8 B. The WGSL declares `size` as `atomic<u32>` so
+/// `prepare_group_bounds` + `compute_group_bounds` can atomically advance it;
+/// the Rust mirror uploads the initial seed (`0`, `bound_group_count` for the
+/// size-0 queues; `0`, `0` for the rest) once at allocation time as plain
+/// `u32`s. WGSL `array<BoundQueueInfo>` stride is 8 B (no padding required
+/// for a 2-u32 struct).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GpuBoundQueueInfo {
+    pub start: u32,
+    pub size: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GpuBoundQueueInfo>() == 8);
+const _: () = assert!(std::mem::offset_of!(GpuBoundQueueInfo, start) == 0);
+const _: () = assert!(std::mem::offset_of!(GpuBoundQueueInfo, size) == 4);
+
 /// IEEE-754 half-float bit pattern of `x` (the C# `f32tof16`).
 ///
 /// A straightforward round-to-nearest-even f32 → f16 conversion, sufficient
@@ -805,5 +827,16 @@ mod tests {
         assert_eq!(offset_of!(GpuHashValueSlot, use_count), 4);
         assert_eq!(offset_of!(GpuHashValueSlot, hash_raw), 8);
         assert_eq!(offset_of!(GpuHashValueSlot, _pad), 12);
+    }
+
+    /// Phase-C W3 — runtime mirror of the `GpuBoundQueueInfo` layout guards
+    /// (`15-design-c.md` §5.3). 8 B = 2 × u32; the WGSL declares `size` as
+    /// `atomic<u32>` but the Rust upload writes plain `u32` at allocation.
+    #[test]
+    fn bound_queue_info_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<GpuBoundQueueInfo>(), 8);
+        assert_eq!(offset_of!(GpuBoundQueueInfo, start), 0);
+        assert_eq!(offset_of!(GpuBoundQueueInfo, size), 4);
     }
 }

@@ -56,6 +56,7 @@
 //!
 //! See `15-design-c.md` §1, §2.1 W0 row, and §3 for the full seam contract.
 
+pub mod bounds_calc;
 pub mod chunk_calc;
 pub mod config;
 pub mod generator_model;
@@ -64,8 +65,10 @@ pub mod map_copy;
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    BindGroup, BindGroupLayoutDescriptor, Buffer, CachedComputePipelineId, PipelineCache,
+    BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, Buffer, BufferDescriptor, BufferUsages,
+    CachedComputePipelineId, PipelineCache,
 };
+use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{GpuResourceAppExt, Render, RenderApp, RenderSystems};
 
 pub use config::ConstructionConfig;
@@ -127,6 +130,16 @@ pub struct ConstructionGpu {
     /// buffer (`15-design-c.md` §1.3, mirrors the Phase-B Batch-4
     /// `sample_refine_dispatch_layout` fix). W3.
     pub bound_dispatch_indirect: Option<Buffer>,
+    /// W3 — `GpuConstructionParams` uniform written once at startup with the
+    /// fixed-for-the-world `size_in_chunks` / `group_size_in_groups` /
+    /// `bound_group_queue_max_size` / `max_group_bound_dispatch`. Bound at
+    /// slot 1 of the `construction_bounds_world` group. (`15-design-c.md` §1.8.)
+    pub bounds_params_buffer: Option<Buffer>,
+    /// W3 — `true` once the `add_initial_groups_to_bound_queue` regime-1
+    /// seed dispatch has run (one-shot at prepare-time, no startup driver
+    /// extension required for the static test grid). Mirrors
+    /// `WorldBoundHandler.Initialize`'s one-time call (`WorldBoundHandler.cs:53`).
+    pub bounds_initialized: bool,
 
     // === W2 — Change-staging family (`worldChange.fx` family) ===============
     /// `changedGroups` (`ChangeHandler.cs:56`) — `Uint2[]` per edited 4³
@@ -163,9 +176,17 @@ pub struct ConstructionGpu {
 #[derive(Resource, Default)]
 pub struct ConstructionBindGroups {
     /// `construction_world` — the parallel-to-`world_layout` bind group for
-    /// the construction passes (chunkCalc / mapCopy / boundsCalc /
-    /// worldChange). W1 builds this when the world buffers exist.
+    /// the construction passes (chunkCalc / mapCopy / worldChange). 8-binding
+    /// layout (`@group(0)` for `chunk_calc.wgsl` + `world_change.wgsl`). W1
+    /// builds this when the world buffers exist.
     pub construction_world: Option<BindGroup>,
+    /// `construction_bounds_world` — the W3 narrow `@group(0)` for
+    /// `bounds_calc.wgsl` (chunks rw texture + params uniform only, 2
+    /// bindings). Separate from `construction_world` so the W3 prepare path
+    /// doesn't need W1's hash-map buffers to exist; built by `prepare_construction`
+    /// once `WorldGpu` has its chunks texture (`15-design-c.md` §1.3,
+    /// `16-impl-c-W3.md` decision #2).
+    pub construction_bounds_world: Option<BindGroup>,
     /// `construction_bounds` — the `@group(1)` bound-queue bind group used by
     /// `boundsCalc`. W3.
     pub construction_bounds: Option<BindGroup>,
@@ -232,6 +253,33 @@ pub struct ConstructionPipelines {
     /// W1 — `map_copy.wgsl::test_hash` (CPU-debug sanity probe; not in
     /// production startup).
     pub map_copy_pipeline_test: CachedComputePipelineId,
+
+    // === W3 (Background AADF queue — `bounds_calc.wgsl`) =====================
+    /// W3 — `construction_bounds_world_layout` `@group(0)` for
+    /// `bounds_calc.wgsl` (chunks + params, 2 bindings — narrower than W1's
+    /// 8-binding layout). See `bounds_calc::construction_bounds_world_layout_descriptor`.
+    pub construction_bounds_world_layout: BindGroupLayoutDescriptor,
+    /// W3 — `construction_bounds_layout` `@group(1)` for the bound-queue
+    /// family (`bound_queue_info` / `bound_group_queues` / `bound_group_masks`
+    /// / `bound_refined_info`, 4 bindings).
+    pub construction_bounds_layout: BindGroupLayoutDescriptor,
+    /// W3 — `bound_dispatch_indirect_layout` `@group(2)` for the
+    /// indirect-dispatch counter write-side (1 binding). The same buffer is
+    /// consumed by `dispatch_workgroups_indirect` as `INDIRECT`; the layout
+    /// split mirrors Phase-B Batch-4's `sample_refine_dispatch_layout`
+    /// (`15-design-c.md` §1.3 wgpu STORAGE_READ_WRITE × INDIRECT split).
+    pub bound_dispatch_indirect_layout: BindGroupLayoutDescriptor,
+    /// W3 — `bounds_calc.wgsl::add_initial_groups_to_bound_queue`
+    /// (regime-1 one-shot seed; the W1 startup driver should call it after
+    /// `compute_block_bounds`).
+    pub bounds_calc_pipeline_add_initial: CachedComputePipelineId,
+    /// W3 — `bounds_calc.wgsl::prepare_group_bounds` (regime-2 single-thread
+    /// queue picker; writes `bound_refined_info` + `bound_dispatch_indirect`).
+    pub bounds_calc_pipeline_prepare: CachedComputePipelineId,
+    /// W3 — `bounds_calc.wgsl::compute_group_bounds` (regime-2 4³-workgroup
+    /// per-chunk AADF expander; dispatched indirect off
+    /// `bound_dispatch_indirect`).
+    pub bounds_calc_pipeline_compute: CachedComputePipelineId,
 }
 
 impl FromWorld for ConstructionPipelines {
@@ -280,6 +328,33 @@ impl FromWorld for ConstructionPipelines {
             map_copy_layout.clone(),
         );
 
+        // === W3 — bounds_calc pipelines + 3 layouts ===========================
+        let construction_bounds_world_layout =
+            bounds_calc::construction_bounds_world_layout_descriptor();
+        let construction_bounds_layout =
+            bounds_calc::construction_bounds_layout_descriptor();
+        let bound_dispatch_indirect_layout =
+            bounds_calc::bound_dispatch_indirect_layout_descriptor();
+        let bounds_calc_pipeline_add_initial = bounds_calc::queue_add_initial_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_bounds_world_layout.clone(),
+            construction_bounds_layout.clone(),
+        );
+        let bounds_calc_pipeline_prepare = bounds_calc::queue_prepare_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_bounds_world_layout.clone(),
+            construction_bounds_layout.clone(),
+            bound_dispatch_indirect_layout.clone(),
+        );
+        let bounds_calc_pipeline_compute = bounds_calc::queue_compute_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_bounds_world_layout.clone(),
+            construction_bounds_layout.clone(),
+        );
+
         Self {
             generator_model_layout,
             generator_model_pipeline,
@@ -290,6 +365,12 @@ impl FromWorld for ConstructionPipelines {
             map_copy_layout,
             map_copy_pipeline_copy,
             map_copy_pipeline_test,
+            construction_bounds_world_layout,
+            construction_bounds_layout,
+            bound_dispatch_indirect_layout,
+            bounds_calc_pipeline_add_initial,
+            bounds_calc_pipeline_prepare,
+            bounds_calc_pipeline_compute,
         }
     }
 }
@@ -310,22 +391,272 @@ impl FromWorld for ConstructionPipelines {
 /// W0 (the empty body cannot conflict); W1..W5 add `.before(...)` /
 /// `.after(...)` as their bind groups gain real `WorldGpu` /
 /// `ConstructionGpu` dependencies.
+// Bevy systems legitimately exceed clippy's 7-argument ceiling (same as
+// `prepare_frame_gpu`'s allow in `render/prepare.rs:302`).
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_construction(
     mut commands: Commands,
-    gpu: Option<Res<ConstructionGpu>>,
-    bind_groups: Option<Res<ConstructionBindGroups>>,
+    gpu: Option<ResMut<ConstructionGpu>>,
+    bind_groups: Option<ResMut<ConstructionBindGroups>>,
+    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    construction_pipelines: Option<Res<ConstructionPipelines>>,
+    construction_config: Res<config::ConstructionConfig>,
+    pipeline_cache: Res<PipelineCache>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
 ) {
-    // W0 — empty seam. Just guarantee the two resources exist.
-    //
-    // W1..W5 will fill this with their workstream's allocate/upload/build
-    // logic. The pattern matches `prepare_world_gpu` (`render/prepare.rs:128`)
-    // — `Option<Res<…>>` for the resource, `Commands::insert_resource` on
-    // first creation, no-op when already present.
+    // W0 seam: ensure-exists for both resources, then W1..W5 fill in their
+    // family's allocations + bind groups on subsequent frames (when the
+    // dependencies — `WorldGpu`, `ConstructionPipelines` — also exist).
     if gpu.is_none() {
         commands.insert_resource(ConstructionGpu::default());
+        // First frame creates the resource; the *next* frame's pass through
+        // this system fills its fields (W3 bound buffers etc.) once
+        // `WorldGpu` is available.
+        return;
     }
     if bind_groups.is_none() {
         commands.insert_resource(ConstructionBindGroups::default());
+        return;
+    }
+
+    let mut gpu = gpu.unwrap();
+    let mut bind_groups = bind_groups.unwrap();
+    let Some(world_gpu) = world_gpu else { return; };
+    let Some(construction_pipelines) = construction_pipelines else { return; };
+
+    // === W3 — bound-queue family + bind groups ===============================
+    //
+    // Fixed-size allocation per `WorldBoundHandler.cs:44-47`:
+    //   - boundQueueInfo:  32 × 3 × BoundQueueInfo (8 B) — 768 B.
+    //   - boundGroupQueues: 32 × 3 × boundGroupCount × u32 — `96 * boundGroupCount` B.
+    //   - boundGroupMasks:  boundGroupCount × 3 × u32 — `12 * boundGroupCount` B.
+    //                       (We flatten the C# `Uint3` into 3 atomic<u32> slots
+    //                       indexed `group * 3 + axis` — `bounds_calc.wgsl`
+    //                       file header documents this.)
+    //   - boundRefinedInfo: 3 × u32 — 12 B.
+    //   - boundDispatchIndirect: 5 × u32 — 20 B, `INDIRECT|STORAGE|COPY_DST`.
+    //
+    // Build-once: only allocate when the buffers do not exist yet. The
+    // size is fixed for the lifetime of the world (the C# allocates once at
+    // `WorldBoundHandler::new` — `WorldBoundHandler.cs:38-51`).
+    let chunk_count = world_gpu.chunks.size().width
+        * world_gpu.chunks.size().height
+        * world_gpu.chunks.size().depth_or_array_layers;
+    let bound_group_count = bounds_calc::bound_group_count_of([
+        world_gpu.chunks.size().width,
+        world_gpu.chunks.size().height,
+        world_gpu.chunks.size().depth_or_array_layers,
+    ]);
+
+    if gpu.bound_queue_info.is_none() {
+        // wgpu rejects zero-size buffers; clamp every size to ≥1 element.
+        let bgc = bound_group_count.max(1) as u64;
+        let info_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_bound_queue_info"),
+            size: 32 * 3 * std::mem::size_of::<crate::render::gpu_types::GpuBoundQueueInfo>()
+                as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // Seed: `boundQueueInfoNew[i*3+xyz] = {start: 0, size: i == 0 ? boundGroupCount : 0}`
+        // — `WorldBoundHandler.cs:55-64`. The size-0 X/Y/Z queues hold every
+        // group at startup; all higher bound sizes start empty.
+        let mut info_seed: Vec<crate::render::gpu_types::GpuBoundQueueInfo> =
+            Vec::with_capacity(32 * 3);
+        for i in 0..32u32 {
+            for _xyz in 0..3u32 {
+                info_seed.push(crate::render::gpu_types::GpuBoundQueueInfo {
+                    start: 0,
+                    size: if i == 0 { bound_group_count } else { 0 },
+                });
+            }
+        }
+        render_queue.write_buffer(&info_buf, 0, bytemuck::cast_slice(&info_seed));
+
+        let queues_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_bound_group_queues"),
+            size: 32 * 3 * bgc * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // Zero-init (the regime-1 `add_initial_groups_to_bound_queue` shader
+        // populates the size-0 queues).
+
+        let masks_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_bound_group_masks"),
+            size: bgc * 3 * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // Zero-init.
+
+        let refined_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_bound_refined_info"),
+            size: 3 * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let indirect_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_bound_dispatch_indirect"),
+            size: 5 * 4,
+            usage: BufferUsages::STORAGE
+                | BufferUsages::COPY_DST
+                | BufferUsages::COPY_SRC
+                | BufferUsages::INDIRECT,
+            mapped_at_creation: false,
+        });
+        // Seed: `{GroupCountX=1, GroupCountY=1, GroupCountZ=1, _=0, _=0}` per
+        // `WorldBoundHandler.cs:50`. `prepare_group_bounds` overwrites
+        // `[0]` (GroupCountX) every frame; `[1]/[2]` stay 1.
+        render_queue.write_buffer(
+            &indirect_buf,
+            0,
+            bytemuck::cast_slice(&[1u32, 1u32, 1u32, 0u32, 0u32]),
+        );
+
+        gpu.bound_queue_info = Some(info_buf);
+        gpu.bound_group_queues = Some(queues_buf);
+        gpu.bound_group_masks = Some(masks_buf);
+        gpu.bound_refined_info = Some(refined_buf);
+        gpu.bound_dispatch_indirect = Some(indirect_buf);
+        // Force bind-group rebuild on the next branch.
+        bind_groups.construction_bounds_world = None;
+        bind_groups.construction_bounds = None;
+        bind_groups.bound_dispatch = None;
+    }
+
+    // Build the per-frame `GpuConstructionParams` uniform once (build-once;
+    // the world topology does not change for the W3 regime-2 path on the
+    // static test grid). The uniform is rewritten every frame in regime-2
+    // through this same code path (W3 doesn't actually need to *update* it
+    // per frame — `bound_group_queue_max_size` / `group_size_in_groups` /
+    // `max_group_bound_dispatch` are fixed — but uploading once at startup
+    // is cheap).
+    if gpu.bounds_params_buffer.is_none() {
+        let params = crate::render::gpu_types::GpuConstructionParams {
+            size_in_chunks: [
+                world_gpu.chunks.size().width,
+                world_gpu.chunks.size().height,
+                world_gpu.chunks.size().depth_or_array_layers,
+            ],
+            _pad0: 0,
+            group_size_in_groups: bounds_calc::group_size_in_groups_of([
+                world_gpu.chunks.size().width,
+                world_gpu.chunks.size().height,
+                world_gpu.chunks.size().depth_or_array_layers,
+            ]),
+            _pad1: 0,
+            bound_group_queue_max_size: bound_group_count.max(1),
+            hash_map_size: construction_config.initial_hash_map_size,
+            segment_size_in_chunks: 4,
+            max_group_bound_dispatch: construction_config.max_group_bound_dispatch,
+            chunk_offset: [0, 0, 0],
+            _pad2: 0,
+            frame_index: 0,
+            changed_chunk_count: 0,
+            changed_block_count: 0,
+            changed_voxel_count: 0,
+        };
+        let buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_bounds_construction_params"),
+            size: std::mem::size_of::<crate::render::gpu_types::GpuConstructionParams>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        render_queue.write_buffer(&buf, 0, bytemuck::bytes_of(&params));
+        gpu.bounds_params_buffer = Some(buf);
+        bind_groups.construction_bounds_world = None;
+    }
+
+    let _ = chunk_count; // referenced for future regime-3 sizing.
+
+    // === Build W3 bind groups when missing ===================================
+    if bind_groups.construction_bounds_world.is_none() {
+        if let Some(params_buf) = gpu.bounds_params_buffer.as_ref() {
+            let bgl = pipeline_cache
+                .get_bind_group_layout(&construction_pipelines.construction_bounds_world_layout);
+            let bg = render_device.create_bind_group(
+                "naadf_construction_bounds_world_bind_group",
+                &bgl,
+                &BindGroupEntries::sequential((
+                    &world_gpu.chunks_view,
+                    params_buf.as_entire_buffer_binding(),
+                )),
+            );
+            bind_groups.construction_bounds_world = Some(bg);
+        }
+    }
+    if bind_groups.construction_bounds.is_none() {
+        if let (Some(info), Some(queues), Some(masks), Some(refined)) = (
+            gpu.bound_queue_info.as_ref(),
+            gpu.bound_group_queues.as_ref(),
+            gpu.bound_group_masks.as_ref(),
+            gpu.bound_refined_info.as_ref(),
+        ) {
+            let bgl = pipeline_cache
+                .get_bind_group_layout(&construction_pipelines.construction_bounds_layout);
+            let bg = render_device.create_bind_group(
+                "naadf_construction_bounds_bind_group",
+                &bgl,
+                &BindGroupEntries::sequential((
+                    info.as_entire_buffer_binding(),
+                    queues.as_entire_buffer_binding(),
+                    masks.as_entire_buffer_binding(),
+                    refined.as_entire_buffer_binding(),
+                )),
+            );
+            bind_groups.construction_bounds = Some(bg);
+        }
+    }
+    if bind_groups.bound_dispatch.is_none() {
+        if let Some(indirect) = gpu.bound_dispatch_indirect.as_ref() {
+            let bgl = pipeline_cache
+                .get_bind_group_layout(&construction_pipelines.bound_dispatch_indirect_layout);
+            let bg = render_device.create_bind_group(
+                "naadf_bound_dispatch_bind_group",
+                &bgl,
+                &BindGroupEntries::sequential((indirect.as_entire_buffer_binding(),)),
+            );
+            bind_groups.bound_dispatch = Some(bg);
+        }
+    }
+
+    // First-frame seed: when the bound-queue family has just been built AND
+    // `WorldGpu`'s chunks texture is the CPU-built version, dispatch
+    // `add_initial_groups_to_bound_queue` to seed the size-0 X/Y/Z queues +
+    // the per-axis mask bits. This mirrors `WorldBoundHandler.Initialize`
+    // (`WorldBoundHandler.cs:53-89`). The dispatch only runs when the W3
+    // pipeline has compiled.
+    if construction_config.gpu_construction_enabled
+        && bound_group_count > 0
+        && !gpu.bounds_initialized
+    {
+        let Some(initial_pipeline) = pipeline_cache
+            .get_compute_pipeline(construction_pipelines.bounds_calc_pipeline_add_initial)
+        else {
+            return;
+        };
+        let (Some(world_bg), Some(bounds_bg)) = (
+            bind_groups.construction_bounds_world.as_ref(),
+            bind_groups.construction_bounds.as_ref(),
+        ) else {
+            return;
+        };
+        let mut encoder =
+            render_device.create_command_encoder(&bevy::render::render_resource::CommandEncoderDescriptor {
+                label: Some("naadf_bounds_calc_add_initial_seed"),
+            });
+        bounds_calc::dispatch_add_initial_groups(
+            &mut encoder,
+            initial_pipeline,
+            world_bg,
+            bounds_bg,
+            bound_group_count,
+        );
+        render_queue.submit([encoder.finish()]);
+        gpu.bounds_initialized = true;
     }
 }
 
