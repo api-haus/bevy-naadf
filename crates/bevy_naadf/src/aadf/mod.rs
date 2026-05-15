@@ -6,7 +6,10 @@
 //! - [`cell`] — `Chunk`/`Block`/`Voxel` cell encode/decode (bit layouts).
 //! - [`construct`] — CPU-side dense-voxel → three-layer buffers + hash dedup.
 //! - [`bounds`] — CPU-side AADF cuboid expansion.
+//! - [`generator`] — Phase-C W5 CPU oracle for `generatorModel.fx` (the GPU
+//!   world generator that produces the input to Algorithm 1).
 
 pub mod bounds;
 pub mod cell;
 pub mod construct;
+pub mod generator;

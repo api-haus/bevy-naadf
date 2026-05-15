@@ -80,6 +80,14 @@ pub struct ConstructionConfig {
     /// "one queue per frame" rate is technically "one batch", and NAADF's
     /// batch is 5 prepare+indirect-compute rounds. W3 honours this directly.
     pub n_bounds_rounds: u32,
+    /// W5-only isolation flag: when `true`, the regime-1 startup driver runs
+    /// **only** the world-generator dispatch and stops — no `chunk_calc`,
+    /// no `bounds_init`. Used by the W5 unit test to exercise its GPU path
+    /// before W1 lands the rest of the chain. **Default `false`** — until
+    /// W1 lands, the full GPU construction path is dormant regardless of
+    /// this flag (`gpu_construction_enabled` gates everything); W1 flips
+    /// the dormant case to "run the full chain".
+    pub run_worldgen_only: bool,
 }
 
 impl Default for ConstructionConfig {
@@ -101,6 +109,9 @@ impl Default for ConstructionConfig {
             cpu_fallback: true,
             // `WorldBoundHandler.cs:113` — 5 rounds per frame.
             n_bounds_rounds: 5,
+            // W5 isolation knob — off by default; unit tests / explicit CLI
+            // opt-ins flip it on.
+            run_worldgen_only: false,
         }
     }
 }
@@ -140,6 +151,7 @@ const _: () = {
         gpu_construction_enabled: false,
         entities_enabled: false,
         cpu_fallback: true,
+        run_worldgen_only: false,
     };
     // Compile-time-only sanity probe — referenced once so the const isn't
     // dead. `ConstructionConfig` is `Copy`, so this is a no-op at runtime.
