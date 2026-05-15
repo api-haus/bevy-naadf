@@ -8,6 +8,8 @@ use bevy::{
     prelude::*,
 };
 
+use crate::DevFont;
+
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::anti_alias::dlss::{Dlss, DlssRayReconstructionFeature, DlssRayReconstructionSupported};
 
@@ -87,12 +89,13 @@ const fn matches_span(path: &str, span: &str) -> bool {
 #[derive(Component)]
 pub struct HudText;
 
-pub fn setup_hud(mut commands: Commands) {
+pub fn setup_hud(mut commands: Commands, dev_font: Res<DevFont>) {
     commands.spawn((
         HudText,
         Text::default(),
         TextColor(Color::WHITE),
         TextFont {
+            font: dev_font.0.clone(),
             font_size: FontSize::Px(14.0),
             ..default()
         },

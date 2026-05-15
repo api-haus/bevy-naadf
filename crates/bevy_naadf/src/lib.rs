@@ -20,6 +20,19 @@ pub mod texture_array;
 pub mod voxel;
 pub mod world;
 
+/// Roboto Regular TTF bytes, embedded at compile time. The font is Apache 2.0;
+/// see `src/assets/fonts/Roboto-LICENSE.txt`.
+static ROBOTO_REGULAR_BYTES: &[u8] =
+    include_bytes!("assets/fonts/Roboto-Regular.ttf");
+
+/// Main-world resource — the `FontSource` for the embedded Roboto Regular
+/// font. Both `hud` and `panel` query this resource to set `TextFont.font`.
+///
+/// To add a second font in future: add another `&[u8]` static + another field
+/// here, load it in `load_dev_font`, and store its `FontSource` alongside this one.
+#[derive(Resource)]
+pub struct DevFont(pub FontSource);
+
 use bevy::{
     asset::AssetPlugin,
     camera_controller::free_camera::FreeCameraPlugin,
@@ -459,6 +472,10 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         app.add_systems(Update, camera::sync_position_split);
     }
 
+    // Load the embedded Roboto Regular font into Assets<Font> and store the
+    // handle as DevFont. Runs first so setup_hud / setup_panel can query it.
+    app.add_systems(Startup, load_dev_font);
+
     // The test grid + camera spawn — shared. The e2e config spawns a fixed-pose
     // camera instead of the production `setup_camera`; the e2e systems own that
     // (`crate::e2e::add_e2e_systems`).
@@ -490,7 +507,7 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     );
 
     if cfg.add_hud {
-        app.add_systems(Startup, hud::setup_hud)
+        app.add_systems(Startup, hud::setup_hud.after(load_dev_font))
             .add_systems(Update, hud::update_hud);
         // Quality panel (`21-design-quality-panel.md` + mouse extension
         // `25-design-panel-mouse.md`) — gated on the same `add_hud` flag as
@@ -502,7 +519,7 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         // (`25-design-panel-mouse.md` §6.1).
         app.init_resource::<panel::PanelState>()
             .init_resource::<panel::PanelDrag>()
-            .add_systems(Startup, panel::setup_panel)
+            .add_systems(Startup, panel::setup_panel.after(load_dev_font))
             .add_systems(
                 Update,
                 (
@@ -538,6 +555,17 @@ pub fn run_e2e_render() -> AppExit {
 pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
     let app = build_app_with_args(AppConfig::e2e(), args);
     e2e::run_with_app(app)
+}
+
+/// `Startup` system: load the embedded Roboto Regular bytes into `Assets<Font>`
+/// and insert the resulting `Handle<Font>` as the [`DevFont`] resource.
+///
+/// Must run before `setup_hud` and `setup_panel` so those systems can resolve
+/// the resource. Runs unconditionally in both windowed and e2e configs.
+fn load_dev_font(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
+    let font = Font::from_bytes(ROBOTO_REGULAR_BYTES.to_vec(), "Roboto");
+    let handle = fonts.add(font);
+    commands.insert_resource(DevFont(FontSource::Handle(handle)));
 }
 
 /// Phase-C wave-3 — startup system that spawns one W4 fixture entity into

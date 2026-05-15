@@ -70,7 +70,7 @@ use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, RelativeCursorPosition};
 use bevy::window::PrimaryWindow;
 
-use crate::{AppArgs, GiSettings, DEFAULT_TAA_RING_DEPTH};
+use crate::{AppArgs, DevFont, GiSettings, DEFAULT_TAA_RING_DEPTH};
 use crate::render::gi::{
     BUCKET_STORAGE_COUNT, INVALID_SAMPLE_STORAGE_COUNT, REFINED_BUCKET_STORAGE_COUNT,
     VALID_SAMPLE_STORAGE_COUNT,
@@ -562,7 +562,7 @@ fn first_interactive() -> usize {
 /// + `RelativeCursorPosition` for mouse hit-testing; `Section`/`Readonly`
 /// rows do not. The root + all rows carry `FocusPolicy::Block` so mouse
 /// presses inside the panel never bleed to a future scene-control system.
-pub fn setup_panel(mut commands: Commands) {
+pub fn setup_panel(mut commands: Commands, dev_font: Res<DevFont>) {
     let root = commands
         .spawn((
             PanelRoot,
@@ -598,6 +598,7 @@ pub fn setup_panel(mut commands: Commands) {
                 Text::new("[F1] Raymarching Quality"),
                 TextColor(Color::srgb(0.85, 0.85, 0.85)),
                 TextFont {
+                    font: dev_font.0.clone(),
                     font_size: FontSize::Px(12.0),
                     ..default()
                 },
@@ -614,6 +615,7 @@ pub fn setup_panel(mut commands: Commands) {
                 Text::new("─────────────────────────────"),
                 TextColor(Color::srgb(0.5, 0.5, 0.5)),
                 TextFont {
+                    font: dev_font.0.clone(),
                     font_size: FontSize::Px(12.0),
                     ..default()
                 },
@@ -649,6 +651,7 @@ pub fn setup_panel(mut commands: Commands) {
                 Text::default(),
                 TextColor(Color::WHITE),
                 TextFont {
+                    font: dev_font.0.clone(),
                     font_size: FontSize::Px(12.0),
                     ..default()
                 },
@@ -667,6 +670,7 @@ pub fn setup_panel(mut commands: Commands) {
                 Text::default(),
                 TextColor(Color::srgb(0.65, 0.65, 0.65)),
                 TextFont {
+                    font: dev_font.0.clone(),
                     font_size: FontSize::Px(11.0),
                     ..default()
                 },
