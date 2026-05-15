@@ -41,6 +41,13 @@ bytemuck = { version = "=1.25.0", features = ["derive"] }
 # Bevy 0.19-rc.1 already pulls in transitively (so there is no second copy of the
 # crate); only the `png` codec is enabled.
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
+# bevy-instamat = the InstaMAT integration crate — DEFAULT FEATURES ONLY. The
+# `instamat` feature is NEVER enabled here: that is the structural hard gate.
+# `bevy-naadf` pulls in `bevy-instamat`'s feature-free surface (the `material.ron`
+# loader + `BakedMaterialPlugin`) and zero FFI / libloading / image-baker code.
+# No `features = [...]` — `bevy-instamat` has no `default` feature set, so the
+# `instamat` feature stays opt-in and uncompiled in the game build.
+bevy-instamat = { path = "../bevy-instamat" }
 
 [features]
 default = ["dlss"]

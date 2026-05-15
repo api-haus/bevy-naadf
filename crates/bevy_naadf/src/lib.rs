@@ -289,6 +289,14 @@ pub fn build_app(cfg: AppConfig) -> App {
             RenderDiagnosticsPlugin,
             world::WorldPlugin,
             render::NaadfRenderPlugin,
+            // InstaMAT baked-material loader — registers `MaterialRonLoader` so
+            // `materials/<name>/material.ron` resolves to a `StandardMaterial`.
+            // Infrastructure only: nothing in the scene consumes a baked
+            // material yet (wiring baked PBR into the custom voxel render path
+            // is a separate future effort). The `bevy-instamat` dependency is
+            // the `instamat` feature OFF — zero FFI / libloading / image-baker
+            // code enters this build.
+            bevy_instamat::BakedMaterialPlugin,
         ));
 
     // The fly camera + runtime DLSS toggle — production only. The e2e config

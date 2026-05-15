@@ -1,8 +1,9 @@
 # bevy-naadf workspace task runner. `just` with no arguments lists the recipes.
 #
 # Workspace layout:
-#   crates/bevy_naadf  — the Bevy 0.19 NAADF voxel renderer
-#   crates/voxel_noise — the FastNoise2 wrapper (native API + Emscripten module)
+#   crates/bevy_naadf   — the Bevy 0.19 NAADF voxel renderer
+#   crates/bevy-instamat — the InstaMAT baked-material loader + dev-side batch baker
+#   crates/voxel_noise  — the FastNoise2 wrapper (native API + Emscripten module)
 
 # Trunk dev-server bind address — keep in sync with crates/bevy_naadf/Trunk.toml.
 web_host := "127.0.0.1"
@@ -31,9 +32,9 @@ run:
 dev:
     cargo run -p bevy-naadf
 
-# Run the workspace test suites.
+# Run the workspace test suites (incl. the dev-side baker's unit tests).
 test:
-    cargo test --workspace
+    cargo test --workspace --features bevy-instamat/instamat
 
 # Format all Rust code.
 fmt:
@@ -50,6 +51,30 @@ lint:
 # Lint for std::time::Instant in WASM-compiled crates (use web_time instead).
 lint-wasm-compat:
     ./scripts/lint/wasm-compat.sh
+
+# ── InstaMAT material baking (dev-side only) ────────────────────────────────
+
+# Dev-side pre-build step — needs InstaMAT Studio + the native-interface wrapper
+# .so (see .envrc.example: INSTAMAT_NATIVE_INTERFACE). Run whenever a .imp source
+# changes; the baked output is committed. The baker resolves the repo-root
+# assets/ dir itself (no env var needed); on an unauthorized machine it prints a
+# hard-stop report and exits 3.
+
+# Bake every .imp under assets/materials/ into per-channel PNGs + material.ron.
+bake:
+    cargo run -p bevy-instamat --bin instamat_bake --features instamat
+
+# Build the dev-side baker without running it (compile check for the FFI path).
+build-baker:
+    cargo build -p bevy-instamat --bin instamat_bake --features instamat
+
+# `bevy-naadf` depends on `bevy-instamat` with the `instamat` feature OFF, so
+# this build never touches the FFI / libloading / baker modules.
+
+# Structural hard gate — the shippable game build compiles zero InstaMAT code.
+check-gate:
+    cargo build -p bevy-naadf
+    @echo "OK: bevy-naadf builds with the instamat feature disabled (structural — separate crate)."
 
 # ── bevy_naadf web build (wasm32-unknown-unknown / WebGPU, via Trunk) ────────
 

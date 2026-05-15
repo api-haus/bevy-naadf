@@ -365,10 +365,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy-instamat"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "image",
+ "libloading",
+ "ron",
+ "serde",
+]
+
+[[package]]
 name = "bevy-naadf"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy-instamat",
  "bytemuck",
  "image",
 ]
