@@ -389,11 +389,13 @@ pub fn prepare_frame_gpu(
         } else {
             FLAG_CHECK_SUN | FLAG_IS_ATMOSPHERE_INTERACTION
         },
-        exposure: 1.5,
-        // C# `Settings.data.general.toneMappingFac` — a constant in the port
-        // (`09-design-b.md` §5.9). Consumed by Batch 6's `base/` final blit;
-        // set now so the layout slot carries the right value from Batch 1 on.
-        tone_mapping_fac: 1.0,
+        // Formerly `exposure` / `tone_mapping_fac` — the custom final-blit
+        // tonemap constants. The TAA-fidelity track switched the port to Bevy's
+        // built-in tonemapping (the camera carries `Camera { hdr: true }` + a
+        // `Tonemapping` component; `naadf_final.wgsl` outputs raw linear HDR),
+        // so these are dead pad slots now (`18-taa-fidelity.md` fix #2).
+        _pad0a: 0,
+        _pad0b: 0,
         sky_sun_dir,
         _pad1: 0,
         sun_color: Vec3::new(1.0, 0.95, 0.85),

@@ -107,10 +107,15 @@ struct GpuGiParams {
     denoise_thresh: f32,
     // Packed GI flags — see the `GI_FLAG_*` consts.
     flags: u32,
-    // Trailing pad u32s (mirror the Rust struct's `_pad4` / `_pad5` / `_pad6`).
+    // Trailing pad u32 (mirrors the Rust struct's `_pad4`) — at struct offset
+    // 276, keeps `taa_jitter` on the 8-byte-aligned offset 280.
     pad_a: u32,
-    pad_b: u32,
-    pad_c: u32,
+    // Sub-pixel TAA jitter (C# `taaJitter`) — the per-frame Halton 2-D offset
+    // the `globalIllum` / `spatialResampling` `get_ray_dir` calls are fired
+    // through (`renderGlobalIllum.fx:69` / `renderSpatialResampling.fx:351`).
+    // `vec2<f32>` at struct offset 280 (8-byte aligned), mirroring the Rust
+    // `taa_jitter: Vec2` that replaced the trailing `_pad5`/`_pad6` pair.
+    taa_jitter: vec2<f32>,
 }
 
 // `flags` bits (mirror `gpu_types::GI_FLAG_*`).

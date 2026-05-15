@@ -4,8 +4,7 @@
 // Derives from: render/common/taa/commonTaa.fxh (`06-design-a2.md` §3, §10.1).
 // A faithful WGSL port of `commonTaa.fxh`'s `compressSample` / `decompressSample`
 // (the 64-bit `uint2` sample format), `getHashFromData`, and `neighborOffsets[9]`,
-// plus the 16-deep sample-ring depth constant (the `01-context.md` §2c / §6
-// VRAM lever: the sample ring is 16-deep, not NAADF's 32).
+// plus the configurable sample-ring-depth constant.
 //
 // NOTE — this is the TAA *sample* compression (8-bit/channel exponential colour,
 // from `commonTaa.fxh`). The 5-bit/channel ReSTIR-GI sample compression
@@ -14,10 +13,17 @@
 //
 // naga-oil import module.
 
-// The TAA sample ring depth — 16, NOT NAADF's 32 (the `01-context.md` §6 VRAM
-// lever). Every `% 32` / `* 32` in the HLSL `taaSamples` indexing becomes
-// `% TAA_SAMPLE_RING_DEPTH` / `* TAA_SAMPLE_RING_DEPTH`.
-const TAA_SAMPLE_RING_DEPTH: u32 = 16u;
+// The TAA sample ring depth — **configurable** (`18-taa-fidelity.md` fix #3,
+// superseding the `01-context.md` §6 binding 16-deep VRAM lever). Default 32
+// (NAADF's / the paper's depth — `WorldRenderBase.cs:17`); 16 / 24 stay
+// available via the config knob. The value is a `#{TAA_SAMPLE_RING_DEPTH}`
+// naga-oil `shader_def` substitution injected at pipeline specialisation from
+// `AppArgs.taa_ring_depth` — see `render/pipelines.rs` `taa_shader_defs`. The
+// Rust buffer sizing (`render/taa.rs`) reads the SAME config value, so the two
+// sides agree exactly (a mismatch is silent ring corruption). Every `% 32` /
+// `* 32` in the HLSL `taaSamples` indexing is `% TAA_SAMPLE_RING_DEPTH` /
+// `* TAA_SAMPLE_RING_DEPTH`.
+const TAA_SAMPLE_RING_DEPTH: u32 = #{TAA_SAMPLE_RING_DEPTH}u;
 
 // The 3×3 neighbour offsets, in `commonTaa.fxh:6-18` order: centre first, then
 // the 4-neighbourhood, then the 4 diagonals. The reproject pass walks these for

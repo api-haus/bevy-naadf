@@ -92,6 +92,20 @@ impl Default for GiSettings {
     }
 }
 
+/// The default TAA sample-ring depth — **32**, NAADF's / the paper's depth
+/// (`WorldRenderBase.cs:17`, paper §4.1 / Fig 6).
+///
+/// `18-taa-fidelity.md` fix #3 made the ring depth a configurable
+/// `AppArgs.taa_ring_depth`, superseding the `01-context.md` §2c / §6 binding
+/// 16-deep VRAM lever (the 16-deep ring was a secondary cause of the port's
+/// "barely resolves" noise — it halves the temporal-averaging window). 16 / 24
+/// stay available via the config knob; **32 is the default**. This single
+/// const is the source of truth for both the WGSL `#{TAA_SAMPLE_RING_DEPTH}`
+/// shader-def (`render/pipelines.rs`) and the Rust buffer sizing
+/// (`render/taa.rs`) — the two MUST agree exactly (a mismatch is silent ring
+/// corruption), so they both read it from here, via `AppArgs.taa_ring_depth`.
+pub const DEFAULT_TAA_RING_DEPTH: u32 = 32;
+
 /// Command-line options, parsed once and stored as a resource (`03-design.md` §4.1).
 #[derive(Resource, Clone, Copy)]
 pub struct AppArgs {
@@ -100,6 +114,16 @@ pub struct AppArgs {
     /// Long-term TAA. Wired but always `false` in Phase A (D4) — Phase A-2
     /// turns it on.
     pub taa: bool,
+    /// The TAA sample-ring depth — the long-term-memory TAA history depth
+    /// (`18-taa-fidelity.md` fix #3). The single config source of truth: it
+    /// feeds BOTH the Rust buffer sizing (`render/taa.rs` — `taa_samples` is
+    /// `pixel_count * taa_ring_depth`) AND the WGSL `#{TAA_SAMPLE_RING_DEPTH}`
+    /// shader-def injected at pipeline specialisation (`render/pipelines.rs`),
+    /// so the loop bounds / `% N` indexing in `taa.wgsl` agree byte-for-byte
+    /// with the buffer size. Default [`DEFAULT_TAA_RING_DEPTH`] (32); 16 / 24
+    /// are the VRAM-lever alternatives. Read on the render side via the
+    /// `TaaRingConfig` render-world resource (`render::taa`).
+    pub taa_ring_depth: u32,
     /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8).
     pub gi: GiSettings,
 }
@@ -109,6 +133,7 @@ impl Default for AppArgs {
         Self {
             grid_preset: GridPreset::default(),
             taa: true,
+            taa_ring_depth: DEFAULT_TAA_RING_DEPTH,
             gi: GiSettings::default(),
         }
     }
@@ -362,4 +387,33 @@ pub fn build_app(cfg: AppConfig) -> App {
 /// returned `AppExit` (`e2e-render-test.md` §3 / §7 / §8 / §11 step 7).
 pub fn run_e2e_render() -> AppExit {
     e2e::run_e2e_render()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `AppArgs::default().taa_ring_depth` MUST be the documented default
+    /// (`18-taa-fidelity.md` fix #3): a mismatch between the const + the
+    /// default would mean the WGSL shader-def and the Rust buffer sizing
+    /// disagree by default, which is silent TAA ring corruption.
+    #[test]
+    fn default_taa_ring_depth_is_32() {
+        assert_eq!(DEFAULT_TAA_RING_DEPTH, 32);
+        assert_eq!(AppArgs::default().taa_ring_depth, DEFAULT_TAA_RING_DEPTH);
+    }
+
+    /// The ring depth must stay in the supported VRAM-lever range — 16 / 24 /
+    /// 32 are the three values the design records (`01-context.md` §2c /
+    /// `design-exploration-qa.md` §6 + the `18-taa-fidelity.md` fix #3
+    /// supersession). Pin the default at 32 so future edits do not silently
+    /// roll back to the old 16-deep value.
+    #[test]
+    fn default_taa_ring_depth_is_a_supported_lever_value() {
+        let depth = AppArgs::default().taa_ring_depth;
+        assert!(
+            matches!(depth, 16 | 24 | 32),
+            "taa_ring_depth = {depth} is not one of the supported 16/24/32 lever values"
+        );
+    }
 }

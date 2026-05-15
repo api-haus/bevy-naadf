@@ -1,8 +1,20 @@
 // naadf_final.wgsl — the Phase-B `base/` final-blit fullscreen fragment pass.
 //
 // Derives from: render/versions/base/renderFinal.fx `MainPS` (`09-design-b.md`
-// §5.9). A near-verbatim port: read the per-pixel accumulated colour, divide by
-// its weight, tonemap (with the `tone_mapping_fac` uniform term), output.
+// §5.9). Reads the per-pixel accumulated colour from `taaSampleAccum`, divides
+// by its weight, and outputs **raw linear HDR** — NO tonemapping in this pass.
+//
+// TONEMAPPING — DELIBERATE USER-DIRECTED DEVIATION (2026-05-15, TAA-fidelity
+// track). NAADF's C# `base/renderFinal.fx` does its own Reinhard-ish tonemap
+// here (the `exposure` / `toneMappingFac` math). The user directed the port to
+// instead "use bevy tonemapping, output raw hdr color from raymarching": the
+// camera carries `Camera { hdr: true }` + a `Tonemapping` component
+// (`TonyMcMapface`), the view target is an `Rgba16Float` HDR texture, this blit
+// writes linear HDR into it, and Bevy's built-in `tonemapping` render-graph
+// node (which runs AFTER the NAADF passes — `render/mod.rs` chains the NAADF
+// nodes `.before(tonemapping)`) does the tonemap + sRGB encode. The custom
+// `exposure` / `tone_mapping_fac` uniform fields are gone from `GpuRenderParams`
+// (`18-taa-fidelity.md` fix #2).
 //
 // The C# draws a unit cube whose pixel shader runs over the screen; the Bevy
 // port uses a standard fullscreen triangle (`02-research.md` divergence #9) —
@@ -16,15 +28,8 @@
 // (`prepare_frame_gpu` clears `FLAG_BLIT_FINAL_COLOR` + binds
 // `taa_sample_accum` at the blit slot).
 //
-// vs. the A-2 `albedo/renderFinal.fx`: (a) the tonemap denominator is the
-// `tone_mapping_fac` uniform (`base/:55`) instead of a hardcoded `1.0`;
-// (b) the `showRayStep` debug reads `first_hit_data[pixelIndex].z & 0x7FFF`
-// directly (`base/:44`) instead of `col_samples.x`. `tone_mapping_fac` is a
-// constant in the port — `prepare_frame_gpu` sets `GpuRenderParams
-// .tone_mapping_fac = 1.0` (C# `Settings.data.general.toneMappingFac`).
-//
-// `HDR` is off in the port (`03-design.md` §5.4) — the C# `#ifdef HDR`
-// branches are dropped.
+// The `showRayStep` debug reads `first_hit_data[pixelIndex].z & 0x7FFF`
+// directly (`base/:44`).
 
 #import "shaders/render_pipeline_common.wgsl"::{
     GpuRenderParams, FLAG_SHOW_RAY_STEP,
@@ -32,8 +37,7 @@
 
 // --- the final-blit pass's own small bind group (`03-design.md` §2.6) -------
 // first_hit_data (the `base/` `showRayStep` debug reads `.z` from it),
-// taa_sample_accum (the blit source), render_params (screen size + exposure +
-// tone_mapping_fac).
+// taa_sample_accum (the blit source), render_params (screen size + flags).
 @group(0) @binding(0) var<storage, read> first_hit_data: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read> taa_sample_accum: array<vec2<u32>>;
 @group(0) @binding(2) var<uniform> params: GpuRenderParams;
@@ -62,17 +66,11 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         cur_color = vec3<f32>(intensity, intensity, intensity);
     }
 
-    // Tone mapping (`base/renderFinal.fx:53-56`):
-    //   luminance = dot(curColor, (0.2126, 0.7152, 0.0722))
-    //   tv = curColor / (toneMappingFac + curColor)
-    //   colorNormalized = lerp(curColor / (exposure + luminance), tv, tv)
-    let luminance = dot(cur_color, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let tv = cur_color / (vec3<f32>(params.tone_mapping_fac) + cur_color);
-    let color_normalized = mix(
-        cur_color / (vec3<f32>(params.exposure) + vec3<f32>(luminance)),
-        tv,
-        tv,
-    );
-
-    return vec4<f32>(color_normalized, 1.0);
+    // Output RAW LINEAR HDR — no tonemapping here (user-directed deviation, see
+    // the file header). The view target is an `Rgba16Float` HDR texture; Bevy's
+    // built-in `tonemapping` render-graph node runs after this pass and does
+    // the tonemap (`TonyMcMapface`) + sRGB encode. NAADF's C# `renderFinal.fx`
+    // tonemapped here with `exposure`/`toneMappingFac` — the port hands that
+    // job to Bevy instead (`18-taa-fidelity.md` fix #2).
+    return vec4<f32>(cur_color, 1.0);
 }

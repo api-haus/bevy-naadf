@@ -140,11 +140,14 @@ struct GpuCamera {
 //
 // Again no explicit padding — WGSL's `vec3` 16-byte slotting + `vec2` 8-byte
 // alignment reproduce the padded Rust `#[repr(C)]` layout: the four `u32`s sit
-// at 0/4/8/12, `taa_index`/`flags`/`exposure`/`tone_mapping_fac` at 16/20/24/28,
+// at 0/4/8/12, `taa_index`/`flags`/`pad0a`/`pad0b` at 16/20/24/28,
 // `sky_sun_dir` slots to 32, `sun_color` to 48, `taa_jitter` to 64,
 // `bounding_box_min` to 80, `bounding_box_max` to 96 — total 112 bytes.
-// `tone_mapping_fac` replaces the former implicit pad at offset 28
-// (`09-design-b.md` §5.9 — used by Batch 6's `base/` final blit).
+// `pad0a`/`pad0b` (offsets 24/28) were formerly `exposure` / `tone_mapping_fac`
+// — the custom final-blit tonemap constants. The TAA-fidelity track switched
+// the port to Bevy's built-in tonemapping (`naadf_final.wgsl` outputs raw
+// linear HDR), so these are dead pad slots now — kept to hold the 112-byte
+// layout (`18-taa-fidelity.md` fix #2).
 struct GpuRenderParams {
     screen_width: u32,
     screen_height: u32,
@@ -154,8 +157,8 @@ struct GpuRenderParams {
     taa_index: u32,
     // packed `showRayStep` / `checkSun` / `isTAA` — see the `FLAG_*` consts.
     flags: u32,
-    exposure: f32,
-    tone_mapping_fac: f32,
+    pad0a: u32,
+    pad0b: u32,
 
     sky_sun_dir: vec3<f32>,
     sun_color: vec3<f32>,

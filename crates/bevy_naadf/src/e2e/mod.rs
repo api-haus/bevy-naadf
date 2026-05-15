@@ -27,6 +27,8 @@ pub mod framebuffer;
 pub mod gates;
 pub mod readback;
 
+use bevy::camera::Hdr;
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::prelude::*;
 use bevy::render::{Render, RenderApp, RenderSystems};
 use bevy::winit::{UpdateMode, WinitSettings};
@@ -216,6 +218,16 @@ fn setup_e2e_camera(mut commands: Commands) {
             clear_color: ClearColorConfig::Custom(Color::BLACK),
             ..default()
         },
+        // `Hdr` + the `Tonemapping` component below — matches
+        // `camera::setup_camera`. The NAADF blit writes raw linear HDR into the
+        // `Rgba16Float` view target; Bevy's `tonemapping` node does the
+        // tonemap. The e2e screenshot reads the post-tonemapping window
+        // surface, so the e2e gates see the Bevy-tonemapped image
+        // (`18-taa-fidelity.md` fix #2 — the e2e gates were recalibrated for
+        // it).
+        Hdr,
+        // Bevy's built-in tonemapper — `TonyMcMapface` (Bevy's default).
+        Tonemapping::default(),
         start,
         // NAADF's int+frac camera-relative position (D1). Seeded from the
         // spawn `Transform`; `sync_position_split` keeps it in step each frame

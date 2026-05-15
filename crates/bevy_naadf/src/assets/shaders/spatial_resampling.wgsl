@@ -579,8 +579,15 @@ fn calc_spatial_resampling(@builtin(global_invocation_id) global_id: vec3<u32>) 
 
     let pixel_pos = vec2<u32>(global_id.x % screen_width, global_id.x / screen_width);
 
+    // `getRayDir(invCamMatrix, pixelPos, screenWidth, screenHeight, taaJitter)`
+    // — the JITTERED ray (`renderSpatialResampling.fx:351`). The spatial pass
+    // reconstructs the surface for reservoir merging from a ray that MUST match
+    // the jittered ray the G-buffer was encoded with; firing it through the
+    // pixel centre every frame leaves it per-frame-constant and inconsistent
+    // with the jittered first-hit encoding (`18-taa-fidelity.md` cause #1).
     let ray_dir = get_ray_dir(
-        gi_params.inv_view_proj, pixel_pos, screen_width, screen_height, vec2<f32>(0.0, 0.0),
+        gi_params.inv_view_proj, pixel_pos, screen_width, screen_height,
+        gi_params.taa_jitter,
     );
 
     let first_hit = first_hit_data[pixel_pos.x + pixel_pos.y * screen_width];

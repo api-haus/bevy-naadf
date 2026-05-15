@@ -25,14 +25,29 @@ use crate::render::gpu_types::{GpuCameraHistorySlot, GpuTaaParams};
 use crate::render::pipelines::NaadfPipelines;
 
 /// The camera-history ring depth — kept at NAADF's 128 (`WorldRenderAlbedo.cs:36-40`).
-/// The `01-context.md` §6 VRAM lever is the *sample* ring (32→16), NOT this one
-/// — the camera-matrix ring is tiny in VRAM, so it stays at NAADF's depth.
+/// The `01-context.md` §6 VRAM lever is the *sample* ring, NOT this one — the
+/// camera-matrix ring is tiny in VRAM, so it stays at NAADF's depth.
 pub const CAMERA_HISTORY_DEPTH: usize = 128;
 
-/// The TAA sample-ring depth — 16, the `01-context.md` §6 VRAM lever. Mirrors
-/// `TAA_SAMPLE_RING_DEPTH` in `taa_common.wgsl`. Re-exported here so the Rust
-/// side (`prepare_taa`, the buffer sizing) has the single source of truth.
-pub const TAA_SAMPLE_RING_DEPTH: u32 = 16;
+/// Render-world resource carrying the configured TAA sample-ring depth
+/// (`18-taa-fidelity.md` fix #3 — supersedes the former hard-coded
+/// `TAA_SAMPLE_RING_DEPTH = 16` const). Inserted into the render sub-app by
+/// `NaadfRenderPlugin::build` from the main-world `AppArgs.taa_ring_depth`
+/// (default [`crate::DEFAULT_TAA_RING_DEPTH`] = 32; 16 / 24 are the VRAM-lever
+/// alternatives).
+///
+/// This is the **single config source of truth** on the render side: it feeds
+/// BOTH the Rust buffer sizing in [`prepare_taa`] (`taa_samples` is
+/// `pixel_count * depth`, `sample_age` clamps to `depth`) AND — via
+/// `NaadfPipelines::from_world` reading the SAME resource — the WGSL
+/// `#{TAA_SAMPLE_RING_DEPTH}` shader-def injected at pipeline specialisation.
+/// The two sides MUST agree exactly: a buffer sized for N with a shader
+/// looping/modulo'ing over M is silent ring corruption.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct TaaRingConfig {
+    /// The sample-ring depth — `AppArgs.taa_ring_depth`.
+    pub depth: u32,
+}
 
 /// The 128-deep camera-history ring + the monotonic frame counter
 /// (`06-design-a2.md` §2.3).
@@ -250,11 +265,6 @@ pub struct TaaGpu {
     pub taa_first_hit_bind_group: BindGroup,
 }
 
-/// `sample_age` — how many past frames the reproject pass walks. Fixed at the
-/// full ring depth in A-2 (`06-design-a2.md` §7.1, §13.4 — NAADF exposes this
-/// as a 1–32 ImGui slider; A-2 has no GUI, so it is the full 16-frame history).
-const TAA_SAMPLE_AGE: u32 = TAA_SAMPLE_RING_DEPTH;
-
 /// `RenderSystems::PrepareResources` system: create + (re)size the TAA buffers,
 /// upload the per-frame camera-history ring + the TAA uniform, and build the
 /// first-hit `@group(2)` bind group (`06-design-a2.md` §9.2).
@@ -277,6 +287,7 @@ pub fn prepare_taa(
     mut commands: Commands,
     extracted_camera: Res<ExtractedCameraData>,
     extracted_history: Res<ExtractedCameraHistory>,
+    ring_config: Res<TaaRingConfig>,
     existing: Option<Res<TaaGpu>>,
     pipelines: Res<NaadfPipelines>,
     pipeline_cache: Res<PipelineCache>,
@@ -288,6 +299,11 @@ pub fn prepare_taa(
     }
     let viewport = extracted_camera.viewport_size.max(UVec2::ONE);
     let pixel_count = viewport.x * viewport.y;
+    // The configured sample-ring depth — the single render-side source of
+    // truth, shared with `NaadfPipelines`'s WGSL `#{TAA_SAMPLE_RING_DEPTH}`
+    // shader-def so the buffer size and the shader's loop bounds / modulo
+    // agree exactly (`18-taa-fidelity.md` fix #3).
+    let ring_depth = ring_config.depth;
 
     // --- (re)create the screen-space buffers on a viewport change -----------
     // `taa_samples` (pixel_count * 16 × vec2<u32>) + `taa_sample_accum`
@@ -316,7 +332,7 @@ pub fn prepare_taa(
                 // Viewport changed — re-create only the screen-space buffers;
                 // keep the fixed-size `camera_history` / `taa_params`.
                 let (taa_samples, taa_sample_accum, taa_dist_min_max) =
-                    create_screen_buffers(&render_device, pixel_count);
+                    create_screen_buffers(&render_device, pixel_count, ring_depth);
                 (
                     taa_samples,
                     taa_sample_accum,
@@ -329,7 +345,7 @@ pub fn prepare_taa(
             None => {
                 // First build — create everything.
                 let (taa_samples, taa_sample_accum, taa_dist_min_max) =
-                    create_screen_buffers(&render_device, pixel_count);
+                    create_screen_buffers(&render_device, pixel_count, ring_depth);
                 let camera_history = render_device.create_buffer(&BufferDescriptor {
                     label: Some("naadf_taa_camera_history"),
                     size: (CAMERA_HISTORY_DEPTH as u64)
@@ -414,8 +430,11 @@ pub fn prepare_taa(
         screen_height: viewport.y,
         frame_count: extracted_history.frame_count,
         taa_index: extracted_history.taa_index,
-        // Clamped to [1, TAA_SAMPLE_RING_DEPTH] (`06-design-a2.md` §7.1).
-        sample_age: TAA_SAMPLE_AGE.clamp(1, TAA_SAMPLE_RING_DEPTH),
+        // How many past frames the reproject pass walks — the full configured
+        // ring depth, clamped to `[1, ring_depth]` (`06-design-a2.md` §7.1).
+        // NAADF exposes this as a 1–`ringDepth` ImGui slider; the port has no
+        // GUI, so it is the full history (`18-taa-fidelity.md` fix #3).
+        sample_age: ring_depth.clamp(1, ring_depth),
         _pad2: 0,
         _pad3: 0,
         _pad4: 0,
@@ -444,19 +463,26 @@ pub fn prepare_taa(
     });
 }
 
-/// Create the three screen-space TAA buffers (`taa_samples` 16-ring +
+/// Create the three screen-space TAA buffers (`taa_samples` ring +
 /// `taa_sample_accum` + `taa_dist_min_max`) for `pixel_count` pixels.
 /// `STORAGE | COPY_DST` — the COPY_DST is for the `clear_buffer` zero-fill +
 /// (Batch 2) any explicit uploads.
+///
+/// `ring_depth` is the configured TAA sample-ring depth (`AppArgs
+/// .taa_ring_depth`, default 32 — `18-taa-fidelity.md` fix #3); `taa_samples`
+/// is sized `pixel_count * ring_depth`. The WGSL side's `% TAA_SAMPLE_RING_DEPTH`
+/// / loop bounds use the SAME value via the `#{TAA_SAMPLE_RING_DEPTH}`
+/// shader-def, so the buffer size and the shader indexing agree exactly.
 fn create_screen_buffers(
     render_device: &RenderDevice,
     pixel_count: u32,
+    ring_depth: u32,
 ) -> (Buffer, Buffer, Buffer) {
     // wgpu rejects zero-length buffers — `pixel_count` is already `>= 1`.
-    // `taa_samples`: pixel_count * 16 × vec2<u32> (8 bytes each).
+    // `taa_samples`: pixel_count * ring_depth × vec2<u32> (8 bytes each).
     let taa_samples = render_device.create_buffer(&BufferDescriptor {
         label: Some("naadf_taa_samples"),
-        size: (pixel_count as u64) * (TAA_SAMPLE_RING_DEPTH as u64) * 8,
+        size: (pixel_count as u64) * (ring_depth as u64) * 8,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });

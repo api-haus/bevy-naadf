@@ -49,12 +49,13 @@ use bevy::render::render_resource::{
 };
 use bevy::render::renderer::RenderDevice;
 use bevy::render::view::ExtractedView;
-use bevy::shader::Shader;
+use bevy::shader::{Shader, ShaderDefVal};
 
 use crate::render::gpu_types::{
     GpuAtmosphereParams, GpuCamera, GpuGiParams, GpuRenderParams, GpuTaaParams,
     GpuWorldMeta,
 };
+use crate::render::taa::TaaRingConfig;
 
 /// Asset paths of the Phase-A entry-point WGSL shaders + the Phase-A-2 TAA
 /// reproject shader.
@@ -264,6 +265,17 @@ impl FromWorld for NaadfPipelines {
         let render_device = world.resource::<RenderDevice>().clone();
         let asset_server = world.resource::<AssetServer>().clone();
         let fullscreen_shader = world.resource::<FullscreenShader>().clone();
+        // The configured TAA sample-ring depth (`18-taa-fidelity.md` fix #3) —
+        // injected as the naga-oil `#{TAA_SAMPLE_RING_DEPTH}` shader-def into
+        // the two pipelines whose shader (`taa.wgsl` + its `taa_common.wgsl`
+        // import) declares `const TAA_SAMPLE_RING_DEPTH = #{...}u`. This is the
+        // SAME `TaaRingConfig` value `prepare_taa` sizes `taa_samples` from, so
+        // the buffer length and the shader's loop bounds / `% N` indexing
+        // agree exactly. `TaaRingConfig` is inserted into the render sub-app by
+        // `NaadfRenderPlugin::build` before this `RenderStartup` `FromWorld`.
+        let taa_ring_depth = world.resource::<TaaRingConfig>().depth;
+        let taa_shader_defs =
+            vec![ShaderDefVal::UInt("TAA_SAMPLE_RING_DEPTH".into(), taa_ring_depth)];
         let pipeline_cache = world.resource::<PipelineCache>();
 
         // Minimum binding sizes for the uniform buffers. The `#[repr(C)]` GPU
@@ -602,12 +614,18 @@ impl FromWorld for NaadfPipelines {
         // not collide with the reproject pass's `@group(0)` in the shared
         // module — so the layout vec has the entry-less `empty_layout`
         // placeholder at index 0).
+        // Both `taa.wgsl` pipelines carry the `#{TAA_SAMPLE_RING_DEPTH}`
+        // shader-def (`18-taa-fidelity.md` fix #3) — `taa.wgsl` imports the
+        // `taa_common.wgsl` module whose `const TAA_SAMPLE_RING_DEPTH` is the
+        // `#{...}` substitution; naga-oil applies the def across the whole
+        // composition, so the imported module's const is substituted too.
         let taa_reproject_shader = asset_server.load(TAA_REPROJECT_SHADER);
         let taa_reproject_pipeline =
             pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
                 label: Some("naadf_taa_reproject_pipeline".into()),
                 layout: vec![taa_reproject_layout.clone()],
                 shader: taa_reproject_shader.clone(),
+                shader_defs: taa_shader_defs.clone(),
                 entry_point: Some(Cow::from("reproject_old_samples")),
                 ..default()
             });
@@ -619,6 +637,7 @@ impl FromWorld for NaadfPipelines {
                     calc_new_taa_sample_layout.clone(),
                 ],
                 shader: taa_reproject_shader,
+                shader_defs: taa_shader_defs.clone(),
                 entry_point: Some(Cow::from("calc_new_taa_sample")),
                 ..default()
             });

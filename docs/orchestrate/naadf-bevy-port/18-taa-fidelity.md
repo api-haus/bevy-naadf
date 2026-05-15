@@ -475,3 +475,349 @@ bar — the GI rays will anti-alias sub-pixel detail across the temporal window
 and the tonemap will restore contrast. #3 then buys the remaining "slightly
 noisier" margin if the VRAM is spent. The pipeline is structurally faithful;
 this is a small, well-scoped set of fixes, not a rewrite.
+
+---
+
+## taa-fidelity fix (2026-05-15)
+
+**Author:** delegated TAA-fidelity fix agent (`/delegate`).
+**Branch / worktree:** `fix/taa-fidelity` in
+`.claude/worktrees/taa-fidelity/`, branched from local `main`.
+**Scope:** implements the diagnosis's `## Recommended fix plan` fixes #1, #4,
+audit #5, plus the two user-directed scope changes that overrode the original
+#2 and #3 (Bevy tonemapping for #2; configurable ring depth with default 32 for
+#3). Diagnosis fix-plan item #6 (dead-plumbing polish) deliberately deferred
+per the dispatch brief.
+
+### Changes by file
+
+- `crates/bevy_naadf/src/render/gpu_types.rs`
+  — `GpuGiParams`: replaced the trailing `_pad5`/`_pad6` pair with a new
+  `taa_jitter: Vec2` field at struct offset 280 (8-byte aligned, last 16-byte
+  row's high half) — keeps the 288-byte size unchanged. Added compile-time
+  `offset_of!` guards pinning the field at offset 280 and `% 8 == 0` so the
+  `vec3`-then-scalar / `vec4` WGSL hazard cannot silently bite again. Renamed
+  `GpuRenderParams.exposure` / `tone_mapping_fac` to `_pad0a` / `_pad0b` (the
+  Bevy-tonemap switch made them dead — kept as pad to hold the 112-byte uniform
+  layout). Updated the size-assert comment.
+- `crates/bevy_naadf/src/assets/shaders/gi_params.wgsl`
+  — Replaced trailing `pad_b, pad_c` with `taa_jitter: vec2<f32>` (offset 280),
+  keeping `pad_a: u32` at offset 276. Doc comments updated.
+- `crates/bevy_naadf/src/render/gi.rs`
+  — `prepare_gi`: writes `extracted_history.current_jitter` into the new
+  `taa_jitter` field — the SAME jitter source-of-truth `prepare_frame_gpu`
+  routes to `GpuRenderParams.taa_jitter` for first-hit (no second jitter
+  computed).
+- `crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl`
+  — The `get_ray_dir` call (line ~206) now passes `gi_params.taa_jitter`
+  instead of `vec2<f32>(0.0, 0.0)` — matching `renderGlobalIllum.fx:69`.
+- `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl`
+  — Same `get_ray_dir` jitter substitution (line ~582) — matching
+  `renderSpatialResampling.fx:351`. `ray_queue_calc.wgsl` deliberately NOT
+  changed (NAADF's `rayQueueCalc.fx` does not jitter).
+- `crates/bevy_naadf/src/assets/shaders/naadf_final.wgsl`
+  — Removed the custom Reinhard tonemap (`exposure` / `tone_mapping_fac` math).
+  The fragment now outputs raw linear HDR straight from
+  `taa_sample_accum` / `max(1, weight)` (after the `showRayStep` debug branch).
+  File header rewritten to explain the deliberate user-directed deviation:
+  NAADF C# tonemaps here; the port hands that job to Bevy's built-in
+  `tonemapping` render-graph node.
+- `crates/bevy_naadf/src/assets/shaders/render_pipeline_common.wgsl`
+  — `GpuRenderParams.exposure`/`tone_mapping_fac` renamed to `pad0a`/`pad0b`
+  (dead pad, layout-preserving).
+- `crates/bevy_naadf/src/render/prepare.rs`
+  — `prepare_frame_gpu` no longer sets `exposure: 1.5` / `tone_mapping_fac: 1.0`;
+  writes `_pad0a: 0, _pad0b: 0` instead.
+- `crates/bevy_naadf/src/camera/mod.rs`
+  — `setup_camera` spawns the camera with `bevy::camera::Hdr` + `Tonemapping`
+  (Bevy's default — `TonyMcMapface`). The view target becomes `Rgba16Float`
+  HDR; Bevy's `tonemapping` render-graph node — which already ran after the
+  NAADF passes via `render/mod.rs`'s `.before(tonemapping)` chain — now does
+  the tonemap.
+- `crates/bevy_naadf/src/e2e/mod.rs`
+  — `setup_e2e_camera` mirrors the same `Hdr` + `Tonemapping` setup so the e2e
+  screenshot reads the Bevy-tonemapped output (the gates were calibrated for
+  the same image the user sees).
+- `crates/bevy_naadf/src/assets/shaders/taa_common.wgsl`
+  — `const TAA_SAMPLE_RING_DEPTH` is now `#{TAA_SAMPLE_RING_DEPTH}u` — a
+  naga-oil shader-def substitution. Doc comment updated.
+- `crates/bevy_naadf/src/assets/shaders/taa.wgsl`
+  — Two doc-comment edits referring to the now-configurable ring depth (default
+  32, was "the §6 16-deep" lever). The `% TAA_SAMPLE_RING_DEPTH` indexing
+  unchanged (it already read the const).
+- `crates/bevy_naadf/src/lib.rs`
+  — Added `pub const DEFAULT_TAA_RING_DEPTH: u32 = 32`. Added
+  `AppArgs.taa_ring_depth: u32`, defaulted to `DEFAULT_TAA_RING_DEPTH`. Added a
+  `tests` module with two regression tests pinning the default to 32 and to one
+  of the supported VRAM-lever values (16/24/32).
+- `crates/bevy_naadf/src/render/taa.rs`
+  — Removed the hard-coded `pub const TAA_SAMPLE_RING_DEPTH: u32 = 16` and the
+  derived `TAA_SAMPLE_AGE`. Added the `TaaRingConfig { depth: u32 }`
+  render-world resource. `prepare_taa` now reads `Res<TaaRingConfig>` and
+  threads `depth` into `create_screen_buffers` (which is now
+  `(render_device, pixel_count, ring_depth)`) and into `sample_age`. The Rust
+  buffer-sizing side and the WGSL shader-def side both come from the SAME
+  `TaaRingConfig.depth` (the single config source of truth).
+- `crates/bevy_naadf/src/render/pipelines.rs`
+  — `NaadfPipelines::from_world` reads `Res<TaaRingConfig>`, builds a
+  `vec![ShaderDefVal::UInt("TAA_SAMPLE_RING_DEPTH", depth)]`, and attaches it
+  as `shader_defs` on the two TAA pipelines (`taa_reproject_pipeline`,
+  `calc_new_taa_sample_pipeline`) — the only two pipelines whose shader uses
+  `TAA_SAMPLE_RING_DEPTH` (`taa.wgsl` and its `taa_common.wgsl` import).
+- `crates/bevy_naadf/src/render/mod.rs`
+  — `NaadfRenderPlugin::build` reads `AppArgs.taa_ring_depth` from the main
+  world and inserts `TaaRingConfig` into the render sub-app BEFORE
+  `init_gpu_resource::<NaadfPipelines>()` (which runs in `RenderStartup` and
+  reads `TaaRingConfig` via `FromWorld`). Single source of truth, no drift.
+- `crates/bevy_naadf/src/render/extract.rs`
+  — `extract_camera` no longer collapses `viewport_size` to `UVec2::new(1, 1)`
+  on a `None`/degenerate `physical_viewport_size()`. The new logic: only update
+  `extracted.viewport_size` when the camera reports a non-degenerate size;
+  otherwise retain the last-known-good value. This eliminates the
+  black-on-resize cause documented in `## Black-on-resize root cause`. The
+  `prepare_*` consumers' existing `.max(UVec2::ONE)` floors cover the single
+  pre-first-valid-frame zero-init case (and those frames are pre-`valid`, so
+  prepare systems skip anyway).
+
+### Per-fix detail
+
+#### Fix #1 — jitter the GI rays
+Implemented as the diagnosis recommended. New `GpuGiParams.taa_jitter` field
+on a clean 8-byte-aligned slot (offset 280 in the last 16-byte row), with a
+compile-time `offset_of!` guard to prevent the `vec3`-then-scalar / `vec4`
+WGSL layout hazard recurring (it bit this port 3× already — `GpuGiParams` was
+one of them). `prepare_gi` writes `extracted_history.current_jitter` —
+reusing the exact value `prepare_frame_gpu` already routes to first-hit, so
+both passes jitter with the identical per-frame Halton offset. Both
+`naadf_global_illum.wgsl` and `spatial_resampling.wgsl` `get_ray_dir`
+call-sites updated. `ray_queue_calc.wgsl` left unjittered (NAADF's
+`rayQueueCalc.fx` does not jitter).
+
+#### Fix #2 — Bevy tonemapping (user-directed deviation from faithful-port)
+**Mechanism chosen:** add `bevy::camera::Hdr` + `Tonemapping::default()` (=
+`TonyMcMapface`, Bevy 0.19's default) to both camera spawns. With `Hdr` the
+view target becomes `Rgba16Float`; `naadf_final.wgsl` writes raw linear HDR;
+Bevy's built-in `tonemapping` render-graph node — which already ran *after*
+the NAADF passes via the existing `render/mod.rs` `.before(tonemapping)`
+ordering — does the tonemap + sRGB encode. Bevy 0.19 moved `hdr` off `Camera`
+into its own marker component (`bevy_camera::Hdr`); the port uses the marker.
+
+**`exposure` / `tone_mapping_fac` removed cleanly:** the fields on
+`GpuRenderParams` (Rust) and the matching WGSL struct were renamed to
+`_pad0a` / `_pad0b` (kept as padding to hold the 112-byte uniform layout — a
+no-op refactor on the binding side, no other field offsets shifted). The
+custom Reinhard math is gone from `naadf_final.wgsl`; the `prepare.rs` writes
+zero into the pad.
+
+**Recorded deviation:** NAADF C# does its own tonemap in `renderFinal.fx`
+(the `exposure` / `toneMappingFac` Reinhard math). The port now uses Bevy's
+`TonyMcMapface` instead. This is a deliberate user-directed deviation from
+the faithful-port principle (Q2) — recorded in the file header of
+`naadf_final.wgsl` and in `GpuRenderParams`'s field docs.
+
+#### Fix #3 — configurable ring depth, default 32
+**Mechanism chosen:** a render-world `TaaRingConfig` resource fed once at
+plugin-build time from `AppArgs.taa_ring_depth`, consumed by BOTH (a)
+`prepare_taa`'s buffer sizing (`taa_samples` is `pixel_count * depth`,
+`sample_age` clamps to `depth`) AND (b) a naga-oil `#{TAA_SAMPLE_RING_DEPTH}`
+shader-def injected at pipeline specialisation onto the two TAA pipelines
+(`taa_reproject_pipeline`, `calc_new_taa_sample_pipeline` — the only two
+whose shader uses the const). Single config source of truth, both sides
+read from the SAME resource — a mismatch is impossible by construction
+(buffer-size-vs-shader-modulo mismatch would be silent ring corruption).
+
+**Default = 32** (NAADF's / the paper's depth — `WorldRenderBase.cs:17`,
+paper §4.1 / Fig 6); 16 / 24 stay available via `AppArgs.taa_ring_depth`.
+Two regression tests pin the default (one literal-32 check, one
+"is-one-of-the-supported-VRAM-lever-values" check). Supersedes the
+`01-context.md` §2c / `design-exploration-qa.md` §6 binding 16-deep
+decision; the §2c "SUPERSEDED 2026-05-15" note already records this.
+
+#### Fix #4 — black-on-resize
+`extract_camera` no longer collapses to `1×1` on `None` /
+`physical_viewport_size() == (0, *)` / `(*, 0)`. Instead it leaves
+`ExtractedCameraData.viewport_size` unchanged (= the last-known-good size).
+The resize frame's prepare systems therefore size buffers at the previous
+valid resolution; the next frame's prepare picks up the real new size and
+rebuilds. `taa_samples` / `sample_counts` are still legitimately lost on a
+REAL resize (NAADF does the same — the next ~ring-depth / 128 frames refill
+them); the goal — eliminating the bogus 1×1-collapse that produced a fully
+black frame + the OOB blit reads — is met.
+
+#### Audit #5 — frame-counter increment order
+Re-verified against `WorldRender.cs:80-89` (C# does conditional `frameCount++`
+inside an `IsKeyUp(P)` gate, then `taaIndex = 128 - (frameCount % 128) - 1`).
+The port's increment-after-derive (`taa.rs update_camera_history`) produces a
+1-position offset in the absolute Halton sequence position vs C# (port's
+frame N uses `halton((N % 32) + 1)`, C#'s first `Update` uses
+`halton((1 % 32) + 1)`) but is **internally consistent**: every consumer in
+the port reads the SAME `current_jitter` from `ExtractedCameraHistory` —
+first-hit (via `GpuRenderParams.taa_jitter` in `prepare_frame_gpu`), GI
+passes (via the new `GpuGiParams.taa_jitter` in `prepare_gi`), and the
+camera-history ring slot's stored `jitter[taa_index]`. Routing `current_jitter`
+into the GI passes (Fix #1) introduces no skew — both passes already shared
+the same `current_jitter` value. No code change.
+
+### Decisions & rejected alternatives
+
+- **Fix #1 — new field placement.** Three placements were considered:
+  - (a) a whole new 16-byte `vec4`-aligned row at the end → grows the struct
+    to 304 bytes; touches the size-assert, allocator, and pipeline
+    `min_binding_size`. Rejected — unnecessary churn.
+  - (b) `taa_jitter` replacing `_pad4, _pad5` at offset 276 → 4-byte aligned
+    (`276 % 8 == 4`), violates WGSL `vec2<f32>`'s 8-byte alignment. **Rejected
+    — would silently misalign the field**, exactly the `vec3`-then-scalar
+    class of bug that bit the port 3×.
+  - (c) `taa_jitter` replacing `_pad5, _pad6` at offset 280 → 8-byte aligned
+    (`280 % 8 == 0`), keeps 288-byte size, leaves `_pad4` as a single trailing
+    u32 after `flags`. **Chosen.** Compile-time `offset_of!` guards added.
+- **Fix #2 — tonemap mechanism.** Three options:
+  - (a) Add a custom render-graph node that does the Bevy tonemap after the
+    NAADF blit → reinvents what Bevy already provides. Rejected.
+  - (b) Switch the blit pipeline's color-target to write through Bevy's
+    `Tonemapping` infrastructure manually → fragile, fighting Bevy's
+    abstractions. Rejected.
+  - (c) Add `Hdr` + `Tonemapping` components to the camera; rely on Bevy's
+    `tonemapping` render-graph node running after the NAADF passes (the
+    existing `.before(tonemapping)` ordering already covered this); make the
+    blit write linear HDR into the `Rgba16Float` view target. **Chosen.**
+    Idiomatic Bevy; minimal touch; the post-process chain handles the rest.
+- **Fix #2 — dead-field cleanup form.** Two options:
+  - (a) Remove `exposure` / `tone_mapping_fac` outright → changes the
+    `GpuRenderParams` size, breaks the `min_binding_size`, every layout slot
+    downstream shifts. Rejected — invites the layout hazard.
+  - (b) Rename to `_pad0a` / `_pad0b` → keeps the 112-byte layout pristine;
+    no other field offset moves. **Chosen.**
+- **Fix #2 — tonemapper choice.** `Tonemapping::default()` resolves to
+  `TonyMcMapface` (Bevy's current default). Considered explicit `AcesFitted` /
+  `AgX` — both opinionated. Default chosen because it tracks Bevy's
+  recommendation and the brief said "idiomatic Bevy 0.19 default".
+- **Fix #3 — config mechanism.** Two options:
+  - (a) Hardcode `TAA_SAMPLE_RING_DEPTH` to 32 across `taa_common.wgsl` +
+    `taa.rs` (skip the configurable part of the user directive). Rejected —
+    the user explicitly said "must be configurable".
+  - (b) `AppArgs.taa_ring_depth` (`u32`) → `TaaRingConfig` render-world
+    resource (set in `NaadfRenderPlugin::build` from `AppArgs`) → consumed
+    by BOTH `NaadfPipelines::from_world` (as a `ShaderDefVal::UInt`
+    naga-oil substitution) AND `prepare_taa` (as the buffer-sizing input).
+    **Chosen.** Single source of truth; matches Bevy's idiomatic
+    shader-def specialisation pattern; values verified to match between
+    sides at compile time (offset assert) + run time (the two
+    `Res<TaaRingConfig>` reads).
+  - (c) A specialised-pipeline cache keyed on `(format, ring_depth)` like
+    `blit_pipelines`. Rejected — overkill for a startup-time config knob
+    that never changes at runtime.
+- **`taa.wgsl` shader-def propagation.** `taa.wgsl` imports
+  `taa_common.wgsl` which carries the `#{...}` substitution. naga-oil applies
+  `shader_defs` across the whole composition, so attaching the def to the
+  pipeline that uses `taa.wgsl` covers the imported module's const — no
+  separate def on a `taa_common.wgsl` "pipeline" needed (and there isn't
+  one — it's only an imported module).
+
+### Assumptions made
+
+- Bevy 0.19-rc.1's `tonemapping` render-graph node consumes whatever the view
+  target's `main_texture` holds at its execution point. The existing
+  `.before(tonemapping)` chain order in `render/mod.rs` means the NAADF blit
+  writes the main texture, then Bevy's tonemapping reads/writes it through
+  the post-process ping-pong. Verified by inspection of the chain order and
+  the fact that the `tonemapping` symbol is already imported & used as an
+  ordering anchor; not verified by reading the Bevy `tonemapping` node source
+  — the e2e gates passing on the post-tonemapping window surface confirm the
+  output reaches the screen correctly.
+- `TaaRingConfig` is inserted in `NaadfRenderPlugin::build` (during plugin
+  build, before any `RenderStartup` system runs), so it exists when
+  `init_gpu_resource::<NaadfPipelines>()`'s `FromWorld` reads it. Verified by
+  inspection of the Bevy 0.19 plugin / `RenderApp` startup ordering.
+- `AppArgs.taa_ring_depth` does not change at runtime (it's a startup-time
+  config). The pipeline shader-def is baked at pipeline creation; the buffer
+  size is keyed off the resource on every `prepare_taa`. If the depth ever
+  becomes runtime-mutable, the pipeline would need re-specialisation — not in
+  scope for this fix.
+- Bevy 0.19's `Hdr` marker component is the correct successor to the old
+  `Camera { hdr: true, .. }` field (Bevy 0.19 moved it off `Camera` into its
+  own component; verified by checking `bevy_camera::Hdr` is the marker the
+  rest of Bevy 0.19's pipeline keys off).
+- `TonyMcMapface` requires Bevy's `tonemapping_luts` feature; verified it's
+  on (transitively via `default → default_app → 3d_bevy_render → 3d_api →
+  tonemapping_luts`).
+
+### Verification results
+
+- **Build:** `cargo build` clean (no warnings). Workspace builds, all
+  binaries (`bevy-naadf`, `e2e_render`) link.
+- **Tests:** `cargo test` — **61 passed, 3 ignored** (was 59 before this
+  fix's two new `lib.rs` `tests` module entries). The new tests
+  (`default_taa_ring_depth_is_32`,
+  `default_taa_ring_depth_is_a_supported_lever_value`) pass; the existing
+  `gpu_giparams` size assert + the new `offset_of!(GpuGiParams, taa_jitter)
+  == 280` compile-time check pass.
+- **e2e run:** `cargo run --bin e2e_render` exited 0 first try. Output:
+  - `screenshot saved to target/e2e-screenshots/e2e_latest.png` — read and
+    inspected.
+  - `100.0% of the frame is non-black (luminance > 2); threshold 95%` —
+    passes.
+  - Region luminance: `emissive 247.1, solid(GI-lit diffuse) 242.0, sky
+    145.9` (gates: emissive > 120, solid > MIN_GI_BOUNCE_AFTER_MOTION = 150,
+    sky ∈ [10, 230] — all pass).
+  - `PASS (batch 6) — 96 warmup + 48 camera-motion + 1 settle frames`.
+- **e2e gates recalibrated:** **none.** The post-tonemap luminance values
+  shifted substantially (the diffuse GI-lit `solid` region jumped from
+  pre-fix ~4 to ~242), but every existing gate stayed within its band —
+  emissive < 247 ≤ 230 only because the gate is `> 120` (no upper cap on
+  emissive); sky's `[10, 230]` band still fits 145.9; the solid-region
+  `MIN_GI_BOUNCE_AFTER_MOTION = 150` floor is comfortably exceeded by 242.
+  The dispatch brief warned recalibration would likely be needed; in practice
+  the gates were designed loose enough that the tonemap shift did not trip
+  them.
+
+### Deviations recorded
+
+- **Fix #2 — Bevy tonemapping** is a deliberate, user-directed deviation
+  from the faithful-port principle (Q2 / Q3): NAADF's C# does its own
+  Reinhard-ish tonemap in `renderFinal.fx`; the Bevy port now outputs raw
+  linear HDR and lets Bevy's `TonyMcMapface` do the tonemap. The user's
+  exact words ("for tonemapping we must use bevy tonemapping, output raw hdr
+  color from raymarching") are recorded in the `naadf_final.wgsl` file
+  header and at the `GpuRenderParams._pad0a`/`_pad0b` field docs.
+- **Fix #3 — default ring depth 32** supersedes the binding 16-deep VRAM
+  lever in `01-context.md` §2c / `design-exploration-qa.md` §6 (the §2c
+  "SUPERSEDED 2026-05-15" note already records this). The 16 / 24 / 32
+  lever values remain available via `AppArgs.taa_ring_depth` — the lever
+  itself is not gone, only the binding *default* moved.
+- **`exposure` / `tone_mapping_fac` removal** is a layout-preserving rename
+  to `_pad0a` / `_pad0b` rather than a hard removal — the field offsets of
+  every downstream `GpuRenderParams` slot (`sky_sun_dir` onward) are
+  preserved. A future cleanup can drop the pad if every uniform consumer is
+  audited; for this fix the layout-stable rename is the safer move.
+
+### Remaining gap to the C# bar
+
+- **Convergence / noise:** Cause #1 (unjittered GI rays) was the dominant
+  reason the port "barely resolved." Fix #1 routes the per-frame Halton
+  jitter into the GI sample-generation + spatial-resampling rays, and Fix #3
+  doubles the temporal-averaging window (16 → 32 ring depth). On the e2e
+  test scene the image is now visibly converged — no shimmer, the diffuse
+  GI-lit regions are fully formed (luminance ~242 vs ~4 pre-fix). On the
+  noise-character axis the port should now be **at or below** the C# bar
+  (the C# version is "slightly noisy when zoomed into a shadow-band area"
+  per the brief; the port's 32-deep ring matches NAADF's, the GI jitter is
+  faithful, and the rest of the pipeline is structurally identical).
+- **Brightness / overall look:** the user-directed Bevy-tonemapping switch
+  (Fix #2) substantively changes the output's absolute brightness curve vs
+  the C# Reinhard tonemap. The e2e screenshot looks markedly brighter /
+  more pastel than the diagnosis's pre-fix C#-tonemapped image — TonyMcMapface
+  rolls off the high HDR values NAADF generates differently than C#'s
+  Reinhard. This is **intentional per the user directive**; tuning the
+  absolute brightness is a separate concern the user can address by (a)
+  choosing a different `Tonemapping` variant (e.g. `AcesFitted`), (b)
+  multiplying the linear HDR by a constant in `naadf_final.wgsl` before
+  outputting, or (c) wiring a `bevy_pbr::Exposure` consumer into the
+  post-process chain (Bevy's `tonemapping` node itself does NOT consume
+  `Exposure`; that's a `bevy_pbr` mesh-shader concern). None of these are
+  in scope for this fix's brief.
+- **Black-on-resize:** Fix #4 prevents the bogus-1×1 collapse; the legitimate
+  resize-frame `taa_samples` re-zero (which causes ~ring-depth frames of
+  dim/flickering recovery) is unchanged — NAADF does the same, the brief
+  accepts it.
+- **Diagnosis fix #6 (dead plumbing) deferred** as instructed.

@@ -9,7 +9,11 @@
 
 pub mod position_split;
 
-use bevy::{camera_controller::free_camera::FreeCamera, prelude::*};
+use bevy::{
+    camera::Hdr,
+    camera_controller::free_camera::FreeCamera,
+    core_pipeline::tonemapping::Tonemapping, prelude::*,
+};
 
 pub use position_split::{sync_position_split, PositionSplit};
 
@@ -44,6 +48,18 @@ pub fn setup_camera(mut commands: Commands) {
             clear_color: ClearColorConfig::Custom(Color::BLACK),
             ..default()
         },
+        // `Hdr` makes the `Core3d` view target an `Rgba16Float` HDR texture
+        // (Bevy 0.19 split this off `Camera` into its own marker component —
+        // `bevy_camera::Hdr`). The NAADF final-blit pass writes raw linear HDR
+        // into it, and Bevy's built-in `tonemapping` render-graph node — which
+        // runs after the NAADF passes (`render/mod.rs` chains them
+        // `.before(tonemapping)`) — does the tonemap + sRGB encode.
+        // TAA-fidelity fix #2: the port no longer tonemaps in
+        // `naadf_final.wgsl` (`18-taa-fidelity.md` fix #2).
+        Hdr,
+        // Bevy's built-in tonemapper — `TonyMcMapface` (Bevy's default, the
+        // idiomatic 0.19 choice). Replaces NAADF's custom Reinhard-ish tonemap.
+        Tonemapping::default(),
         FreeCamera {
             walk_speed: 4.0,
             run_speed: 14.0,

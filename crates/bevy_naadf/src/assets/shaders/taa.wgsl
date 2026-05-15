@@ -34,8 +34,11 @@
 //     matrix — the `05-review.md` perspective-fix convention, exactly as
 //     `get_ray_dir` was corrected. Every matrix multiply below uses `M * v`
 //     with the perspective `w`-divide. Do NOT "fix" this back to `v * M`.
-//   * The §6 16-deep sample ring: `(taaIndex + i) % 32` in the HLSL becomes
-//     `% TAA_SAMPLE_RING_DEPTH` (= 16). The camera-history `% 128` stays 128.
+//   * The configurable sample ring: `(taaIndex + i) % 32` in the HLSL becomes
+//     `% TAA_SAMPLE_RING_DEPTH`, where `TAA_SAMPLE_RING_DEPTH` is a naga-oil
+//     `#{...}` shader-def substitution fed from `AppArgs.taa_ring_depth`
+//     (default 32 — `18-taa-fidelity.md` fix #3, superseding the §6 binding
+//     16-deep lever). The camera-history `% 128` stays 128.
 //   * Entity blocks (`renderTaaSampleReverse.fx:76-84, 96-104`,
 //     `entityInstancesHistory`) are OMITTED — A-2 is entity-free, exactly as
 //     Phase A omitted the `ENTITIES` traversal branch. `entityPosChange` is
@@ -288,7 +291,7 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     for (var i = 1u; i < params.sample_age; i = i + 1u) {
         let cur_history_index = (params.taa_index + i) % 128u;
-        // The §6 16-deep sample ring — the SECOND `% 32` in the HLSL (`:91`).
+        // The configurable sample ring — the SECOND `% 32` in the HLSL (`:91`).
         let cur_taa_index = (params.taa_index + i) % TAA_SAMPLE_RING_DEPTH;
 
         // `curPosVirtual = posVirtual` (+ entityPosChange — omitted, A-2 is
@@ -455,8 +458,8 @@ fn calc_new_taa_sample(@builtin(global_invocation_id) global_id: vec3<u32>) {
         dist, light, first_hit_result.normal_tang & 0x7u, is_diffuse,
         specular_normals, extra_data8, first_hit.x & 0x3FFFu,
     );
-    // The 16-deep ring — HLSL `% 32` → `% TAA_SAMPLE_RING_DEPTH` (the §6
-    // VRAM lever, `taa_common.wgsl`).
+    // The sample ring — HLSL `% 32` → `% TAA_SAMPLE_RING_DEPTH` (the
+    // configurable ring depth, default 32 — `taa_common.wgsl`).
     cnts_taa_samples[
         (cnts_params.taa_index % TAA_SAMPLE_RING_DEPTH) * screen_width * screen_height
         + pixel_index

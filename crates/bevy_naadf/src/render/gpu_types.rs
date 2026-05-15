@@ -74,14 +74,16 @@ pub struct GpuRenderParams {
     /// Packed boolean flags — see `FLAG_SHOW_RAY_STEP` / `FLAG_CHECK_SUN` /
     /// `FLAG_IS_TAA`.
     pub flags: u32,
-    /// Final-blit tonemap exposure (the C# `renderFinal.fx` `exposure`).
-    pub exposure: f32,
-    /// Final-blit tonemap factor — the C# `base/renderFinal.fx` `toneMappingFac`
-    /// in `tv = curColor / (toneMappingFac + curColor)` (`09-design-b.md` §5.9).
-    /// Replaces the former `_pad0` slot (offset 28); set to `1.0` in
-    /// `prepare_frame_gpu`. Unused until Batch 6 ports the `base/` final blit;
-    /// the layout slot is reserved now so the 112-byte size is Batch-6-ready.
-    pub tone_mapping_fac: f32,
+    /// Padding (offsets 24/28). Formerly `exposure` / `tone_mapping_fac` — the
+    /// custom final-blit tonemap constants. The TAA-fidelity track switched the
+    /// port to Bevy's built-in tonemapping (`Camera { hdr: true }` + a
+    /// `Tonemapping` component; `naadf_final.wgsl` outputs raw linear HDR), so
+    /// these fields are dead — replaced with padding to keep the 112-byte
+    /// uniform layout (and every downstream field offset) unchanged
+    /// (`18-taa-fidelity.md` fix #2).
+    pub _pad0a: u32,
+    /// Padding — see `_pad0a`.
+    pub _pad0b: u32,
 
     /// Direction *towards* the sun (the C# `skySunDir`).
     pub sky_sun_dir: Vec3,
@@ -398,7 +400,10 @@ pub struct GpuBucketInfo {
 ///
 /// Layout: `mat4 (64) + mat4 (64)` then 4 × 16-byte `vec3` rows
 /// (`cam_pos_int`/`cam_pos_frac`/`sky_sun_dir`/`sun_color`, 64 B) then a 24-slot
-/// scalar tail (`screen_width` … `_pad6`, 96 B) — total 288 bytes.
+/// scalar tail (`screen_width` … the last 16-byte row `flags`/`_pad4`/
+/// `taa_jitter`, 96 B) — total 288 bytes. The TAA-fidelity fix replaced the
+/// trailing `_pad5`/`_pad6` pair with `taa_jitter: Vec2` (offset 280, 8-byte
+/// aligned) — the GI rays' per-frame Halton sub-pixel jitter.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuGiParams {
@@ -471,12 +476,20 @@ pub struct GpuGiParams {
     pub denoise_thresh: f32,
     /// Packed GI flags — see the `GI_FLAG_*` constants.
     pub flags: u32,
-    /// Padding to a 16-byte stride.
+    /// Padding to a 16-byte stride. Sits at struct offset 276 — keeps
+    /// `taa_jitter` on the 8-byte-aligned offset 280 (a `Vec2` needs 8-byte
+    /// alignment to mirror a WGSL `vec2<f32>` — see the layout note below).
     pub _pad4: u32,
-    /// Padding to a 16-byte stride.
-    pub _pad5: u32,
-    /// Padding to a 16-byte stride.
-    pub _pad6: u32,
+    /// Sub-pixel TAA jitter (the C# `taaJitter`) — the per-frame Halton 2-D
+    /// offset the GI sample-generation + spatial-resampling rays are fired
+    /// through (`renderGlobalIllum.fx:69` / `renderSpatialResampling.fx:351`).
+    /// Zero when `AppArgs.taa` is off. **Layout (the `vec3`-then-scalar /
+    /// `vec4` WGSL hazard that bit this port 3×):** this field occupies the
+    /// former `_pad5`/`_pad6` slot — struct offset **280**, which is 8-byte
+    /// aligned (`280 % 8 == 0`), so a WGSL `vec2<f32>` lands here byte-for-byte.
+    /// The struct stays 288 bytes; the WGSL counterpart declares `flags: u32,
+    /// pad_a: u32, taa_jitter: vec2<f32>` so the offsets match exactly.
+    pub taa_jitter: Vec2,
 }
 
 /// `flags` bit: skip samples — the 1↔0.25-spp toggle (C# `skipSamples`).
@@ -534,8 +547,15 @@ fn f16_bits(x: f32) -> u16 {
 
 // Compile-time sanity: the GPU structs must be exactly the size their WGSL
 // counterparts declare (no surprise padding). `GpuRenderParams` is 7 × 16-byte
-// rows: (u32×4) (taa_index/flags/exposure/tone_mapping_fac) (sky_sun_dir/_pad1)
+// rows: (u32×4) (taa_index/flags/_pad0a/_pad0b) (sky_sun_dir/_pad1)
 // (sun_color/_pad2) (taa_jitter/_pad3) (bbox_min/_pad4) (bbox_max/_pad5).
+//
+// `GpuGiParams.taa_jitter` placement guard (`18-taa-fidelity.md` fix #1): the
+// new `taa_jitter` field must land at struct offset 280 — the last row's
+// 8-byte-aligned slot — so the WGSL `vec2<f32>` matches byte-for-byte. The
+// `vec3`-then-scalar / `vec4` layout hazard bit this port 3× already; pin the
+// offset at compile time. (`280 % 8 == 0`, satisfying WGSL's 8-byte `vec2<f32>`
+// alignment; `288 - 280 == 8` bytes for the `Vec2`.)
 const _: () = assert!(std::mem::size_of::<GpuCamera>() == 64 + 32);
 const _: () = assert!(std::mem::size_of::<GpuRenderParams>() == 16 * 7);
 const _: () = assert!(std::mem::size_of::<GpuWorldMeta>() == 48);
@@ -550,6 +570,10 @@ const _: () = assert!(std::mem::size_of::<GpuAtmosphereParams>() == 128);
 const _: () = assert!(std::mem::size_of::<GpuSampleValid>() == 32);
 const _: () = assert!(std::mem::size_of::<GpuBucketInfo>() == 8);
 const _: () = assert!(std::mem::size_of::<GpuGiParams>() == 288);
+// `taa_jitter` placement guard — must land at offset 280, 8-byte aligned, so
+// the WGSL `vec2<f32>` matches byte-for-byte (`18-taa-fidelity.md` fix #1).
+const _: () = assert!(std::mem::offset_of!(GpuGiParams, taa_jitter) == 280);
+const _: () = assert!(std::mem::offset_of!(GpuGiParams, taa_jitter) % 8 == 0);
 
 // Keep the material enums referenced so a future material-format change can't
 // silently drift this file out of step (also documents the intent).

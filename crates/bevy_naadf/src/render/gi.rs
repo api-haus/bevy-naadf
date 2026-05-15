@@ -353,8 +353,17 @@ pub fn prepare_gi(
         denoise_thresh: gi.denoise_thresh,
         flags,
         _pad4: 0,
-        _pad5: 0,
-        _pad6: 0,
+        // The GI sample-generation + spatial-resampling rays are fired through
+        // this per-frame Halton sub-pixel offset (the C# `taaJitter` passed to
+        // `getRayDir` in `renderGlobalIllum.fx:69` / `renderSpatialResampling
+        // .fx:351`). Reuse the SAME jitter source of truth `prepare_frame_gpu`
+        // already routes to `GpuRenderParams.taa_jitter` for the first-hit pass
+        // — `extracted_history.current_jitter`, computed once per frame in
+        // `update_camera_history` (zero when `AppArgs.taa` is off). Do NOT
+        // compute a second jitter. Without this the GI rays sample the exact
+        // same sub-pixel point every frame and the long-term TAA can never
+        // resolve sub-pixel detail (`18-taa-fidelity.md` cause #1).
+        taa_jitter: extracted_history.current_jitter,
     };
     render_queue.write_buffer(&resources.gi_params, 0, bytemuck::bytes_of(&gi_params_data));
 

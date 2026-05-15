@@ -128,15 +128,33 @@ pub fn extract_camera(
     let clip_from_view_rot = rotation_only_view_proj(camera, global_transform.rotation());
     let inv_view_proj = clip_from_view_rot.inverse();
 
-    let viewport_size = camera
-        .physical_viewport_size()
-        .unwrap_or(UVec2::new(1, 1))
-        .max(UVec2::ONE);
+    // Viewport size — **retain the last-known-good value on a degenerate read**
+    // (`18-taa-fidelity.md` fix #4 / black-on-resize root cause). During a
+    // window resize `Camera::physical_viewport_size()` transiently returns
+    // `None` (Bevy's `camera_system` recomputes the viewport rect *after* the
+    // window's new size is known, and `ExtractSchedule` can run on a frame
+    // before that) — or a degenerate `(0, *)` / `(*, 0)`. The OLD code did
+    // `.unwrap_or(UVec2::new(1,1))`, collapsing every screen-space buffer to
+    // 1×1 while the final blit covered the full new-size view target → OOB
+    // storage reads → a fully-black frame. Instead: keep whatever
+    // `extracted.viewport_size` already holds (the previous frame's valid
+    // size) until a real new size arrives — never shrink to a bogus size.
+    // On the very first frame `extracted.viewport_size` is the `Default`
+    // `UVec2::ZERO`; the `.max(UVec2::ONE)` floor in the consumers
+    // (`prepare_taa` / `prepare_gi` / `prepare_frame_gpu`) covers that single
+    // pre-first-valid-frame case — but that frame is also pre-`valid`, so the
+    // prepare systems skip it anyway.
+    if let Some(size) = camera.physical_viewport_size() {
+        if size.x > 0 && size.y > 0 {
+            extracted.viewport_size = size;
+        }
+        // else: degenerate read — keep the last-known-good `viewport_size`.
+    }
+    // else: `None` (mid-resize) — keep the last-known-good `viewport_size`.
 
     extracted.position_split = *position_split;
     extracted.inv_view_proj = inv_view_proj;
     extracted.view_proj = clip_from_view_rot;
-    extracted.viewport_size = viewport_size;
     extracted.valid = true;
 }
 

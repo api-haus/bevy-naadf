@@ -56,18 +56,34 @@ use graph_b::{
 };
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
-use taa::prepare_taa;
+use taa::{prepare_taa, TaaRingConfig};
 
 /// Plugin: wires the Phase-A NAADF render path into the render sub-app.
 pub struct NaadfRenderPlugin;
 
 impl Plugin for NaadfRenderPlugin {
     fn build(&self, app: &mut App) {
+        // The configured TAA sample-ring depth (`18-taa-fidelity.md` fix #3):
+        // read once from the main-world `AppArgs` (inserted before this plugin
+        // in `build_app`) and mirrored into the render sub-app as
+        // `TaaRingConfig`. `NaadfPipelines::from_world` (built in
+        // `RenderStartup`, after this `build`) reads it for the WGSL
+        // `#{TAA_SAMPLE_RING_DEPTH}` shader-def; `prepare_taa` reads it for the
+        // buffer sizing — one source of truth, both sides agree.
+        let taa_ring_depth = app
+            .world()
+            .get_resource::<crate::AppArgs>()
+            .map(|args| args.taa_ring_depth)
+            .unwrap_or(crate::DEFAULT_TAA_RING_DEPTH);
+
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
 
         render_app
+            .insert_resource(TaaRingConfig {
+                depth: taa_ring_depth,
+            })
             .init_resource::<ExtractedWorld>()
             .init_resource::<ExtractedCameraData>()
             .init_resource::<ExtractedCameraHistory>()

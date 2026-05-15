@@ -203,8 +203,16 @@ fn calc_global_ilum(
     // lane reads `pixel_pos_comp == 0` ⇒ `pixel_pos == (0,0)`; guard with the
     // explicit dispatch-tail check below.
     var rand = init_rand(vec3<u32>(global_id.x, gi_params.rand_counter, gi_params.rand_counter_b));
+    // `getRayDir(invCamMatrix, pixelPos, screenWidth, screenHeight, taaJitter)`
+    // — the JITTERED primary ray (`renderGlobalIllum.fx:69`). The GI ray must
+    // be fired through the per-frame Halton sub-pixel offset, not the pixel
+    // centre — without it the long-term TAA has no sub-pixel variation to
+    // average and can never resolve sub-pixel detail (`18-taa-fidelity.md`
+    // cause #1). `gi_params.taa_jitter` is the same value the first-hit pass
+    // jitters with — the G-buffer was encoded for a jittered ray.
     let ray_dir = get_ray_dir(
-        gi_params.inv_view_proj, pixel_pos, screen_width, screen_height, vec2<f32>(0.0, 0.0),
+        gi_params.inv_view_proj, pixel_pos, screen_width, screen_height,
+        gi_params.taa_jitter,
     );
 
     let first_hit = first_hit_data[pixel_pos.x + pixel_pos.y * screen_width];
