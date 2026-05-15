@@ -21,40 +21,70 @@ Distance Fields", Ulschmid et al. CGF 2026) at `/mnt/archive4/DEV/NAADF` — int
   fresh worktree from local `main`** — `docs/orchestrate/naadf-bevy-port/` and all code are
   on `main`.
 
-## THE NEXT DISPATCH — do this first
+## PRIORITY REDIRECT — 2026-05-15 (third Architectural Q&A)
 
-A single "compound" agent (designs + implements in one continuous dispatch, grounded in the
-NAADF C# reference at `/mnt/archive4/DEV/NAADF/`) for **two reported TAA bugs**:
+The user redirected the next priority away from the TAA bug-fixes (below, now folded into
+Phase C as the B-1 fix-first item) toward **Phase C — canonical methodology completion**:
+the GPU build algorithm + the complete canonical NAADF+GI methodology per the paper. Scope
+locked by Q&A E1–E4 (`01-context.md` §2e):
 
-1. **PRIMARY — TAA never resolves / perpetually noisy.** The port's TAA output stays noisy
-   and never resolves to a clean image, unlike the C# NAADF version. Tasks: (a) establish an
-   e2e test that analyzes noise in the captured screenshot up-close — a per-pixel /
-   local-high-frequency / local-variance noise metric, gated; (b) study NAADF's C# TAA +
-   denoiser to learn how it resolves clean (the long-term-memory TAA accumulation, the
-   16-deep `taa_samples` ring, sample-count weighting, the sparse bilateral denoiser's role,
-   frame-over-frame convergence); (c) find why the port stays noisy where C# resolves;
-   (d) mitigate faithfully — port what C# does.
-2. **SECONDARY — TAA goes black on window resize.** A framebuffer-resize resource-lifecycle
-   bug: on window/framebuffer resize, the TAA history/accumulation buffers (possibly also GI
-   buffers, the camera-history ring) are likely not correctly reallocated/reset → TAA reads
-   stale/zero/wrong-sized data → black. Investigate the resize path, fix faithfully, add e2e
-   resize coverage if feasible. (The e2e harness uses a fixed window size — structurally
-   blind to this.)
+- **E1 scope:** all 4 paper contributions — GPU hashing construction (Algorithm 1), O(3·d·n)
+  AADF construction, world generation, editing + flood-fill AADF invalidation, background
+  AADF queues, dynamic entities. SVGF OUT (un-portable from NAADF source).
+- **E2:** the TAA-never-resolves / camera-motion reprojection-decay bug (B-1) is **fixed
+  first**, before any Phase-C construction work.
+- **E3:** seam-first design — a self-contained construction sub-module/sub-graph owns the
+  shared render-graph wiring; workstreams then fan out into parallel worktrees.
+- **E4:** the CPU construction path (`src/aadf/construct.rs`) is kept as a bit-exact test
+  oracle + fallback — not deleted.
+- **Execution:** distributed `/delegate` via the **team** system + parallel git worktrees,
+  one per workstream; the orchestrator stays the coordinator.
 
-Verification: `cargo build` + `cargo test` (currently 46) + `cargo run --bin e2e_render`
-(with the new noise metric + ideally resize coverage) + Read `target/e2e-screenshots/e2e_latest.png`.
-Cap e2e runs ~10. Deliverable: append a section to `10-impl-b.md`.
+Foundation docs done: `13-reuse-audit-c.md` (GPU-construction reuse audit) +
+`14-paper-gap.md` (canonical-paper gap table + prioritized completion list).
 
-## Other open items (after the above)
+## THE NEXT DISPATCH — do this first (TAA-fidelity track, per E2 — explore-first)
+
+The user refined the B-1 scope (2026-05-15):
+- **Camera-motion reprojection-decay — NOT a live bug.** The user and `12-alignment-gap.md`
+  agree it was already resolved (the `sync_position_split` fix). Dropped from scope.
+- **Black-on-resize — confirmed real.** A framebuffer-resize resource-lifecycle bug: on
+  window/framebuffer resize, the TAA history/accumulation buffers (possibly also GI buffers,
+  the camera-history ring) are likely not correctly reallocated/reset → TAA reads
+  stale/zero/wrong-sized data → black. The fixed-size e2e harness is structurally blind to it.
+- **TAA noisier than C# / barely resolves — the real problem.** The port's TAA is noticeably
+  noisier than the C# NAADF version and barely resolves; the C# is only slightly noisy when
+  zoomed into a shadow-band area between two surfaces. Cause unknown — could be implementation
+  details, entirely missing pipeline parts, or plain configuration differences.
+
+Approach: **explore first, then fix.** Dispatch a read-only diagnosis agent that compares the
+port's full TAA + denoiser + GI-accumulation pipeline against the NAADF C# reference + the
+paper, and produces a ranked list of suspected causes → `18-taa-fidelity.md`. Then a
+code-mutating fix dispatch (in a worktree branched from local `main`) brings TAA fidelity to
+at least the C# level and fixes black-on-resize. **Bar = the C# version, not a perfect
+renderer.**
+
+Prime suspect to evaluate explicitly: the **16-deep vs. the paper's 32-deep `taaSamples`
+ring** (`14-paper-gap.md` TAA row + `design-exploration-qa.md` §6 binding VRAM decision) —
+half the history depth is a direct candidate for "barely resolves." Verification for the fix:
+`cargo build` + `cargo test` (currently 46) + `cargo run --bin e2e_render` (cap ~10) + Read
+`target/e2e-screenshots/e2e_latest.png`. Deliverable group file: `18-taa-fidelity.md`.
+
+## Then — Phase C proper
+
+`design` (`delegate-architect` → `15-design-c.md`: seam-first extension design + the
+worktree/workstream decomposition plan respecting the construction→editing→queues dependency
+DAG) → team-based parallel `impl` across worktrees (`16-impl-c.md`) → fresh-eyes `review`
+(`17-review-c.md`). See `README.md` Phase-C checklist + `01-context.md` §2e.
+
+## Other open items
 
 - **Review follow-ups** (`11-review-b.md` — non-blocking): #1 the e2e harness's dead
   "temporal-stability gate" scaffolding (implement or delete); #3 `expected_spans(6)` not
   `is_denoise`-config-aware; #5 dead plumbing debris from the B2/B6 seams
   (`FLAG_BLIT_FINAL_COLOR`, dormant `taa_layout`, the `taa_sample_accum` no-op touch); #6
   advisory — add a mechanical GPU-struct-offset assert harness (the `vec3`-then-scalar layout
-  class recurred 3×).
-- **Phase C** (GPU-based world construction/editing) — a deliberate future phase, explicitly
-  deferred; out of the current scope.
+  class recurred 3×). Fold into Phase-C work where they overlap.
 
 ## Key working rules (carry these into any continuation)
 

@@ -258,6 +258,98 @@ stable via the A-2 TAA, no obvious artifacts) — the Phase-B review gate.
 
 ---
 
+## 2e. Phase C (canonical methodology completion) working context
+
+Phases A, A-2, and B are complete and review-gated — the port faithfully implements the
+**rendering half** of the NAADF paper. **Phase C completes the *construction, maintenance
+and dynamism* half** so the port is canonically complete per Ulschmid et al. (CGF 2026).
+This section is the canonical Phase-C context — the Phase-C `design` agent
+(`delegate-architect`) reads it first. It supersedes the original §2b/D5 framing of "Phase C"
+as a narrow optional speed-up track: Phase C is now the deliberate completion of the paper's
+methodology, scoped by a third Architectural Q&A (2026-05-15).
+
+### Source paper (canonical reference for this phase)
+
+`/mnt/archive4/PAPERS/Prepared/ulschmid-2026-naadf-voxel-gi.md` — the extracted canonical
+paper (mirrored in-repo at `docs/research/ulschmid-2026-naadf-voxel-gi.md`). C# reference for
+every Phase-C subsystem: `/mnt/archive4/DEV/NAADF/` — `chunkCalc.fx`, `boundsCalc.fx`,
+`boundsCommon.fxh`, `worldChange.fx`, `mapCopy.fx`, `BlockHashingHandler.cs`,
+`WorldBoundHandler.cs`, `ChangeHandler.cs`, `EditingHandler.cs`, `EntityHandler.cs`,
+`WorldGenerator`.
+
+### Binding scope decision (Architectural Q&A 2026-05-15)
+
+| # | Question | User's choice | Consequence |
+|---|---|---|---|
+| E1 | How much of the canonical paper methodology is in this push? | **All 4 paper contributions** | IN: GPU hashing construction (Algorithm 1, paper §3.2 — `14-paper-gap.md` item #1), O(3·d·n) synchronised-iteration AADF construction (§3.3, item #5), world generation (§5 scenes / `WorldGenerator`, item #6), editing + flood-fill AADF invalidation (§3.5, item #2), background AADF computation queues (§3.3, item #3), and dynamic entities (§3.6 — contribution #4, item #4). OUT: SVGF alternative denoiser (item #8) — un-portable from the NAADF source (never released); the paper itself favours the sparse bilateral, which *is* ported faithfully. |
+| E2 | Fate of the deferred TAA bug B-1 (TAA never resolves / camera-motion reprojection decay)? | **Fix it first** | B-1 is fixed in a single focused dispatch *before* any Phase-C construction work starts, so the construction push begins from a clean temporally-stable baseline. B-1 detail: `12-alignment-gap.md` §4 + `RESUME.md` "THE NEXT DISPATCH" + `10-impl-b.md`. It is a faithfulness defect *within* the already-implemented `base/` TAA — not a Phase-C methodology item; its fix appends to `10-impl-b.md`. |
+| E3 | How to handle the shared render-graph integration surface under parallel worktrees? | **Seam-first, then fan out** | The Phase-C `design` agent's FIRST deliverable is a clean **extension seam**: a self-contained construction sub-module / sub-graph that owns its own render-graph wiring, bind-group layouts, and `WorldGpu` extension, so parallel workstreams touch minimal shared surface (`render/mod.rs`, `NaadfPipelines`, the `WorldGpu` struct). Workstreams then fan out into parallel git worktrees; a final thin integration step wires the seams together. |
+| E4 | Fate of the existing CPU construction path (`src/aadf/construct.rs` + its tests)? | **Keep as test oracle + fallback** | GPU construction (Algorithm 1) becomes the default build path; the CPU `construct.rs` 3-phase build stays as (a) a selectable fallback and (b) the **bit-exact validation oracle** — GPU construction output is asserted bit-identical to CPU output in tests. Leverages the project's faithful-port verification discipline. Do NOT delete `construct.rs`. |
+
+### Execution model — teams + parallel worktrees (user directive, 2026-05-15)
+
+> "work in worktree. [...] lets work with teams instead of just local agents on this one
+> [...] if we can parralelise work, its trivial with worktrees on a rust codebase"
+
+- **Distributed `/delegate` mode**, executed via the **team** system (TeamCreate + named
+  addressable agents) rather than only one-shot Agent dispatches. The orchestrator remains the
+  coordinator (scopes / briefs / synthesizes / gates); teams provide addressable parallel agents.
+- **Each genuinely-independent workstream gets its own git worktree** branched from local
+  `main`, on its own branch. Parallel worktrees isolate *new files* with zero conflict; the
+  *shared* integration surface is handled by the E3 seam-first design + a final integration
+  step. Code-mutating agents may run in parallel **only because each is in a separate
+  worktree** — the user's explicit, reasoned override of the usual "code-mutating dispatches
+  serialise" rule; it is sound *because* worktrees eliminate the shared-tree conflict.
+- **The dependency DAG still constrains the fan-out** — `14-paper-gap.md` notes GPU
+  construction (#1) is foundational, editing (#2) depends on it, background queues (#3) depend
+  on editing producing changes. The `design` agent must produce a workstream plan that
+  respects this DAG (likely wave-based: foundational + independent tracks first, then dependent
+  tracks) rather than a naive all-at-once fan-out. Many-dependency work is exactly where
+  multi-agent underperforms — the seam + wave structure is what makes the parallelism safe.
+
+### Reuse audit + paper-gap analysis (read both — Phase-C foundation)
+
+- `13-reuse-audit-c.md` — what already exists for GPU construction/editing. Headlines:
+  `GrowableBuffer<T>` is a direct reuse (= NAADF's `BlockHashingHandler` / `mapCopy.fx`
+  grow-and-copy); the `Core3d` compute-node pattern + the `WorldGpu` resource are
+  reuse/extend; CPU `construct.rs` + `cell.rs` bit-layouts are the WGSL design reference +
+  test oracle. Greenfield: ~5 WGSL files / ~15 compute entry points / 3 new buffer types /
+  3-4 new Bevy systems. The wgpu `STORAGE_READ_WRITE`-vs-`read` constraint forces a parallel
+  construction-mode `@group(0)` bind-group layout.
+- `14-paper-gap.md` — the canonical-paper gap table. The full main table + the
+  `## Prioritized completion list` (items #1-#8) are the Phase-C work breakdown: items
+  #1, #5, #6 = the "GPU build algorithm" core; #2, #3 = editing + maintenance; #4 = dynamic
+  entities; #8 (SVGF) = OUT per E1.
+
+### Phase C deliverable / done-bar
+
+The port implements the paper's full Method §3.2-3.6: GPU hashing construction (Algorithm 1)
+as the default build path with the CPU path as a bit-exact oracle, the O(3·d·n) AADF
+construction, world generation, editing with flood-fill AADF invalidation, the background
+AADF queues, and dynamic entities (per-chunk entity pointer + entity instance buffer +
+per-entity AADF volumes + traversal-time entity sub-traversal). Build + the test suite green
+(incl. the GPU-vs-CPU bit-exact construction asserts) + `cargo run --bin e2e_render` exits 0
+with an editable / entity-bearing test scene. Phase C review gate: a fresh-eyes
+`delegate-reviewer` pass + user confirmation.
+
+### Forbidden / out of Phase C scope
+
+- **SVGF denoiser** (`14-paper-gap.md` #8) — un-portable from NAADF source, OUT per E1.
+- **Do NOT delete the CPU construction path** (`src/aadf/construct.rs`) — it is the bit-exact
+  test oracle + fallback per E4.
+- **Do NOT let parallel code-mutating agents share a worktree** — each workstream gets its own
+  worktree; sharing one reintroduces the conflict the worktree isolation exists to remove.
+- **Do NOT design the construction passes to edit `render/mod.rs` / `NaadfPipelines` /
+  `WorldGpu` ad-hoc from each workstream** — that is the shared-surface collision E3's
+  seam-first design exists to prevent. Wire through the seam.
+- The standard faithful-port rule: port what NAADF's C#/HLSL actually does; ground every
+  construction / editing / entity subsystem in `/mnt/archive4/DEV/NAADF/`. Documented
+  MonoGame↔wgpu deviations are fine; novel inventions are not.
+- The WGSL `vec3`-then-scalar layout hazard (`RESUME.md` "Hazard class") applies to every new
+  shared GPU struct in Phase C — audit each one.
+
+---
+
 ## 3. Reuse audit summary
 
 Full audit: `docs/orchestrate/naadf-bevy-port/00-reuse-audit.md`. Condensed verdict:

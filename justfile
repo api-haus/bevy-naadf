@@ -28,6 +28,9 @@ build:
 run:
     cargo run -p bevy-naadf --release
 
+dev:
+    cargo run -p bevy-naadf
+
 # Run the workspace test suites.
 test:
     cargo test --workspace

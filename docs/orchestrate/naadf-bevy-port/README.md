@@ -31,6 +31,12 @@ render), no editor GUI / persistence / importers.
 | `10-impl-b.md` | `impl` group | Phase B (GI) implementation log |
 | `11-review-b.md` | `review` group | Phase B (GI) fresh-eyes review brief + findings |
 | `12-alignment-gap.md` | `analysis` | port-vs-NAADF alignment gap analysis — subsystem faithfulness table, divergence/open-question reconciliation, open bugs, prioritized "what's left to fully align" list |
+| `13-reuse-audit-c.md` | `delegate-auditor` | Phase-C reuse audit — what already exists for GPU world construction/editing vs. what is greenfield (DONE) |
+| `14-paper-gap.md` | `paper-gap` group | canonical-paper gap analysis — every paper methodology step classified FAITHFUL/DEVIATION/PARTIAL/MISSING vs. the port; the prioritized completion list is the Phase-C work breakdown (DONE) |
+| `15-design-c.md` | `design` group | Phase-C architecture — the seam-first extension design + the worktree/workstream decomposition plan (respecting the construction→editing→queues dependency DAG) |
+| `16-impl-c.md` | `impl` group | Phase-C implementation log — per-workstream batches across parallel worktrees + the final integration step |
+| `17-review-c.md` | `review` group | Phase-C fresh-eyes review brief + findings |
+| `18-taa-fidelity.md` | `taa-fidelity` group | TAA-fidelity track — diagnosis of why the port's TAA is noisier / "barely resolves" vs. NAADF C#, then the fix log (incl. black-on-resize) |
 | `e2e-render-test.md` | `delegate-architect` | headless e2e integration render-test harness design — replaces the live `cargo run` smoke-run as the impl-agent verification step |
 | `design-exploration-qa.md` | orchestrator | methodology/capability/VRAM Q&A reference (lineage, PBR texturing, dynamic entities, microvoxels, LOD, TAA-history VRAM lever) — read before scoping features it covers; holds one binding decision (§6) |
 
@@ -65,10 +71,31 @@ B (GI) → C (GPU construction/editing)**. One gated phase at a time.
 - [x] **Phase A-2 (TAA) — COMPLETE.** Context (`01-context.md` §2c) + design (`06-design-a2.md`) + impl (all 9 steps, `07-impl-a2.md`) + review (`08-review-a2.md`): 0.25-spp readiness READY, faithful HLSL→WGSL port + `M*v` matrix convention verified, leftover step-8 instrumentation reverted, 39 tests pass, smoke-runs clean. Deliverable: NAADF's 16-frame long-term-memory TAA, on by default; per-pixel sample-count signal exposed for Phase B.
 - [~] Phase B (GI) — in worktree `feat/phase-b-gi`. Context (`01-context.md` §2d) + **design done** (`09-design-b.md`, ~1711 lines: 13-node render graph, 6-batch impl sequence). Scope = NAADF's real-time `WorldRenderBase` GI only (compressed ReSTIR GI + sparse bilateral denoiser + 4-plane first-hit + `rayQueueCalc` adaptive 0.25-spp + atmosphere); reference pathtracer + DLSS-RR OUT (future). **impl in progress** — Batches 1–5 done + B6 implemented (`10-impl-b.md`: B1 shared WGSL + GPU types + atmosphere subsystem; B2 4-plane first-hit restructure; B3 rayQueueCalc + globalIllum; B4 sampleRefine ×5 passes; B5 spatialResampling + denoiser; B6 base/ TAA rewire + final blit + integration). Verification: windowed e2e render-test harness (`cargo run --bin e2e_render`, design `e2e-render-test.md`) replaces the live smoke-run; saves `target/e2e-screenshots/e2e_latest.png` for vision review. Streak/ring artifact fixed (`10-impl-b.md` "Streaking artifact fix": `update_camera_history` query filter froze the frame counter for non-`FreeCamera` cameras → atmosphere precompute stuck on 1/4 of its octahedral buffer). e2e test scene expanded — shared test grid now has 5 emissive blocks + towers/wall/pillars/spheres (richer GI test scene); e2e gates recalibrated. **Phase B impl FEATURE-COMPLETE.** Three bugs surfaced + fixed once the GI data flow was un-blocked: the streaking artifact (frozen TAA frame counter), the Batch-6 TAA-path black frame (`GpuTaaParams` `vec3`-then-scalar WGSL vs Rust `#[repr(C)]` layout mismatch), and GI-bounce invisibility (same layout-mismatch class in `GpuGiParams` → `bucket_count` mis-decoded → the whole `sampleRefine`→`spatialResampling` reservoir chain produced nothing; fix: `vec3`→`vec4` rows, consumers read `.xyz`). GI bounce now **VISIBLE** — the voxel structure (towers, wall+arch, pillars, spheres, ground) is fully lit by colored bounce from the 5 emissive blocks; e2e frame budget raised 8→96 for ReSTIR temporal convergence. 46 tests pass, `cargo run --bin e2e_render` exits 0, all gates green (`assert_batch_6` honest at `MIN_GI_BOUNCE_LUMINANCE=12.0`, 99.2% GI-lit). **Phase B review gate PASSED** (`11-review-b.md`: 0 blockers, 2 concerns, 5 nits — all coverage gaps / debris / advisory, no correctness defects; faithful port confirmed line-by-line vs NAADF source, all 8 GPU struct layouts audited clean). **Post-review production-app bug found** — under camera *motion* the TAA reprojection path degrades shadowed regions to pitch black (a static-camera e2e doesn't catch it; the `base/` TAA running-average is convergent + audited faithful for a static camera). Tangential `sync_position_split` `With<FreeCamera>` query-filter bug found + fixed (`position_split.rs`) — unblocks moving-camera e2e coverage. → TAA camera-motion reprojection **audited faithful vs NAADF C#** (`10-impl-b.md`) — no shader fix needed; the real motion-decay was the already-fixed `sync_position_split` trap; a deterministic moving-camera e2e mode + `assert_batch_6` motion-stability gate were added as permanent coverage. **Two new TAA bugs reported:** (a) TAA goes black on window resize (framebuffer-resize resource-lifecycle bug; the fixed-size e2e is structurally blind to it); (b) TAA never resolves — output stays perpetually noisy, unlike the C# version. → e2e noise-analysis test + C#-grounded noise mitigation + window-resize fix → review-follow-up cleanup → Phase B COMPLETE
 - [x] Gap analysis (`12-alignment-gap.md`) — port vs NAADF C#, in-scope core engine: 16 subsystems assessed (7 faithful, 9 faithful-with-documented-deviations, 0 diverging); all ~11 `02-research.md` divergences + ~7 open questions reconciled + 5 new ones documented; 1 blocking open bug (TAA camera-motion reprojection decay), 4 review nits/concerns open; Phase C deliberately deferred. Bottom line: in-scope port functionally complete + faithful, one well-scoped fix from a clean temporally-stable production gate.
-- [ ] Phase C (GPU construction/editing): design → impl → review
+
+### Phase C — canonical methodology completion (scoped 2026-05-15, third Architectural Q&A)
+
+Scope = the paper's construction/maintenance/dynamism half (Method §3.2–3.6): GPU hashing
+construction (Algorithm 1), O(3·d·n) AADF construction, world generation, editing +
+flood-fill AADF invalidation, background AADF queues, dynamic entities. SVGF OUT. Executed in
+**distributed mode via the team system + parallel git worktrees**; the orchestrator stays the
+coordinator. Canonical context: `01-context.md` §2e.
+
+- [x] Phase-C re-implementation audit → `13-reuse-audit-c.md` (7 candidates; large greenfield surface)
+- [x] Phase-C canonical-paper gap analysis → `14-paper-gap.md` (~38 rows; 8 MISSING, 2 PARTIAL, 4 sanctioned DEVIATION)
+- [x] Phase-C Architectural Q&A → E1–E4 (`01-context.md` §2e)
+- [x] Phase-C context written (`01-context.md` §2e, README/RESUME updated)
+- [ ] **TAA-fidelity track** (E2, explore-first — refined by the user 2026-05-15): the port's TAA is noticeably noisier than the C# NAADF version and "barely resolves"; the C# is only slightly noisy on close-up shadow-band areas. Camera-motion reprojection-decay is **confirmed not a live bug** (user + `12-alignment-gap.md` agree it was already resolved via the `sync_position_split` fix — dropped). Black-on-resize **confirmed real**. Done before Phase-C construction work.
+  - [ ] diagnosis/exploration → `18-taa-fidelity.md` — compare the port's TAA + denoiser + GI-accumulation pipeline against NAADF C# + the paper; ranked suspected causes (missing pipeline parts / config diffs / impl bugs)
+  - [ ] fix → `18-taa-fidelity.md` — bring TAA fidelity to at least the C# level; fix black-on-resize
+- [ ] `design` phase (Phase C) → `15-design-c.md` — seam-first extension design + worktree/workstream decomposition plan
+- [ ] `impl` phase (Phase C) → `16-impl-c.md` — team-based parallel implementation across worktrees + final integration
+- [ ] `review` phase (Phase C) → `17-review-c.md` — fresh-eyes review gate
 
 ## Pacing
 
-One dispatch at a time. After each agent returns, the orchestrator pauses and submits to the
-user before the next dispatch. Each substantive dispatch is preceded by a delegated checkpoint
-commit.
+One substantive dispatch at a time; the orchestrator pauses at every hard gate (any
+code-mutating dispatch) and submits to the user before the next. Each substantive dispatch is
+preceded by a delegated checkpoint commit. **Phase C uses the team system** — within a single
+read-only phase, or within a single wave of parallel code-mutating impl agents that each work
+in their own isolated git worktree, agents are dispatched concurrently; the orchestrator still
+pauses at the hard gate after each wave.
