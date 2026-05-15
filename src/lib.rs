@@ -237,6 +237,18 @@ pub fn build_app(cfg: AppConfig) -> App {
         primary_window.resolution = WindowResolution::new(w as u32, h as u32);
     }
 
+    // Web (wasm32 / WebGPU) build: bind the Bevy window to the
+    // `<canvas id="bevy">` declared in `index.html` and track its parent's
+    // size, instead of letting winit create a detached canvas the page never
+    // shows. `prevent_default_event_handling` keeps browser hotkeys (F5, tab,
+    // …) from firing while the app has focus. No effect on native targets.
+    #[cfg(target_arch = "wasm32")]
+    {
+        primary_window.canvas = Some("#bevy".to_string());
+        primary_window.fit_canvas_to_parent = true;
+        primary_window.prevent_default_event_handling = true;
+    }
+
     app.insert_resource(args)
         // The 128-deep camera-history ring + the monotonic frame counter
         // (`06-design-a2.md` §2.3). Main-world resource, `Default`-seeded,
@@ -252,6 +264,14 @@ pub fn build_app(cfg: AppConfig) -> App {
             DefaultPlugins
                 .set(AssetPlugin {
                     file_path: "src/assets".to_string(),
+                    // Web: Trunk's dev server has no `.meta` sidecars and
+                    // answers unknown paths with a 200 HTML fallback, so Bevy's
+                    // default meta probe parses that HTML as RON and fails the
+                    // load of every shader. The project ships no `.meta` files
+                    // anyway — skip the probe. Gated to wasm32 so the native
+                    // boot path stays byte-identical.
+                    #[cfg(target_arch = "wasm32")]
+                    meta_check: bevy::asset::AssetMetaCheck::Never,
                     ..default()
                 })
                 .set(RenderPlugin {

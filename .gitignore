@@ -1,5 +1,8 @@
 # Build artifacts
 /target
 
+# Trunk WebGPU (wasm32) build output
+/dist
+
 # Local environment — machine-specific paths (see .envrc.example)
 .envrc

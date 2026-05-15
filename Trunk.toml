@@ -1,0 +1,16 @@
+# Trunk configuration for the bevy-naadf WebGPU (wasm32) build.
+# The build asset pipeline (wasm bin, cargo features, shader copy) lives in
+# `index.html`; `just web` drives `trunk serve` + Chrome.
+
+[build]
+target = "index.html"
+# Debug wasm by default — `trunk serve` is the dev loop. For an optimised
+# artifact run `trunk build --release` (or `just web-build-release`).
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+# `just web` launches Chrome itself (WebGPU is the only browser backend that
+# ships on Linux Chrome, and the NAADF render path needs it), so Trunk must
+# not also open the default browser.
+open = false

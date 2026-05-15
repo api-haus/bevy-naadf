@@ -48,6 +48,11 @@ dlss = ["bevy/dlss"]
 # Mirrors Bevy's escape hatch so `cargo build --all-features` works without the
 # SDK; it overrides `dlss` at the Bevy level.
 force_disable_dlss = ["bevy/force_disable_dlss"]
+# WebGPU (wasm32) build. Forwards to Bevy's `webgpu` feature, which selects the
+# WebGPU wgpu backend over Bevy's default `webgl2` (when both are on, `webgpu`
+# wins). Build with `--no-default-features --features webgpu` — `dlss` has no
+# web build, so the web pipeline drops it (see `index.html` / `just web`).
+webgpu = ["bevy/webgpu"]
 
 # Bevy's standard fast-iteration tweak: optimise dependencies even in dev builds.
 [profile.dev.package."*"]

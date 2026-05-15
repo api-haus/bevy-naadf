@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>bevy-naadf — WebGPU</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }
+      /* The Bevy window binds to this canvas (see `build_app`, wasm32 block);
+         `fit_canvas_to_parent` keeps it sized to <body>. */
+      #bevy {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+    </style>
+
+    <!-- The wasm binary. Trunk compiles `--bin bevy-naadf` for
+         wasm32-unknown-unknown with `--no-default-features` (drops `dlss`,
+         which has no web build) and `--features webgpu` (selects the WebGPU
+         wgpu backend over Bevy's default webgl2). -->
+    <link
+      data-trunk
+      rel="rust"
+      data-bin="bevy-naadf"
+      data-cargo-no-default-features
+      data-cargo-features="webgpu"
+    />
+
+    <!-- The NAADF WGSL shaders are loaded at runtime by the Bevy asset server
+         from `src/assets/` (AssetPlugin.file_path). Copy that tree into dist so
+         the dev server serves it at the same path the asset server fetches. -->
+    <link
+      data-trunk
+      rel="copy-dir"
+      href="src/assets"
+      data-target-path="src/assets"
+    />
+  </head>
+  <body>
+    <canvas id="bevy"></canvas>
+  </body>
+</html>
