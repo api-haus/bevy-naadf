@@ -78,9 +78,20 @@ luminance **~4 → 242** — "barely resolves" decisively gone. User assessment:
 [...] cant tell without directly comparing same vox scenes, so its a good sign." Branch
 `fix/taa-fidelity` + worktree `.claude/worktrees/taa-fidelity` kept for reference.
 
-**Next dispatch:** Phase C `delegate-architect` → `15-design-c.md` — seam-first extension
-design + worktree/workstream decomposition plan respecting the construction → editing →
-queues dependency DAG (`01-context.md` §2e E1–E4).
+**Phase C in flight (2026-05-15) — team-based parallel execution per `15-design-c.md`:**
+- Design: COMPLETE → `15-design-c.md` (~83 KB / 1292 lines; 7 workstreams in 3 waves; seam under `render/construction/`).
+- **Wave 1a COMPLETE:** W0 seam (`c10b6bd`) + W6 O(3·d·n) AADF rewrite (`7f2630b`, 16.3× speedup) merged at `564a1f4`.
+- **Wave 1b COMPLETE:** W5 worldgen (`912c984`) merged at `912c984` — GPU/CPU bit-exact 8192 u32s byte-equal; 66 tests pass.
+- **Wave 2 — foundational dispatched:** W1 GPU Algorithm 1 (`chunkCalc.fx` + `mapCopy.fx` + `BlockHashingHandler` + startup regime-1 driver). The largest Phase-C workstream.
+- **Pending:** wave 2 = (W1 merge) → W3 ‖ W4 → W2; wave 3 = final integration agent.
+
+**Key architectural finding from W6 (carries into W1):** the paper §3.3 O(3·d·n) merge
+algorithm and the old per-cell slice-empty algorithm produce *different (both valid)* empty
+cuboids in the general case. The CPU oracle in `aadf/bounds.rs` now implements the merge
+algorithm (= what GPU `ComputeBounds4` produces). W1's bit-exact GPU/CPU oracle test
+(`15-design-c.md` §1.6) compares GPU output against this NEW CPU oracle, not the legacy
+per-cell expansion. The existing `bounds.rs` per-cell tests still pass because their cases
+sit in the merge-equals-per-cell agreement region. Detail in `16-impl-c-W6.md` Decision #2.
 
 ## Then — Phase C proper
 
