@@ -84,7 +84,9 @@ luminance **~4 → 242** — "barely resolves" decisively gone. User assessment:
 - **Wave 1b COMPLETE:** W5 worldgen (`912c984`) merged at `912c984` — GPU/CPU bit-exact 8192 u32s byte-equal; 66 tests pass.
 - **Wave 2 — foundational COMPLETE:** W1 GPU Algorithm 1 (`53a4c8f`) merged. 76 tests (+10); 388-byte GPU/CPU byte-equal on minimal scene; design's §1.6 Assumption #7 (CPU-HashMap vs GPU-open-addressing pointer divergence) confirmed and handled — full-scene byte-equality deferred to consumer workstreams. `gpu_construction_enabled` is now default `true`.
 - **Wave 2 — fan-out COMPLETE:** W3 (`48835b5`) + W4 (`e11b705`) merged at `5f2cc92`. W4 rebase resolved via an additive merge (both workstreams add disjoint fields in shared seam files — design §2.3 anticipated this; resolution kept both sides). W4 deferred the renderer-side entity sub-traversal *invocation* to wave-3 per its hard-rule constraint on `NaadfPipelines`. The chunks texture is now `Rg32Uint` and every renderer chunks-read site uses `.x` explicitly.
-- **Wave 2 — editing dispatched:** W2 last (depends on W3 bound queues for re-enqueueing). Then wave 3 = final integration agent + Phase-C review.
+- **Wave 2 COMPLETE:** W2 editing (`3c200a9`) merged. 109 tests pass; all 6 oracle bit-exact gates pass; `--edit-mode` PASS. W2 fixed a cross-cutting W3 bug at integration time (stale `R32Uint` storage-texture decl + zeroed `.y` entity-pointer channel).
+- **Wave 3 — final integration dispatched:** wire W4's deferred entity rendering (`NaadfPipelines::world_layout` extension + entity-buffer bindings + `naadf_entity_update_node` dispatch body + `shoot_ray` entity sub-traversal invocation) + full-gate validation pass.
+- **Pending:** Phase-C `delegate-reviewer` against `17-review-c.md` brief (the fresh-eyes review).
 
 **Key architectural finding from W6 (carries into W1):** the paper §3.3 O(3·d·n) merge
 algorithm and the old per-cell slice-empty algorithm produce *different (both valid)* empty
