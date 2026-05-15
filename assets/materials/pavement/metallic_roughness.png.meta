@@ -1,0 +1,15 @@
+// `Load`-action sidecar — opts this source PNG out of the default PNG→Basis
+// processor so the texture-array baker (`just bake`) reads raw pixels. Linear — packed G=roughness, B=metallic.
+// Inert outside `AssetMode::Processed`. See `crate::texture_array`.
+(
+    meta_format_version: "1.0",
+    asset: Load(
+        loader: "bevy_image::image_loader::ImageLoader",
+        settings: (
+            format: FromExtension,
+            is_srgb: false,
+            sampler: Default,
+            asset_usage: ("MAIN_WORLD | RENDER_WORLD"),
+        ),
+    ),
+)

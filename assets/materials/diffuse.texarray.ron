@@ -1,0 +1,40 @@
+// Diffuse / albedo 2D-array — one layer per InstaMAT-baked material under
+// `assets/materials/<name>/`, all sampled straight from each material's
+// `base_color.png` (RGBA). sRGB pixel format because albedo is colour data.
+//
+// Layer index ↔ material is fixed across `diffuse`, `normal`, and
+// `occlusion_roughness_metallic_height` — a renderer reading layer N gets the
+// same material's albedo / normal / data triplet:
+//   0  fabric
+//   1  gravelrock
+//   2  pavement
+//
+// Path resolution: `assets/materials/` is symlinked into
+// `crates/bevy_naadf/src/assets/materials/` so paths are relative to Bevy's
+// asset root.
+(
+    format: Rgba8UnormSrgb,
+    elements: [
+        // layer 0 — fabric.base_color
+        (
+            r: (input: "materials/fabric/base_color.png",     channel: R),
+            g: (input: "materials/fabric/base_color.png",     channel: G),
+            b: (input: "materials/fabric/base_color.png",     channel: B),
+            a: (input: "materials/fabric/base_color.png",     channel: A),
+        ),
+        // layer 1 — gravelrock.base_color
+        (
+            r: (input: "materials/gravelrock/base_color.png", channel: R),
+            g: (input: "materials/gravelrock/base_color.png", channel: G),
+            b: (input: "materials/gravelrock/base_color.png", channel: B),
+            a: (input: "materials/gravelrock/base_color.png", channel: A),
+        ),
+        // layer 2 — pavement.base_color
+        (
+            r: (input: "materials/pavement/base_color.png",   channel: R),
+            g: (input: "materials/pavement/base_color.png",   channel: G),
+            b: (input: "materials/pavement/base_color.png",   channel: B),
+            a: (input: "materials/pavement/base_color.png",   channel: A),
+        ),
+    ],
+)

@@ -1,0 +1,35 @@
+// Normal-map 2D-array — one layer per material, pass-through of each
+// material's `normal.png` (RGB tangent-space normal, A unused). Linear pixel
+// format (not sRGB) so the GPU does not gamma-decode normal data.
+//
+// Layer index ↔ material order matches `diffuse.texarray.ron` /
+// `occlusion_roughness_metallic_height.texarray.ron`:
+//   0  fabric
+//   1  gravelrock
+//   2  pavement
+(
+    format: Rgba8Unorm,
+    elements: [
+        // layer 0 — fabric.normal
+        (
+            r: (input: "materials/fabric/normal.png",     channel: R),
+            g: (input: "materials/fabric/normal.png",     channel: G),
+            b: (input: "materials/fabric/normal.png",     channel: B),
+            a: (input: "materials/fabric/normal.png",     channel: A),
+        ),
+        // layer 1 — gravelrock.normal
+        (
+            r: (input: "materials/gravelrock/normal.png", channel: R),
+            g: (input: "materials/gravelrock/normal.png", channel: G),
+            b: (input: "materials/gravelrock/normal.png", channel: B),
+            a: (input: "materials/gravelrock/normal.png", channel: A),
+        ),
+        // layer 2 — pavement.normal
+        (
+            r: (input: "materials/pavement/normal.png",   channel: R),
+            g: (input: "materials/pavement/normal.png",   channel: G),
+            b: (input: "materials/pavement/normal.png",   channel: B),
+            a: (input: "materials/pavement/normal.png",   channel: A),
+        ),
+    ],
+)

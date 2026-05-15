@@ -28,3 +28,11 @@ nohup.out
 /crates/bevy_naadf/imported_assets
 /crates/bevy_naadf/src/assets/shaders/*.meta
 /crates/bevy_naadf/src/assets/textures/sample.texarray.ron.meta
+# Source-side processor metas the `bake` pass auto-writes next to every
+# `*.texarray.ron` at assets/materials/. The hand-written `*.png.meta` sidecars
+# next to the source maps stay tracked (they pin the `Load` opt-out).
+/assets/materials/*.texarray.ron.meta
+# bevy-instamat's MaterialRonLoader is registered but has no default processor,
+# so `material.ron` gets an auto-generated default `Load` meta on bake. Inert
+# source-side noise — same treatment as the shaders.
+/assets/materials/*/*.ron.meta

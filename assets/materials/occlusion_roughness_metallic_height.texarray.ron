@@ -1,0 +1,46 @@
+// Occlusion / Roughness / Metallic / Height 2D-array — one layer per material,
+// PBR data channels gathered from each material's separate maps:
+//
+//   R  ← occlusion.png            .R       (Bevy `StandardMaterial::occlusion_texture`)
+//   G  ← metallic_roughness.png   .G       (Bevy roughness — glTF convention)
+//   B  ← metallic_roughness.png   .B       (Bevy metallic — glTF convention)
+//   A  ← height.png               .R       (parallax height; see note below)
+//
+// Linear pixel format — all four channels are data, not colour.
+//
+// `height.png` is authored Luma16 (16-bit grayscale) by the InstaMAT baker for
+// parallax precision; the loader's `to_rgba8()` downconverts it to 8-bit
+// before reading the R channel, so the alpha channel here is 8-bit height.
+// That is fine for v1; a future revision could ship height as its own 16-bit
+// single-channel array.
+//
+// Layer order matches `diffuse.texarray.ron` / `normal.texarray.ron`:
+//   0  fabric
+//   1  gravelrock
+//   2  pavement
+(
+    format: Rgba8Unorm,
+    elements: [
+        // layer 0 — fabric (O · R · M · H)
+        (
+            r: (input: "materials/fabric/occlusion.png",              channel: R),
+            g: (input: "materials/fabric/metallic_roughness.png",     channel: G),
+            b: (input: "materials/fabric/metallic_roughness.png",     channel: B),
+            a: (input: "materials/fabric/height.png",                 channel: R),
+        ),
+        // layer 1 — gravelrock (O · R · M · H)
+        (
+            r: (input: "materials/gravelrock/occlusion.png",          channel: R),
+            g: (input: "materials/gravelrock/metallic_roughness.png", channel: G),
+            b: (input: "materials/gravelrock/metallic_roughness.png", channel: B),
+            a: (input: "materials/gravelrock/height.png",             channel: R),
+        ),
+        // layer 2 — pavement (O · R · M · H)
+        (
+            r: (input: "materials/pavement/occlusion.png",            channel: R),
+            g: (input: "materials/pavement/metallic_roughness.png",   channel: G),
+            b: (input: "materials/pavement/metallic_roughness.png",   channel: B),
+            a: (input: "materials/pavement/height.png",               channel: R),
+        ),
+    ],
+)

@@ -64,23 +64,23 @@ code-mutating fix dispatch (in a worktree branched from local `main`) brings TAA
 at least the C# level and fixes black-on-resize. **Bar = the C# version, not a perfect
 renderer.**
 
-**Diagnosis COMPLETE** → `18-taa-fidelity.md` (5 ranked causes; pipeline structurally complete,
-no missing passes). Top causes: #1 GI rays unjittered (`GpuGiParams` has no jitter field) — the
-dominant "barely resolves" mechanism; #2 `exposure`/`tone_mapping_fac` swapped vs C#; #3 16-deep
-ring (secondary). Black-on-resize root cause pinned: `extract_camera`'s `.unwrap_or(UVec2::new(1,1))`.
+**TAA-fidelity track COMPLETE (2026-05-15).** Diagnosis (`18-taa-fidelity.md` — 5 ranked
+causes; pipeline structurally complete, no missing passes) → fix landed on `fix/taa-fidelity`
+→ rebased + fast-forwarded to `main` at `8995c88`. Implemented: #1 jittered GI rays (new
+`GpuGiParams.taa_jitter` with `offset_of!` guard at byte 280), #2 Bevy `TonyMcMapface`
+tonemapping with the port emitting raw linear HDR (deliberate user-directed deviation from
+the faithful-port principle), #3 TAA ring depth configurable, **default 32** (supersedes the
+binding 16-deep decision in `design-exploration-qa.md` §6 / `01-context.md` §2c), #4
+`extract_camera` keeps last-known-good viewport on transient `None` (no more black-on-resize),
+audit #5 done (no skew found). Verification: 61 tests pass (was 59; +2 ring-depth regressions
++ the `offset_of!` guard); `cargo run --bin e2e_render` PASS first try; GI-lit diffuse
+luminance **~4 → 242** — "barely resolves" decisively gone. User assessment: "acceptable
+[...] cant tell without directly comparing same vox scenes, so its a good sign." Branch
+`fix/taa-fidelity` + worktree `.claude/worktrees/taa-fidelity` kept for reference.
 
-**Fix dispatched** (one `general-purpose` agent, worktree `.claude/worktrees/taa-fidelity`,
-branch `fix/taa-fidelity`) with two user-directed scope changes (2026-05-15):
-- **#2 revised** — do NOT just swap the tonemap constants; **switch to Bevy's built-in
-  tonemapping**: output raw linear HDR from the final/raymarching pass, drop the port's custom
-  Reinhard tonemap. A deliberate user-directed deviation from the faithful-port principle.
-- **#3 revised** — not deferred; **make the TAA ring depth configurable, default 32**
-  (supersedes the binding 16-deep decision in `design-exploration-qa.md` §6 / `01-context.md`
-  §2c).
-Plus #1 (jitter GI rays), #4 (black-on-resize), audit #5. Verification: `cargo build` +
-`cargo test` (currently 46) + `cargo run --bin e2e_render` (cap ~10) + Read
-`target/e2e-screenshots/e2e_latest.png` — note the Bevy-tonemapping switch will change the
-output image and likely needs honest e2e-gate recalibration. Deliverable: `18-taa-fidelity.md`.
+**Next dispatch:** Phase C `delegate-architect` → `15-design-c.md` — seam-first extension
+design + worktree/workstream decomposition plan respecting the construction → editing →
+queues dependency DAG (`01-context.md` §2e E1–E4).
 
 ## Then — Phase C proper
 
@@ -91,6 +91,9 @@ DAG) → team-based parallel `impl` across worktrees (`16-impl-c.md`) → fresh-
 
 ## Other open items
 
+- **Future shadow-filtering improvements** (user note 2026-05-15, post-TAA-fidelity merge):
+  "there are ways to improve shadow filtering in the future which would help significantly."
+  Separate later track; **not Phase C scope**. Revisit after Phase C lands.
 - **Review follow-ups** (`11-review-b.md` — non-blocking): #1 the e2e harness's dead
   "temporal-stability gate" scaffolding (implement or delete); #3 `expected_spans(6)` not
   `is_denoise`-config-aware; #5 dead plumbing debris from the B2/B6 seams
