@@ -5,10 +5,10 @@
 // `renderGlobalIllum.fx:16-28`, `renderSampleRefine.fx:21-32`,
 // `renderSpatialResampling.fx:15-27`, `renderDenoiseSplit.fx:11-14`). One shared
 // uniform bound by every GI pass. The CPU counterpart is
-// `gpu_types::GpuGiParams` (304 bytes — kept in step by the compile-time size
-// assert there). 288 bytes pre-Phase-D-shadow-A; grew by one 16-byte row when
-// `sun_shadow_taps: u32` landed (mirrors C# single-tap sun ray generalised to
-// N taps for paper §5.2 soft-shadow noise).
+// `gpu_types::GpuGiParams` (336 bytes — kept in step by the compile-time size
+// assert there). 288 bytes pre-Phase-D-shadow-A; +16 (Dispatch A
+// `sun_shadow_taps` row) → 304; +32 (quality panel — 5 promoted MAX_RAY_STEPS_*
+// + spatial_iter_count, two fresh 16-byte rows) → 336.
 //
 // LAYOUT — naga-oil composable-module structs cannot carry the `_pad0`-style /
 // `data1`-style identifiers the Rust `#[repr(C)]` struct uses (naga writeback
@@ -129,6 +129,22 @@ struct GpuGiParams {
     pad_b: u32,
     pad_c: u32,
     pad_d: u32,
+    // Quality-panel runtime knobs (`21-design-quality-panel.md` §4.2). Five
+    // u32 fields at struct offset 304..324, padded to 336 — two fresh 16-byte
+    // rows. All five replace WGSL `const` literals at their use-sites
+    // (`ray_tracing.wgsl:122-126` / `spatial_resampling.wgsl:622`). Defaults
+    // bit-equivalent to the pre-dispatch consts (the C#/paper values). The
+    // consumer call sites clamp `max(_, 1u)` defensively, so a zero from a
+    // hand-constructed `GiSettings { ..: 0, .. }` resolves to a single-step
+    // ray rather than a divide-by-zero / always-pass.
+    max_ray_steps_secondary: u32,
+    max_ray_steps_sun: u32,
+    max_ray_steps_sun_secondary: u32,
+    max_ray_steps_visibility: u32,
+    spatial_iter_count: u32,
+    pad_e: u32,
+    pad_f: u32,
+    pad_g: u32,
 }
 
 // `flags` bits (mirror `gpu_types::GI_FLAG_*`).

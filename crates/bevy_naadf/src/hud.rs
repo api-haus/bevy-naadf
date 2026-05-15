@@ -219,7 +219,7 @@ pub fn update_hud(
         FINAL_BLIT_CPU_PATH,
     );
 
-    let _ = write!(s, "\nWASD / Shift / mouse: fly camera");
+    let _ = write!(s, "\nWASD / Shift / mouse: fly camera   [F1] quality panel");
 }
 
 /// Append one `label  N.NN ms` line for a render-node timing.

@@ -39,7 +39,9 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 
 use crate::render::atmosphere::AtmosphereGpu;
-use crate::render::extract::{ExtractedCameraData, ExtractedCameraHistory, ExtractedWorld};
+use crate::render::extract::{
+    ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig, ExtractedWorld,
+};
 use crate::render::gi::{GiBindGroups, GiGpu};
 use crate::render::gpu_types::{
     GpuCamera, GpuRenderParams, GpuVoxelType, GpuWorldMeta, FLAG_CHECK_SUN,
@@ -457,6 +459,7 @@ pub fn prepare_frame_gpu(
     extracted_camera: Res<ExtractedCameraData>,
     extracted_history: Res<ExtractedCameraHistory>,
     extracted_taa: Res<crate::render::extract::ExtractedTaaConfig>,
+    extracted_gi: Res<ExtractedGiConfig>,
     existing: Option<ResMut<FrameGpu>>,
     existing_gi_bind_groups: Option<Res<GiBindGroups>>,
     taa_gpu: Option<Res<TaaGpu>>,
@@ -555,12 +558,14 @@ pub fn prepare_frame_gpu(
         } else {
             FLAG_CHECK_SUN | FLAG_IS_ATMOSPHERE_INTERACTION
         },
-        // Formerly `exposure` / `tone_mapping_fac` — the custom final-blit
-        // tonemap constants. The TAA-fidelity track switched the port to Bevy's
-        // built-in tonemapping (the camera carries `Camera { hdr: true }` + a
-        // `Tonemapping` component; `naadf_final.wgsl` outputs raw linear HDR),
-        // so these are dead pad slots now (`18-taa-fidelity.md` fix #2).
-        _pad0a: 0,
+        // Was `_pad0a` (formerly `exposure` — dead since `18-taa-fidelity.md`
+        // fix #2). Now `max_ray_steps_primary` — the quality-panel runtime
+        // knob for the primary G-buffer DDA cap
+        // (`21-design-quality-panel.md` §4.1). Default 120, bit-equivalent to
+        // the pre-dispatch `MAX_RAY_STEPS_PRIMARY` const. Layout-preserving
+        // rename; struct size unchanged.
+        max_ray_steps_primary: extracted_gi.settings.max_ray_steps_primary,
+        // Padding — formerly `tone_mapping_fac`, dead since fix #2.
         _pad0b: 0,
         sky_sun_dir,
         _pad1: 0,

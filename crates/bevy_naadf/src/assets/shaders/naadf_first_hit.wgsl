@@ -55,7 +55,7 @@
     FLAG_SHOW_RAY_STEP, FLAG_IS_ATMOSPHERE_INTERACTION,
 }
 #import "shaders/ray_tracing.wgsl"::{
-    RayResult, ray_aabb, shoot_ray, MAX_RAY_STEPS_PRIMARY,
+    RayResult, ray_aabb, shoot_ray,
 }
 #import "shaders/world_data.wgsl"::{voxel_types, world_meta}
 #import "shaders/atmosphere.wgsl"::{
@@ -177,7 +177,9 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
 
             let is_hit = shoot_ray(
-                cur_pos_int, cur_pos_frac, ray_dir, MAX_RAY_STEPS_PRIMARY, &ray_result,
+                cur_pos_int, cur_pos_frac, ray_dir,
+                i32(max(params.max_ray_steps_primary, 1u)),
+                &ray_result,
             );
             norm_tangs[i] = ray_result.normal_comp;
 

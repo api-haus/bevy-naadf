@@ -14,6 +14,7 @@ pub mod aadf;
 pub mod camera;
 pub mod e2e;
 pub mod hud;
+pub mod panel;
 pub mod render;
 pub mod texture_array;
 pub mod voxel;
@@ -81,6 +82,46 @@ pub struct GiSettings {
     /// knob only (Dispatch A scope; see
     /// `docs/orchestrate/naadf-bevy-port/19-gi-reservoir-scope.md` §3.1).
     pub sun_shadow_taps: u32,
+    // === Quality-panel runtime knobs (`21-design-quality-panel.md` §2.1) ====
+    // The 5 ray-step caps + spatial iter count promoted from WGSL `const`s
+    // to runtime uniform fields, so the in-app quality panel can dial them
+    // live without rebuilds. All defaults match the C#/paper canonical values
+    // bit-for-bit — panel-disabled (or default-loaded) behaviour is identical
+    // to pre-dispatch. The WGSL consumers clamp `max(_, 1u)` defensively;
+    // zero is safe.
+    /// Max DDA step count for the primary G-buffer ray
+    /// (`naadf_first_hit.wgsl::shoot_ray` arg, was const
+    /// `MAX_RAY_STEPS_PRIMARY = 120`). Uploaded into
+    /// `GpuRenderParams.max_ray_steps_primary` (offset 24, repurposed `_pad0a`
+    /// slot — layout-preserving).
+    pub max_ray_steps_primary: u32,
+    /// Max DDA step count for GI secondary bounce rays
+    /// (`naadf_global_illum.wgsl::shoot_ray`, was const
+    /// `MAX_RAY_STEPS_SECONDARY = 100`). Uploaded into
+    /// `GpuGiParams.max_ray_steps_secondary`.
+    pub max_ray_steps_secondary: u32,
+    /// Max DDA step count for the spatial-resampling sun-visibility ray
+    /// (`spatial_resampling.wgsl::shoot_ray`, was const
+    /// `MAX_RAY_STEPS_SUN = 120`). Uploaded into `GpuGiParams.max_ray_steps_sun`.
+    pub max_ray_steps_sun: u32,
+    /// Max DDA step count for the per-bounce sun-shadow ray inside
+    /// `globalIllum` (`naadf_global_illum.wgsl::shoot_ray` sun-secondary call,
+    /// was const `MAX_RAY_STEPS_SUN_SECONDARY = 80`). Uploaded into
+    /// `GpuGiParams.max_ray_steps_sun_secondary`.
+    pub max_ray_steps_sun_secondary: u32,
+    /// Max DDA step count for the spatial-resampling reservoir-visibility ray
+    /// (`spatial_resampling.wgsl::shoot_ray` visibility-loop, was const
+    /// `MAX_RAY_STEPS_VISIBILITY = 60`). Note the 3-iteration outer mirror
+    /// loop multiplies this cost up to 3×. Uploaded into
+    /// `GpuGiParams.max_ray_steps_visibility`.
+    pub max_ray_steps_visibility: u32,
+    /// Algorithm-2 spatial-resampling iteration count
+    /// (`spatial_resampling.wgsl::sample_neighbors` `sample_count` arg, was
+    /// hardcoded `12u`). Paper §4.2 + C# `renderSpatialResampling.fx:359`
+    /// default = 12. Variance ∝ 1/√N — bump to 16/24 trades cost for less
+    /// indirect-bounce noise (`19-gi-reservoir-scope.md` §3.3). Uploaded into
+    /// `GpuGiParams.spatial_iter_count`.
+    pub spatial_iter_count: u32,
 }
 
 impl Default for GiSettings {
@@ -102,6 +143,17 @@ impl Default for GiSettings {
             // Multi-tap sun shadow — paper §5.2 soft-shadow noise mitigation
             // (Dispatch A — `19-gi-reservoir-scope.md` §3.1). Default 4.
             sun_shadow_taps: 4,
+            // Quality-panel runtime knobs — defaults bit-equivalent to the
+            // pre-dispatch WGSL `const`s these promotions replaced (the
+            // `MAX_RAY_STEPS_*` consts at `ray_tracing.wgsl:122-126` and the
+            // `12u` literal at `spatial_resampling.wgsl:622`). Verified by the
+            // §6 defaults table of `21-design-quality-panel.md`.
+            max_ray_steps_primary: 120,
+            max_ray_steps_secondary: 100,
+            max_ray_steps_sun: 120,
+            max_ray_steps_sun_secondary: 80,
+            max_ray_steps_visibility: 60,
+            spatial_iter_count: 12,
         }
     }
 }
@@ -440,6 +492,21 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     if cfg.add_hud {
         app.add_systems(Startup, hud::setup_hud)
             .add_systems(Update, hud::update_hud);
+        // Quality panel (`21-design-quality-panel.md`) — gated on the same
+        // `add_hud` flag as the HUD itself. The e2e harness (`AppConfig::e2e`)
+        // sets `add_hud = false`, so the panel never spawns in the bounded
+        // harness — luminance gates are unaffected.
+        app.init_resource::<panel::PanelState>()
+            .add_systems(Startup, panel::setup_panel)
+            .add_systems(
+                Update,
+                (
+                    panel::toggle_panel,
+                    panel::adjust_panel,
+                    panel::update_panel_text,
+                )
+                    .chain(),
+            );
     }
 
     app

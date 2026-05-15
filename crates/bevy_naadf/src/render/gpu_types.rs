@@ -74,15 +74,20 @@ pub struct GpuRenderParams {
     /// Packed boolean flags — see `FLAG_SHOW_RAY_STEP` / `FLAG_CHECK_SUN` /
     /// `FLAG_IS_TAA`.
     pub flags: u32,
-    /// Padding (offsets 24/28). Formerly `exposure` / `tone_mapping_fac` — the
-    /// custom final-blit tonemap constants. The TAA-fidelity track switched the
-    /// port to Bevy's built-in tonemapping (`Camera { hdr: true }` + a
-    /// `Tonemapping` component; `naadf_final.wgsl` outputs raw linear HDR), so
-    /// these fields are dead — replaced with padding to keep the 112-byte
-    /// uniform layout (and every downstream field offset) unchanged
-    /// (`18-taa-fidelity.md` fix #2).
-    pub _pad0a: u32,
-    /// Padding — see `_pad0a`.
+    /// Max DDA step count for the primary G-buffer ray
+    /// (`naadf_first_hit.wgsl:180`'s `shoot_ray` arg). Runtime knob promoted
+    /// from the WGSL `MAX_RAY_STEPS_PRIMARY` const (`ray_tracing.wgsl:122`) so
+    /// the quality panel can dial it live without a rebuild
+    /// (`21-design-quality-panel.md` §4.1 / §6). Default 120 — bit-equivalent
+    /// to the pre-dispatch hardcoded const. The shader clamps `< 1u` to `1u`
+    /// defensively. The field lives at offset 24 in the existing 112-byte
+    /// layout — the `18-taa-fidelity.md` fix #2 dropped `exposure` /
+    /// `tone_mapping_fac` here as `_pad0a` / `_pad0b`; this dispatch
+    /// reclaims `_pad0a` as a real field (layout-preserving rename).
+    pub max_ray_steps_primary: u32,
+    /// Padding — formerly the dead `tone_mapping_fac` half of the
+    /// `18-taa-fidelity.md` fix #2 repurpose; kept as a pad to preserve the
+    /// 112-byte layout.
     pub _pad0b: u32,
 
     /// Direction *towards* the sun (the C# `skySunDir`).
@@ -509,6 +514,35 @@ pub struct GpuGiParams {
     pub _pad6: u32,
     /// Padding — see `sun_shadow_taps`.
     pub _pad7: u32,
+    // === Quality-panel runtime knobs (`21-design-quality-panel.md` §4.2) ====
+    // Five `u32` fields at struct offset 304..324, padded out to 336 — two
+    // fresh 16-byte rows. All five replace WGSL `const` literals at their
+    // use-sites (`ray_tracing.wgsl:122-126` / `spatial_resampling.wgsl:622`);
+    // each call site clamps `max(_, 1u)` defensively. Defaults bit-equivalent
+    // to the pre-dispatch consts (§6 of the design).
+    /// Max DDA step count for GI secondary bounce rays
+    /// (`naadf_global_illum.wgsl:290`). Default 100 (C# `MAX_RAY_STEPS_SECONDARY`).
+    pub max_ray_steps_secondary: u32,
+    /// Max DDA step count for the spatial-resampling sun-visibility ray
+    /// (`spatial_resampling.wgsl:556`). Default 120 (C# `MAX_RAY_STEPS_SUN`).
+    pub max_ray_steps_sun: u32,
+    /// Max DDA step count for the per-bounce sun-shadow ray inside
+    /// `globalIllum` (`naadf_global_illum.wgsl:374`). Default 80
+    /// (C# `MAX_RAY_STEPS_SUN_SECONDARY`).
+    pub max_ray_steps_sun_secondary: u32,
+    /// Max DDA step count for the spatial-resampling reservoir-visibility ray
+    /// (`spatial_resampling.wgsl:457`). Default 60 (C# `MAX_RAY_STEPS_VISIBILITY`).
+    pub max_ray_steps_visibility: u32,
+    /// Algorithm-2 spatial-resampling iteration count
+    /// (`spatial_resampling.wgsl:622`'s `sample_neighbors` call). Default 12
+    /// (paper §4.2 / C# `renderSpatialResampling.fx:359`). Variance ∝ 1/√N.
+    pub spatial_iter_count: u32,
+    /// Padding — keeps the struct 16-byte aligned at 336 bytes total.
+    pub _pad8: u32,
+    /// Padding — see `_pad8`.
+    pub _pad9: u32,
+    /// Padding — see `_pad8`.
+    pub _pad10: u32,
 }
 
 /// `flags` bit: skip samples — the 1↔0.25-spp toggle (C# `skipSamples`).
@@ -812,7 +846,7 @@ const _: () = assert!(std::mem::size_of::<GpuCameraHistorySlot>() == 64 + 64 + 1
 const _: () = assert!(std::mem::size_of::<GpuAtmosphereParams>() == 128);
 const _: () = assert!(std::mem::size_of::<GpuSampleValid>() == 32);
 const _: () = assert!(std::mem::size_of::<GpuBucketInfo>() == 8);
-const _: () = assert!(std::mem::size_of::<GpuGiParams>() == 304);
+const _: () = assert!(std::mem::size_of::<GpuGiParams>() == 336);
 // `taa_jitter` placement guard — must land at offset 280, 8-byte aligned, so
 // the WGSL `vec2<f32>` matches byte-for-byte (`18-taa-fidelity.md` fix #1).
 const _: () = assert!(std::mem::offset_of!(GpuGiParams, taa_jitter) == 280);
@@ -825,6 +859,18 @@ const _: () = assert!(std::mem::offset_of!(GpuGiParams, taa_jitter) % 8 == 0);
 // `_pad5`/`_pad6`/`_pad7` fields. Keeps the `vec3`/scalar-trail hazard inert.
 const _: () = assert!(std::mem::offset_of!(GpuGiParams, sun_shadow_taps) == 288);
 const _: () = assert!(std::mem::offset_of!(GpuGiParams, sun_shadow_taps) % 4 == 0);
+// Quality-panel knobs placement guards (`21-design-quality-panel.md` §4.2,
+// §R2). Two fresh 16-byte rows at offsets 304..336; pinning the start of each
+// row catches the entire 5-knob sequence in one place. Plain `u32` lanes — no
+// `vec3`-then-scalar hazard can fire (§4.3).
+const _: () =
+    assert!(std::mem::offset_of!(GpuGiParams, max_ray_steps_secondary) == 304);
+const _: () =
+    assert!(std::mem::offset_of!(GpuGiParams, max_ray_steps_secondary) % 16 == 0);
+const _: () =
+    assert!(std::mem::offset_of!(GpuGiParams, spatial_iter_count) == 320);
+const _: () =
+    assert!(std::mem::offset_of!(GpuGiParams, spatial_iter_count) % 16 == 0);
 // Phase C — `GpuConstructionParams` layout pins (`15-design-c.md` §5.1).
 // 80 bytes = 5 × 16-byte rows; every `vec3` 3-tuple explicitly padded to 16
 // so the WGSL `vec3<u32>`-then-scalar hazard cannot recur on the construction

@@ -55,7 +55,7 @@
     HIT_NOTHING, SURFACE_SPECULAR_ROUGH, SURFACE_SPECULAR_MIRROR,
 }
 #import "shaders/ray_tracing.wgsl"::{
-    RayResult, shoot_ray, MAX_RAY_STEPS_VISIBILITY, MAX_RAY_STEPS_SUN,
+    RayResult, shoot_ray,
 }
 #import "shaders/ray_tracing_common.wgsl"::{
     init_rand, next_rand, oct_decode,
@@ -454,7 +454,8 @@ fn sample_neighbors(
         var ray_result: RayResult;
         is_hit = shoot_ray(
             cur_test_pos_int, cur_test_pos_frac, cur_test_ray_dir,
-            MAX_RAY_STEPS_VISIBILITY, &ray_result,
+            i32(max(gi_params.max_ray_steps_visibility, 1u)),
+            &ray_result,
         );
         if (!is_hit || selected_is_sky) {
             break;
@@ -553,7 +554,8 @@ fn sample_neighbors(
         var sun_temp: RayResult;
         let is_sun_blocked = shoot_ray(
             first_hit_pos_int, first_hit_pos_frac, sun_dir_rand,
-            MAX_RAY_STEPS_SUN, &sun_temp,
+            i32(max(gi_params.max_ray_steps_sun, 1u)),
+            &sun_temp,
         );
         let sun_dir_cos_theta = clamp(dot(sun_dir_rand, first_hit.normal), 0.0, 1.0);
         if (!is_sun_blocked && first_hit.normal_tang != HIT_NOTHING
@@ -619,7 +621,17 @@ fn calc_spatial_resampling(@builtin(global_invocation_id) global_id: vec3<u32>) 
     );
     let first_hit_type_index = first_hit.z & 0x7FFFu;
     if (first_hit_result.normal_tang != HIT_NOTHING) {
-        color = sample_neighbors(pixel_pos, 12u, first_hit_result, first_hit_type_index);
+        // The spatial-resampling Algorithm-2 iteration count (was hardcoded
+        // `12u` const, the C# `renderSpatialResampling.fx:359` value). Now a
+        // runtime knob via `gi_params.spatial_iter_count`
+        // (`21-design-quality-panel.md` §2.1 row 6). Default 12 = paper /
+        // C# bit-equivalent. Variance ∝ 1/√N. The `max(_, 1u)` clamp keeps a
+        // zero-init `GiSettings` from emitting a 0-iter empty-loop black GI.
+        color = sample_neighbors(
+            pixel_pos,
+            max(gi_params.spatial_iter_count, 1u),
+            first_hit_result, first_hit_type_index,
+        );
     }
 
     let absorption_comp = first_hit_absorption[global_id.x];

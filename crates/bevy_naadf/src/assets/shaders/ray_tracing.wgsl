@@ -119,6 +119,16 @@ fn decompress_entity_instance_from_chunk(
 }
 
 // Ray-step caps (HLSL `rayTracing.fxh` `MAX_RAY_STEPS_*`).
+//
+// **PORT NOTE — these consts are now DOCUMENTATION-ONLY** for the C#/paper
+// canonical values; all consumers were rewritten by
+// `21-design-quality-panel.md` to read runtime knobs from
+// `GpuRenderParams.max_ray_steps_primary` (first-hit) or `GpuGiParams`
+// (`max_ray_steps_secondary`/`_sun`/`_sun_secondary`/`_visibility`). The
+// `GiSettings::default()` values in `lib.rs` MUST equal the consts below
+// bit-for-bit; verified by the §6 defaults table in the design doc. naga DCEs
+// these unused consts at compile time — zero binary impact. Kept so future
+// readers see the canonical values in one place.
 const MAX_RAY_STEPS_PRIMARY: i32 = 120;
 const MAX_RAY_STEPS_SECONDARY: i32 = 100;
 const MAX_RAY_STEPS_SUN: i32 = 120;

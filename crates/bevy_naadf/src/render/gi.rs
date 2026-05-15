@@ -372,6 +372,18 @@ pub fn prepare_gi(
         _pad5: 0,
         _pad6: 0,
         _pad7: 0,
+        // Quality-panel runtime knobs (`21-design-quality-panel.md` §4.2). 5
+        // `MAX_RAY_STEPS_*` caps + the Algorithm-2 spatial iter count. Each
+        // consumer WGSL site clamps `max(_, 1u)` defensively, so the
+        // bytemuck::Zeroable / `GiSettings { ..: 0, .. }` cases are harmless.
+        max_ray_steps_secondary: gi.max_ray_steps_secondary,
+        max_ray_steps_sun: gi.max_ray_steps_sun,
+        max_ray_steps_sun_secondary: gi.max_ray_steps_sun_secondary,
+        max_ray_steps_visibility: gi.max_ray_steps_visibility,
+        spatial_iter_count: gi.spatial_iter_count,
+        _pad8: 0,
+        _pad9: 0,
+        _pad10: 0,
     };
     render_queue.write_buffer(&resources.gi_params, 0, bytemuck::bytes_of(&gi_params_data));
 

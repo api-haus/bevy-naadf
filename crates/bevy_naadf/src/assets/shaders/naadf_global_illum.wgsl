@@ -44,7 +44,7 @@
     SURFACE_EMISSIVE, SURFACE_SPECULAR_ROUGH, SURFACE_SPECULAR_MIRROR,
 }
 #import "shaders/ray_tracing.wgsl"::{
-    RayResult, shoot_ray, MAX_RAY_STEPS_SECONDARY, MAX_RAY_STEPS_SUN_SECONDARY,
+    RayResult, shoot_ray,
 }
 #import "shaders/ray_tracing_common.wgsl"::{
     init_rand, next_rand, next_rand2,
@@ -287,7 +287,9 @@ fn calc_global_ilum(
 
         var ray_result: RayResult;
         let is_hit = shoot_ray(
-            cur_pos_int, cur_pos_frac, cur_dir, MAX_RAY_STEPS_SECONDARY, &ray_result,
+            cur_pos_int, cur_pos_frac, cur_dir,
+            i32(max(gi_params.max_ray_steps_secondary, 1u)),
+            &ray_result,
         );
         // `if (bounce < 3 && !isFirstDiffuseHit) normTangs[bounce] = ...`.
         if (bounce < 3u && !is_first_diffuse_hit) {
@@ -366,12 +368,16 @@ fn calc_global_ilum(
                     / (4.0 * 1.0 * dot(-cur_dir, ray_result.normal));
             }
 
-            // The single sun-shadow ray (`MAX_RAY_STEPS_SUN_SECONDARY`).
+            // The single sun-shadow ray (was `MAX_RAY_STEPS_SUN_SECONDARY`
+            // const; now `gi_params.max_ray_steps_sun_secondary` runtime knob —
+            // `21-design-quality-panel.md`). The defensive `max(_, 1u)` clamp
+            // mirrors Dispatch A's `sun_shadow_taps` clamp.
             if (dot(sun_dir_rand, ray_result.normal) > 0.0) {
                 var temp: RayResult;
                 let sun_blocked = shoot_ray(
                     new_pos_int, new_pos_frac, sun_dir_rand,
-                    MAX_RAY_STEPS_SUN_SECONDARY, &temp,
+                    i32(max(gi_params.max_ray_steps_sun_secondary, 1u)),
+                    &temp,
                 );
                 if (!sun_blocked) {
                     radiance += cur_absorption * gi_params.sun_color.xyz * fac * 1.0;

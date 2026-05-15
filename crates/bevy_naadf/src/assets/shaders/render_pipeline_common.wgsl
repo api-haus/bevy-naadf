@@ -140,14 +140,16 @@ struct GpuCamera {
 //
 // Again no explicit padding — WGSL's `vec3` 16-byte slotting + `vec2` 8-byte
 // alignment reproduce the padded Rust `#[repr(C)]` layout: the four `u32`s sit
-// at 0/4/8/12, `taa_index`/`flags`/`pad0a`/`pad0b` at 16/20/24/28,
-// `sky_sun_dir` slots to 32, `sun_color` to 48, `taa_jitter` to 64,
-// `bounding_box_min` to 80, `bounding_box_max` to 96 — total 112 bytes.
-// `pad0a`/`pad0b` (offsets 24/28) were formerly `exposure` / `tone_mapping_fac`
-// — the custom final-blit tonemap constants. The TAA-fidelity track switched
-// the port to Bevy's built-in tonemapping (`naadf_final.wgsl` outputs raw
-// linear HDR), so these are dead pad slots now — kept to hold the 112-byte
-// layout (`18-taa-fidelity.md` fix #2).
+// at 0/4/8/12, `taa_index`/`flags`/`max_ray_steps_primary`/`pad0b` at
+// 16/20/24/28, `sky_sun_dir` slots to 32, `sun_color` to 48, `taa_jitter` to
+// 64, `bounding_box_min` to 80, `bounding_box_max` to 96 — total 112 bytes.
+// `max_ray_steps_primary` (offset 24) was `pad0a`, formerly `exposure` /
+// `tone_mapping_fac` — the custom final-blit tonemap constants. The
+// TAA-fidelity track switched the port to Bevy's built-in tonemapping
+// (`naadf_final.wgsl` outputs raw linear HDR), so the pad slot was free; this
+// dispatch reclaims it for the runtime-tunable primary-ray DDA cap (the
+// quality panel — `21-design-quality-panel.md` §4.1). Layout-preserving
+// rename only; the 112-byte struct size is unchanged.
 struct GpuRenderParams {
     screen_width: u32,
     screen_height: u32,
@@ -157,7 +159,12 @@ struct GpuRenderParams {
     taa_index: u32,
     // packed `showRayStep` / `checkSun` / `isTAA` — see the `FLAG_*` consts.
     flags: u32,
-    pad0a: u32,
+    // Max DDA step count for the primary G-buffer ray
+    // (`naadf_first_hit.wgsl::shoot_ray`). Runtime knob promoted from the WGSL
+    // `MAX_RAY_STEPS_PRIMARY` const (`ray_tracing.wgsl:122`) — quality panel.
+    // Default 120 = pre-dispatch const bit-equivalent. Consumer clamps
+    // `max(_, 1u)` defensively.
+    max_ray_steps_primary: u32,
     pad0b: u32,
 
     sky_sun_dir: vec3<f32>,
