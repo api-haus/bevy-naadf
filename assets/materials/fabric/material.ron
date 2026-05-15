@@ -1,5 +1,5 @@
 (
-    name: "gravelrock",
+    name: "fabric",
     base_color: Some("base_color.png"),
     normal: Some("normal.png"),
     metallic_roughness: Some("metallic_roughness.png"),

@@ -47,6 +47,14 @@ pub struct MaterialRon {
     pub occlusion: Option<String>,
     /// Emissive PNG.
     pub emissive: Option<String>,
+    /// Height / displacement PNG — a `Luma16` single-channel grayscale, linear
+    /// (white = high, the InstaMAT convention). Feeds
+    /// `StandardMaterial::depth_map` for parallax mapping; `#[serde(default)]`
+    /// so manifests written before the height field was added still load (the
+    /// `None` default = "no height baked", same as a freshly-baked material
+    /// whose `.imp` produced no height output).
+    #[serde(default)]
+    pub height: Option<String>,
     /// Scalar roughness fallback for channels that were not baked (mirrors
     /// `StandardMaterial::perceptual_roughness` default 0.5).
     pub perceptual_roughness: f32,
@@ -134,14 +142,12 @@ impl AssetLoader for MaterialRonLoader {
             // `resolve_embed_str` resolves `file` as a sibling of `material.ron`
             // (RFC-1808 embedded semantics — the manifest's filename is dropped
             // before concatenation), so the material directory is relocatable.
-            let sibling = manifest_path
-                .resolve_embed_str(file)
-                .map_err(|e| {
-                    MaterialRonError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("invalid sibling texture path `{file}` in material.ron: {e}"),
-                    ))
-                })?;
+            let sibling = manifest_path.resolve_embed_str(file).map_err(|e| {
+                MaterialRonError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid sibling texture path `{file}` in material.ron: {e}"),
+                ))
+            })?;
             Ok(load_context
                 .load_builder()
                 .with_settings(move |s: &mut ImageLoaderSettings| {
@@ -170,16 +176,29 @@ impl AssetLoader for MaterialRonLoader {
             Some(f) => Some(load_png(f, true)?),
             None => None,
         };
+        // Height is linear; Bevy's PNG loader decodes `Luma16` into a 16-bit
+        // single-channel `Image`, which `depth_map` samples as R. The R channel
+        // therefore carries the full 65 536-step precision the baker preserved.
+        let depth_map = match manifest.height.as_deref() {
+            Some(f) => Some(load_png(f, false)?),
+            None => None,
+        };
 
         // 3. Build the StandardMaterial. Texture handles for present channels;
         //    scalar fallbacks for absent metallic/roughness; a white `emissive`
-        //    color when an emissive map is present so it is actually visible.
+        //    color when an emissive map is present so it is actually visible;
+        //    `depth_map` wired from the baked height texture when present —
+        //    parallax mapping then runs with Bevy's `StandardMaterial` defaults
+        //    (`parallax_depth_scale` 0.1, `parallax_mapping_method::Occlusion`).
+        //    Tune those at the consumer if a material needs deeper / shallower
+        //    parallax than the default.
         Ok(StandardMaterial {
             base_color_texture: base_color,
             normal_map_texture: normal_map,
             metallic_roughness_texture: metallic_roughness,
             occlusion_texture: occlusion,
             emissive_texture: emissive,
+            depth_map,
             perceptual_roughness: manifest.perceptual_roughness,
             metallic: manifest.metallic,
             emissive: if manifest.emissive_is_textured {
