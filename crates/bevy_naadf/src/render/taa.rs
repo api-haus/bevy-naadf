@@ -18,6 +18,7 @@ use bevy::render::render_resource::{
     CommandEncoderDescriptor, PipelineCache,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::window::WindowResized;
 
 use crate::camera::PositionSplit;
 use crate::render::extract::{ExtractedCameraData, ExtractedCameraHistory};
@@ -223,6 +224,54 @@ pub fn update_camera_history(
     history.frame_count = history.frame_count.wrapping_add(1);
 }
 
+/// Main-world `Update` system: zero-reset the [`CameraHistory`] ring on any
+/// `WindowResized` event.
+///
+/// Per the user directive 2026-05-15 ("reallocate all buffers on resize,
+/// preserve nothing"), the 128-deep camera-matrix ring carried by
+/// [`CameraHistory`] MUST NOT survive a resize — pre-resize entries are at
+/// the old projection / old aspect, and feeding them into the GPU
+/// `camera_history` buffer for up to 128 frames post-resize is exactly the
+/// "preserve" behavior the directive forbids. The render-side `prepare_taa`
+/// already reallocates + zero-clears the GPU `camera_history` buffer on
+/// resize; this system resets the CPU source-of-truth so subsequent
+/// per-frame uploads don't re-populate the buffer with stale matrices.
+///
+/// This is also the C# behavior: `WorldRenderBase.cs:150-154` recreates the
+/// camera-matrix CPU arrays (`taaSampleCamTransform`,
+/// `taaSampleCamTransformInvers`, `oldCamPositions`, `taaSampleJitter`,
+/// `taaOldCamPosFromCurCamInt`) as fresh zero-initialised C# arrays on every
+/// `CreateScreenTextures()` call (which is invoked from `ScreenUpdate()`,
+/// triggered by the window-resize event). So this divergence-from-current-
+/// Bevy is in fact a CONVERGENCE-with-C# — it restores the faithful port.
+///
+/// `frame_count` is intentionally NOT reset: it is a monotonic counter
+/// (C# `WorldRender.frameCount` is similarly monotonic; the C# resize
+/// path resets the camera-history arrays but never the frame counter).
+/// The descending `taa_index_of(frame_count)` walks the freshly-zeroed ring
+/// from its current cursor; old slots are zero, new writes overwrite them
+/// slot-by-slot starting next frame.
+pub fn reset_camera_history_on_resize(
+    mut events: MessageReader<WindowResized>,
+    mut history: ResMut<CameraHistory>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    // Drain the events — we only need to know "at least one resize fired
+    // this frame". reallocate-all-on-resize: per user directive 2026-05-15 —
+    // preserve nothing.
+    events.clear();
+    // Zero the four 128-entry rings. `frame_count` / `taa_index` /
+    // `current_jitter` are NOT reset (frame_count is a monotonic counter;
+    // the other two are derived/overwritten each frame by
+    // `update_camera_history`).
+    history.positions = [PositionSplit::default(); CAMERA_HISTORY_DEPTH];
+    history.view_proj = [Mat4::IDENTITY; CAMERA_HISTORY_DEPTH];
+    history.view_proj_inv = [Mat4::IDENTITY; CAMERA_HISTORY_DEPTH];
+    history.jitter = [Vec2::ZERO; CAMERA_HISTORY_DEPTH];
+}
+
 /// The render-world GPU resource owning the TAA buffers (`06-design-a2.md`
 /// §9.4). Created once by [`prepare_taa`].
 ///
@@ -305,13 +354,15 @@ pub fn prepare_taa(
     // agree exactly (`18-taa-fidelity.md` fix #3).
     let ring_depth = ring_config.depth;
 
-    // --- (re)create the screen-space buffers on a viewport change -----------
-    // `taa_samples` (pixel_count * 16 × vec2<u32>) + `taa_sample_accum`
-    // (pixel_count × vec2<u32>) resize on the same trigger as `first_hit_data`.
-    // `camera_history` + `taa_params` are fixed-size — created once, never
-    // resized. On resize the whole `taa_samples` ring is discarded (it is
-    // screen-space); the next ~16 frames rebuild it from zeroed (rejected)
-    // history, which is correct and unavoidable (NAADF does the same).
+    // --- (re)create EVERY TAA buffer on a viewport change -------------------
+    // reallocate-all-on-resize: per user directive 2026-05-15 — preserve
+    // nothing. On a `pixel_count` mismatch we drop and rebuild every buffer
+    // owned by `TaaGpu`, including the fixed-size `camera_history` and
+    // `taa_params` (these are dimensionally invariant; the directive still
+    // says to reallocate them so NO GPU state survives a resize). This
+    // mirrors C# `WorldRenderBase.CreateScreenTextures()` (`WorldRenderBase
+    // .cs:104-171`) which unconditionally disposes + reallocates every
+    // TAA buffer on each `ScreenUpdate()`.
     let (
         taa_samples,
         taa_sample_accum,
@@ -328,22 +379,14 @@ pub fn prepare_taa(
                 taa.taa_params.clone(),
                 false,
             ),
-            Some(taa) => {
-                // Viewport changed — re-create only the screen-space buffers;
-                // keep the fixed-size `camera_history` / `taa_params`.
-                let (taa_samples, taa_sample_accum, taa_dist_min_max) =
-                    create_screen_buffers(&render_device, pixel_count, ring_depth);
-                (
-                    taa_samples,
-                    taa_sample_accum,
-                    taa_dist_min_max,
-                    taa.camera_history.clone(),
-                    taa.taa_params.clone(),
-                    true,
-                )
-            }
-            None => {
-                // First build — create everything.
+            _ => {
+                // First build OR resize — create EVERYTHING fresh. The resize
+                // path used to clone `camera_history` / `taa_params`; that
+                // was the "preserve" path the user directive forbids. We
+                // now allocate fresh handles unconditionally so no contents
+                // survive a `pixel_count` change.
+                // reallocate-all-on-resize: per user directive 2026-05-15 —
+                // preserve nothing.
                 let (taa_samples, taa_sample_accum, taa_dist_min_max) =
                     create_screen_buffers(&render_device, pixel_count, ring_depth);
                 let camera_history = render_device.create_buffer(&BufferDescriptor {
@@ -370,12 +413,16 @@ pub fn prepare_taa(
             }
         };
 
-    // Zero-clear the screen-space buffers when freshly (re)created so the
-    // first ~16 frames — before the sample ring is full — read zeroed
-    // (rejected) history rather than garbage (`06-design-a2.md` §2.1).
-    // `taa_dist_min_max` is zero-cleared here too — Batch 6 wires its shader
-    // write; until then it stays the zero-cleared buffer (`09-design-b.md` §11
-    // Batch 4 step 13).
+    // Zero-clear EVERY freshly-(re)allocated buffer. The screen-space ring
+    // contents being zero are required by the reproject pass's "rejected
+    // history" semantics (`06-design-a2.md` §2.1). `taa_dist_min_max` is
+    // overwritten per-frame by `ReprojectOld` but cleared for safety.
+    // `camera_history` is overwritten in full further down (lines below);
+    // the explicit clear is belt-and-braces — preserve nothing — and is the
+    // C# behavior (`WorldRenderBase.cs:150-154` resets the camera-matrix
+    // CPU arrays as fresh zero-initialised arrays on every resize).
+    // reallocate-all-on-resize: per user directive 2026-05-15 — preserve
+    // nothing.
     if needs_new_storage {
         let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("naadf_clear_taa_buffers"),
@@ -383,6 +430,10 @@ pub fn prepare_taa(
         encoder.clear_buffer(&taa_samples, 0, None);
         encoder.clear_buffer(&taa_sample_accum, 0, None);
         encoder.clear_buffer(&taa_dist_min_max, 0, None);
+        // reallocate-all-on-resize: per user directive 2026-05-15 — preserve
+        // nothing. Zero-clear `camera_history` even though it is rewritten
+        // every frame; the directive forbids preservation.
+        encoder.clear_buffer(&camera_history, 0, None);
         render_queue.submit([encoder.finish()]);
     }
 

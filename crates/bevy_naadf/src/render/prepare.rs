@@ -597,6 +597,12 @@ pub fn prepare_frame_gpu(
     // §9.4). Phase B Batch 2 adds `first_hit_absorption` + `final_color`
     // (`09-design-b.md` §3.4) — both `vec2<u32>` per pixel, created/resized/
     // zero-cleared alongside `first_hit_data`.
+    //
+    // reallocate-all-on-resize: per user directive 2026-05-15 — preserve
+    // nothing. On a `pixel_count` mismatch we drop and recreate EVERY buffer
+    // owned by `FrameGpu`, including the fixed-size camera + render_params
+    // uniform handles. The uniforms are rewritten every frame anyway, but
+    // the directive forbids preservation, so we reallocate them too.
     let (first_hit_data, first_hit_absorption, final_color, needs_new_storage) =
         match &existing {
             Some(frame) if frame.pixel_count == pixel_count => (
@@ -631,24 +637,35 @@ pub fn prepare_frame_gpu(
             }
         };
 
-    // The uniform buffers persist across frames; create them once.
-    let (camera_buf, render_params_buf) = match &existing {
-        Some(frame) => (frame.camera.clone(), frame.render_params.clone()),
-        None => {
-            let camera_buf = render_device.create_buffer(&BufferDescriptor {
-                label: Some("naadf_camera"),
-                size: std::mem::size_of::<GpuCamera>() as u64,
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let render_params_buf = render_device.create_buffer(&BufferDescriptor {
-                label: Some("naadf_render_params"),
-                size: std::mem::size_of::<GpuRenderParams>() as u64,
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            (camera_buf, render_params_buf)
-        }
+    // The uniform buffers are rewritten every frame; under the
+    // reallocate-all-on-resize directive (user 2026-05-15 — preserve nothing)
+    // we still drop + recreate them on a `pixel_count` change (i.e. whenever
+    // `needs_new_storage`). On first build (existing is None) we always
+    // create. On the steady-state path we clone.
+    let (camera_buf, render_params_buf) = if needs_new_storage {
+        // reallocate-all-on-resize: per user directive 2026-05-15 — preserve
+        // nothing. Recreate even though the contents are overwritten this
+        // frame.
+        let camera_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_camera"),
+            size: std::mem::size_of::<GpuCamera>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let render_params_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_render_params"),
+            size: std::mem::size_of::<GpuRenderParams>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        (camera_buf, render_params_buf)
+    } else if let Some(frame) = &existing {
+        (frame.camera.clone(), frame.render_params.clone())
+    } else {
+        unreachable!(
+            "`!needs_new_storage` ⇒ `existing.is_some()` (the match above sets \
+             needs_new_storage = true on the None arm)"
+        )
     };
     render_queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&camera_data));
     render_queue.write_buffer(&render_params_buf, 0, bytemuck::bytes_of(&render_params));

@@ -561,10 +561,25 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // The camera-history ring update must run *after* `sync_position_split` so
     // the ring stores this frame's current camera state (`06-design-a2.md`
     // §9.3).
+    //
+    // `reset_camera_history_on_resize` runs *before* `update_camera_history`
+    // so a resize on frame N produces:
+    //   1. zero-reset the 128-entry ring (drop all old-projection entries),
+    //   2. write *this* frame's current camera state into slot `taa_index_of
+    //      (frame_count)`,
+    //   3. advance frame_count.
+    // The render side's `prepare_taa` reads the just-written ring on the next
+    // ExtractSchedule, so the GPU `camera_history` buffer sees zeros
+    // everywhere except this frame's slot — preserve nothing.
+    // reallocate-all-on-resize: per user directive 2026-05-15 — preserve
+    // nothing.
     app.add_systems(
         Update,
-        render::taa::update_camera_history.after(camera::sync_position_split),
+        render::taa::update_camera_history
+            .after(camera::sync_position_split)
+            .after(render::taa::reset_camera_history_on_resize),
     );
+    app.add_systems(Update, render::taa::reset_camera_history_on_resize);
 
     if cfg.add_hud {
         app.add_systems(Startup, hud::setup_hud.after(load_dev_font))
