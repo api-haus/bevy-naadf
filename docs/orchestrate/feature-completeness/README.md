@@ -11,8 +11,8 @@ per `12-alignment-gap.md` rows 17–21).
 | `README.md` | This index. Phase checklist. | live |
 | `00-reuse-audit.md` | Re-implementation audit, both tracks. | **complete** (delegate-auditor, 2026-05-15) |
 | `01-context.md` | Canonical context bundle — every non-review agent reads this first. | **complete** |
-| `02a-design-vox-loading.md` | Track A design — `.vox` import path. | pending |
-| `02b-design-editor.md` | Track B design — paint/cube/sphere + Bevy-UI. | pending |
+| `02a-design-vox-loading.md` | Track A design — `.vox` import path. | **complete** (delegate-architect, 2026-05-15) |
+| `02b-design-editor.md` | Track B design — paint/cube/sphere + Bevy-UI. | **complete** (delegate-architect, 2026-05-15) |
 | `03a-impl-vox-loading.md` | Track A implementation log. | pending |
 | `03b-impl-editor.md` | Track B implementation log. | pending |
 | `04a-review-vox-loading.md` | Track A fresh-eyes review brief + verdict. | pending |
@@ -36,9 +36,9 @@ per `12-alignment-gap.md` rows 17–21).
 - [x] Step 3 — present method to user
 - [x] Step 4 — architectural Q&A (K-means impl, obj2voxel posture, set_voxel batching)
 - [x] Step 5 — shared-context files (`README.md`, `01-context.md`)
-- [ ] **Step 6a** — checkpoint + dispatch `design-vox` (parallel with `design-editor`)
-- [ ] **Step 6b** — checkpoint + dispatch `design-editor` (parallel with `design-vox`)
-- [ ] Step 7a — synthesis after design phase, hard gate
+- [x] **Step 6a** — checkpoint + dispatch `design-vox` (parallel with `design-editor`)
+- [x] **Step 6b** — checkpoint + dispatch `design-editor` (parallel with `design-vox`)
+- [ ] **Step 7a** — synthesis after design phase, hard gate (← we are here)
 - [ ] Step 8a — checkpoint + dispatch `impl-vox`
 - [ ] Step 7b — synthesis after `impl-vox`, hard gate
 - [ ] Step 8b — checkpoint + dispatch `review-vox`
