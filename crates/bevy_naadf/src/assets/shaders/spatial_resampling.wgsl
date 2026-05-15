@@ -530,34 +530,55 @@ fn sample_neighbors(
     // INDEPENDENT of the refine buffers — this is why direct-sun bounce light
     // lands at end-of-Batch-5 even though the reservoir loop yields nothing
     // until Batch 6 fills `taa_dist_min_max` (see the module header).
-    let sun_dir_rand = get_uniform_hemisphere_sample(
-        vec2<f32>(next_rand(&rand), next_rand(&rand)), gi_params.sky_sun_dir.xyz, 0.9999,
-    );
-    var sun_temp: RayResult;
-    let is_sun_blocked = shoot_ray(
-        first_hit_pos_int, first_hit_pos_frac, sun_dir_rand, MAX_RAY_STEPS_SUN, &sun_temp,
-    );
-    let sun_dir_cos_theta = clamp(dot(sun_dir_rand, first_hit.normal), 0.0, 1.0);
-    if (!is_sun_blocked && first_hit.normal_tang != HIT_NOTHING && sun_dir_cos_theta > 0.001) {
-        var weight = vec3<f32>(2.0 * sun_dir_cos_theta);
+    //
+    // MULTI-TAP EXTENSION (paper §5.2 limitation — "soft shadows from the sun
+    // are not handled during resampling, resulting in slightly increased
+    // noise"). The C# reference fires ONE sun-disk cone sample (the
+    // `0.9999`-deviation `getUniformHemisphereSample` — a ~0.81° half-angle
+    // cone around `skySunDir`) and accumulates the binary visibility result.
+    // Generalised here to `gi_params.sun_shadow_taps` independent taps, each
+    // with a fresh rand-stream pair; the cone width (`0.9999`) is unchanged.
+    // Visibility is accumulated over the N taps and the per-tap weighted
+    // contribution is divided by N to keep the expected value identical to
+    // the single-tap path (so `sun_shadow_taps == 1` matches C# bit-equivalently
+    // modulo the loop-induced rand-stream advancement, which is the same two
+    // `next_rand` draws per tap as the original single-tap code did once).
+    let n_sun_taps = max(gi_params.sun_shadow_taps, 1u);
+    var sun_accum = vec3<f32>(0.0);
+    for (var sun_tap: u32 = 0u; sun_tap < n_sun_taps; sun_tap = sun_tap + 1u) {
+        let sun_dir_rand = get_uniform_hemisphere_sample(
+            vec2<f32>(next_rand(&rand), next_rand(&rand)),
+            gi_params.sky_sun_dir.xyz, 0.9999,
+        );
+        var sun_temp: RayResult;
+        let is_sun_blocked = shoot_ray(
+            first_hit_pos_int, first_hit_pos_frac, sun_dir_rand,
+            MAX_RAY_STEPS_SUN, &sun_temp,
+        );
+        let sun_dir_cos_theta = clamp(dot(sun_dir_rand, first_hit.normal), 0.0, 1.0);
+        if (!is_sun_blocked && first_hit.normal_tang != HIT_NOTHING
+            && sun_dir_cos_theta > 0.001) {
+            var weight = vec3<f32>(2.0 * sun_dir_cos_theta);
 
-        // HLSL `firstHitType.materialBase == 2` ⇒ `SURFACE_SPECULAR_ROUGH`.
-        if (first_hit_type.material_base == SURFACE_SPECULAR_ROUGH) {
-            let g_in = geometry_term(first_hit_type.roughness, sun_dir_cos_theta);
-            let g_out = geometry_term(
-                first_hit_type.roughness, dot(-first_hit.ray_dir, first_hit.normal),
-            );
-            let half_dir = normalize(sun_dir_rand + -first_hit.ray_dir);
-            let nh = dot(first_hit.normal, half_dir);
-            let r2 = first_hit_type.roughness * first_hit_type.roughness;
-            let denom = nh * nh * (r2 - 1.0) + 1.0;
-            let d = r2 / (PI * denom * denom);
-            let f = get_reflectance_fresnel(first_hit_type.color_base, sun_dir_cos_theta);
-            weight *= (0.5 * d * g_in * g_out * f)
-                / (4.0 * sun_dir_cos_theta * dot(-first_hit.ray_dir, first_hit.normal));
+            // HLSL `firstHitType.materialBase == 2` ⇒ `SURFACE_SPECULAR_ROUGH`.
+            if (first_hit_type.material_base == SURFACE_SPECULAR_ROUGH) {
+                let g_in = geometry_term(first_hit_type.roughness, sun_dir_cos_theta);
+                let g_out = geometry_term(
+                    first_hit_type.roughness, dot(-first_hit.ray_dir, first_hit.normal),
+                );
+                let half_dir = normalize(sun_dir_rand + -first_hit.ray_dir);
+                let nh = dot(first_hit.normal, half_dir);
+                let r2 = first_hit_type.roughness * first_hit_type.roughness;
+                let denom = nh * nh * (r2 - 1.0) + 1.0;
+                let d = r2 / (PI * denom * denom);
+                let f = get_reflectance_fresnel(first_hit_type.color_base, sun_dir_cos_theta);
+                weight *= (0.5 * d * g_in * g_out * f)
+                    / (4.0 * sun_dir_cos_theta * dot(-first_hit.ray_dir, first_hit.normal));
+            }
+            sun_accum += gi_params.sun_color.xyz * weight;
         }
-        color += gi_params.sun_color.xyz * weight;
     }
+    color += sun_accum / f32(n_sun_taps);
 
     return color;
 }

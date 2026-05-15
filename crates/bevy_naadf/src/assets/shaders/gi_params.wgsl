@@ -5,8 +5,10 @@
 // `renderGlobalIllum.fx:16-28`, `renderSampleRefine.fx:21-32`,
 // `renderSpatialResampling.fx:15-27`, `renderDenoiseSplit.fx:11-14`). One shared
 // uniform bound by every GI pass. The CPU counterpart is
-// `gpu_types::GpuGiParams` (288 bytes — kept in step by the compile-time size
-// assert there).
+// `gpu_types::GpuGiParams` (304 bytes — kept in step by the compile-time size
+// assert there). 288 bytes pre-Phase-D-shadow-A; grew by one 16-byte row when
+// `sun_shadow_taps: u32` landed (mirrors C# single-tap sun ray generalised to
+// N taps for paper §5.2 soft-shadow noise).
 //
 // LAYOUT — naga-oil composable-module structs cannot carry the `_pad0`-style /
 // `data1`-style identifiers the Rust `#[repr(C)]` struct uses (naga writeback
@@ -116,6 +118,17 @@ struct GpuGiParams {
     // `vec2<f32>` at struct offset 280 (8-byte aligned), mirroring the Rust
     // `taa_jitter: Vec2` that replaced the trailing `_pad5`/`_pad6` pair.
     taa_jitter: vec2<f32>,
+    // Per-pixel sun-shadow tap count for the spatial-resampling sun sample
+    // (`renderSpatialResampling.fx:321-339` port — multi-tap extension for the
+    // paper §5.2 limitation). Default 4. N=1 is bit-equivalent to the C#
+    // single-tap path (modulo loop-induced rand-stream advancement). Lives at
+    // struct offset 288 — a fresh 16-byte row whose remaining 12 bytes are
+    // `_pad_b`/`_pad_c`/`_pad_d` pads (mirrors Rust `_pad5`/`_pad6`/`_pad7`)
+    // so the struct stays 16-byte-aligned at 304 bytes total.
+    sun_shadow_taps: u32,
+    pad_b: u32,
+    pad_c: u32,
+    pad_d: u32,
 }
 
 // `flags` bits (mirror `gpu_types::GI_FLAG_*`).

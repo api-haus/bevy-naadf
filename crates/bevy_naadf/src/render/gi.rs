@@ -364,6 +364,14 @@ pub fn prepare_gi(
         // same sub-pixel point every frame and the long-term TAA can never
         // resolve sub-pixel detail (`18-taa-fidelity.md` cause #1).
         taa_jitter: extracted_history.current_jitter,
+        // Multi-tap sun shadow (`spatial_resampling.wgsl:529-560` — paper §5.2
+        // mitigation; Dispatch A in `19-gi-reservoir-scope.md` §3.1). The
+        // shader clamps `< 1u` to `1u`, so a zero here resolves to the C#
+        // single-tap path.
+        sun_shadow_taps: gi.sun_shadow_taps,
+        _pad5: 0,
+        _pad6: 0,
+        _pad7: 0,
     };
     render_queue.write_buffer(&resources.gi_params, 0, bytemuck::bytes_of(&gi_params_data));
 

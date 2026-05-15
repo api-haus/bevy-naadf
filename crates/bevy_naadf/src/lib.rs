@@ -70,6 +70,17 @@ pub struct GiSettings {
     pub is_varying_resampling_radius: bool,
     /// Apply the in-volume atmosphere interaction (C# `isAtmosphereInteraction`).
     pub is_atmosphere_interaction: bool,
+    /// Per-pixel sun-shadow tap count for the spatial-resampling sun sample
+    /// (`crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl:529-560`).
+    /// Multi-tap extension addressing the paper §5.2 limitation: *"soft shadows
+    /// from the sun are not handled during resampling, resulting in slightly
+    /// increased noise."* Default **4** — N=1 reproduces the C# single-tap path
+    /// bit-equivalently (modulo loop-induced rand-stream advancement). The
+    /// shader clamps to `max(_, 1)`, so writing 0 here is harmless (resolves
+    /// to a single tap, matching the C# baseline). No CLI flag — config-struct
+    /// knob only (Dispatch A scope; see
+    /// `docs/orchestrate/naadf-bevy-port/19-gi-reservoir-scope.md` §3.1).
+    pub sun_shadow_taps: u32,
 }
 
 impl Default for GiSettings {
@@ -88,6 +99,9 @@ impl Default for GiSettings {
             is_sample_leveling: true,
             is_varying_resampling_radius: true,
             is_atmosphere_interaction: true,
+            // Multi-tap sun shadow — paper §5.2 soft-shadow noise mitigation
+            // (Dispatch A — `19-gi-reservoir-scope.md` §3.1). Default 4.
+            sun_shadow_taps: 4,
         }
     }
 }

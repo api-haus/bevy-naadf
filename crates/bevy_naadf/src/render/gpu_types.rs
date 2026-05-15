@@ -487,9 +487,28 @@ pub struct GpuGiParams {
     /// `vec4` WGSL hazard that bit this port 3×):** this field occupies the
     /// former `_pad5`/`_pad6` slot — struct offset **280**, which is 8-byte
     /// aligned (`280 % 8 == 0`), so a WGSL `vec2<f32>` lands here byte-for-byte.
-    /// The struct stays 288 bytes; the WGSL counterpart declares `flags: u32,
-    /// pad_a: u32, taa_jitter: vec2<f32>` so the offsets match exactly.
+    /// The struct stays 288 bytes through `taa_jitter`'s tail; the WGSL
+    /// counterpart declares `flags: u32, pad_a: u32, taa_jitter: vec2<f32>` so
+    /// the offsets match exactly.
     pub taa_jitter: Vec2,
+    /// Per-pixel sun-shadow tap count for the spatial-resampling sun sample
+    /// (`renderSpatialResampling.fx:321-339` port — multi-tap extension for the
+    /// paper §5.2 limitation: *"soft shadows from the sun are not handled
+    /// during resampling, resulting in slightly increased noise"*). Default 4
+    /// (`GiSettings::default`). N=1 reproduces the C# single-tap path
+    /// bit-equivalently (modulo loop-induced rand-stream advancement, which
+    /// matches the original code's two `next_rand` draws per tap). Sits at
+    /// struct offset **288** — a fresh 16-byte row whose remaining 12 bytes
+    /// are `_pad5`/`_pad6`/`_pad7` (mirroring the WGSL `pad_b`/`pad_c`/`pad_d`
+    /// lanes) so the struct stays 16-byte-aligned at 304 bytes total.
+    pub sun_shadow_taps: u32,
+    /// Padding — see `sun_shadow_taps`. Trailing pad to keep the struct
+    /// 16-byte-aligned.
+    pub _pad5: u32,
+    /// Padding — see `sun_shadow_taps`.
+    pub _pad6: u32,
+    /// Padding — see `sun_shadow_taps`.
+    pub _pad7: u32,
 }
 
 /// `flags` bit: skip samples — the 1↔0.25-spp toggle (C# `skipSamples`).
@@ -793,11 +812,19 @@ const _: () = assert!(std::mem::size_of::<GpuCameraHistorySlot>() == 64 + 64 + 1
 const _: () = assert!(std::mem::size_of::<GpuAtmosphereParams>() == 128);
 const _: () = assert!(std::mem::size_of::<GpuSampleValid>() == 32);
 const _: () = assert!(std::mem::size_of::<GpuBucketInfo>() == 8);
-const _: () = assert!(std::mem::size_of::<GpuGiParams>() == 288);
+const _: () = assert!(std::mem::size_of::<GpuGiParams>() == 304);
 // `taa_jitter` placement guard — must land at offset 280, 8-byte aligned, so
 // the WGSL `vec2<f32>` matches byte-for-byte (`18-taa-fidelity.md` fix #1).
 const _: () = assert!(std::mem::offset_of!(GpuGiParams, taa_jitter) == 280);
 const _: () = assert!(std::mem::offset_of!(GpuGiParams, taa_jitter) % 8 == 0);
+// `sun_shadow_taps` placement guard (`20-impl-phase-d-shadow-A.md`) — must land
+// at offset 288, the start of a fresh 16-byte row immediately after the
+// `taa_jitter` Vec2 ends (`280 + 8 == 288`). The WGSL counterpart declares
+// `sun_shadow_taps: u32, pad_b: u32, pad_c: u32, pad_d: u32` so the struct
+// stays 16-byte-aligned at 304 bytes. The trailing pad u32s mirror the Rust
+// `_pad5`/`_pad6`/`_pad7` fields. Keeps the `vec3`/scalar-trail hazard inert.
+const _: () = assert!(std::mem::offset_of!(GpuGiParams, sun_shadow_taps) == 288);
+const _: () = assert!(std::mem::offset_of!(GpuGiParams, sun_shadow_taps) % 4 == 0);
 // Phase C — `GpuConstructionParams` layout pins (`15-design-c.md` §5.1).
 // 80 bytes = 5 × 16-byte rows; every `vec3` 3-tuple explicitly padded to 16
 // so the WGSL `vec3<u32>`-then-scalar hazard cannot recur on the construction
