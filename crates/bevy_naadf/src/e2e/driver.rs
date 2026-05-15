@@ -34,9 +34,9 @@
 //! motion, `assert_batch_6`'s `solid_block_rect` GI-bounce check fails at the
 //! settled readback; a correct reprojection keeps it GI-lit.
 
+use bevy::camera::Viewport;
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
 
 use std::path::Path;
 
@@ -164,8 +164,7 @@ pub fn e2e_driver(
     mut resize_test: ResMut<ResizeTestState>,
     diagnostics: Res<DiagnosticsStore>,
     pipeline_scan: Res<PipelineScanResult>,
-    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
-    mut window: Single<&mut Window, With<PrimaryWindow>>,
+    mut camera: Single<(&mut Transform, &mut PositionSplit, &mut Camera), With<Camera3d>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
     app_args: Option<Res<crate::AppArgs>>,
@@ -189,7 +188,7 @@ pub fn e2e_driver(
             // it explicit so WARMUP is unambiguously static at the start pose
             // and the GI converges there before the camera moves.
             let pose = e2e_orbit_camera_transform(0.0);
-            let (transform, position_split) = &mut *camera;
+            let (transform, position_split, _cam) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             // E2E_WARMUP_FRAMES render frames is comfortably above the
@@ -214,7 +213,7 @@ pub fn e2e_driver(
             // pose.
             let t = state.phase_ticks as f32 / E2E_MOTION_FRAMES as f32;
             let pose = e2e_orbit_camera_transform(t);
-            let (transform, position_split) = &mut *camera;
+            let (transform, position_split, _cam) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             if state.phase_ticks >= E2E_MOTION_FRAMES {
@@ -239,7 +238,7 @@ pub fn e2e_driver(
             // carried the GI bounce here through the motion, a broken one has
             // reprojected it away and the shadowed regions are black.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
+            let (transform, position_split, _cam) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             if state.phase_ticks >= E2E_SETTLE_FRAMES {
@@ -312,9 +311,33 @@ pub fn e2e_driver(
             // accumulate, so the post-resize zero-clear of those rings will
             // produce an observable luma collapse.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
+            let (transform, position_split, cam) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
+            // On the first tick of ResizePre, force a known starting viewport
+            // (E2E_WIDTH × E2E_HEIGHT = 256×256) via Camera.viewport so the
+            // pre-resize baseline reads at a deterministic size regardless of
+            // what the WM gave the window. This makes the "pre" frame's
+            // `pixel_count` equal to (E2E_WIDTH * E2E_HEIGHT), and the
+            // subsequent ResizeDoIt override to (E2E_RESIZE_WIDTH ×
+            // E2E_RESIZE_HEIGHT) genuinely changes `pixel_count` through the
+            // exact code path the bug lives in (extract_camera →
+            // ExtractedCameraData.viewport_size → prepare_taa / prepare_gi).
+            if state.phase_ticks == 0 {
+                cam.viewport = Some(Viewport {
+                    physical_position: UVec2::ZERO,
+                    physical_size: UVec2::new(
+                        super::E2E_WIDTH,
+                        super::E2E_HEIGHT,
+                    ),
+                    depth: 0.0..1.0,
+                });
+                println!(
+                    "e2e_render: resize-test pinned Camera.viewport to {}x{} (pre-resize baseline)",
+                    super::E2E_WIDTH,
+                    super::E2E_HEIGHT
+                );
+            }
             state.phase_ticks += 1;
             if state.phase_ticks >= E2E_RESIZE_PRE_FRAMES {
                 // Drop any stale screenshot stash and request the pre-resize
@@ -333,7 +356,7 @@ pub fn e2e_driver(
             // Keep the camera pinned while we wait — the screenshot is
             // async and may take a frame or two.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
+            let (transform, position_split, _cam) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             state.phase_ticks += 1;
@@ -366,25 +389,29 @@ pub fn e2e_driver(
             }
         }
         E2ePhase::ResizeDoIt => {
-            // One-shot: mutate the primary window's physical resolution.
-            // `bevy_winit`'s `changed_windows` system sees the change in the
-            // same frame's `Last` schedule and forwards it to the underlying
-            // winit window; the OS WindowResized event fires, the next
-            // `extract_camera` reads the new viewport, and `prepare_taa` /
-            // `prepare_gi` see `pixel_count != old_pixel_count` and hit the
+            // One-shot: override the primary camera's viewport. This is
+            // WM-independent — the compositor cannot block it because we
+            // never touch the Window. `extract_camera` reads
+            // `camera.physical_viewport_size()` which returns
+            // `viewport.physical_size` when `viewport.is_some()` — so the
+            // next `ExtractSchedule` sees the new size, `prepare_taa` /
+            // `prepare_gi` see `pixel_count != old_pixel_count`, and hit the
             // ring-recreation zero-clear codepath — the bug.
-            window
-                .resolution
-                .set_physical_resolution(E2E_RESIZE_WIDTH, E2E_RESIZE_HEIGHT);
-            println!(
-                "e2e_render: resize-test triggered window resize to {E2E_RESIZE_WIDTH}x\
-                 {E2E_RESIZE_HEIGHT} (was 256x256)"
-            );
-            // Keep the camera pinned and advance immediately.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
+            let (transform, position_split, cam) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
+            cam.viewport = Some(Viewport {
+                physical_position: UVec2::ZERO,
+                physical_size: UVec2::new(E2E_RESIZE_WIDTH, E2E_RESIZE_HEIGHT),
+                depth: 0.0..1.0,
+            });
+            println!(
+                "e2e_render: resize-test overrode Camera.viewport to {E2E_RESIZE_WIDTH}x\
+                 {E2E_RESIZE_HEIGHT} (was {}x{})",
+                super::E2E_WIDTH,
+                super::E2E_HEIGHT
+            );
             state.phase = E2ePhase::ResizePost;
             state.phase_ticks = 0;
         }
@@ -396,7 +423,7 @@ pub fn e2e_driver(
             // luma gate then trips. Once Impl-B's fix lands, the rings are
             // preserved across resize and the post-resize luma matches pre.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
+            let (transform, position_split, _cam) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             state.phase_ticks += 1;
@@ -413,7 +440,7 @@ pub fn e2e_driver(
         }
         E2ePhase::ResizeDrainPost => {
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
+            let (transform, position_split, _cam) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             state.phase_ticks += 1;

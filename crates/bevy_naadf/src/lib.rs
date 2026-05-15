@@ -287,8 +287,10 @@ impl WindowConfig {
                 crate::e2e::E2E_WIDTH as f32,
                 crate::e2e::E2E_HEIGHT as f32,
             )),
-            // resizable: true required for --resize-test mode to propagate programmatic Window::resolution changes (test-only e2e mode)
-            resizable: true,
+            // The --resize-test mode triggers the GI/TAA pixel_count change
+            // via a Camera.viewport override instead of a Window resize, so
+            // the window stays non-resizable (matches the production e2e config).
+            resizable: false,
             title: "bevy-naadf e2e_render",
         }
     }
