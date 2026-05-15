@@ -132,54 +132,53 @@ pub const E2E_DRAIN_FRAMES: u32 = 8;
 
 // --- Resize-test constants (`docs/orchestrate/taa-resize-blackness/`) ------
 //
-// The resize-test wait spans are specified by the user in WALL-CLOCK seconds:
-// **5 seconds settle between each major step** (post-launch, post-togglefloating,
-// post-resize). The bounded e2e driver has no wall clock; it only counts
-// `Update` ticks. With vsync the present mode defaults to FIFO, so on a 60 Hz
-// display the harness ticks at ~60 fps and the conversion below gives the
-// user's spec exactly: 5 seconds × 60 fps = 300 ticks. On other refresh rates
-// the constants approximate the spec rather than match it.
+// Three-step resize: boot at 800×600, resize to 1920×1080, resize to 2000×1000.
+// Each step waits 5 wall-clock seconds before screenshotting. The bounded
+// e2e driver has no wall clock; it only counts `Update` ticks. With vsync the
+// present mode defaults to FIFO, so on a 60 Hz display the harness ticks at
+// ~60 fps and the conversion below gives the user's spec: 5 s × 60 fps = 300
+// ticks. On other refresh rates the constants approximate the spec rather
+// than match it.
 
-/// Render frames the driver counts before triggering the resize-prep hyprctl
-/// dispatches — the user's first 5-second settle leg. At 60 fps ≈ 5.0 s. Long
-/// enough that the TAA 32-deep ring and the GI 128-frame `sample_counts`
-/// accumulator are meaningfully filled before they get zero-cleared.
-/// **60 fps assumption** — see module comment above.
-pub const E2E_RESIZE_PRE_FRAMES: u32 = 300;
+/// Boot width for the resize-test window (user spec: "start the game in
+/// 800×600"). At 60 fps the harness reaches the first screenshot after
+/// [`E2E_RESIZE_LAUNCH_SETTLE_FRAMES`] ticks ≈ 5 s post-launch.
+pub const E2E_RESIZE_BOOT_WIDTH: u32 = 800;
+/// Boot height for the resize-test window — see [`E2E_RESIZE_BOOT_WIDTH`].
+pub const E2E_RESIZE_BOOT_HEIGHT: u32 = 600;
 
-/// Render frames the driver counts after the `hyprctl togglefloating`
-/// dispatch, before the actual resize. The user's "at least 5 seconds to
-/// settle in-between" requirement: lets the compositor finish unmapping the
-/// tiled window and remapping it as a floating window before we ask for a
-/// pixel-precise resize. 300 frames ≈ 5.0 s at 60 fps.
-pub const E2E_RESIZE_FLOAT_SETTLE_FRAMES: u32 = 300;
+/// First resize target (user spec: "resize it to 1920×1080").
+pub const E2E_RESIZE_A_WIDTH: u32 = 1920;
+/// First resize target height — see [`E2E_RESIZE_A_WIDTH`].
+pub const E2E_RESIZE_A_HEIGHT: u32 = 1080;
 
-/// Render frames the driver counts after triggering the resize, before the
-/// post-resize screenshot. The user's third 5-second settle leg. 300 frames
-/// ≈ 5.0 s at 60 fps. (Earlier 30-frame value was an attempt to catch the
-/// drain near the bottom of the user-observed recovery window; for this
-/// dispatch we settle conservatively first and let the assert decide.)
-pub const E2E_RESIZE_POST_FRAMES: u32 = 300;
+/// Second resize target (user spec: "resize it to 2000×1000").
+pub const E2E_RESIZE_B_WIDTH: u32 = 2000;
+/// Second resize target height — see [`E2E_RESIZE_B_WIDTH`].
+pub const E2E_RESIZE_B_HEIGHT: u32 = 1000;
 
-/// Post-resize physical resolution — picks an aspect-changing target so the
-/// resize exercises the GI/TAA pixel-count buffer-recreation path AND a
-/// non-trivial aspect ratio change (256×256 → 384×288 is 1:1 → 4:3, +50%
-/// width / +12.5% height; matches `02-design.md` §A.3).
-pub const E2E_RESIZE_WIDTH: u32 = 384;
-/// Post-resize physical height — see [`E2E_RESIZE_WIDTH`].
-pub const E2E_RESIZE_HEIGHT: u32 = 288;
+/// Render frames between window launch and the first (initial-baseline)
+/// screenshot. ≈ 5 s at 60 fps; gives the rings time to fill.
+pub const E2E_RESIZE_LAUNCH_SETTLE_FRAMES: u32 = 300;
 
-/// The minimum post/pre luma ratio at which the resize-test passes. Healthy
-/// shadow-band luma is ~242 on both screenshots (ratio ≈ 1.0); the broken
-/// regime collapses post-resize to ~4 (ratio ≈ 0.017). 0.5 is the threshold:
-/// well above the broken regime, well below a steady-state healthy run, so
-/// the gate has massive headroom in both directions.
-pub const E2E_RESIZE_MIN_LUMA_RATIO: f32 = 0.5;
+/// Render frames between each `hyprctl resizewindowpixel` and the
+/// corresponding post-resize screenshot. ≈ 5 s at 60 fps. Conservative wait;
+/// the user-observed recovery window for the TAA/GI ring drain is
+/// fractions-of-a-second to ~1-2 s, so by 5 s the rings should be refilled
+/// on a healthy build.
+pub const E2E_RESIZE_WAIT_FRAMES: u32 = 300;
 
-/// Filenames for the two screenshots saved by the resize-test (alongside
+/// The minimum post-resize / initial luma ratio at which a single resize
+/// step passes. Per the dispatch brief: a ≥ 30% full-frame luma drop fails.
+/// Healthy ratio ≈ 1.0; the prior bug-reproducing run showed a 54% drop
+/// (ratio ≈ 0.46), well below this threshold.
+pub const E2E_RESIZE_MIN_LUMA_RATIO: f32 = 0.7;
+
+/// Filenames for the three screenshots saved by the resize-test (alongside
 /// [`E2E_SCREENSHOT_LATEST`] inside [`E2E_SCREENSHOT_DIR`]).
-pub const E2E_RESIZE_PRE_PNG: &str = "resize_pre.png";
-pub const E2E_RESIZE_POST_PNG: &str = "resize_post.png";
+pub const E2E_RESIZE_INITIAL_PNG: &str = "resize_initial.png";
+pub const E2E_RESIZE_A_PNG: &str = "resize_a.png";
+pub const E2E_RESIZE_B_PNG: &str = "resize_b.png";
 
 // --- App wiring -----------------------------------------------------------
 

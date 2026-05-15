@@ -44,15 +44,15 @@ use crate::camera::PositionSplit;
 use super::checks::{assert_nodes_dispatched, pipeline_scan_result, PipelineScanResult};
 use super::framebuffer::{Framebuffer, Rect};
 use super::gates::{
-    batch_gate, e2e_orbit_camera_transform, expected_spans, region_luminance_report, GateState,
-    CURRENT_BATCH,
+    batch_gate, e2e_orbit_camera_transform, e2e_resize_test_camera_transform, expected_spans,
+    region_luminance_report, GateState, CURRENT_BATCH,
 };
 use super::readback::{shoot_primary_window, E2eScreenshot};
 use super::{
-    E2E_DRAIN_FRAMES, E2E_MOTION_FRAMES, E2E_RESIZE_FLOAT_SETTLE_FRAMES, E2E_RESIZE_HEIGHT,
-    E2E_RESIZE_MIN_LUMA_RATIO, E2E_RESIZE_POST_FRAMES, E2E_RESIZE_POST_PNG,
-    E2E_RESIZE_PRE_FRAMES, E2E_RESIZE_PRE_PNG, E2E_RESIZE_WIDTH, E2E_SCREENSHOT_DIR,
-    E2E_SCREENSHOT_LATEST, E2E_SETTLE_FRAMES, E2E_WARMUP_FRAMES,
+    E2E_DRAIN_FRAMES, E2E_MOTION_FRAMES, E2E_RESIZE_A_HEIGHT, E2E_RESIZE_A_PNG, E2E_RESIZE_A_WIDTH,
+    E2E_RESIZE_B_HEIGHT, E2E_RESIZE_B_PNG, E2E_RESIZE_B_WIDTH, E2E_RESIZE_INITIAL_PNG,
+    E2E_RESIZE_LAUNCH_SETTLE_FRAMES, E2E_RESIZE_MIN_LUMA_RATIO, E2E_RESIZE_WAIT_FRAMES,
+    E2E_SCREENSHOT_DIR, E2E_SCREENSHOT_LATEST, E2E_SETTLE_FRAMES, E2E_WARMUP_FRAMES,
 };
 
 /// The driver's state-machine phase.
@@ -77,45 +77,46 @@ pub enum E2ePhase {
     // --- Resize-test phases (`docs/orchestrate/taa-resize-blackness/`) -----
     //
     // Selected when `AppArgs.resize_test == true`. The Warmup branch routes
-    // straight into ResizePre on tick 0 instead of the production
+    // straight into LaunchSettle on tick 0 instead of the production
     // Warmup→Motion→Settle→Shoot→Drain→Assert flow. The camera is pinned at
-    // the fixed readback pose (the same pose Batch-6's `solid_block_rect`
-    // discriminator is calibrated against) for the entire test.
-    /// Render frames the driver counts before triggering the resize — user's
-    /// "waits 3 seconds" leg. Long enough that the TAA + GI rings have
-    /// meaningfully filled before the buffer-recreation zero-clear hits.
-    ResizePre,
-    /// Spawn `Screenshot::primary_window()` for the **pre-resize** capture.
-    ResizeShootPre,
-    /// Wait (bounded) for the pre-resize capture to deliver, then stash its
-    /// framebuffer into `ResizeTestState.pre`.
-    ResizeDrainPre,
-    /// After togglefloating has been dispatched (on the last tick of
-    /// `ResizePre`), wait 5 seconds (≈ 300 frames at 60 fps) so the
-    /// compositor finishes unmapping the tiled surface and remapping the
-    /// window as floating before we ask for a pixel-precise resize.
-    /// `resizewindowpixel exact` only takes effect on floating windows;
-    /// dispatching it too soon either gets ignored or only adjusts the tile
-    /// layout, leaving the bevy swapchain at its original allocation.
-    ResizeFloatSettle,
-    /// One-shot: ask Hyprland to resize our window to (`E2E_RESIZE_WIDTH` ×
-    /// `E2E_RESIZE_HEIGHT`) via `hyprctl dispatch resizewindowpixel`. The
-    /// resulting Wayland resize event propagates through `bevy_winit`, the
-    /// GPU surface is reconfigured, and the next `extract_camera` sees the
-    /// new viewport so `prepare_taa` / `prepare_gi` re-allocate + zero-clear
+    // the resize-test pose (see [`super::gates::e2e_resize_test_camera_transform`])
+    // — a low-angle, shadow-heavy framing — for the entire sequence.
+    //
+    // Three-step resize sequence: boot at 800×600, resize to 1920×1080,
+    // resize to 2000×1000. Each step waits ~5 s before the screenshot.
+    /// 5-second post-launch settle — lets the TAA 32-deep ring and GI
+    /// 128-frame `sample_counts` accumulator fill before the first capture.
+    LaunchSettle,
+    /// Spawn `Screenshot::primary_window()` for the **initial 800×600** capture.
+    ShootInitial,
+    /// Wait (bounded) for the initial capture to deliver, then stash its
+    /// framebuffer into `ResizeTestState.initial`.
+    DrainInitial,
+    /// One-shot: ask Hyprland to resize our window to 1920×1080 via
+    /// `hyprctl dispatch resizewindowpixel`. The resulting Wayland resize
+    /// event propagates through `bevy_winit`, the GPU surface is
+    /// reconfigured, and `prepare_taa` / `prepare_gi` re-allocate + zero-clear
     /// the rings.
-    ResizeDoIt,
-    /// Render frames the driver counts after the resize, before the
-    /// post-resize screenshot — user's "waits 2 seconds" leg. Inside the
-    /// user-observed recovery window (fractions-of-a-second to ~1-2 s).
-    ResizePost,
-    /// Spawn `Screenshot::primary_window()` for the **post-resize** capture.
-    ResizeShootPost,
-    /// Wait (bounded) for the post-resize capture to deliver, then stash its
-    /// framebuffer into `ResizeTestState.post`.
-    ResizeDrainPost,
-    /// Compare the pre/post luma values, panic (and write `AppExit::error()`)
-    /// on collapse.
+    ResizeA,
+    /// 5-second post-resize settle after the resize to 1920×1080.
+    WaitA,
+    /// Spawn `Screenshot::primary_window()` for the post-resize-A capture.
+    ShootA,
+    /// Wait (bounded) for the post-resize-A capture to deliver, then stash
+    /// it into `ResizeTestState.after_resize_a`.
+    DrainA,
+    /// One-shot: ask Hyprland to resize our window to 2000×1000.
+    ResizeB,
+    /// 5-second post-resize settle after the resize to 2000×1000.
+    WaitB,
+    /// Spawn `Screenshot::primary_window()` for the post-resize-B capture.
+    ShootB,
+    /// Wait (bounded) for the post-resize-B capture to deliver, then stash
+    /// it into `ResizeTestState.after_resize_b`.
+    DrainB,
+    /// Compare the three luma values, fail (and write `AppExit::error()`) if
+    /// either post-resize capture's full-frame luma falls below the threshold
+    /// ratio vs the initial.
     ResizeAssert,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
@@ -138,18 +139,83 @@ pub struct E2eOutcome {
     pub gate_result: Option<Result<(), String>>,
 }
 
-/// Stash for the two framebuffers captured by the resize-test
+/// Stash for the three framebuffers captured by the resize-test
 /// (`docs/orchestrate/taa-resize-blackness/`).
 ///
-/// The driver's `ResizeDrainPre` / `ResizeDrainPost` phases each consume the
+/// The driver's `DrainInitial` / `DrainA` / `DrainB` phases each consume the
 /// shared [`E2eScreenshot`] resource — decode the `Image` to a CPU-side
 /// [`Framebuffer`], dump the resource back to `None`, and stash the decoded
-/// frame here. The `ResizeAssert` phase then compares luma values between
-/// `pre` and `post`.
+/// frame here. The `ResizeAssert` phase then compares the two post-resize
+/// captures' full-frame luma against the initial.
 #[derive(Resource, Default)]
 pub struct ResizeTestState {
-    pub pre: Option<Framebuffer>,
-    pub post: Option<Framebuffer>,
+    /// 800×600 capture, before any resize.
+    pub initial: Option<Framebuffer>,
+    /// Capture after the first resize (1920×1080).
+    pub after_resize_a: Option<Framebuffer>,
+    /// Capture after the second resize (2000×1000).
+    pub after_resize_b: Option<Framebuffer>,
+}
+
+/// Pin the camera to the resize-test pose ([`e2e_resize_test_camera_transform`])
+/// — same pose for every resize-test phase (no orbit motion), so any luma
+/// difference between the three captures is attributable to the resize, not
+/// the camera.
+fn pin_resize_test_camera(
+    camera: &mut Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
+) {
+    let pose = e2e_resize_test_camera_transform();
+    let (transform, position_split) = &mut **camera;
+    **transform = pose;
+    **position_split = PositionSplit::from_world(pose.translation);
+}
+
+/// Send a `hyprctl dispatch resizewindowpixel exact W H,class:e2e_render`
+/// asking the compositor to resize our window to `(width, height)` physical
+/// pixels. Also dumps `hyprctl clients -j` immediately before and after so
+/// the log captures the floating/size state at each transition. `label` is
+/// a tag for the log line (e.g. "A" or "B").
+fn dispatch_hyprctl_resize(label: &str, width: u32, height: u32) {
+    let before = std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+        .ok();
+    println!(
+        "e2e_render: resize-test {label} hyprctl clients (pre-resize): {}",
+        summarise_clients_for_e2e_render(before.as_ref())
+    );
+
+    let selector = hyprctl_window_selector();
+    let dispatch_arg = format!("exact {width} {height},{selector}");
+    // test-only: hyprctl-driven Wayland resize
+    let output = std::process::Command::new("hyprctl")
+        .args(["dispatch", "resizewindowpixel", &dispatch_arg])
+        .output();
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            println!(
+                "e2e_render: resize-test {label} hyprctl resizewindowpixel \
+                 '{dispatch_arg}' -> exit {:?} stdout={stdout:?} stderr={stderr:?}",
+                o.status
+            );
+        }
+        Err(e) => eprintln!(
+            "e2e_render: resize-test {label} hyprctl resizewindowpixel \
+             '{dispatch_arg}' FAILED to spawn: {e} — test will report \
+             failure via luma comparison"
+        ),
+    }
+
+    let after = std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+        .ok();
+    println!(
+        "e2e_render: resize-test {label} hyprctl clients (post-resize): {}",
+        summarise_clients_for_e2e_render(after.as_ref())
+    );
 }
 
 /// Pick the Hyprland window-selector string for our primary window.
@@ -165,11 +231,81 @@ pub struct ResizeTestState {
 /// prepends `,` when building the full hyprctl dispatch argument
 /// (`<resize-args>,<selector>` or `,<selector>` for togglefloating).
 ///
-/// Only called from the resize-test phases (`ResizePre` / `ResizeDoIt`),
-/// which are gated behind `AppArgs.resize_test` — the default e2e harness
-/// never shells out to hyprctl.
+/// Only called from the resize-test phases (`ResizeA` / `ResizeB`), which
+/// are gated behind `AppArgs.resize_test` — the default e2e harness never
+/// shells out to hyprctl.
 fn hyprctl_window_selector() -> String {
     "class:e2e_render".to_string()
+}
+
+/// Pull the JSON object describing the `e2e_render`-class window out of a
+/// `hyprctl clients -j` output blob and return it as a `(floating, size, at)`
+/// triple-style string for logging.
+///
+/// `hyprctl clients -j` prints a JSON array; each element is one window. We
+/// don't pull a JSON dep in for a diagnostic — a forward scan from `"class":
+/// "e2e_render"` back to the enclosing `{` and forward to the matching `}` is
+/// enough to extract just our window's record. If the parse fails we fall back
+/// to a length-capped raw substring so the diagnostic still carries signal.
+fn summarise_clients_for_e2e_render(out: Option<&std::process::Output>) -> String {
+    let Some(o) = out else {
+        return "<hyprctl clients spawn failed>".to_string();
+    };
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let needle = "\"class\": \"e2e_render\"";
+    let Some(class_pos) = stdout.find(needle) else {
+        return format!(
+            "<no e2e_render entry in hyprctl clients output> exit={:?} stdout_len={}",
+            o.status,
+            stdout.len()
+        );
+    };
+    // Walk backwards from `class_pos` to find the enclosing window record's
+    // opening `{` — NOT the nearest `{` (the window record has nested objects
+    // like `workspace: { id, name }`, so the nearest preceding `{` lands inside
+    // that nested object). Count brace depth from `class_pos` backwards: every
+    // `}` increases depth (we're entering a nested closed object) and every
+    // `{` decreases it. The first `{` that drops depth below 0 is the outer
+    // record's opener.
+    let bytes = stdout.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for i in (0..class_pos).rev() {
+        match bytes[i] {
+            b'}' => depth += 1,
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    // Walk forwards from `start` to find the matching `}` by counting depth.
+    let mut depth = 0i32;
+    let mut end = stdout.len();
+    for (i, ch) in stdout[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let record = &stdout[start..end.min(stdout.len())];
+    // Cap output at ~2000 chars so the log line stays readable.
+    if record.len() > 2000 {
+        format!("{}…<truncated>", &record[..2000])
+    } else {
+        record.to_string()
+    }
 }
 
 /// The `Update` driver system — advances the state machine one step per tick.
@@ -219,7 +355,7 @@ pub fn e2e_driver(
             state.phase = E2ePhase::Done;
             return;
         }
-        state.phase = E2ePhase::ResizePre;
+        state.phase = E2ePhase::LaunchSettle;
         state.phase_ticks = 0;
     }
 
@@ -347,68 +483,46 @@ pub fn e2e_driver(
             state.phase = E2ePhase::Done;
         }
         // ---- Resize-test phases ------------------------------------------
-        E2ePhase::ResizePre => {
-            // Pin the camera at the readback pose — the same pose Batch-6
-            // gates' `solid_block_rect` discriminator is calibrated for. The
-            // 5-second wait lets GI converge and `taa_samples` /
-            // `sample_counts` accumulate, so the post-resize zero-clear of
-            // those rings will produce an observable luma collapse.
-            let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
-            **transform = pose;
-            **position_split = PositionSplit::from_world(pose.translation);
+        E2ePhase::LaunchSettle => {
+            // Pin the camera at the resize-test pose — a low-angle,
+            // shadow-heavy framing where the bug (post-resize TAA/GI ring
+            // drain → shadow regions go black) is observable in full-frame
+            // luma. Pose held identical through every resize-test phase so
+            // any luma drop between the three captures is attributable to
+            // the resize itself, not camera motion.
+            pin_resize_test_camera(&mut camera);
             state.phase_ticks += 1;
-            if state.phase_ticks >= E2E_RESIZE_PRE_FRAMES {
-                // On the last tick of ResizePre: (a) request the pre-resize
-                // screenshot and (b) dispatch `hyprctl togglefloating`. The
-                // pre-screenshot captures the un-resized baseline; the
-                // togglefloating dispatch tells Hyprland to take our window
-                // out of the tiled layout so the subsequent
-                // `resizewindowpixel exact` actually changes the surface
-                // size (without floating, the dispatcher only adjusts the
-                // tile layout and the bevy swapchain stays at the original
-                // allocation).
+            if state.phase_ticks >= E2E_RESIZE_LAUNCH_SETTLE_FRAMES {
+                // Drop any prior capture before requesting the initial one.
                 screenshot.0 = None;
-                let selector = hyprctl_window_selector();
-                // test-only: hyprctl-driven Wayland resize
-                let status = std::process::Command::new("hyprctl")
-                    .args(["dispatch", "togglefloating", &format!(",{selector}")])
-                    .status();
-                match status {
-                    Ok(s) => println!(
-                        "e2e_render: resize-test hyprctl togglefloating ,{selector} -> {s:?}"
-                    ),
-                    Err(e) => eprintln!(
-                        "e2e_render: resize-test hyprctl togglefloating ,{selector} FAILED to spawn: {e}"
-                    ),
-                }
-                state.phase = E2ePhase::ResizeShootPre;
+                state.phase = E2ePhase::ShootInitial;
                 state.phase_ticks = 0;
             }
         }
-        E2ePhase::ResizeShootPre => {
+        E2ePhase::ShootInitial => {
+            pin_resize_test_camera(&mut camera);
             shoot_primary_window(&mut commands);
-            state.phase = E2ePhase::ResizeDrainPre;
+            state.phase = E2ePhase::DrainInitial;
             state.phase_ticks = 0;
         }
-        E2ePhase::ResizeDrainPre => {
-            // Keep the camera pinned while we wait — the screenshot is
-            // async and may take a frame or two.
-            let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
-            **transform = pose;
-            **position_split = PositionSplit::from_world(pose.translation);
+        E2ePhase::DrainInitial => {
+            pin_resize_test_camera(&mut camera);
             state.phase_ticks += 1;
             if let Some(image) = screenshot.0.take() {
                 match Framebuffer::from_image(&image) {
                     Ok(fb) => {
-                        resize_test.pre = Some(fb);
-                        state.phase = E2ePhase::ResizeFloatSettle;
+                        println!(
+                            "e2e_render: resize-test initial capture {}x{}",
+                            fb.width(),
+                            fb.height()
+                        );
+                        resize_test.initial = Some(fb);
+                        state.phase = E2ePhase::ResizeA;
                         state.phase_ticks = 0;
                     }
                     Err(msg) => {
                         let err = format!(
-                            "resize-test: pre-resize framebuffer decode failed: {msg}"
+                            "resize-test: initial framebuffer decode failed: {msg}"
                         );
                         eprintln!("e2e_render: FAIL — {err}");
                         outcome.gate_result = Some(Err(err));
@@ -418,7 +532,7 @@ pub fn e2e_driver(
                 }
             } else if state.phase_ticks >= E2E_DRAIN_FRAMES {
                 let err = format!(
-                    "resize-test: pre-resize screenshot never delivered within \
+                    "resize-test: initial screenshot never delivered within \
                      {E2E_DRAIN_FRAMES} drain frames"
                 );
                 eprintln!("e2e_render: FAIL — {err}");
@@ -427,98 +541,45 @@ pub fn e2e_driver(
                 state.phase = E2ePhase::Done;
             }
         }
-        E2ePhase::ResizeFloatSettle => {
-            // 5-second settle (≈ 300 frames at 60 fps) so the compositor
-            // finishes the toggle-to-floating remap before we ask for a
-            // pixel-precise resize. No actions during settle — just count
-            // frames and keep the camera pinned (same as the standard
-            // SETTLE phase).
-            let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
-            **transform = pose;
-            **position_split = PositionSplit::from_world(pose.translation);
-            state.phase_ticks += 1;
-            if state.phase_ticks >= E2E_RESIZE_FLOAT_SETTLE_FRAMES {
-                state.phase = E2ePhase::ResizeDoIt;
-                state.phase_ticks = 0;
-            }
-        }
-        E2ePhase::ResizeDoIt => {
-            // One-shot: tell Hyprland to resize our window. This propagates a
-            // real Wayland resize event through `bevy_winit`, which triggers
-            // the full GPU surface reconfig + `WindowResized` event +
-            // `prepare_taa` / `prepare_gi` `pixel_count != old_pixel_count`
-            // chain — the exact code path the bug lives in. Previous
-            // Window::resolution / Camera.viewport experiments did NOT
-            // exercise this chain (the compositor either ignored the request
-            // or only the camera changed; the surface stayed the original
-            // size).
-            let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
-            **transform = pose;
-            **position_split = PositionSplit::from_world(pose.translation);
-
-            let selector = hyprctl_window_selector();
-            let dispatch_arg = format!(
-                "exact {E2E_RESIZE_WIDTH} {E2E_RESIZE_HEIGHT},{selector}"
-            );
-            // test-only: hyprctl-driven Wayland resize
-            let status = std::process::Command::new("hyprctl")
-                .args(["dispatch", "resizewindowpixel", &dispatch_arg])
-                .status();
-            match status {
-                Ok(s) => println!(
-                    "e2e_render: resize-test hyprctl resizewindowpixel '{dispatch_arg}' -> {s:?}"
-                ),
-                Err(e) => eprintln!(
-                    "e2e_render: resize-test hyprctl resizewindowpixel '{dispatch_arg}' FAILED to spawn: {e} \
-                     — test will report failure via luma comparison"
-                ),
-            }
-            state.phase = E2ePhase::ResizePost;
+        E2ePhase::ResizeA => {
+            pin_resize_test_camera(&mut camera);
+            dispatch_hyprctl_resize("A", E2E_RESIZE_A_WIDTH, E2E_RESIZE_A_HEIGHT);
+            state.phase = E2ePhase::WaitA;
             state.phase_ticks = 0;
         }
-        E2ePhase::ResizePost => {
-            // 5-second post-resize settle (≈ 300 frames at 60 fps) — the
-            // user-directed wait between hyprctl resize and the post-resize
-            // screenshot. This is a conservative wait; the user-observed
-            // recovery window is "fractions of a second to ~1-2 seconds"
-            // (TAA 32-frame ring + GI 128-frame sample_counts ring drain),
-            // so by 5 s the rings should have refilled. Where mid-drain
-            // detection is required, the test would need a shorter post
-            // frame count — for this dispatch we settle conservatively first.
-            let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
-            **transform = pose;
-            **position_split = PositionSplit::from_world(pose.translation);
+        E2ePhase::WaitA => {
+            pin_resize_test_camera(&mut camera);
             state.phase_ticks += 1;
-            if state.phase_ticks >= E2E_RESIZE_POST_FRAMES {
+            if state.phase_ticks >= E2E_RESIZE_WAIT_FRAMES {
                 screenshot.0 = None;
-                state.phase = E2ePhase::ResizeShootPost;
+                state.phase = E2ePhase::ShootA;
                 state.phase_ticks = 0;
             }
         }
-        E2ePhase::ResizeShootPost => {
+        E2ePhase::ShootA => {
+            pin_resize_test_camera(&mut camera);
             shoot_primary_window(&mut commands);
-            state.phase = E2ePhase::ResizeDrainPost;
+            state.phase = E2ePhase::DrainA;
             state.phase_ticks = 0;
         }
-        E2ePhase::ResizeDrainPost => {
-            let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split) = &mut *camera;
-            **transform = pose;
-            **position_split = PositionSplit::from_world(pose.translation);
+        E2ePhase::DrainA => {
+            pin_resize_test_camera(&mut camera);
             state.phase_ticks += 1;
             if let Some(image) = screenshot.0.take() {
                 match Framebuffer::from_image(&image) {
                     Ok(fb) => {
-                        resize_test.post = Some(fb);
-                        state.phase = E2ePhase::ResizeAssert;
+                        println!(
+                            "e2e_render: resize-test after_resize_a capture {}x{}",
+                            fb.width(),
+                            fb.height()
+                        );
+                        resize_test.after_resize_a = Some(fb);
+                        state.phase = E2ePhase::ResizeB;
                         state.phase_ticks = 0;
                     }
                     Err(msg) => {
                         let err = format!(
-                            "resize-test: post-resize framebuffer decode failed: {msg}"
+                            "resize-test: after_resize_a framebuffer decode failed: {msg}"
                         );
                         eprintln!("e2e_render: FAIL — {err}");
                         outcome.gate_result = Some(Err(err));
@@ -528,7 +589,64 @@ pub fn e2e_driver(
                 }
             } else if state.phase_ticks >= E2E_DRAIN_FRAMES {
                 let err = format!(
-                    "resize-test: post-resize screenshot never delivered within \
+                    "resize-test: after_resize_a screenshot never delivered within \
+                     {E2E_DRAIN_FRAMES} drain frames"
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::ResizeB => {
+            pin_resize_test_camera(&mut camera);
+            dispatch_hyprctl_resize("B", E2E_RESIZE_B_WIDTH, E2E_RESIZE_B_HEIGHT);
+            state.phase = E2ePhase::WaitB;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::WaitB => {
+            pin_resize_test_camera(&mut camera);
+            state.phase_ticks += 1;
+            if state.phase_ticks >= E2E_RESIZE_WAIT_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::ShootB;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::ShootB => {
+            pin_resize_test_camera(&mut camera);
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::DrainB;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::DrainB => {
+            pin_resize_test_camera(&mut camera);
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        println!(
+                            "e2e_render: resize-test after_resize_b capture {}x{}",
+                            fb.width(),
+                            fb.height()
+                        );
+                        resize_test.after_resize_b = Some(fb);
+                        state.phase = E2ePhase::ResizeAssert;
+                        state.phase_ticks = 0;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "resize-test: after_resize_b framebuffer decode failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks >= E2E_DRAIN_FRAMES {
+                let err = format!(
+                    "resize-test: after_resize_b screenshot never delivered within \
                      {E2E_DRAIN_FRAMES} drain frames"
                 );
                 eprintln!("e2e_render: FAIL — {err}");
@@ -542,11 +660,16 @@ pub fn e2e_driver(
             match &result {
                 Ok(()) => {
                     println!(
-                        "e2e_render: resize-test PASS — pre/post luma ratio above threshold \
-                         {E2E_RESIZE_MIN_LUMA_RATIO} after {E2E_RESIZE_PRE_FRAMES} pre-frames \
-                         + togglefloating + {E2E_RESIZE_FLOAT_SETTLE_FRAMES} float-settle frames \
-                         + window resize to {E2E_RESIZE_WIDTH}x{E2E_RESIZE_HEIGHT} + \
-                         {E2E_RESIZE_POST_FRAMES} post-frames."
+                        "e2e_render: resize-test PASS — both post-resize / initial luma ratios \
+                         above threshold {E2E_RESIZE_MIN_LUMA_RATIO} after three-step resize \
+                         (boot {}x{} → A {}x{} → B {}x{}, {E2E_RESIZE_LAUNCH_SETTLE_FRAMES} \
+                         launch-settle + {E2E_RESIZE_WAIT_FRAMES} wait frames between steps).",
+                        crate::e2e::E2E_RESIZE_BOOT_WIDTH,
+                        crate::e2e::E2E_RESIZE_BOOT_HEIGHT,
+                        E2E_RESIZE_A_WIDTH,
+                        E2E_RESIZE_A_HEIGHT,
+                        E2E_RESIZE_B_WIDTH,
+                        E2E_RESIZE_B_HEIGHT,
                     );
                     exit.write(AppExit::Success);
                 }
@@ -565,122 +688,134 @@ pub fn e2e_driver(
     }
 }
 
-/// Run the resize-test luma comparison + save both PNGs.
+/// Compute mean luminance over the **entire** framebuffer. The user-spec
+/// metric per the dispatch brief: `solid_block_rect` was tuned for the
+/// original Batch-6 pose at 256×256 and doesn't reliably catch the bug at
+/// other resolutions/poses (previous run: full-frame 136 → 63 vs
+/// solid-block 241 → 229). Full-frame mean is the honest discriminator.
+fn full_frame_luma(fb: &Framebuffer) -> f32 {
+    fb.region_luminance(Rect {
+        x0: 0,
+        y0: 0,
+        x1: fb.width(),
+        y1: fb.height(),
+    })
+}
+
+/// Run the three-step resize-test luma comparison + save all three PNGs.
 ///
-/// The user's verbatim spec is: "the test establishes a window, waits 3
-/// seconds, screenshots, resizes window, waits 2 seconds, screenshots it,
-/// compares luma values." That is what this function does, evaluated *after*
-/// the driver has finished both captures.
+/// User spec (verbatim, this dispatch): "start the game in 800×600, then
+/// resize it to 1920×1080 then resize it to 2000×1000 and each time wait 5
+/// seconds and screenshot". This function runs after the driver has finished
+/// all three captures (`initial` at 800×600, `after_resize_a` at 1920×1080,
+/// `after_resize_b` at 2000×1000) and validates each post-resize capture's
+/// full-frame luma against the initial.
 ///
-/// Discriminator choice: the `solid_block_rect` region from `gates.rs:188`
-/// — the dark diffuse voxel geometry directly below the warm-white emissive
-/// block — is the targeted bug discriminator: healthy steady-state ~242,
-/// broken (post-resize black-shadow drain) ~4. The full-frame mean luma is
-/// also computed as a sanity check (it moves a lot less but should never
-/// catastrophically collapse).
-///
-/// Pass/fail criterion: post-resize `solid_block_rect` luma divided by the
-/// pre-resize value must be ≥ [`E2E_RESIZE_MIN_LUMA_RATIO`] (0.5). Healthy
-/// ratio ≈ 1.0; broken ratio ≈ 0.017; 0.5 cleanly separates them with
-/// massive headroom on both sides.
+/// **Pass criterion**: both `after_resize_a / initial` and `after_resize_b /
+/// initial` ratios must be ≥ [`E2E_RESIZE_MIN_LUMA_RATIO`] (0.7). A 30%
+/// drop or worse is the bug signal. The prior bug-reproducing single-resize
+/// run showed a 54% drop in full-frame luma (136 → 63, ratio ≈ 0.46) —
+/// well below this threshold.
 fn run_resize_test_assertions(state: &mut ResizeTestState) -> Result<(), String> {
-    let pre = state.pre.take().ok_or_else(|| {
-        "resize-test: ResizeAssert reached with no pre-resize framebuffer (driver bug)".to_string()
+    let initial = state.initial.take().ok_or_else(|| {
+        "resize-test: ResizeAssert reached with no initial framebuffer (driver bug)".to_string()
     })?;
-    let post = state.post.take().ok_or_else(|| {
-        "resize-test: ResizeAssert reached with no post-resize framebuffer (driver bug)".to_string()
+    let after_a = state.after_resize_a.take().ok_or_else(|| {
+        "resize-test: ResizeAssert reached with no after_resize_a framebuffer (driver bug)".to_string()
+    })?;
+    let after_b = state.after_resize_b.take().ok_or_else(|| {
+        "resize-test: ResizeAssert reached with no after_resize_b framebuffer (driver bug)".to_string()
     })?;
 
-    // Save both PNGs unconditionally so the user can visually inspect.
-    let pre_path = Path::new(E2E_SCREENSHOT_DIR).join(E2E_RESIZE_PRE_PNG);
-    let post_path = Path::new(E2E_SCREENSHOT_DIR).join(E2E_RESIZE_POST_PNG);
-    let _ = pre
-        .save_png(&pre_path)
-        .map_err(|e| eprintln!("e2e_render: resize-test: pre PNG save failed: {e}"));
-    let _ = post
-        .save_png(&post_path)
-        .map_err(|e| eprintln!("e2e_render: resize-test: post PNG save failed: {e}"));
+    // Save all three PNGs unconditionally so the user can visually inspect.
+    let initial_path = Path::new(E2E_SCREENSHOT_DIR).join(E2E_RESIZE_INITIAL_PNG);
+    let a_path = Path::new(E2E_SCREENSHOT_DIR).join(E2E_RESIZE_A_PNG);
+    let b_path = Path::new(E2E_SCREENSHOT_DIR).join(E2E_RESIZE_B_PNG);
+    let _ = initial
+        .save_png(&initial_path)
+        .map_err(|e| eprintln!("e2e_render: resize-test: initial PNG save failed: {e}"));
+    let _ = after_a
+        .save_png(&a_path)
+        .map_err(|e| eprintln!("e2e_render: resize-test: resize_a PNG save failed: {e}"));
+    let _ = after_b
+        .save_png(&b_path)
+        .map_err(|e| eprintln!("e2e_render: resize-test: resize_b PNG save failed: {e}"));
     // Also keep the standard `e2e_latest.png` slot populated (with the
-    // post-resize frame) so the established harness path is consistent.
-    let _ = post
+    // final post-resize frame) so the established harness path is
+    // consistent.
+    let _ = after_b
         .save_png(Path::new(E2E_SCREENSHOT_DIR).join(E2E_SCREENSHOT_LATEST))
         .map_err(|e| eprintln!("e2e_render: resize-test: latest PNG save failed: {e}"));
 
     println!(
-        "e2e_render: resize-test pre  {}x{} -> saved {}",
-        pre.width(),
-        pre.height(),
-        pre_path.display()
+        "e2e_render: resize-test initial  {}x{} -> saved {}",
+        initial.width(),
+        initial.height(),
+        initial_path.display()
     );
     println!(
-        "e2e_render: resize-test post {}x{} -> saved {}",
-        post.width(),
-        post.height(),
-        post_path.display()
+        "e2e_render: resize-test resize_a {}x{} -> saved {}",
+        after_a.width(),
+        after_a.height(),
+        a_path.display()
+    );
+    println!(
+        "e2e_render: resize-test resize_b {}x{} -> saved {}",
+        after_b.width(),
+        after_b.height(),
+        b_path.display()
     );
 
-    // The targeted discriminator: `solid_block_rect`-shaped fractional rect
-    // (gates.rs:188-190 — `Rect::from_fractional(fb, 0.42, 0.52, 0.58, 0.66)`).
-    // The rect is fractional, so it transparently follows the new
-    // resolution after the resize.
-    let solid_pre = pre.region_luminance(Rect::from_fractional(&pre, 0.42, 0.52, 0.58, 0.66));
-    let solid_post = post.region_luminance(Rect::from_fractional(&post, 0.42, 0.52, 0.58, 0.66));
-
-    // Sanity-check: full-frame mean luma.
-    let full_pre = pre.region_luminance(Rect {
-        x0: 0,
-        y0: 0,
-        x1: pre.width(),
-        y1: pre.height(),
-    });
-    let full_post = post.region_luminance(Rect {
-        x0: 0,
-        y0: 0,
-        x1: post.width(),
-        y1: post.height(),
-    });
+    // Full-frame mean luma — the metric per the dispatch brief.
+    let luma_initial = full_frame_luma(&initial);
+    let luma_a = full_frame_luma(&after_a);
+    let luma_b = full_frame_luma(&after_b);
 
     // Per-frame diagnostic reports (reuse the standard helper).
-    println!("e2e_render: resize-test pre  {}", region_luminance_report(&pre));
-    println!("e2e_render: resize-test post {}", region_luminance_report(&post));
+    println!("e2e_render: resize-test initial  {}", region_luminance_report(&initial));
+    println!("e2e_render: resize-test resize_a {}", region_luminance_report(&after_a));
+    println!("e2e_render: resize-test resize_b {}", region_luminance_report(&after_b));
 
-    let ratio = if solid_pre > 1.0e-3 {
-        solid_post / solid_pre
-    } else {
-        // Pre-resize luma was already near zero → there's no rings-fill
-        // collapse to detect; this is a setup failure, not the bug we're
-        // hunting. Treat as fail with a clear message.
+    if luma_initial <= 1.0e-3 {
         return Err(format!(
-            "resize-test: pre-resize `solid_block_rect` luminance is essentially zero \
-             ({solid_pre:.3}); the harness never converged the GI bounce before the resize. \
-             Bump E2E_RESIZE_PRE_FRAMES or investigate. Full-frame pre luma = {full_pre:.1}, \
-             full-frame post luma = {full_post:.1}."
+            "resize-test: initial full-frame luminance is essentially zero \
+             ({luma_initial:.3}); the harness never produced a lit image. \
+             Bump E2E_RESIZE_LAUNCH_SETTLE_FRAMES or investigate."
         ));
-    };
+    }
+
+    let ratio_a = luma_a / luma_initial;
+    let ratio_b = luma_b / luma_initial;
 
     println!(
-        "e2e_render: resize-test luma — solid pre {:.2}, solid post {:.2}, ratio {:.4} \
-         (threshold {:.2}); full-frame pre {:.2}, full-frame post {:.2}",
-        solid_pre, solid_post, ratio, E2E_RESIZE_MIN_LUMA_RATIO, full_pre, full_post
+        "e2e_render: resize-test luma — initial {luma_initial:.2}, \
+         after_a {luma_a:.2} (ratio {ratio_a:.4}), \
+         after_b {luma_b:.2} (ratio {ratio_b:.4}); \
+         threshold {E2E_RESIZE_MIN_LUMA_RATIO:.2}"
     );
 
-    if ratio < E2E_RESIZE_MIN_LUMA_RATIO {
+    let fail_a = ratio_a < E2E_RESIZE_MIN_LUMA_RATIO;
+    let fail_b = ratio_b < E2E_RESIZE_MIN_LUMA_RATIO;
+    if fail_a || fail_b {
         return Err(format!(
             "resize-test: TAA/GI ring drain detected after window resize.\n  \
-             pre-resize  `solid_block_rect` luma = {solid_pre:.2}\n  \
-             post-resize `solid_block_rect` luma = {solid_post:.2}\n  \
-             ratio (post/pre)                     = {ratio:.4}\n  \
-             threshold                            = {:.2}\n  \
-             full-frame  pre luma  = {full_pre:.2}\n  \
-             full-frame  post luma = {full_post:.2}\n  \
-             screenshots saved to: {} + {}\n  \
+             initial  ({}x{}) full-frame luma = {luma_initial:.2}\n  \
+             resize_a ({}x{}) full-frame luma = {luma_a:.2}, ratio = {ratio_a:.4} [{}]\n  \
+             resize_b ({}x{}) full-frame luma = {luma_b:.2}, ratio = {ratio_b:.4} [{}]\n  \
+             threshold                          = {E2E_RESIZE_MIN_LUMA_RATIO:.2}\n  \
+             screenshots saved to: {} + {} + {}\n  \
              This is the bug `docs/orchestrate/taa-resize-blackness/` reproduces — the\n  \
              post-resize TAA `taa_samples` ring + GI `sample_counts` accumulator are\n  \
              zero-cleared by `prepare_taa` / `prepare_gi`, and the multi-frame drain\n  \
              collapses the shadow-band luma until the rings refill.",
-            E2E_RESIZE_MIN_LUMA_RATIO,
-            pre_path.display(),
-            post_path.display(),
+            initial.width(), initial.height(),
+            after_a.width(), after_a.height(),
+            if fail_a { "FAIL" } else { "pass" },
+            after_b.width(), after_b.height(),
+            if fail_b { "FAIL" } else { "pass" },
+            initial_path.display(),
+            a_path.display(),
+            b_path.display(),
         ));
     }
 

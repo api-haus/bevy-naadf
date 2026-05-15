@@ -317,9 +317,14 @@ impl WindowConfig {
     /// branch picks this up.
     fn e2e_resize_test() -> Self {
         Self {
+            // User spec for the three-step resize test (boot → 1920×1080 →
+            // 2000×1000): the *initial* screenshot is taken at 800×600, so
+            // the window boots at exactly that size. Larger than the
+            // standard e2e 256×256 because the user wants visual coverage of
+            // shadow regions across resolution changes.
             resolution: Some((
-                crate::e2e::E2E_WIDTH as f32,
-                crate::e2e::E2E_HEIGHT as f32,
+                crate::e2e::E2E_RESIZE_BOOT_WIDTH as f32,
+                crate::e2e::E2E_RESIZE_BOOT_HEIGHT as f32,
             )),
             // test-only: must be true for hyprctl-driven resize to propagate
             // through winit; resize-test mode only.

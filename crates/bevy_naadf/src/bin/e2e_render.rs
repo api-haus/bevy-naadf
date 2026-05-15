@@ -97,9 +97,75 @@ fn main() -> ExitCode {
     // exit code != 0. After Impl-B the rings are preserved across resize →
     // test passes with exit code 0.
     let app_exit = if resize_test {
+        // taa-resize-blackness: pre-launch — install a Hyprland windowrule so
+        // the e2e_render window starts ALREADY-FLOATING (no togglefloating
+        // dance after the fact). Pixel-precise resize via
+        // `hyprctl dispatch resizewindowpixel` only takes effect on floating
+        // windows; the prior togglefloating-after-launch approach was unreliable
+        // because Hyprland's default behaviour or user windowrules could leave
+        // the window tiled (or re-tile it after toggling). A pre-launch
+        // windowrule sidesteps the race entirely.
+        //
+        // Hyprland 0.54+ syntax: `match:class <regex>, float on` (the older
+        // `windowrulev2 float,class:^(...)$` is deprecated). Verified against
+        // the live `hyprctl --help` + `hyprctl keyword windowrule "..."` on
+        // 2026-05-15.
+        //
+        // Cleanup uses `hyprctl reload` (after the run) to re-read the config
+        // from disk, which discards every runtime keyword set since boot. If
+        // the test panics the rule leaks until the next manual `hyprctl reload`
+        // / Hyprland restart — explicitly acceptable per the dispatch brief.
+        //
+        // Both invocations are gated behind `--resize-test` so the standard
+        // e2e path never shells out to hyprctl.
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+            let status = std::process::Command::new("hyprctl")
+                .args([
+                    "keyword",
+                    "windowrule",
+                    "match:class ^(e2e_render)$, float on",
+                ])
+                .status();
+            match status {
+                Ok(s) => eprintln!(
+                    "e2e_render: pre-launch hyprctl keyword windowrule \
+                     'match:class ^(e2e_render)$, float on' -> {s:?}"
+                ),
+                Err(e) => eprintln!(
+                    "e2e_render: pre-launch hyprctl keyword windowrule \
+                     FAILED to spawn: {e} — test will likely fall back to \
+                     tiled behaviour and assert via luma comparison"
+                ),
+            }
+        } else {
+            eprintln!(
+                "e2e_render: pre-launch — HYPRLAND_INSTANCE_SIGNATURE not set; \
+                 skipping windowrule install (driver will abort the run)"
+            );
+        }
+
         let mut app_args = bevy_naadf::AppArgs::default();
         app_args.resize_test = true;
-        bevy_naadf::run_e2e_render_with_args(app_args)
+        let exit = bevy_naadf::run_e2e_render_with_args(app_args);
+
+        // Cleanup: discard the runtime windowrule by reloading the config
+        // from disk. Best-effort — failure here doesn't change the test's
+        // pass/fail verdict, it just leaves a runtime rule until the user
+        // reloads Hyprland.
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+            let status = std::process::Command::new("hyprctl")
+                .args(["reload"])
+                .status();
+            match status {
+                Ok(s) => eprintln!("e2e_render: post-run hyprctl reload -> {s:?}"),
+                Err(e) => eprintln!(
+                    "e2e_render: post-run hyprctl reload FAILED to spawn: {e} \
+                     — runtime windowrule may persist until next reload"
+                ),
+            }
+        }
+
+        exit
     } else if entities_mode {
         let mut app_args = bevy_naadf::AppArgs::default();
         app_args.construction_config.entities_enabled = true;

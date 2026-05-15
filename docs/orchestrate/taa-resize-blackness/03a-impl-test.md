@@ -263,3 +263,53 @@ selector mismatch rather than a resizable-flag issue.
 - Pre / post full-frame luma: 136.48 / 63.13
 - Pass/fail verbatim: `e2e_render: resize-test PASS — pre/post luma ratio above threshold 0.5 after 300 pre-frames + togglefloating + 300 float-settle frames + window resize to 384x288 + 300 post-frames.`
 - Conclusion: resize propagated and bug reproduces
+
+## Three-step resize (800×600 → 1920×1080 → 2000×1000) + camera repose
+- Files touched:
+  - `crates/bevy_naadf/src/lib.rs:318-339` (`WindowConfig::e2e_resize_test`): boot resolution changed from `(E2E_WIDTH, E2E_HEIGHT)` = 256×256 to `(E2E_RESIZE_BOOT_WIDTH, E2E_RESIZE_BOOT_HEIGHT)` = 800×600. Doc comment updated for the three-step sequence rationale.
+  - `crates/bevy_naadf/src/e2e/mod.rs:133-184` (resize-test constants block): rewrote the constants set. New: `E2E_RESIZE_BOOT_WIDTH/HEIGHT = 800/600`, `E2E_RESIZE_A_WIDTH/HEIGHT = 1920/1080`, `E2E_RESIZE_B_WIDTH/HEIGHT = 2000/1000`, `E2E_RESIZE_LAUNCH_SETTLE_FRAMES = 300`, `E2E_RESIZE_WAIT_FRAMES = 300`, `E2E_RESIZE_MIN_LUMA_RATIO = 0.7` (was 0.5), `E2E_RESIZE_INITIAL_PNG/A_PNG/B_PNG`. Removed: `E2E_RESIZE_PRE_FRAMES`, `E2E_RESIZE_FLOAT_SETTLE_FRAMES`, `E2E_RESIZE_POST_FRAMES`, `E2E_RESIZE_WIDTH`, `E2E_RESIZE_HEIGHT`, `E2E_RESIZE_PRE_PNG`, `E2E_RESIZE_POST_PNG`.
+  - `crates/bevy_naadf/src/e2e/gates.rs:131-180` (new `e2e_resize_test_camera_transform()`): added the resize-test pose `Transform::from_xyz(20.0, 12.0, 50.0).looking_at(Vec3::new(58.0, 18.0, 30.0), Vec3::Y)` — low-angle 3/4 view of the back wall area, framing the wall's self-shadowed -x face and box A's cast shadow. Pin used for every resize-test phase.
+  - `crates/bevy_naadf/src/e2e/driver.rs:46-58` (imports): swapped phase-imports to the new constants/symbols.
+  - `crates/bevy_naadf/src/e2e/driver.rs:80-128` (`E2ePhase` enum, resize-test variants): replaced `ResizePre/ResizeShootPre/ResizeDrainPre/ResizeFloatSettle/ResizeDoIt/ResizePost/ResizeShootPost/ResizeDrainPost/ResizeAssert` with `LaunchSettle/ShootInitial/DrainInitial/ResizeA/WaitA/ShootA/DrainA/ResizeB/WaitB/ShootB/DrainB/ResizeAssert` (11 variants + Assert).
+  - `crates/bevy_naadf/src/e2e/driver.rs:140-158` (`ResizeTestState`): pre/post fields → `initial`/`after_resize_a`/`after_resize_b`.
+  - `crates/bevy_naadf/src/e2e/driver.rs:160-235` (new helpers): `pin_resize_test_camera()` (pins the camera at the resize-test pose) and `dispatch_hyprctl_resize(label, w, h)` (hyprctl-resize + before/after `hyprctl clients -j` dumps). De-duplicates the resize/clients-dump logic across `ResizeA` and `ResizeB`.
+  - `crates/bevy_naadf/src/e2e/driver.rs:343` (resize-fast-path): routes Warmup → `LaunchSettle` (was `ResizePre`).
+  - `crates/bevy_naadf/src/e2e/driver.rs:487-660` (resize-test phase arms): rewrote the 11 phases per the new sequence. Each arm pins the camera at `e2e_resize_test_camera_transform()` and forwards counters/transitions deterministically. Camera pinned for **every** tick of the resize-test (no orbit motion).
+  - `crates/bevy_naadf/src/e2e/driver.rs:677-805` (`run_resize_test_assertions`): rewrote to consume three framebuffers, save three PNGs, compute full-frame luma on each, and emit FAIL if either `after_a/initial` or `after_b/initial` ratio < 0.7. Also added `full_frame_luma(&Framebuffer)` helper.
+- Boot dims: **800×600** (was 256×256).
+- Pre-launch windowrule: unchanged at `crates/bevy_naadf/src/bin/e2e_render.rs:121-145` — `hyprctl keyword windowrule "match:class ^(e2e_render)$, float on"`. This is the existing pre-launch float rule from the prior dispatch.
+- Cleanup unset: unchanged at `crates/bevy_naadf/src/bin/e2e_render.rs:155-166` — `hyprctl reload` (discards every runtime keyword set since boot). Per dispatch brief: rule leak acceptable if test panics.
+- togglefloating removed from: no togglefloating dispatch existed in `driver.rs` in this dispatch's starting state (prior dispatch had already removed it in favour of the pre-launch windowrule). The driver doc comment at `crates/bevy_naadf/src/e2e/driver.rs:432-438` already documented its removal.
+- Camera pose: `e2e_resize_test_camera_transform()` at `crates/bevy_naadf/src/e2e/gates.rs:131-180`. Position `(20, 12, 50)` looking at `(58, 18, 30)` — a low (`y=12`) 3/4 view from the -x/+z front quadrant looking toward the back wall above the arch top (`y=18 > y_arch_top=14`). Sun direction from `atmosphere.rs:323-330` is `~(0.514, 0.783, 0.351)` (elevation 0.9 rad, azimuth 0.6 rad), so the back wall's -x face (toward camera) is in self-shadow, box A (x=12..23) casts shadow on the ground between camera and centre, and the lower 60% of the frame is dominated by shadow regions. Smoke confirms: `solid` region luma is 204 on initial (the diffuse geometry IS GI-lit and bright in the chosen framing — consistent with substantial shadow regions in the rest of the frame whose collapse drives full-frame luma down).
+- Phase sequence: LaunchSettle → ShootInitial → DrainInitial → ResizeA → WaitA → ShootA → DrainA → ResizeB → WaitB → ShootB → DrainB → ResizeAssert → Done.
+- Smoke run:
+  - Command: `cargo run --release --bin e2e_render -- --resize-test`
+  - Build: clean, no warnings.
+  - Exit code: **1** (test FAIL — bug reproduces, as expected on `main`).
+  - Initial dims / luma: **800×600 / 199.37**
+  - Resize A dims / luma / ratio vs initial: **1920×1080 / 100.06 / 0.5019** (≈ 49.8% drop — FAIL vs threshold 0.70)
+  - Resize B dims / luma / ratio vs initial: **2000×1000 / 95.08 / 0.4769** (≈ 52.3% drop — FAIL vs threshold 0.70)
+  - hyprctl clients states (floating + size at each transition):
+    - Before A resize: `floating: true`, `size: [800, 600]`
+    - After A resize: `floating: true`, `size: [1920, 1080]`
+    - Before B resize: `floating: true`, `size: [1920, 1080]`
+    - After B resize: `floating: true`, `size: [2000, 1000]`
+  - resizewindowpixel A exit/stdout: `exit 0 / stdout="ok\n"`
+  - resizewindowpixel B exit/stdout: `exit 0 / stdout="ok\n"`
+  - Pass/fail message verbatim:
+    ```
+    e2e_render: resize-test luma — initial 199.37, after_a 100.06 (ratio 0.5019), after_b 95.08 (ratio 0.4769); threshold 0.70
+    e2e_render: FAIL —
+    resize-test: TAA/GI ring drain detected after window resize.
+      initial  (800x600) full-frame luma = 199.37
+      resize_a (1920x1080) full-frame luma = 100.06, ratio = 0.5019 [FAIL]
+      resize_b (2000x1000) full-frame luma = 95.08, ratio = 0.4769 [FAIL]
+      threshold                          = 0.70
+      screenshots saved to: target/e2e-screenshots/resize_initial.png + target/e2e-screenshots/resize_a.png + target/e2e-screenshots/resize_b.png
+      ...
+    ```
+- Conclusion: **bug reproduces on both resizes**. The full-frame luma dropped from 199 to ~100 (≈ 50%) on the first resize and stayed collapsed at ~95 (≈ 52%) on the second resize. The region-by-region report makes the failure mechanism explicit: post-resize the `emissive` region (warm-white block) collapsed from 208 → 2.5 (≈ 99% drop) and the `solid` GI-lit diffuse from 204 → 16.7 (≈ 92% drop), while sky luma stayed roughly stable (167 → 160 → 154). This matches the TAA `taa_samples` + GI `sample_counts` zero-clear footprint exactly: sky is sampled directly from the atmosphere LUT (unaffected by the GI rings); emissive blocks and indirect-bounce diffuse regions are sampled from the rings that get cleared on `pixel_count` change. The bug also persists across the second resize: `after_b` is approximately as collapsed as `after_a`, indicating the 5-second settle is not enough for the rings to refill at the larger resolutions (1920×1080 = ~2.07M px, 2000×1000 = ~2.0M px), OR a fresh resize keeps the rings drained throughout.
+- PNGs saved:
+  - `target/e2e-screenshots/resize_initial.png` (800×600)
+  - `target/e2e-screenshots/resize_a.png` (1920×1080)
+  - `target/e2e-screenshots/resize_b.png` (2000×1000)

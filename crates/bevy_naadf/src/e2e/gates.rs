@@ -128,6 +128,53 @@ pub fn e2e_motion_start_transform() -> Transform {
     Transform::from_xyz(-28.0, 70.0, 96.0).looking_at(E2E_LOOK_TARGET, Vec3::Y)
 }
 
+/// Camera pose for the **TAA-resize-blackness reproduction test**
+/// (`docs/orchestrate/taa-resize-blackness/`).
+///
+/// **Why a different pose from [`e2e_camera_transform`]?** The standard
+/// readback pose `(86, 42, 90)` was tuned for the GI-lit Batch-6 region gate:
+/// the `solid_block_rect` rect (frac 0.42..0.58 × 0.52..0.66) hits the small
+/// shadowed sliver directly below the warm-white emissive block — a tiny
+/// fraction of the frame. The user's directive for this dispatch is
+/// explicit: "the camera is positioned so that it only sees tiny slivers of
+/// shadowed areas". To make the TAA/GI ring-drain bug observable in
+/// full-frame luma (the metric this test now uses), shadow regions must
+/// occupy a *significant* portion of the frame — not a sliver.
+///
+/// **Scene + sun geometry** (`atmosphere.rs:323-330`): the sun is at elevation
+/// 0.9 rad (~51° above horizon) and azimuth 0.6 rad — direction approximately
+/// `(0.514, 0.783, 0.351)`. Sun comes from +x, slightly +z, high above. Shadows
+/// cast toward -x, slightly -z.
+///
+/// **Pose choice — close low-angle view of the back wall + box A.** The back
+/// wall sits at `x=56..60, y=3..22, z=14..49` with an arch carved at
+/// `x=55..61, y=3..14, z=26..37`. With the sun in +x/+y/+z, the back wall's
+/// -x face (toward the scene interior) is in self-shadow. The wall and the
+/// towers in the +x corners also cast shadows on the ground that stretches
+/// across the volume in the -x direction.
+///
+/// Camera at `(20, 12, 50)` looking at `(58, 18, 30)`:
+/// - Low altitude (`y=12`) — ground-plane-grazing 3/4 view.
+/// - From the -x, +z front quadrant of the volume — the camera sees the -x
+///   (self-shadowed) faces of all the geometry to the right of the frame.
+/// - Look target `(58, 18, 30)` lands on the back wall *above* the arch top
+///   (`y=18 > y_arch_top=14`), so the wall fills the right side of the frame
+///   as a large dark shadowed surface — not as a hole the camera can see
+///   through.
+/// - Box A (`x=12..23, y=3..20, z=14..25`) sits between the camera and the
+///   sun; its shadow falls across the ground on the camera-side of the scene
+///   centre — visible as a large dark band in the lower-left of the frame.
+/// - The atmospheric sky band still occupies the top of the frame.
+///
+/// Used **only** by the resize-test phases (gated by `AppArgs.resize_test`);
+/// the standard Batch-6 harness keeps using [`e2e_camera_transform`]. The
+/// pose is pinned for the entire resize-test sequence — no orbit motion, no
+/// per-phase changes — so any luma collapse between the three captures is
+/// attributable to the resize-induced ring drain, not to camera motion.
+pub fn e2e_resize_test_camera_transform() -> Transform {
+    Transform::from_xyz(20.0, 12.0, 50.0).looking_at(Vec3::new(58.0, 18.0, 30.0), Vec3::Y)
+}
+
 /// The highest batch currently implemented — the `ASSERT` step runs this
 /// batch's region gate (older batches' gates are kept as called helpers so an
 /// earlier-gate regression still trips). Phase B Batches 1-6 exist
