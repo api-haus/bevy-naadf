@@ -26,6 +26,7 @@ pub mod driver;
 pub mod framebuffer;
 pub mod gates;
 pub mod readback;
+pub mod vox_e2e;
 
 use bevy::camera::Hdr;
 use bevy::core_pipeline::tonemapping::Tonemapping;

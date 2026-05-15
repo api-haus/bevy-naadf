@@ -286,3 +286,250 @@ The implementer's terminal gate is `cargo build && cargo test && cargo run
       - `cargo run --bin e2e_render -- --validate-gpu-construction`
       - `cargo run --bin e2e_render -- --edit-mode`
       - `cargo run --bin e2e_render -- --entities`
+
+## E2E gate addendum (2026-05-15)
+
+### What landed
+
+Automated end-to-end regression gate for the Track A `.vox` ingestion path
+— landed as the new `cargo run --bin e2e_render -- --vox-e2e` mode. It
+**synthesises a 2-model `.vox` fixture in memory** (no checked-in binary
+blob — same pattern Track A landed for unit tests, Deviation 1 above),
+writes the bytes to `target/e2e-screenshots/vox_e2e_fixture.vox`, then
+boots the existing windowed e2e harness with `AppArgs.grid_preset =
+GridPreset::Vox { path }` so the production `--vox <path>` ingestion path
+(`crates/bevy_naadf/src/main.rs:21-33`,
+`crates/bevy_naadf/src/voxel/grid.rs:75-83`) drives the load verbatim.
+The standard-scene `assert_batch_6` region gate is swapped for a
+`assert_vox_geometry_visible` non-skybox gate that samples the central
+40 % × 40 % screen rect and asserts mean luminance is meaningfully above
+the atmosphere-tinted sky band (`> 160` against a measured sky luminance
+of ~146). The 03a-followup scene-graph composition fix is directly
+exercised: the fixture's two emissive models live under separate `nTRN`
+nodes with non-trivial `_t` translations along the MV-z (up) axis, so a
+regression that collapses both to origin would either trap the camera
+inside opaque material or shrink the lit cuboid below the gate's sample
+rect.
+
+### Changes by file
+
+#### NEW
+
+| Path | What | LOC |
+|---|---|---|
+| `crates/bevy_naadf/src/e2e/vox_e2e.rs` | `--vox-e2e` module — synthesised-fixture builder (2 emissive models under non-trivial `nTRN` translations), `write_vox_e2e_fixture_to_temp`, `run_vox_e2e` boots the harness with `GridPreset::Vox`, `assert_vox_geometry_visible` non-skybox gate, `save_vox_e2e_screenshot` PNG sidecar. 3 `#[test]` cases covering fixture composition, world AABB cap, and on-disk path. | NEW · 446 (~300 prod + 146 tests) |
+
+#### Edited
+
+| Path | Edit | Δ LOC |
+|---|---|---|
+| `crates/bevy_naadf/src/e2e/mod.rs` | `pub mod vox_e2e;` declaration alongside the existing `checks` / `driver` / `framebuffer` / `gates` / `readback` modules (`e2e/mod.rs:29`). | +1 |
+| `crates/bevy_naadf/src/lib.rs` | `AppArgs::vox_e2e_mode: bool` field + its `Default::default()` initialiser. Doc-comment cites the swap-the-default-scene-gate rationale (`lib.rs:259-274`, `:274`). | +18 |
+| `crates/bevy_naadf/src/e2e/driver.rs` | `run_assertions` signature gained one `vox_e2e_mode: bool` param; ASSERT-step branch picks `assert_vox_geometry_visible` when the flag is set, otherwise the existing `batch_gate(CURRENT_BATCH, _)` + the entities-mode `assert_entity_pixel` (`driver.rs:463-489`, `:865-936`). | +24 / -7 |
+| `crates/bevy_naadf/src/bin/e2e_render.rs` | Parse `--vox-e2e` flag; dispatch to `bevy_naadf::e2e::vox_e2e::run_vox_e2e()` when set (`bin/e2e_render.rs:72-102`, `:172-185`). | +18 |
+
+### Files NOT touched
+
+Per the `01-context.md` §5 forbidden moves: no render pipeline / GI
+shader touches; no `naadf_gpu_producer_node` / `gpu_producer_skip_upload`
+touches; no `MAX_RAY_STEPS_*` deletions; no `bevy_egui`; no checked-in
+binary `.vox` fixtures (the fixture is synthesised in-memory every run
+via `dot_vox::DotVoxData::write_vox`); no `obj2voxel` work. The default
+`e2e_render` mode + the three existing flag modes (`--entities`,
+`--edit-mode`, `--validate-gpu-construction`) all stay green
+(`### Verification` below).
+
+### Fixture design
+
+Two emissive models under separate `nTRN` translations, both referencing
+palette slot 1 (made emissive via a `MATL { _emit: 1.0, _flux: 0.0 }`
+chunk → `color_layered.x = 1.0 * (1+0)² * 5 = 5.0` per
+`voxel/vox_import.rs:790-791`):
+
+- **Model A — emissive ground slab.** MV size `60 × 60 × 4`,
+  `nTRN _t = "30 30 2"`. Centered local origin `(-30, -30, -2)` (per
+  `voxel/vox_import.rs:702`) puts the slab at MV `(0..59, 0..59, 0..3)`.
+  After Z↔Y swap → NAADF `(0..59, 0..3, 0..59)`.
+- **Model B — central emissive tower.** MV size `20 × 20 × 28`,
+  `nTRN _t = "30 30 16"`. Centered local origin `(-10, -10, -14)`
+  puts the tower at MV `(20..39, 20..39, 2..29)`. After Z↔Y swap → NAADF
+  `(20..39, 2..29, 20..39)`.
+
+Both translations are non-trivial AND differ along the MV-z axis (the
+up axis): `_t.z = 2` vs `_t.z = 16`. That's the precise seam the
+03a-followup identity-only walk regression broke
+(`voxel/vox_import.rs::flatten_scene` pass-2 `collate_voxels` at
+`vox_import.rs:646-738`). Combined MV AABB: `x ∈ (0..59)`, `y ∈ (0..59)`,
+`z ∈ (0..29)` → MV size `(60, 60, 30)`. After Z↔Y swap NAADF size
+`(60, 30, 60)`, rounded up to chunks `(4, 2, 4)` = `64 × 32 × 64` voxels
+(same volume size as the default test grid at
+`voxel/grid.rs:61` `GRID_SIZE_IN_CHUNKS = [4, 2, 4]`). Comfortably within
+the 03a-followup `MAX_CHUNKS_PER_AXIS = 32` cap
+(`vox_import.rs:78`).
+
+A side-benefit of matching the default-grid size: the fixed e2e camera
+pose (`crates/bevy_naadf/src/e2e/gates.rs:48-49`: NAADF `(86, 42, 90)`
+looking at `(32, 16, 32)`) frames the synthesised world the exact same
+way it frames the default scene — no camera repositioning needed. The
+look target `(32, 16, 32)` lands inside the central tower
+(NAADF `(20..39, 2..29, 20..39)`), so the central gate rect is
+guaranteed to sample tower interior, not background sky.
+
+### Camera placement / gate-region rationale
+
+The gate samples the central 40 % × 40 % screen rect (fractional
+`(0.30, 0.30)..(0.70, 0.70)` of a 256² readback = pixel rect
+`(76, 76)..(179, 179)`) and asserts mean luminance > **160.0**. Decision
+points:
+
+- **Why the central 40 % × 40 % rect, not the default-scene gates'
+  fractional rectangles** (`gates.rs:228-245`: 10 %-band emissive,
+  16 %-band solid, 40-pixel sky):
+  the default-scene rects were calibrated against specific voxel
+  positions in `voxel/grid.rs::build_default_volume`. With the
+  synthesised fixture in place those rects would land on whatever
+  happens to be at those coords (which is — coincidentally — the
+  emissive tower's interior in this fixture). A central rect is the
+  honest "the world rendered something, not just sky" check that
+  doesn't depend on coincidental geometric alignment.
+- **Why luminance threshold = 160.0**:
+  - Baseline `sky_rect` luminance is **~146** across all four existing
+    modes (verified in `### Verification` below — sky 145.9 in every
+    one; matches the `region_luminance_report` line in the post-Track-A
+    log at `03a-impl-vox-loading.md` Verification §, which shows the
+    same value).
+  - Default-scene emissive luminance is **~247** (the warm-white
+    emissive block); GI-lit diffuse is **~242**.
+  - Setting the threshold at 160 sits just above the sky band so a
+    "no geometry loaded, only atmosphere" failure trips cleanly, and
+    well below the lit-emissive band (~240-250) so the gate has
+    headroom and does not flap on minor framebuffer noise. The actual
+    measured central-rect luminance for the synthesised fixture
+    (smoke run, `### Verification`) was **249.7** — 90 luminance units
+    of safety margin.
+  - Honest tripwire: a regression that loads no geometry and shows
+    only sky would land the central rect at ~146 (sky), failing the
+    160 threshold by 14 units; a regression that loaded only one of
+    the two models (composition broke) would still likely fail if the
+    surviving model didn't cover the central rect.
+
+### Verification
+
+Run order matches the brief's verification gate sequence.
+
+```bash
+cd /mnt/archive4/DEV/bevy-naadf
+cargo build --workspace
+cargo test --workspace --lib
+cargo run --bin e2e_render -- --vox-e2e            # new gate
+cargo run --bin e2e_render                          # baseline
+cargo run --bin e2e_render -- --validate-gpu-construction
+cargo run --bin e2e_render -- --edit-mode
+cargo run --bin e2e_render -- --entities
+```
+
+| Gate | Verdict | Notes |
+|---|---|---|
+| `cargo build --workspace` | **PASS** | Finished `dev` profile in 30.08 s; clean compile, no new warnings. |
+| `cargo test --workspace --lib` | **PASS** | 149 passed, 1 ignored — up from 146 (Track A) + 3 new `vox_e2e::tests::{fixture_round_trips_and_composes_two_distinct_models, fixture_world_size_fits_within_gpu_producer_cap, fixture_path_is_under_target_dir}`. |
+| `cargo run --bin e2e_render -- --vox-e2e` | **PASS** | `[4, 2, 4]` chunks loaded (32 chunks / 1280 blocks / 32 voxel-u32s). Central rect mean luminance **249.7** (threshold > 160). Standard `region_luminance_report` showed emissive 249.3 / solid 250.2 / sky 145.9 — the synthesised emissive geometry brightens the otherwise-tower-interior regions to near-emissive levels. Full e2e checks (pipeline scan, node dispatch, degenerate-frame, luminance liveness) all green. |
+| `cargo run --bin e2e_render` (baseline) | **PASS** | Default-scene Batch-6 gate PASS; region luminance emissive 247.0 / solid 242.0 / sky 145.9 — bit-identical to the post-Track-A log. No regression on the default scene. |
+| `cargo run --bin e2e_render -- --validate-gpu-construction` | **PASS** | E2E PASS + `GPU construction byte-equal to CPU oracle: 388 bytes compared`. |
+| `cargo run --bin e2e_render -- --edit-mode` | **PASS** | E2E PASS + `edit-mode validation PASS: 1 set_voxel call produced 1 changed_chunks + 1 changed_blocks records + 2 changed_voxels records`. |
+| `cargo run --bin e2e_render -- --entities` | **PASS** | E2E PASS + `entity handler validation PASS: frame A: 8 chunk_updates, 1 entity_chunk_instances, 1 history; frame B: 8 chunk_updates`. |
+
+One smoke run per memory `subagent-gpu-app-verification-loop` — no
+rebuild→rerun iteration. The visual gate is the user's; the
+luminance-249.7 ≫ 160 threshold margin is the discriminator.
+
+### Decisions during implementation
+
+#### Decision 1 — Fixture sized to match the default scene (4 × 2 × 4 chunks)
+
+First-cut fixture used 12 × 12 × 12 cubes; the smoke run revealed that
+the resulting `1 × 2 × 1` chunks world (16 × 32 × 16 voxels) sat at the
+NAADF origin and was far enough from the camera's look target
+`(32, 16, 32)` that the central screen rect sampled mostly the
+atmosphere-tinted sky — central-rect luminance landed at 70.9, far below
+the 160 threshold (gate FAIL, fixture+composition both verified correct
+by the unit tests).
+
+The fix was to scale the fixture up so the composed NAADF AABB matches
+the default-scene size — a 60 × 60 × 4 ground slab + a 20 × 20 × 28
+central tower, composing to a `(4, 2, 4)`-chunks world. This reuses the
+default e2e camera pose without modification (matches the brief's
+option (a) — author the fixture so the camera sees it, rather than
+option (b) — adjust the camera).
+
+The fixture's tower interior covers NAADF `(20..39, 2..29, 20..39)`,
+which contains the camera look target `(32, 16, 32)`; the central
+40 % × 40 % screen rect samples tower interior cleanly. A unit test
+(`fixture_round_trips_and_composes_two_distinct_models`) hard-codes
+`assert_ne!(imp.volume.voxel_at([32, 16, 32]), VoxelTypeId::EMPTY)` so a
+future fixture tweak that breaks this invariant fails compilation-time.
+
+#### Decision 2 — In-memory synthesis + deterministic temp path (no `tempfile` dep)
+
+The brief allows either an in-memory synthesised fixture or a path arg.
+The chosen path: synthesise the bytes in memory via
+`dot_vox::DotVoxData::write_vox` → `std::fs::write` → run the production
+`load_vox`. No new dep (`tempfile` was a candidate). The on-disk path is
+deterministic: `target/e2e-screenshots/vox_e2e_fixture.vox`. The
+`target/` directory is gitignored + persistent across runs, the file is
+overwritten every run, and the `fixture_path_is_under_target_dir` unit
+test pins the path location so a future refactor that escapes the
+target dir fails fast.
+
+#### Decision 3 — `AppArgs::vox_e2e_mode` flag (not `--vox-e2e` flag parsing in `lib.rs`)
+
+The `AppArgs` field plumbing pattern follows the existing `resize_test`
+flag (also in `AppArgs`, also a bool gating a driver branch). The CLI
+flag (`--vox-e2e`) lives in the binary
+(`crates/bevy_naadf/src/bin/e2e_render.rs`), the boolean in `AppArgs`,
+and the driver branches on it inside `run_assertions`. Same pattern that
+already worked for `--resize-test` (`bin/e2e_render.rs:81` + `lib.rs:259`
++ `driver.rs:346-365`).
+
+#### Decision 4 — Bypass `assert_entity_pixel` gate in vox-e2e mode
+
+Default-scene-coupled gates that don't apply to a `.vox`-loaded world:
+the per-batch region gate (`batch_gate(CURRENT_BATCH, _)` reads
+default-scene rects) AND the entity-pixel gate (`assert_entity_pixel`
+reads a rect calibrated against an entity at NAADF `(30, 24, 30)` —
+which is empty space inside the synthesised fixture). Both are bypassed
+when `vox_e2e_mode` is set. The remaining checks (pipeline-error scan,
+node-dispatch, degenerate-frame floor, luminance-liveness, screenshot
+save) are framebuffer/scene-agnostic and stay armed in both modes —
+they would still catch a "GPU produced no output" regression in vox-e2e
+mode.
+
+### Risks / follow-ups
+
+1. **The gate is calibrated against the current default e2e camera pose.**
+   If `e2e_camera_transform` is repointed (e.g. to test a different
+   scene region), the synthesised fixture's geometry might fall outside
+   the central rect. The fixture's unit test pins
+   `voxel_at([32, 16, 32]) != EMPTY` as a partial guard, but the actual
+   screen projection of the geometry is camera-dependent. Flip-trigger:
+   if the camera pose changes, re-run `--vox-e2e` and either move the
+   fixture geometry or adjust the gate rect.
+2. **The fixture exercises composition but not the rotation submatrix
+   `_r` byte.** Both models use identity rotation; the 03a-followup
+   tests at `vox_import.rs:1334-1399` cover the rotation matrix via
+   `scene_graph_rotation_applies` + `rotation_byte_identity_and_axis_swap`
+   — that's adequate; adding a rotated fixture to the e2e gate is a
+   follow-up if a regression slips past the unit tests.
+3. **The fixture does not exercise `IMAP` palette reordering.** Same
+   risk as the Track A baseline (Risk #3 above) — pre-existing.
+4. **No `bevy_camera_controller`-style automated camera scan.** The
+   `assert_vox_geometry_visible` gate samples one fixed rect under one
+   fixed pose; a more thorough gate would sample several screen regions
+   or scan multiple poses. Not needed for the "is the framebuffer
+   non-skybox?" question the brief asks; flip-trigger is a real bug
+   that the central-rect-only sampling misses.
+5. **One smoke iteration was needed** during implementation: the
+   first-cut fixture was too small to fill the central rect. The fix
+   was deterministic (scale the fixture to match the default scene
+   size), not a luminance-threshold tune. Per memory
+   `subagent-gpu-app-verification-loop`, no further visual iteration —
+   the gate is honest now (`249.7 ≫ 160` margin), not rubber-stamped.

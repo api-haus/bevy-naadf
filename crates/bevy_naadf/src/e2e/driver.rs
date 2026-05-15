@@ -467,8 +467,21 @@ pub fn e2e_driver(
             // entity-mode-specific).
             let entities_mode =
                 app_args.as_deref().is_some_and(|a| a.spawn_test_entity);
-            let result =
-                run_assertions(screenshot.as_mut(), &diagnostics, &pipeline_scan, entities_mode);
+            // vox-e2e mode — swap the default-scene `assert_batch_6` region
+            // gate for the `assert_vox_geometry_visible` non-skybox gate.
+            // The default-scene gate rects (`solid_block_rect`,
+            // `emissive_rect`) sample voxels in `voxel/grid.rs`'s hardcoded
+            // test grid and don't apply when a `.vox` file is loaded
+            // (`crate::e2e::vox_e2e`).
+            let vox_e2e_mode =
+                app_args.as_deref().is_some_and(|a| a.vox_e2e_mode);
+            let result = run_assertions(
+                screenshot.as_mut(),
+                &diagnostics,
+                &pipeline_scan,
+                entities_mode,
+                vox_e2e_mode,
+            );
             match &result {
                 Ok(()) => {
                     println!(
@@ -867,6 +880,7 @@ fn run_assertions(
     diagnostics: &DiagnosticsStore,
     pipeline_scan: &PipelineScanResult,
     entities_mode: bool,
+    vox_e2e_mode: bool,
 ) -> Result<(), String> {
     let mut failures: Vec<String> = Vec::new();
 
@@ -899,19 +913,36 @@ fn run_assertions(
                 // (pass or fail) so a moving-camera decay is visible as a
                 // trend even when the gate still passes by a margin.
                 println!("e2e_render: {}", super::gates::region_luminance_report(&fb));
-                // (4) Per-batch region gate.
+                // (4) Per-batch region gate — OR the vox-e2e geometry gate
+                // when the `.vox` ingestion gate mode is requested. The two
+                // are mutually exclusive: vox-e2e replaces the default test
+                // grid, so the default-scene gate rect calibrations don't
+                // apply, and vice versa.
                 let state = GateState {
                     fb: &fb,
                     fb_next: None,
                 };
-                if let Err(msg) = batch_gate(CURRENT_BATCH, &state) {
-                    failures.push(format!("region gate:\n  {msg}"));
-                }
-                // (4b) Phase-C followup #5 — entity-pixel gate. Fires only
-                // in `--entities` mode (where the fixture entity is spawned).
-                if entities_mode {
-                    if let Err(msg) = super::gates::assert_entity_pixel(&state) {
-                        failures.push(format!("entity_pixel gate:\n  {msg}"));
+                if vox_e2e_mode {
+                    // Persist a dedicated vox-e2e PNG alongside the
+                    // standard `e2e_latest.png` slot so the user has a
+                    // distinct artifact to inspect for this mode's runs.
+                    super::vox_e2e::save_vox_e2e_screenshot(&fb);
+                    if let Err(msg) =
+                        super::vox_e2e::assert_vox_geometry_visible(&fb)
+                    {
+                        failures.push(format!("vox_e2e geometry gate:\n  {msg}"));
+                    }
+                } else {
+                    if let Err(msg) = batch_gate(CURRENT_BATCH, &state) {
+                        failures.push(format!("region gate:\n  {msg}"));
+                    }
+                    // (4b) Phase-C followup #5 — entity-pixel gate. Fires
+                    // only in `--entities` mode (where the fixture entity
+                    // is spawned). Vox-e2e mode never spawns the entity.
+                    if entities_mode {
+                        if let Err(msg) = super::gates::assert_entity_pixel(&state) {
+                            failures.push(format!("entity_pixel gate:\n  {msg}"));
+                        }
                     }
                 }
             }

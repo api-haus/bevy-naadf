@@ -15,6 +15,7 @@ per `12-alignment-gap.md` rows 17–21).
 | `02b-design-editor.md` | Track B design — paint/cube/sphere + Bevy-UI. | **complete** (delegate-architect, 2026-05-15) |
 | `03a-impl-vox-loading.md` | Track A implementation log. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
 | `03a-followup-empty-scene-diagnosis.md` | Track A follow-up — diagnose + fix empty-scene + camera-dark on real `.vox` file; lifted Decision-6 identity-only walk. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
+| `crates/bevy_naadf/src/e2e/vox_e2e.rs` | Track A E2E gate addendum — synthesised-fixture `--vox-e2e` mode + `assert_vox_geometry_visible` non-skybox gate. Logged in `03a-impl-vox-loading.md` `## E2E gate addendum`. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
 | `03b-impl-editor.md` | Track B implementation log. | pending |
 | `04a-review-vox-loading.md` | Track A fresh-eyes review brief + verdict. | pending |
 | `04b-review-editor.md` | Track B fresh-eyes review brief + verdict. | pending |
@@ -43,7 +44,7 @@ per `12-alignment-gap.md` rows 17–21).
 - [x] **Step 8a** — checkpoint + dispatch `impl-vox`
 - [x] **Step 7b** — synthesis after `impl-vox`, hard gate
 - [x] **Step 8b-followup** — checkpoint + dispatch `diagnose-empty-scene` (user-directed; scene-graph composition fix landed)
-- [ ] **Step 8b-e2e-test** — checkpoint + dispatch `impl-vox-e2e-test` (user-directed; automated .vox-render gate) (← we are here)
+- [x] **Step 8b-e2e-test** — checkpoint + dispatch `impl-vox-e2e-test` (user-directed; automated .vox-render gate). `--vox-e2e` mode + `assert_vox_geometry_visible` non-skybox gate landed; addendum logged in `03a-impl-vox-loading.md`.
 - [ ] Step 8c — checkpoint + dispatch `review-vox`
 - [ ] Step 7c — synthesis after `review-vox`, hard gate
 - [ ] Step 8c — checkpoint + dispatch `impl-editor`

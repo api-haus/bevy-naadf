@@ -257,6 +257,19 @@ pub struct AppArgs {
     /// the larger viewports → GI bounce disappears → ratio collapses to
     /// ~0.5. See [`crate::e2e::driver`].
     pub resize_test: bool,
+    /// When `true`, the e2e driver swaps the default `assert_batch_6`
+    /// region gates for the `--vox-e2e` "non-skybox" assertion. The
+    /// default-scene gate rectangles (`solid_block_rect`, `emissive_rect`,
+    /// etc.) are tuned for the hard-coded test grid's content layout, so
+    /// they don't apply when [`GridPreset::Vox`] loaded a different scene.
+    ///
+    /// Permanent regression coverage for the `.vox` ingestion path landed
+    /// in Track A (`docs/orchestrate/feature-completeness/03a-impl-vox-loading.md`)
+    /// — the brief explicitly required an automated assert that the
+    /// framebuffer captures something other than skybox after loading a
+    /// `.vox` file through the production `--vox` path. See
+    /// [`crate::e2e::vox_e2e`].
+    pub vox_e2e_mode: bool,
 }
 
 impl Default for AppArgs {
@@ -269,6 +282,7 @@ impl Default for AppArgs {
             construction_config: render::construction::ConstructionConfig::default(),
             spawn_test_entity: false,
             resize_test: false,
+            vox_e2e_mode: false,
         }
     }
 }

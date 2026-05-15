@@ -74,11 +74,15 @@ fn main() -> ExitCode {
     // `--entities` (W4) + `--edit-mode` (W2) + `--resize-test`
     // (resize-blackness reproduction — see
     // `docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
-    // `## GI-bounce-on-resize fix (2026-05-16)`), default off.
+    // `## GI-bounce-on-resize fix (2026-05-16)`) + `--vox-e2e`
+    // (synthesised-.vox regression gate — see
+    // `docs/orchestrate/feature-completeness/03a-impl-vox-loading.md` —
+    // `## E2E gate addendum`), default off.
     let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
     let entities_mode = args.iter().any(|a| a == "--entities");
     let edit_mode = args.iter().any(|a| a == "--edit-mode");
     let resize_test = args.iter().any(|a| a == "--resize-test");
+    let vox_e2e_mode = args.iter().any(|a| a == "--vox-e2e");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -169,6 +173,18 @@ fn main() -> ExitCode {
         }
 
         exit
+    } else if vox_e2e_mode {
+        // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
+        // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then
+        // boot the e2e harness with `GridPreset::Vox { path: ... }` so
+        // the production `--vox <path>` load path drives the test. The
+        // driver swaps the default-scene region gate for the
+        // `assert_vox_geometry_visible` non-skybox gate (the synthesised
+        // fixture replaces the default voxel grid; the default-scene
+        // gate rects don't apply). See
+        // `docs/orchestrate/feature-completeness/03a-impl-vox-loading.md`
+        // `## E2E gate addendum`.
+        bevy_naadf::e2e::vox_e2e::run_vox_e2e()
     } else if entities_mode {
         let mut app_args = bevy_naadf::AppArgs::default();
         app_args.construction_config.entities_enabled = true;
