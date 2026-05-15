@@ -15,6 +15,12 @@
 
 pub mod atmosphere;
 pub mod color_compression;
+// Phase C (`15-design-c.md` §1.1) — the construction sub-module. W0 lands the
+// empty seam (`ConstructionGpu` / `ConstructionBindGroups` shells +
+// `ConstructionPipelines` empty registry + the prepare + startup placeholders
+// + `ConstructionPlugin` wiring); W1..W5 each extend it with their own
+// pipelines, buffers and bind groups.
+pub mod construction;
 pub mod extract;
 pub mod gi;
 pub mod gpu_types;
@@ -220,6 +226,22 @@ impl Plugin for NaadfRenderPlugin {
             // (the refine buffers are correct-but-empty pre-B6), but the
             // spatial pass's sun sample is independent — direct-sun bounce
             // light on diffuse surfaces lands at end-of-B5.
+            // Phase-C construction nodes — TODO, NOT inserted by W0
+            // (`15-design-c.md` §3). The three construction nodes that
+            // belong here belong to W2 / W3 / W4 — each one lands in its own
+            // workstream merge so the integration step touches `.chain()`
+            // once per workstream rather than all at once:
+            //   * `naadf_bounds_compute_node` — W3 (regime-2, background
+            //     AADF queue, 5 prepare+indirect-compute rounds per frame).
+            //   * `naadf_world_change_node`   — W2 (regime-3, gated on
+            //     `ConstructionEvents::has_pending_changes()`).
+            //   * `naadf_entity_update_node`  — W4 (regime-3, gated on
+            //     `ConstructionConfig.entities_enabled`).
+            // Insertion order: the three live **before** `naadf_atmosphere_node`
+            // (the first existing node) so atmosphere / first-hit / GI see
+            // the up-to-date chunk state. W0 leaves this comment as the load-
+            // bearing handoff to W2/W3/W4 — see `15-design-c.md §3` for the
+            // diagram.
             .add_systems(
                 Core3d,
                 (

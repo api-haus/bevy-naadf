@@ -145,7 +145,19 @@ pub fn prepare_world_gpu(
 
     let size = extracted.size_in_chunks.max(UVec3::ONE);
 
-    // --- chunk layer: a CPU-built, upload-only R32Uint 3D texture -----------
+    // --- chunk layer: an R32Uint 3D texture, CPU-built today + GPU-writable
+    //     for Phase C ---------------------------------------------------------
+    // Phase A built the chunks texture as a CPU-built, upload-only resource
+    // (TEXTURE_BINDING | COPY_DST). Phase C (`15-design-c.md` §1.4) makes
+    // construction the GPU-side producer: `chunkCalc.fx` / `worldChange.fx`
+    // (W1, W2) write the chunks texture via
+    // `texture_storage_3d<r32uint, read_write>`, and `boundsCalc.fx` (W3)
+    // mutates the 5-bit AADFs the chunks texture stores. STORAGE_BINDING is
+    // the **one production-side seam touch** every later workstream depends
+    // on — added by W0 so W1..W4 can write to the chunks texture from
+    // compute shaders without further `prepare.rs` edits. The Phase-A render
+    // passes are read-only on `chunks` and unaffected by the widened usage
+    // mask; the W0 build produces the byte-identical screenshot of pre-W0.
     let chunks = render_device.create_texture(&TextureDescriptor {
         label: Some("naadf_chunks"),
         size: Extent3d {
@@ -157,7 +169,9 @@ pub fn prepare_world_gpu(
         sample_count: 1,
         dimension: TextureDimension::D3,
         format: TextureFormat::R32Uint,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        usage: TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::STORAGE_BINDING,
         view_formats: &[],
     });
     // Pad the chunk buffer to the full texture extent (the CPU mirror is

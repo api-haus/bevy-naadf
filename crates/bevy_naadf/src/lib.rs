@@ -126,6 +126,17 @@ pub struct AppArgs {
     pub taa_ring_depth: u32,
     /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8).
     pub gi: GiSettings,
+    /// The Phase-C GPU-construction configuration (`15-design-c.md` §1.8,
+    /// §2.1 W0 row). Same plumbing pattern as `taa_ring_depth`: this main-
+    /// world field is the source of truth; `render::construction::
+    /// ConstructionPlugin::build` mirrors it into the render sub-app as the
+    /// `ConstructionConfig` `Resource` (via `From<&AppArgs>`).
+    ///
+    /// W0 default: GPU construction off / CPU fallback on. W1 flips
+    /// `gpu_construction_enabled` after the bit-exact CPU/GPU oracle is
+    /// green; W4 may flip `entities_enabled`. The CLI flags that mutate
+    /// individual fields land per-workstream — W0 only exposes the struct.
+    pub construction_config: render::construction::ConstructionConfig,
 }
 
 impl Default for AppArgs {
@@ -135,6 +146,7 @@ impl Default for AppArgs {
             taa: true,
             taa_ring_depth: DEFAULT_TAA_RING_DEPTH,
             gi: GiSettings::default(),
+            construction_config: render::construction::ConstructionConfig::default(),
         }
     }
 }
@@ -321,6 +333,17 @@ pub fn build_app(cfg: AppConfig) -> App {
             RenderDiagnosticsPlugin,
             world::WorldPlugin,
             render::NaadfRenderPlugin,
+            // Phase-C construction seam (`15-design-c.md` §3, §1.1). W0 lands
+            // the empty `ConstructionPlugin` (empty pipeline registry, empty
+            // `ConstructionGpu` / `ConstructionBindGroups` resources, the
+            // empty `prepare_construction` + `run_gpu_construction_startup`
+            // placeholders). W1..W5 each merge in their workstream's
+            // pipelines / buffers / systems behind this plugin — without
+            // re-editing `build_app`. Inserted **after** `NaadfRenderPlugin`
+            // so the render sub-app exists and our `init_gpu_resource` call
+            // succeeds (same ordering as `NaadfRenderPlugin`'s
+            // `init_gpu_resource::<NaadfPipelines>()`).
+            render::construction::ConstructionPlugin,
             // InstaMAT baked-material loader — registers `MaterialRonLoader` so
             // `materials/<name>/material.ron` resolves to a `StandardMaterial`.
             // Infrastructure only: nothing in the scene consumes a baked

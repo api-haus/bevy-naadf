@@ -505,6 +505,70 @@ pub const GI_FLAG_IS_VARYING_RADIUS: u32 = 1 << 3;
 /// (C# `isAtmosphereInteraction`).
 pub const GI_FLAG_IS_ATMOSPHERE_INTERACTION: u32 = 1 << 4;
 
+// === Phase C — `GpuConstructionParams` (`15-design-c.md` §1.8, §5.1) ========
+
+/// Phase-C construction-pass uniform — the per-frame scalar parameters every
+/// construction pass needs (`15-design-c.md` §1.8 / §5.1).
+///
+/// Collapses NAADF's per-handler `Effect.Parameters` scalars
+/// (`WorldBoundHandler.cs:97-111`, `ChangeHandler.cs:188-200`,
+/// `BlockHashingHandler` size, the segment offsets) into a single uniform
+/// the construction WGSL shaders bind once per pass.
+///
+/// **Layout discipline (`18-taa-fidelity.md` fix #1, `15-design-c.md` §1.5).**
+/// Every 3-tuple is **explicitly padded to 16 bytes at the Rust level** so the
+/// WGSL counterpart can declare `vec3<u32>` + scalar without triggering the
+/// `vec3`-then-scalar / `vec4` layout hazard. Total: 80 B = 5 × 16-byte rows.
+/// `offset_of!` guards below pin the row boundaries; a runtime mirror lives in
+/// `tests::construction_params_layout`.
+///
+/// WGSL counterpart lives in W1's `chunk_calc.wgsl` shader-prelude
+/// (`construction_common.wgsl`); W0 lands the Rust struct + guards so W1's
+/// WGSL has a stable Rust mirror to point at.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GpuConstructionParams {
+    // Row 0 (offset 0): sizeInChunks (vec3) + pad to 16.
+    /// `chunkSizeX/Y/Z` — world size in chunks. C# `WorldData.sizeInChunks`.
+    pub size_in_chunks: [u32; 3],
+    /// std140 padding so the next row starts on a 16-byte boundary.
+    pub _pad0: u32,
+    // Row 1 (offset 16): groupSizeInGroups (vec3) + pad to 16.
+    /// `groupSizeInGroups.x/y/z` — world size in 4³-chunk groups
+    /// (`sizeInChunks / 4`). C# `WorldBoundHandler.groupCountX/Y/Z`.
+    pub group_size_in_groups: [u32; 3],
+    /// std140 padding to the next 16-byte row.
+    pub _pad1: u32,
+    // Row 2 (offset 32): 4 × u32.
+    /// `boundGroupQueueMaxSize` == `boundGroupCount = chunkCount / 64`. C#
+    /// `WorldBoundHandler.cs:44` queue-size derivation.
+    pub bound_group_queue_max_size: u32,
+    /// Current power-of-two hash-map capacity (grows via `mapCopy.fx`). C#
+    /// `BlockHashingHandler.hashMapSize`.
+    pub hash_map_size: u32,
+    /// `segmentSizeInChunks` — NAADF default 4 (`WorldData.cs:73`).
+    pub segment_size_in_chunks: u32,
+    /// `maxGroupBoundDispatch` — the regime-2 throttle. NAADF default `512 * 64`
+    /// (`WorldBoundHandler.cs:25`). Mirrored from `ConstructionConfig`.
+    pub max_group_bound_dispatch: u32,
+    // Row 3 (offset 48): chunkOffset (vec3) + pad to 16.
+    /// `chunkOffsetX/Y/Z` — per-segment chunk offset for the regime-1 dispatch
+    /// loop. C# `WorldData.cs:138-151`.
+    pub chunk_offset: [u32; 3],
+    /// std140 padding to the next 16-byte row.
+    pub _pad2: u32,
+    // Row 4 (offset 64): 4 × u32.
+    /// Monotonic frame counter — shared with `GpuRenderParams.frame_count` /
+    /// `GpuTaaParams.frame_count`; populated identically.
+    pub frame_index: u32,
+    /// Per-frame edit-event counts (regime-3 — `worldChange.fx`). Zero on
+    /// frames with no pending edits (the `naadf_world_change_node` is gated
+    /// off when all three are zero — `15-design-c.md` §1.2 regime 3).
+    pub changed_chunk_count: u32,
+    pub changed_block_count: u32,
+    pub changed_voxel_count: u32,
+}
+
 /// IEEE-754 half-float bit pattern of `x` (the C# `f32tof16`).
 ///
 /// A straightforward round-to-nearest-even f32 → f16 conversion, sufficient
@@ -574,6 +638,22 @@ const _: () = assert!(std::mem::size_of::<GpuGiParams>() == 288);
 // the WGSL `vec2<f32>` matches byte-for-byte (`18-taa-fidelity.md` fix #1).
 const _: () = assert!(std::mem::offset_of!(GpuGiParams, taa_jitter) == 280);
 const _: () = assert!(std::mem::offset_of!(GpuGiParams, taa_jitter) % 8 == 0);
+// Phase C — `GpuConstructionParams` layout pins (`15-design-c.md` §5.1).
+// 80 bytes = 5 × 16-byte rows; every `vec3` 3-tuple explicitly padded to 16
+// so the WGSL `vec3<u32>`-then-scalar hazard cannot recur on the construction
+// uniform. The runtime mirror lives in `tests::construction_params_layout`.
+const _: () = assert!(std::mem::size_of::<GpuConstructionParams>() == 80);
+const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, size_in_chunks) == 0);
+const _: () =
+    assert!(std::mem::offset_of!(GpuConstructionParams, group_size_in_groups) == 16);
+const _: () =
+    assert!(std::mem::offset_of!(GpuConstructionParams, bound_group_queue_max_size) == 32);
+const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, chunk_offset) == 48);
+const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, frame_index) == 64);
+const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, size_in_chunks) % 16 == 0);
+const _: () =
+    assert!(std::mem::offset_of!(GpuConstructionParams, group_size_in_groups) % 16 == 0);
+const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, chunk_offset) % 16 == 0);
 
 // Keep the material enums referenced so a future material-format change can't
 // silently drift this file out of step (also documents the intent).
@@ -612,5 +692,68 @@ mod tests {
         // color_base.r = 1.0 → 0x3C00 low half of data[1]; .g = 0.0 → 0 high.
         assert_eq!(g.data[1] & 0xFFFF, 0x3C00);
         assert_eq!(g.data[1] >> 16, 0x0000);
+    }
+
+    /// Phase-C — runtime mirror of the compile-time `GpuConstructionParams`
+    /// layout guards (`15-design-c.md` §1.5, §5.1; `18-taa-fidelity.md` fix #1
+    /// pattern). The struct is 80 bytes = 5 × 16-byte rows; every `vec3` is
+    /// explicitly padded to 16 so the WGSL `vec3<u32>`-then-scalar hazard
+    /// cannot recur. The `const _: () = assert!(...)` guards above already
+    /// catch this at compile time; this `#[test]` exists so a test-only
+    /// failure mode (a refactor that adds `#[cfg(feature = ...)]` around a
+    /// guard, future tooling that strips `const _ = assert!(…)`, an editor
+    /// auto-fix that "fixes" the casts) still has a runtime line to fire on.
+    #[test]
+    fn construction_params_layout() {
+        assert_eq!(std::mem::size_of::<GpuConstructionParams>(), 80);
+        assert_eq!(std::mem::offset_of!(GpuConstructionParams, size_in_chunks), 0);
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, group_size_in_groups),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, bound_group_queue_max_size),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, hash_map_size),
+            36
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, segment_size_in_chunks),
+            40
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, max_group_bound_dispatch),
+            44
+        );
+        assert_eq!(std::mem::offset_of!(GpuConstructionParams, chunk_offset), 48);
+        assert_eq!(std::mem::offset_of!(GpuConstructionParams, frame_index), 64);
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, changed_chunk_count),
+            68
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, changed_block_count),
+            72
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, changed_voxel_count),
+            76
+        );
+        // Every `vec3` 3-tuple lands on a 16-byte boundary — the WGSL
+        // `vec3<u32>`-then-scalar hazard guard.
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, size_in_chunks) % 16,
+            0
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, group_size_in_groups) % 16,
+            0
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, chunk_offset) % 16,
+            0
+        );
     }
 }
