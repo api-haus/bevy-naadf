@@ -107,6 +107,13 @@ agent reads it first.
 > (~501 MB @1440p) instead of 32-sample (~973 MB) — a ~470 MB saving, pipeline fully intact,
 > modest quality cost. **The `taaSamples` ring is 16-deep, not 32-deep.**
 
+> **SUPERSEDED 2026-05-15 (user directive).** During the TAA-fidelity track the user
+> overrode this: **the TAA sample-ring depth must be configurable, with default 32.** The
+> 16-deep value was a contributing (secondary) cause of the port's "barely resolves" noise
+> (`18-taa-fidelity.md` cause #3); it confirmed-does-NOT affect the adaptive 0.25-spp rate.
+> The VRAM lever (16 / 24 / 32) stays available via the config knob, but **32 is now the
+> default**. `design-exploration-qa.md` §6's "16-deep" conclusion is superseded accordingly.
+
 - The **camera-history ring stays at NAADF's depth** (128-deep ring of camera matrices /
   positions / jitters — `02-research.md` divergence #5). The §6 lever is specifically the
   *sample* ring (32→16); the camera-matrix ring is tiny in VRAM — leave it as NAADF has it.

@@ -64,11 +64,23 @@ code-mutating fix dispatch (in a worktree branched from local `main`) brings TAA
 at least the C# level and fixes black-on-resize. **Bar = the C# version, not a perfect
 renderer.**
 
-Prime suspect to evaluate explicitly: the **16-deep vs. the paper's 32-deep `taaSamples`
-ring** (`14-paper-gap.md` TAA row + `design-exploration-qa.md` §6 binding VRAM decision) —
-half the history depth is a direct candidate for "barely resolves." Verification for the fix:
-`cargo build` + `cargo test` (currently 46) + `cargo run --bin e2e_render` (cap ~10) + Read
-`target/e2e-screenshots/e2e_latest.png`. Deliverable group file: `18-taa-fidelity.md`.
+**Diagnosis COMPLETE** → `18-taa-fidelity.md` (5 ranked causes; pipeline structurally complete,
+no missing passes). Top causes: #1 GI rays unjittered (`GpuGiParams` has no jitter field) — the
+dominant "barely resolves" mechanism; #2 `exposure`/`tone_mapping_fac` swapped vs C#; #3 16-deep
+ring (secondary). Black-on-resize root cause pinned: `extract_camera`'s `.unwrap_or(UVec2::new(1,1))`.
+
+**Fix dispatched** (one `general-purpose` agent, worktree `.claude/worktrees/taa-fidelity`,
+branch `fix/taa-fidelity`) with two user-directed scope changes (2026-05-15):
+- **#2 revised** — do NOT just swap the tonemap constants; **switch to Bevy's built-in
+  tonemapping**: output raw linear HDR from the final/raymarching pass, drop the port's custom
+  Reinhard tonemap. A deliberate user-directed deviation from the faithful-port principle.
+- **#3 revised** — not deferred; **make the TAA ring depth configurable, default 32**
+  (supersedes the binding 16-deep decision in `design-exploration-qa.md` §6 / `01-context.md`
+  §2c).
+Plus #1 (jitter GI rays), #4 (black-on-resize), audit #5. Verification: `cargo build` +
+`cargo test` (currently 46) + `cargo run --bin e2e_render` (cap ~10) + Read
+`target/e2e-screenshots/e2e_latest.png` — note the Bevy-tonemapping switch will change the
+output image and likely needs honest e2e-gate recalibration. Deliverable: `18-taa-fidelity.md`.
 
 ## Then — Phase C proper
 
