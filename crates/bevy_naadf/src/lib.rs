@@ -492,17 +492,23 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     if cfg.add_hud {
         app.add_systems(Startup, hud::setup_hud)
             .add_systems(Update, hud::update_hud);
-        // Quality panel (`21-design-quality-panel.md`) — gated on the same
-        // `add_hud` flag as the HUD itself. The e2e harness (`AppConfig::e2e`)
-        // sets `add_hud = false`, so the panel never spawns in the bounded
-        // harness — luminance gates are unaffected.
+        // Quality panel (`21-design-quality-panel.md` + mouse extension
+        // `25-design-panel-mouse.md`) — gated on the same `add_hud` flag as
+        // the HUD itself. The e2e harness (`AppConfig::e2e`) sets
+        // `add_hud = false`, so the panel never spawns in the bounded harness
+        // — luminance gates are unaffected. The mouse system slots in
+        // between `adjust_panel` and `update_panel_text` so per-frame mouse
+        // mutations are reflected in the same frame's text refresh
+        // (`25-design-panel-mouse.md` §6.1).
         app.init_resource::<panel::PanelState>()
+            .init_resource::<panel::PanelDrag>()
             .add_systems(Startup, panel::setup_panel)
             .add_systems(
                 Update,
                 (
                     panel::toggle_panel,
                     panel::adjust_panel,
+                    panel::mouse_interact_panel,
                     panel::update_panel_text,
                 )
                     .chain(),
