@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::aadf::bounds::{compute_aadf, CellBox};
+use crate::aadf::bounds::compute_aadf_layer;
 use crate::aadf::cell::{
     pack_voxels, BlockCell, BlockPtr, ChunkCell, VoxelCell, VoxelPtr,
 };
@@ -213,36 +213,23 @@ pub fn construct(volume: &DenseVolume) -> ConstructedWorld {
         }
     }
 
-    // Chunk AADFs + encode the chunk buffer.
-    let mut chunks_buf = vec![0u32; cx * cy * cz];
-    let chunk_is_empty = |c: [i32; 3]| -> bool {
+    // Chunk AADFs — one O(3·d·n) synchronised pass over the whole chunk layer
+    // (`15-design-c.md` §2.1 W6 / paper §3.3). Replaces the previous per-cell
+    // `compute_aadf` loop; emits identical `Aadf6` values.
+    let chunk_is_empty_at = |c: [i32; 3]| -> bool {
         let idx = c[0] as usize + c[1] as usize * cx + c[2] as usize * cx * cy;
         matches!(chunk_class[idx], ChunkClass::Empty)
     };
-    let world_bound = CellBox {
-        min: [0, 0, 0],
-        max: [cx as i32 - 1, cy as i32 - 1, cz as i32 - 1],
-    };
-    for cz_i in 0..cz {
-        for cy_i in 0..cy {
-            for cx_i in 0..cx {
-                let chunk_idx = cx_i + cy_i * cx + cz_i * cx * cy;
-                let cell = match chunk_class[chunk_idx] {
-                    ChunkClass::Empty => {
-                        let aadf = compute_aadf(
-                            [cx_i as i32, cy_i as i32, cz_i as i32],
-                            world_bound,
-                            AADF_MAX_CHUNK,
-                            chunk_is_empty,
-                        );
-                        ChunkCell::Empty(aadf)
-                    }
-                    ChunkClass::UniformFull(ty) => ChunkCell::UniformFull(ty),
-                    ChunkClass::Mixed(ptr) => ChunkCell::Mixed(ptr),
-                };
-                chunks_buf[chunk_idx] = cell.encode();
-            }
-        }
+    let chunk_aadfs = compute_aadf_layer([cx, cy, cz], AADF_MAX_CHUNK, chunk_is_empty_at);
+
+    let mut chunks_buf = vec![0u32; cx * cy * cz];
+    for chunk_idx in 0..(cx * cy * cz) {
+        let cell = match chunk_class[chunk_idx] {
+            ChunkClass::Empty => ChunkCell::Empty(chunk_aadfs[chunk_idx]),
+            ChunkClass::UniformFull(ty) => ChunkCell::UniformFull(ty),
+            ChunkClass::Mixed(ptr) => ChunkCell::Mixed(ptr),
+        };
+        chunks_buf[chunk_idx] = cell.encode();
     }
 
     ConstructedWorld {
@@ -346,6 +333,9 @@ fn uniform_chunk_type(blocks: &[BlockClass; CELL_CHILDREN]) -> Option<VoxelTypeI
 
 /// Encode the 64 voxels of one mixed block into `voxels_buf` at `ptr`, with
 /// per-empty-voxel AADFs (bounded by the block's 4³ extent, max distance 3).
+///
+/// AADFs computed by [`compute_aadf_layer`] (one synchronised
+/// `O(3·d·n)`-style pass over the 4³ voxel layer — paper §3.3).
 fn encode_block_voxels(
     group: &[VoxelTypeId; CELL_CHILDREN],
     ptr: VoxelPtr,
@@ -355,7 +345,8 @@ fn encode_block_voxels(
         let idx = c[0] as usize + c[1] as usize * CELL_DIM + c[2] as usize * CELL_DIM * CELL_DIM;
         group[idx] == VoxelTypeId::EMPTY
     };
-    let bound = CellBox::cube(CELL_DIM as i32);
+
+    let voxel_aadfs = compute_aadf_layer([CELL_DIM, CELL_DIM, CELL_DIM], AADF_MAX_SMALL, local_empty);
 
     let mut encoded = [0u16; CELL_CHILDREN];
     for lz in 0..CELL_DIM {
@@ -363,13 +354,7 @@ fn encode_block_voxels(
             for lx in 0..CELL_DIM {
                 let i = lx + ly * CELL_DIM + lz * CELL_DIM * CELL_DIM;
                 let cell = if group[i] == VoxelTypeId::EMPTY {
-                    let aadf = compute_aadf(
-                        [lx as i32, ly as i32, lz as i32],
-                        bound,
-                        AADF_MAX_SMALL,
-                        local_empty,
-                    );
-                    VoxelCell::Empty(aadf)
+                    VoxelCell::Empty(voxel_aadfs[i])
                 } else {
                     VoxelCell::Full(group[i])
                 };
@@ -386,6 +371,9 @@ fn encode_block_voxels(
 
 /// Encode the 64 blocks of one mixed chunk into `blocks_buf` at `base`, with
 /// per-empty-block AADFs (bounded by the chunk's 4³ extent, max distance 3).
+///
+/// AADFs computed by [`compute_aadf_layer`] (one synchronised
+/// `O(3·d·n)`-style pass over the 4³ block layer — paper §3.3).
 fn encode_chunk_blocks(
     blocks: &[BlockClass; CELL_CHILDREN],
     base: BlockPtr,
@@ -395,22 +383,15 @@ fn encode_chunk_blocks(
         let idx = c[0] as usize + c[1] as usize * CELL_DIM + c[2] as usize * CELL_DIM * CELL_DIM;
         matches!(blocks[idx], BlockClass::Empty)
     };
-    let bound = CellBox::cube(CELL_DIM as i32);
+
+    let block_aadfs = compute_aadf_layer([CELL_DIM, CELL_DIM, CELL_DIM], AADF_MAX_SMALL, local_empty);
 
     for lz in 0..CELL_DIM {
         for ly in 0..CELL_DIM {
             for lx in 0..CELL_DIM {
                 let i = lx + ly * CELL_DIM + lz * CELL_DIM * CELL_DIM;
                 let cell = match blocks[i] {
-                    BlockClass::Empty => {
-                        let aadf = compute_aadf(
-                            [lx as i32, ly as i32, lz as i32],
-                            bound,
-                            AADF_MAX_SMALL,
-                            local_empty,
-                        );
-                        BlockCell::Empty(aadf)
-                    }
+                    BlockClass::Empty => BlockCell::Empty(block_aadfs[i]),
                     BlockClass::UniformFull(ty) => BlockCell::UniformFull(ty),
                     BlockClass::Mixed(ptr) => BlockCell::Mixed(ptr),
                 };
