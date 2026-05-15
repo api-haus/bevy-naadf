@@ -266,6 +266,11 @@ pub struct WindowConfig {
     pub resizable: bool,
     /// Window title.
     pub title: &'static str,
+    /// Wayland `app_id` / X11 `WM_CLASS` (Bevy `Window.name`). `None` lets
+    /// winit pick a default (usually the binary name). The resize-test config
+    /// sets this explicitly so the hyprctl `class:...` selector is
+    /// deterministic.
+    pub name: Option<&'static str>,
 }
 
 impl WindowConfig {
@@ -275,6 +280,7 @@ impl WindowConfig {
             resolution: None,
             resizable: true,
             title: "bevy-naadf",
+            name: None,
         }
     }
 
@@ -287,11 +293,43 @@ impl WindowConfig {
                 crate::e2e::E2E_WIDTH as f32,
                 crate::e2e::E2E_HEIGHT as f32,
             )),
-            // The --resize-test mode triggers the GI/TAA pixel_count change
-            // via a Camera.viewport override instead of a Window resize, so
-            // the window stays non-resizable (matches the production e2e config).
+            // Production e2e config — non-resizable for determinism (every
+            // `pixel_count`-sized buffer identical run-to-run). The
+            // taa-resize-blackness reproduction test forks into
+            // [`WindowConfig::e2e_resize_test`] (resizable: true) instead.
             resizable: false,
             title: "bevy-naadf e2e_render",
+            name: None,
+        }
+    }
+
+    /// The e2e window for the taa-resize-blackness reproduction test
+    /// (`docs/orchestrate/taa-resize-blackness/`).
+    ///
+    /// Same 256×256 starting size as [`WindowConfig::e2e`] but with
+    /// `resizable: true` — must be true for hyprctl-driven resize to
+    /// propagate through winit; resize-test mode only.
+    ///
+    /// Without this flag the Hyprland compositor refuses pixel-precise resize
+    /// requests on the surface (winit advertises the surface as fixed-size to
+    /// the compositor when `resizable: false`). The standard e2e harness
+    /// continues to use [`WindowConfig::e2e`] — only the `--resize-test`
+    /// branch picks this up.
+    fn e2e_resize_test() -> Self {
+        Self {
+            resolution: Some((
+                crate::e2e::E2E_WIDTH as f32,
+                crate::e2e::E2E_HEIGHT as f32,
+            )),
+            // test-only: must be true for hyprctl-driven resize to propagate
+            // through winit; resize-test mode only.
+            resizable: true,
+            title: "bevy-naadf e2e_render",
+            // test-only: pin Wayland app_id to "e2e_render" so the hyprctl
+            // `class:e2e_render` selector matches deterministically. Without
+            // this, winit picks a default app_id that varies by build and
+            // the hyprctl dispatcher prints "resizeWindow: no window".
+            name: Some("e2e_render"),
         }
     }
 }
@@ -383,6 +421,7 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     let mut primary_window = Window {
         title: cfg.window.title.to_string(),
         resizable: cfg.window.resizable,
+        name: cfg.window.name.map(|s| s.to_string()),
         ..default()
     };
     if let Some((w, h)) = cfg.window.resolution {
@@ -569,7 +608,15 @@ pub fn run_e2e_render() -> AppExit {
 /// `main` toggle `entities_enabled = true` + `spawn_test_entity = true` for
 /// the fixture-entity render path.
 pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
-    let app = build_app_with_args(AppConfig::e2e(), args);
+    // taa-resize-blackness reproduction: swap in the resize-test window
+    // config so the surface is advertised as resizable to the compositor —
+    // a hard prerequisite for hyprctl-driven resize to propagate through
+    // winit. All non-`--resize-test` runs keep `AppConfig::e2e()` unchanged.
+    let mut cfg = AppConfig::e2e();
+    if args.resize_test {
+        cfg.window = WindowConfig::e2e_resize_test();
+    }
+    let app = build_app_with_args(cfg, args);
     e2e::run_with_app(app)
 }
 

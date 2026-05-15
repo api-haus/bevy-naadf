@@ -34,7 +34,6 @@
 //! motion, `assert_batch_6`'s `solid_block_rect` GI-bounce check fails at the
 //! settled readback; a correct reprojection keeps it GI-lit.
 
-use bevy::camera::Viewport;
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
 
@@ -50,10 +49,10 @@ use super::gates::{
 };
 use super::readback::{shoot_primary_window, E2eScreenshot};
 use super::{
-    E2E_DRAIN_FRAMES, E2E_MOTION_FRAMES, E2E_RESIZE_HEIGHT, E2E_RESIZE_MIN_LUMA_RATIO,
-    E2E_RESIZE_POST_FRAMES, E2E_RESIZE_POST_PNG, E2E_RESIZE_PRE_FRAMES, E2E_RESIZE_PRE_PNG,
-    E2E_RESIZE_WIDTH, E2E_SCREENSHOT_DIR, E2E_SCREENSHOT_LATEST, E2E_SETTLE_FRAMES,
-    E2E_WARMUP_FRAMES,
+    E2E_DRAIN_FRAMES, E2E_MOTION_FRAMES, E2E_RESIZE_FLOAT_SETTLE_FRAMES, E2E_RESIZE_HEIGHT,
+    E2E_RESIZE_MIN_LUMA_RATIO, E2E_RESIZE_POST_FRAMES, E2E_RESIZE_POST_PNG,
+    E2E_RESIZE_PRE_FRAMES, E2E_RESIZE_PRE_PNG, E2E_RESIZE_WIDTH, E2E_SCREENSHOT_DIR,
+    E2E_SCREENSHOT_LATEST, E2E_SETTLE_FRAMES, E2E_WARMUP_FRAMES,
 };
 
 /// The driver's state-machine phase.
@@ -91,11 +90,20 @@ pub enum E2ePhase {
     /// Wait (bounded) for the pre-resize capture to deliver, then stash its
     /// framebuffer into `ResizeTestState.pre`.
     ResizeDrainPre,
-    /// One-shot: programmatically resize the primary window from the e2e
-    /// default (256×256) to the resize-test target (`E2E_RESIZE_WIDTH` ×
-    /// `E2E_RESIZE_HEIGHT`). The next frame `extract_camera` sees the new
-    /// viewport and the next `prepare_taa` / `prepare_gi` re-allocate +
-    /// zero-clear the rings.
+    /// After togglefloating has been dispatched (on the last tick of
+    /// `ResizePre`), wait 5 seconds (≈ 300 frames at 60 fps) so the
+    /// compositor finishes unmapping the tiled surface and remapping the
+    /// window as floating before we ask for a pixel-precise resize.
+    /// `resizewindowpixel exact` only takes effect on floating windows;
+    /// dispatching it too soon either gets ignored or only adjusts the tile
+    /// layout, leaving the bevy swapchain at its original allocation.
+    ResizeFloatSettle,
+    /// One-shot: ask Hyprland to resize our window to (`E2E_RESIZE_WIDTH` ×
+    /// `E2E_RESIZE_HEIGHT`) via `hyprctl dispatch resizewindowpixel`. The
+    /// resulting Wayland resize event propagates through `bevy_winit`, the
+    /// GPU surface is reconfigured, and the next `extract_camera` sees the
+    /// new viewport so `prepare_taa` / `prepare_gi` re-allocate + zero-clear
+    /// the rings.
     ResizeDoIt,
     /// Render frames the driver counts after the resize, before the
     /// post-resize screenshot — user's "waits 2 seconds" leg. Inside the
@@ -144,6 +152,26 @@ pub struct ResizeTestState {
     pub post: Option<Framebuffer>,
 }
 
+/// Pick the Hyprland window-selector string for our primary window.
+///
+/// Strategy: use `class:e2e_render` — Hyprland's `class:` selector matches
+/// the Wayland `app_id` / X11 `WM_CLASS`, which `bevy_winit` defaults to the
+/// binary name when no `Window.name` is set in [`crate::WindowConfig`]. The
+/// e2e binary is named `e2e_render` (see `crates/bevy_naadf/src/bin/e2e_render.rs`),
+/// so the default `app_id` is `e2e_render`. This per the dispatch brief's
+/// directive (`docs/orchestrate/taa-resize-blackness/`).
+///
+/// The selector is returned without its leading `,` separator. The caller
+/// prepends `,` when building the full hyprctl dispatch argument
+/// (`<resize-args>,<selector>` or `,<selector>` for togglefloating).
+///
+/// Only called from the resize-test phases (`ResizePre` / `ResizeDoIt`),
+/// which are gated behind `AppArgs.resize_test` — the default e2e harness
+/// never shells out to hyprctl.
+fn hyprctl_window_selector() -> String {
+    "class:e2e_render".to_string()
+}
+
 /// The `Update` driver system — advances the state machine one step per tick.
 ///
 /// Also drives the deterministic camera motion: during [`E2ePhase::Motion`] it
@@ -164,7 +192,7 @@ pub fn e2e_driver(
     mut resize_test: ResMut<ResizeTestState>,
     diagnostics: Res<DiagnosticsStore>,
     pipeline_scan: Res<PipelineScanResult>,
-    mut camera: Single<(&mut Transform, &mut PositionSplit, &mut Camera), With<Camera3d>>,
+    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
     app_args: Option<Res<crate::AppArgs>>,
@@ -176,6 +204,21 @@ pub fn e2e_driver(
     // batch_gate path does NOT run for resize-test runs.
     let resize_test_mode = app_args.as_deref().is_some_and(|a| a.resize_test);
     if resize_test_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+        // Hyprland-only gate. The resize-test triggers the real Wayland
+        // resize chain via `hyprctl dispatch resizewindowpixel`, which only
+        // exists on Hyprland. Bail loudly rather than wasting 5 s ticking
+        // through the test on the wrong compositor and reporting a
+        // misleading "test passed" result.
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+            let err = "resize-test requires Hyprland — HYPRLAND_INSTANCE_SIGNATURE \
+                       env var is not set. Aborting (the test mechanism is hyprctl-driven; \
+                       see docs/orchestrate/taa-resize-blackness/).".to_string();
+            eprintln!("e2e_render: FAIL — {err}");
+            outcome.gate_result = Some(Err(err));
+            exit.write(AppExit::error());
+            state.phase = E2ePhase::Done;
+            return;
+        }
         state.phase = E2ePhase::ResizePre;
         state.phase_ticks = 0;
     }
@@ -188,7 +231,7 @@ pub fn e2e_driver(
             // it explicit so WARMUP is unambiguously static at the start pose
             // and the GI converges there before the camera moves.
             let pose = e2e_orbit_camera_transform(0.0);
-            let (transform, position_split, _cam) = &mut *camera;
+            let (transform, position_split) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             // E2E_WARMUP_FRAMES render frames is comfortably above the
@@ -213,7 +256,7 @@ pub fn e2e_driver(
             // pose.
             let t = state.phase_ticks as f32 / E2E_MOTION_FRAMES as f32;
             let pose = e2e_orbit_camera_transform(t);
-            let (transform, position_split, _cam) = &mut *camera;
+            let (transform, position_split) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             if state.phase_ticks >= E2E_MOTION_FRAMES {
@@ -238,7 +281,7 @@ pub fn e2e_driver(
             // carried the GI bounce here through the motion, a broken one has
             // reprojected it away and the shadowed regions are black.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split, _cam) = &mut *camera;
+            let (transform, position_split) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             if state.phase_ticks >= E2E_SETTLE_FRAMES {
@@ -307,42 +350,38 @@ pub fn e2e_driver(
         E2ePhase::ResizePre => {
             // Pin the camera at the readback pose — the same pose Batch-6
             // gates' `solid_block_rect` discriminator is calibrated for. The
-            // 3-second wait lets GI converge and `taa_samples` / `sample_counts`
-            // accumulate, so the post-resize zero-clear of those rings will
-            // produce an observable luma collapse.
+            // 5-second wait lets GI converge and `taa_samples` /
+            // `sample_counts` accumulate, so the post-resize zero-clear of
+            // those rings will produce an observable luma collapse.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split, cam) = &mut *camera;
+            let (transform, position_split) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
-            // On the first tick of ResizePre, force a known starting viewport
-            // (E2E_WIDTH × E2E_HEIGHT = 256×256) via Camera.viewport so the
-            // pre-resize baseline reads at a deterministic size regardless of
-            // what the WM gave the window. This makes the "pre" frame's
-            // `pixel_count` equal to (E2E_WIDTH * E2E_HEIGHT), and the
-            // subsequent ResizeDoIt override to (E2E_RESIZE_WIDTH ×
-            // E2E_RESIZE_HEIGHT) genuinely changes `pixel_count` through the
-            // exact code path the bug lives in (extract_camera →
-            // ExtractedCameraData.viewport_size → prepare_taa / prepare_gi).
-            if state.phase_ticks == 0 {
-                cam.viewport = Some(Viewport {
-                    physical_position: UVec2::ZERO,
-                    physical_size: UVec2::new(
-                        super::E2E_WIDTH,
-                        super::E2E_HEIGHT,
-                    ),
-                    depth: 0.0..1.0,
-                });
-                println!(
-                    "e2e_render: resize-test pinned Camera.viewport to {}x{} (pre-resize baseline)",
-                    super::E2E_WIDTH,
-                    super::E2E_HEIGHT
-                );
-            }
             state.phase_ticks += 1;
             if state.phase_ticks >= E2E_RESIZE_PRE_FRAMES {
-                // Drop any stale screenshot stash and request the pre-resize
-                // capture.
+                // On the last tick of ResizePre: (a) request the pre-resize
+                // screenshot and (b) dispatch `hyprctl togglefloating`. The
+                // pre-screenshot captures the un-resized baseline; the
+                // togglefloating dispatch tells Hyprland to take our window
+                // out of the tiled layout so the subsequent
+                // `resizewindowpixel exact` actually changes the surface
+                // size (without floating, the dispatcher only adjusts the
+                // tile layout and the bevy swapchain stays at the original
+                // allocation).
                 screenshot.0 = None;
+                let selector = hyprctl_window_selector();
+                // test-only: hyprctl-driven Wayland resize
+                let status = std::process::Command::new("hyprctl")
+                    .args(["dispatch", "togglefloating", &format!(",{selector}")])
+                    .status();
+                match status {
+                    Ok(s) => println!(
+                        "e2e_render: resize-test hyprctl togglefloating ,{selector} -> {s:?}"
+                    ),
+                    Err(e) => eprintln!(
+                        "e2e_render: resize-test hyprctl togglefloating ,{selector} FAILED to spawn: {e}"
+                    ),
+                }
                 state.phase = E2ePhase::ResizeShootPre;
                 state.phase_ticks = 0;
             }
@@ -356,7 +395,7 @@ pub fn e2e_driver(
             // Keep the camera pinned while we wait — the screenshot is
             // async and may take a frame or two.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split, _cam) = &mut *camera;
+            let (transform, position_split) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             state.phase_ticks += 1;
@@ -364,7 +403,7 @@ pub fn e2e_driver(
                 match Framebuffer::from_image(&image) {
                     Ok(fb) => {
                         resize_test.pre = Some(fb);
-                        state.phase = E2ePhase::ResizeDoIt;
+                        state.phase = E2ePhase::ResizeFloatSettle;
                         state.phase_ticks = 0;
                     }
                     Err(msg) => {
@@ -388,42 +427,68 @@ pub fn e2e_driver(
                 state.phase = E2ePhase::Done;
             }
         }
-        E2ePhase::ResizeDoIt => {
-            // One-shot: override the primary camera's viewport. This is
-            // WM-independent — the compositor cannot block it because we
-            // never touch the Window. `extract_camera` reads
-            // `camera.physical_viewport_size()` which returns
-            // `viewport.physical_size` when `viewport.is_some()` — so the
-            // next `ExtractSchedule` sees the new size, `prepare_taa` /
-            // `prepare_gi` see `pixel_count != old_pixel_count`, and hit the
-            // ring-recreation zero-clear codepath — the bug.
+        E2ePhase::ResizeFloatSettle => {
+            // 5-second settle (≈ 300 frames at 60 fps) so the compositor
+            // finishes the toggle-to-floating remap before we ask for a
+            // pixel-precise resize. No actions during settle — just count
+            // frames and keep the camera pinned (same as the standard
+            // SETTLE phase).
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split, cam) = &mut *camera;
+            let (transform, position_split) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
-            cam.viewport = Some(Viewport {
-                physical_position: UVec2::ZERO,
-                physical_size: UVec2::new(E2E_RESIZE_WIDTH, E2E_RESIZE_HEIGHT),
-                depth: 0.0..1.0,
-            });
-            println!(
-                "e2e_render: resize-test overrode Camera.viewport to {E2E_RESIZE_WIDTH}x\
-                 {E2E_RESIZE_HEIGHT} (was {}x{})",
-                super::E2E_WIDTH,
-                super::E2E_HEIGHT
+            state.phase_ticks += 1;
+            if state.phase_ticks >= E2E_RESIZE_FLOAT_SETTLE_FRAMES {
+                state.phase = E2ePhase::ResizeDoIt;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::ResizeDoIt => {
+            // One-shot: tell Hyprland to resize our window. This propagates a
+            // real Wayland resize event through `bevy_winit`, which triggers
+            // the full GPU surface reconfig + `WindowResized` event +
+            // `prepare_taa` / `prepare_gi` `pixel_count != old_pixel_count`
+            // chain — the exact code path the bug lives in. Previous
+            // Window::resolution / Camera.viewport experiments did NOT
+            // exercise this chain (the compositor either ignored the request
+            // or only the camera changed; the surface stayed the original
+            // size).
+            let pose = e2e_orbit_camera_transform(1.0);
+            let (transform, position_split) = &mut *camera;
+            **transform = pose;
+            **position_split = PositionSplit::from_world(pose.translation);
+
+            let selector = hyprctl_window_selector();
+            let dispatch_arg = format!(
+                "exact {E2E_RESIZE_WIDTH} {E2E_RESIZE_HEIGHT},{selector}"
             );
+            // test-only: hyprctl-driven Wayland resize
+            let status = std::process::Command::new("hyprctl")
+                .args(["dispatch", "resizewindowpixel", &dispatch_arg])
+                .status();
+            match status {
+                Ok(s) => println!(
+                    "e2e_render: resize-test hyprctl resizewindowpixel '{dispatch_arg}' -> {s:?}"
+                ),
+                Err(e) => eprintln!(
+                    "e2e_render: resize-test hyprctl resizewindowpixel '{dispatch_arg}' FAILED to spawn: {e} \
+                     — test will report failure via luma comparison"
+                ),
+            }
             state.phase = E2ePhase::ResizePost;
             state.phase_ticks = 0;
         }
         E2ePhase::ResizePost => {
-            // The user-observed recovery window is "fractions of a second to
-            // ~1-2 seconds". `E2E_RESIZE_POST_FRAMES` ≈ 2 s at 60 fps, so on
-            // current `main` the screenshot may catch the symptom mid-drain
-            // (TAA ring is 32 deep, GI sample_counts is 128 frames). The
-            // luma gate then trips. Once Impl-B's fix lands, the rings are
-            // preserved across resize and the post-resize luma matches pre.
+            // 5-second post-resize settle (≈ 300 frames at 60 fps) — the
+            // user-directed wait between hyprctl resize and the post-resize
+            // screenshot. This is a conservative wait; the user-observed
+            // recovery window is "fractions of a second to ~1-2 seconds"
+            // (TAA 32-frame ring + GI 128-frame sample_counts ring drain),
+            // so by 5 s the rings should have refilled. Where mid-drain
+            // detection is required, the test would need a shorter post
+            // frame count — for this dispatch we settle conservatively first.
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split, _cam) = &mut *camera;
+            let (transform, position_split) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             state.phase_ticks += 1;
@@ -440,7 +505,7 @@ pub fn e2e_driver(
         }
         E2ePhase::ResizeDrainPost => {
             let pose = e2e_orbit_camera_transform(1.0);
-            let (transform, position_split, _cam) = &mut *camera;
+            let (transform, position_split) = &mut *camera;
             **transform = pose;
             **position_split = PositionSplit::from_world(pose.translation);
             state.phase_ticks += 1;
@@ -479,6 +544,7 @@ pub fn e2e_driver(
                     println!(
                         "e2e_render: resize-test PASS — pre/post luma ratio above threshold \
                          {E2E_RESIZE_MIN_LUMA_RATIO} after {E2E_RESIZE_PRE_FRAMES} pre-frames \
+                         + togglefloating + {E2E_RESIZE_FLOAT_SETTLE_FRAMES} float-settle frames \
                          + window resize to {E2E_RESIZE_WIDTH}x{E2E_RESIZE_HEIGHT} + \
                          {E2E_RESIZE_POST_FRAMES} post-frames."
                     );

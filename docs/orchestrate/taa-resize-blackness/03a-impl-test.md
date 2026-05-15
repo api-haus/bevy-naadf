@@ -114,3 +114,141 @@ I deliberately did **not** flip `resizable: true` myself — that change is outs
   4. **The viewport override didn't actually reach `extract_camera`** for some Bevy 0.19 reason I missed (unlikely but possible — e.g. `camera_system` resets the override every frame in some configurations).
 
   My recommended next step is **(1) + diagnostic**: cut `E2E_RESIZE_POST_FRAMES` to ~16-32 to screenshot mid-drain, and also add a render-world log of `ExtractedCameraData.viewport_size` to confirm interpretation (4) is ruled out. (2)/(3) suggest the camera-viewport mechanism is the wrong surrogate for a real WM resize — if the user's compositor will honor a Window resize when the window is initially `resizable: true`, the previous attempt's setup is closer to truth than this one, and the right fix may be to keep `resizable: true` AND swap to a Window resize where the new size is **smaller** than 1103×709 (so the WM has no excuse to override it back). User needs to make the call.
+
+## Hyprland integration (resizable=true + togglefloating + 5s settles + resizewindowpixel)
+
+- Files touched:
+  - `crates/bevy_naadf/src/e2e/mod.rs:133-179` — replaced the 180/30-frame
+    constants with three 300-frame constants (`E2E_RESIZE_PRE_FRAMES = 300`,
+    `E2E_RESIZE_FLOAT_SETTLE_FRAMES = 300`, `E2E_RESIZE_POST_FRAMES = 300`)
+    and documented the 60-fps assumption explicitly in the module comment.
+  - `crates/bevy_naadf/src/e2e/driver.rs:52-56` — added
+    `E2E_RESIZE_FLOAT_SETTLE_FRAMES` to the `super::` import block.
+  - `crates/bevy_naadf/src/e2e/driver.rs:99-107` — added a new
+    `E2ePhase::ResizeFloatSettle` variant between `ResizeDrainPre` and
+    `ResizeDoIt`.
+  - `crates/bevy_naadf/src/e2e/driver.rs:148-167` — rewrote
+    `hyprctl_window_selector` to return `class:e2e_render` (per dispatch
+    brief), with a comment pointing at where `Window.name` pins the
+    Wayland `app_id` to keep the selector deterministic.
+  - `crates/bevy_naadf/src/e2e/driver.rs:343-400` — restructured `ResizePre`:
+    the togglefloating dispatch now runs on the LAST tick of `ResizePre`
+    (alongside requesting the pre-resize screenshot), not at tick 60.
+  - `crates/bevy_naadf/src/e2e/driver.rs:402-455` — `ResizeDrainPre` now
+    transitions to the new `ResizeFloatSettle` phase (300 ticks pure wait)
+    instead of going straight to `ResizeDoIt`.
+  - `crates/bevy_naadf/src/e2e/driver.rs:459-475` — added the
+    `ResizeFloatSettle` arm: pin camera at readback pose, count ticks,
+    transition to `ResizeDoIt` after `E2E_RESIZE_FLOAT_SETTLE_FRAMES` (300).
+  - `crates/bevy_naadf/src/e2e/driver.rs:496-498` — annotated the
+    `hyprctl dispatch resizewindowpixel` call with the
+    `// test-only: hyprctl-driven Wayland resize` comment per the brief.
+  - `crates/bevy_naadf/src/e2e/driver.rs:511-519` — updated the `ResizePost`
+    comment to describe the 5-second post-resize settle (was the
+    "mid-drain" 30-frame strategy).
+  - `crates/bevy_naadf/src/e2e/driver.rs:575-583` — updated the resize-test
+    PASS message to mention the togglefloating + float-settle phases.
+  - `crates/bevy_naadf/src/lib.rs:262-272` — added `name: Option<&'static str>`
+    to `WindowConfig` (Bevy `Window.name` → Wayland `app_id`).
+  - `crates/bevy_naadf/src/lib.rs:273-336` — populated the `name` field on all
+    three `WindowConfig` constructors: `None` for windowed + e2e,
+    `Some("e2e_render")` for `e2e_resize_test()` (load-bearing — pins
+    the Wayland `app_id` so `class:e2e_render` selects the right window).
+  - `crates/bevy_naadf/src/lib.rs:410-419` — thread `cfg.window.name` into
+    `Window.name` in `build_app_with_args`.
+
+- **WindowConfig.resizable: false → true** — already done in the prior
+  dispatch (`WindowConfig::e2e_resize_test()`, `crates/bevy_naadf/src/lib.rs:311-323`).
+  Only the `e2e_resize_test()` config flips `resizable: true`; the
+  production `WindowConfig::e2e()` keeps `resizable: false`. The
+  `run_e2e_render_with_args(args)` path picks the right config based on
+  `args.resize_test`.
+
+- **Camera.viewport overrides removed:** yes — already removed in the
+  prior dispatch. No `cam.viewport = Some(Viewport { .. })` references
+  remain in the resize-test phases. The camera `Single` in `e2e_driver`
+  no longer destructures a `&mut Camera`, and `ResizePre` / `ResizeDoIt`
+  use only `Transform` + `PositionSplit`.
+
+- Hyprland selector: **`class:e2e_render`** (per brief). Requires
+  `Window.name = Some("e2e_render")` in the test-only window config —
+  without it, winit picks a default Wayland `app_id` and the dispatcher
+  returns `resizeWindow: no window` (observed in the smoke run below).
+  The selector is set by `hyprctl_window_selector()` in `driver.rs:148-167`.
+
+- Phase frame counts:
+  - `E2E_RESIZE_PRE_FRAMES = 300` (5 s @ 60 fps post-launch settle).
+  - `E2E_RESIZE_FLOAT_SETTLE_FRAMES = 300` (5 s post-togglefloating).
+  - `E2E_RESIZE_POST_FRAMES = 300` (5 s post-resize settle).
+  - Total resize-test runtime ≈ 15 s + screenshot/drain overhead.
+  - 60-fps assumption documented in `e2e/mod.rs:133-143`.
+
+### Smoke run
+
+- Command: `cargo run --release --bin e2e_render -- --resize-test`
+- Build: clean (`Finished 'release' profile in 8.99s`)
+- Exit code: **0** (test PASSED — but see findings below; this is **not**
+  the expected outcome and the resize did NOT propagate to the surface
+  this run, exactly as in the prior `set_physical_resolution` attempt).
+- Framebuffer dimensions:
+  - pre:  **797 × 1116**
+  - post: **797 × 1116** (unchanged)
+- hyprctl togglefloating exit: `ExitStatus(unix_wait_status(0))` (clean
+  exit code), but stdout printed `ok` — the dispatch ACCEPTED but the
+  togglefloating may have hit the wrong window (see selector finding
+  below).
+- hyprctl resizewindowpixel exit: `ExitStatus(unix_wait_status(0))`, but
+  stdout printed **`resizeWindow: no window`** — this is Hyprland's
+  message-payload for "no window matched the selector". Exit code is
+  always 0 because the dispatcher itself ran fine; the WINDOW SELECTION
+  failed.
+- Pre  solid luma (`solid_block_rect`): **239.61**
+- Post solid luma (`solid_block_rect`): **241.73**
+- Ratio: **1.0089**
+- Full-frame pre luma:  **163.50**
+- Full-frame post luma: **164.94**
+- Pass/fail line (verbatim):
+  > `e2e_render: resize-test PASS — pre/post luma ratio above threshold
+  > 0.5 after 300 pre-frames + togglefloating + 300 float-settle frames +
+  > window resize to 384x288 + 300 post-frames.`
+
+### Finding: the smoke ran AGAINST a 797×1116 surface that Hyprland never resized
+
+The smoke run revealed that **the `class:e2e_render` selector did NOT
+match any window on the first attempt** — Hyprland's `resizewindowpixel`
+dispatch returned the literal string `"resizeWindow: no window"`. The
+togglefloating dispatch printed `"ok"`, which suggests the toggle *did*
+match some window (possibly a different bevy-naadf window class), but
+the subsequent resizewindowpixel resolved no matching window. The
+framebuffer dimensions confirm the swapchain stayed unchanged
+(797×1116 → 797×1116). The luma stayed near-identical because the
+underlying GPU surface never reconfigured.
+
+**Diagnostic interpretation:**
+1. The window was launched at 256×256 (per `WindowConfig::e2e_resize_test`)
+   but Hyprland/Bevy gave it 797×1116 — the WM made it floating-ish
+   already and gave it a desktop-default size on map.
+2. `hyprctl_window_selector()` returned `class:e2e_render`. Without
+   `Window.name` set explicitly in `WindowConfig`, the Wayland `app_id`
+   was whatever winit picked by default — and winit's default does NOT
+   match the binary name on this build.
+3. The follow-up fix lands `Window.name = Some("e2e_render")` in
+   `WindowConfig::e2e_resize_test()` (only the resize-test config —
+   production paths still pass `None`) so the `app_id` is deterministic.
+   This was committed AFTER the smoke run because the brief stipulates
+   one smoke run maximum; the orchestrator/user makes the call on whether
+   to re-run.
+
+**Conclusion:** Test scaffold is structurally in place per the brief
+(class selector, togglefloating, 5 s settles, resizewindowpixel,
+ResizeFloatSettle phase, `// test-only` annotations). The single
+smoke run exercised the entire state machine cleanly (PRE 300 → ShootPre
+→ DrainPre → FloatSettle 300 → DoIt → POST 300 → ShootPost → DrainPost
+→ Assert) and confirmed the `class:e2e_render` selector mismatch.
+A re-run with the `Window.name = Some("e2e_render")` fix should now
+match — if the orchestrator chooses to re-run. Until then, the test is
+PASS-by-vacuity (surface never reconfigured, so rings were never
+zero-cleared, so no luma collapse to detect). This mirrors the prior
+`set_physical_resolution`-Wayland-ignored failure mode — the surface
+reconfig was again silently skipped, this time because of a class
+selector mismatch rather than a resizable-flag issue.
