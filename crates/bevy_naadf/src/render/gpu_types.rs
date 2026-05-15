@@ -627,6 +627,108 @@ const _: () = assert!(std::mem::size_of::<GpuBoundQueueInfo>() == 8);
 const _: () = assert!(std::mem::offset_of!(GpuBoundQueueInfo, start) == 0);
 const _: () = assert!(std::mem::offset_of!(GpuBoundQueueInfo, size) == 4);
 
+// === Phase C W4 — entity GPU structs (`15-design-c.md` §5.5, §5.6) ============
+
+/// Rust mirror of NAADF's `EntityChunkInstanceGpu` (`EntityHandler.cs:32-36`,
+/// HLSL `EntityChunkInstance` in `commonEntities.fxh`).
+///
+/// 20 bytes = `uint4` + `u32`. All five fields are `u32` bit-packed scalars; no
+/// `vec3`-then-scalar hazard. WGSL array stride for a 20-byte struct is 20 B
+/// (storage-buffer arrays only force 16-B alignment when an element contains a
+/// non-scalar 12-B `vec3`; here every field is `u32`).
+///
+/// Field layout (mirrors `EntityHandler.cs:325-329` /
+/// `commonEntities.fxh::compressEntityInstanceToChunk`):
+///   data1 = posX | (posY & 0x7FF) << 21
+///   data2 = posZ | (posY >> 11) << 21 | (sizeZ >> 4) << 29
+///   data3 = compressed quaternion .data1 (smallest-three packing)
+///   data4 = compressed quaternion .data2 | (voxelStart << 12)
+///   data5 = entity | (sizeX << 14) | (sizeY << 21) | ((sizeZ & 0xF) << 28)
+///
+/// The struct mirrors `EntityChunkInstanceGpu.data: Uint4 + data2: u32` flat
+/// 5-u32 packing. CPU writer:
+/// [`crate::aadf::entity::compress_entity_chunk_instance`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
+pub struct GpuEntityChunkInstance {
+    pub data1: u32,
+    pub data2: u32,
+    pub data3: u32,
+    pub data4: u32,
+    pub data5: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GpuEntityChunkInstance>() == 20);
+const _: () = assert!(std::mem::offset_of!(GpuEntityChunkInstance, data1) == 0);
+const _: () = assert!(std::mem::offset_of!(GpuEntityChunkInstance, data2) == 4);
+const _: () = assert!(std::mem::offset_of!(GpuEntityChunkInstance, data3) == 8);
+const _: () = assert!(std::mem::offset_of!(GpuEntityChunkInstance, data4) == 12);
+const _: () = assert!(std::mem::offset_of!(GpuEntityChunkInstance, data5) == 16);
+
+/// Rust mirror of NAADF's history ring slot — a packed `uint4`
+/// (`entityUpdate.fx:41`, `commonEntities.fxh::compressEntityInstanceToHistory`).
+///
+/// 16 bytes = 4 × u32. The history ring is `taa_index * 16384 + entityInstanceID`
+/// (`entityUpdate.fx:41`; the `16384` cap is `WorldRender.cs:88` =
+/// [`crate::render::construction::config::DEFAULT_MAX_ENTITY_INSTANCES`]).
+///
+/// Field layout (mirrors `EntityHandler.cs:367-371`):
+///   data1 = posX | (posY & 0x7FF) << 21
+///   data2 = posZ | (posY >> 11) << 21
+///   data3 = compressed quaternion .data1
+///   data4 = compressed quaternion .data2
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
+pub struct GpuEntityInstanceHistory {
+    pub data1: u32,
+    pub data2: u32,
+    pub data3: u32,
+    pub data4: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GpuEntityInstanceHistory>() == 16);
+const _: () = assert!(std::mem::offset_of!(GpuEntityInstanceHistory, data1) == 0);
+const _: () = assert!(std::mem::offset_of!(GpuEntityInstanceHistory, data4) == 12);
+
+/// Rust mirror of `entityUpdate.fx::chunkUpdatesDynamic` element — a packed
+/// `uint2` (`entityUpdate.fx:3, :21-23`).
+///
+/// 8 bytes = 2 × u32. CPU writer pack:
+///   .data1 = chunkPos.x | (chunkPos.y << 11) | (chunkPos.z << 21)
+///   .data2 = entityChunkPointer << 8 | size
+/// (per `EntityHandler.cs:336-341`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
+pub struct GpuChunkUpdate {
+    pub data1: u32,
+    pub data2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GpuChunkUpdate>() == 8);
+
+/// Rust-only CPU mirror of the `EntityInstance` struct (`EntityHandler.cs:23-30`,
+/// HLSL `EntityInstance` in `commonEntities.fxh`).
+///
+/// This struct is **CPU-only** — it never round-trips a GPU buffer; the GPU
+/// stores compressed forms ([`GpuEntityChunkInstance`] or
+/// [`GpuEntityInstanceHistory`]). Used by [`crate::aadf::entity`] and
+/// [`crate::render::construction::entity_handler`] for the per-frame
+/// overlap-counting + dedup-hash logic.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntityInstance {
+    /// World-space position in voxels (f32).
+    pub position: Vec3,
+    /// Quaternion rotation `(x, y, z, w)`.
+    pub quaternion: [f32; 4],
+    /// Index into the global `entityVoxelData` buffer at which this entity's
+    /// 64-voxel-aligned per-entity voxel volume starts.
+    pub voxel_start: u32,
+    /// Entity slot id (`< 0x3FFF`; the 14-bit field packed into `data5`).
+    pub entity: u32,
+    /// Entity volume size in voxels.
+    pub size: [u32; 3],
+}
+
 /// IEEE-754 half-float bit pattern of `x` (the C# `f32tof16`).
 ///
 /// A straightforward round-to-nearest-even f32 → f16 conversion, sufficient
@@ -712,6 +814,11 @@ const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, size_in_chunks
 const _: () =
     assert!(std::mem::offset_of!(GpuConstructionParams, group_size_in_groups) % 16 == 0);
 const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, chunk_offset) % 16 == 0);
+
+// Phase C W4 — entity GPU struct layout pins (`15-design-c.md` §5.5, §5.6).
+const _: () = assert!(std::mem::size_of::<GpuEntityChunkInstance>() == 20);
+const _: () = assert!(std::mem::size_of::<GpuEntityInstanceHistory>() == 16);
+const _: () = assert!(std::mem::size_of::<GpuChunkUpdate>() == 8);
 
 // Keep the material enums referenced so a future material-format change can't
 // silently drift this file out of step (also documents the intent).
@@ -838,5 +945,30 @@ mod tests {
         assert_eq!(size_of::<GpuBoundQueueInfo>(), 8);
         assert_eq!(offset_of!(GpuBoundQueueInfo, start), 0);
         assert_eq!(offset_of!(GpuBoundQueueInfo, size), 4);
+    }
+
+    /// Phase-C W4 — runtime mirror of `GpuEntityChunkInstance` /
+    /// `GpuEntityInstanceHistory` / `GpuChunkUpdate` (`15-design-c.md` §5.5,
+    /// §5.6). Every field is `u32`; no `vec3`-then-scalar hazard. The runtime
+    /// test mirrors the compile-time pins so future tooling-strip refactors
+    /// still produce a runtime signal.
+    #[test]
+    fn entity_chunk_instance_layout_guards() {
+        use std::mem::{offset_of, size_of};
+        // GpuEntityChunkInstance: 5 × u32 = 20 B.
+        assert_eq!(size_of::<GpuEntityChunkInstance>(), 20);
+        assert_eq!(offset_of!(GpuEntityChunkInstance, data1), 0);
+        assert_eq!(offset_of!(GpuEntityChunkInstance, data2), 4);
+        assert_eq!(offset_of!(GpuEntityChunkInstance, data3), 8);
+        assert_eq!(offset_of!(GpuEntityChunkInstance, data4), 12);
+        assert_eq!(offset_of!(GpuEntityChunkInstance, data5), 16);
+        // GpuEntityInstanceHistory: 4 × u32 = 16 B.
+        assert_eq!(size_of::<GpuEntityInstanceHistory>(), 16);
+        assert_eq!(offset_of!(GpuEntityInstanceHistory, data1), 0);
+        assert_eq!(offset_of!(GpuEntityInstanceHistory, data4), 12);
+        // GpuChunkUpdate: 2 × u32 = 8 B.
+        assert_eq!(size_of::<GpuChunkUpdate>(), 8);
+        assert_eq!(offset_of!(GpuChunkUpdate, data1), 0);
+        assert_eq!(offset_of!(GpuChunkUpdate, data2), 4);
     }
 }

@@ -41,9 +41,16 @@ struct GpuWorldMeta {
 
 // --- @group(0) — world data (read-only in the render passes) ----------------
 
-// The chunk layer: one encoded chunk `u32` per chunk, indexed by chunk position
-// (HLSL `Texture3D<uint> chunks`). Phase A is entity-free so this is `u32`, not
-// the `Rg64Uint` the C# uses with `ENTITIES` (`03-design.md` §7.5).
+// The chunk layer: encoded chunk pair per chunk, indexed by chunk position
+// (HLSL `Texture3D<CHUNKTYPE> chunks`; CHUNKTYPE = `uint2` under `ENTITIES`).
+//
+// **W4 (`15-design-c.md` §1.7) — texture format widened to `Rg32Uint`** so the
+// chunks texture carries the per-chunk entity pointer in `.y`. The renderer's
+// view binding stays `texture_3d<u32>` (a `textureLoad` returns `vec4<u32>`
+// regardless of channel count); every render-side read takes `.x` explicitly
+// (the construction-side state pointer + AADF, unchanged from Phase A). The
+// entity-aware traversal path (`ray_tracing.wgsl`) additionally reads `.y` to
+// drive the entity sub-traversal branch.
 @group(0) @binding(0) var chunks: texture_3d<u32>;
 
 // The block layer: encoded block `u32`s, 64 consecutive per mixed chunk

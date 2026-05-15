@@ -91,8 +91,11 @@ struct ConstructionParams {
 };
 
 // `chunkCalc.fx:13-20` HashValue struct.
+// W4 (`15-design-c.md` §1.7) — chunks texture format widened to `rg32uint`.
+// The chunk_calc write site stores into `.x` only (`.y` stays 0 here; the
+// entity pointer in `.y` is owned by `entity_update.wgsl`).
 @group(0) @binding(0)
-var chunks: texture_storage_3d<r32uint, read_write>;
+var chunks: texture_storage_3d<rg32uint, read_write>;
 @group(0) @binding(1)
 var<storage, read_write> blocks: array<u32>;
 @group(0) @binding(2)

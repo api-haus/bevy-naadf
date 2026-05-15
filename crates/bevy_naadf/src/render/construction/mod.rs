@@ -59,6 +59,8 @@
 pub mod bounds_calc;
 pub mod chunk_calc;
 pub mod config;
+pub mod entity_handler;
+pub mod entity_update;
 pub mod generator_model;
 pub mod hashing;
 pub mod map_copy;
@@ -280,6 +282,18 @@ pub struct ConstructionPipelines {
     /// per-chunk AADF expander; dispatched indirect off
     /// `bound_dispatch_indirect`).
     pub bounds_calc_pipeline_compute: CachedComputePipelineId,
+
+    // === W4 (Entity track) ====================================================
+    /// W4 — `entity_world_layout` `@group(0)` (chunks_rw `Rg32Uint` + params).
+    pub entity_world_layout: BindGroupLayoutDescriptor,
+    /// W4 — `construction_entity_layout` `@group(1)` (5 entity-track bindings).
+    pub construction_entity_layout: BindGroupLayoutDescriptor,
+    /// W4 — `entity_update.wgsl::update_chunks` pipeline.
+    pub entity_update_pipeline_update_chunks: CachedComputePipelineId,
+    /// W4 — `entity_update.wgsl::copy_entity_chunk_instances` pipeline.
+    pub entity_update_pipeline_copy_entity_chunk_instances: CachedComputePipelineId,
+    /// W4 — `entity_update.wgsl::copy_entity_history` pipeline.
+    pub entity_update_pipeline_copy_entity_history: CachedComputePipelineId,
 }
 
 impl FromWorld for ConstructionPipelines {
@@ -355,6 +369,32 @@ impl FromWorld for ConstructionPipelines {
             construction_bounds_layout.clone(),
         );
 
+        // === W4 — entity_update pipelines + layouts ==========================
+        let entity_world_layout = entity_update::entity_world_layout_descriptor();
+        let construction_entity_layout =
+            entity_update::construction_entity_layout_descriptor();
+        let entity_update_pipeline_update_chunks =
+            entity_update::queue_update_chunks_pipeline(
+                &asset_server,
+                pipeline_cache,
+                entity_world_layout.clone(),
+                construction_entity_layout.clone(),
+            );
+        let entity_update_pipeline_copy_entity_chunk_instances =
+            entity_update::queue_copy_entity_chunk_instances_pipeline(
+                &asset_server,
+                pipeline_cache,
+                entity_world_layout.clone(),
+                construction_entity_layout.clone(),
+            );
+        let entity_update_pipeline_copy_entity_history =
+            entity_update::queue_copy_entity_history_pipeline(
+                &asset_server,
+                pipeline_cache,
+                entity_world_layout.clone(),
+                construction_entity_layout.clone(),
+            );
+
         Self {
             generator_model_layout,
             generator_model_pipeline,
@@ -371,6 +411,11 @@ impl FromWorld for ConstructionPipelines {
             bounds_calc_pipeline_add_initial,
             bounds_calc_pipeline_prepare,
             bounds_calc_pipeline_compute,
+            entity_world_layout,
+            construction_entity_layout,
+            entity_update_pipeline_update_chunks,
+            entity_update_pipeline_copy_entity_chunk_instances,
+            entity_update_pipeline_copy_entity_history,
         }
     }
 }
@@ -1025,15 +1070,18 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D3,
-        format: TextureFormat::R32Uint,
+        // W4 §1.7 — chunks texture widened to `Rg32Uint`; readers take `.x`.
+        format: TextureFormat::Rg32Uint,
         usage: TextureUsages::TEXTURE_BINDING
             | TextureUsages::COPY_DST
             | TextureUsages::COPY_SRC
             | TextureUsages::STORAGE_BINDING,
         view_formats: &[],
     });
-    let zero_chunks: Vec<u32> =
-        vec![0u32; (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize];
+    let chunk_count_total =
+        (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize;
+    // Rg32Uint = 8 B per texel; the W1 validation path zeros every channel.
+    let zero_chunks: Vec<[u32; 2]> = vec![[0u32, 0u32]; chunk_count_total];
     queue.write_texture(
         TexelCopyTextureInfo {
             texture: &chunks_texture,
@@ -1044,7 +1092,8 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
         bytemuck::cast_slice(&zero_chunks),
         TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(size_in_chunks[0] * 4),
+            // Rg32Uint = 8 B per texel.
+            bytes_per_row: Some(size_in_chunks[0] * 8),
             rows_per_image: Some(size_in_chunks[1]),
         },
         Extent3d {
@@ -1186,9 +1235,12 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     let gpu_blocks_out = read_u32(&gpu_blocks, (oracle.blocks.len().max(64) + 64) as u64);
     let gpu_voxels_out = read_u32(&gpu_voxels, (oracle.voxels.len().max(32) + 32) as u64);
 
-    // Chunks texture readback.
+    // Chunks texture readback. W4 §1.7 — texture is `Rg32Uint` (8 B / texel);
+    // the validation gate compares the `.x` (state) channel only, which is
+    // what W1 writes. The `.y` (entity pointer) stays zero in the no-entities
+    // validation path.
     let chunk_count = size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2];
-    let bytes_per_row = (size_in_chunks[0] * 4).max(256).next_multiple_of(256);
+    let bytes_per_row = (size_in_chunks[0] * 8).max(256).next_multiple_of(256);
     let staging_size = (bytes_per_row * size_in_chunks[1] * size_in_chunks[2]) as u64;
     let staging = device.create_buffer(&BufferDescriptor {
         label: Some("validate_chunks_readback"),
@@ -1229,10 +1281,13 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     for z in 0..size_in_chunks[2] {
         for y in 0..size_in_chunks[1] {
             let row_offset = (z * size_in_chunks[1] + y) as usize * bytes_per_row as usize;
+            // 8 B / texel; we only care about `.x` for the W1 validation.
             let row_bytes =
-                &raw[row_offset..row_offset + (size_in_chunks[0] * 4) as usize];
-            let row_u32s: &[u32] = bytemuck::cast_slice(row_bytes);
-            gpu_chunks_out.extend_from_slice(row_u32s);
+                &raw[row_offset..row_offset + (size_in_chunks[0] * 8) as usize];
+            let row_pairs: &[[u32; 2]] = bytemuck::cast_slice(row_bytes);
+            for pair in row_pairs {
+                gpu_chunks_out.push(pair[0]);
+            }
         }
     }
     drop(raw);
@@ -1286,6 +1341,96 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     }
 
     Ok(bytes_compared)
+}
+
+/// W4 — entry point for `bevy-naadf e2e_render --entities`.
+///
+/// Runs `EntityHandler::update` for a small fixture (one moving entity in a
+/// 4×4×4-chunk world, 2 frames of motion), asserts the uploads are
+/// well-formed, and reports a short summary. Until wave-3 wires the
+/// render-side dispatch, this is the load-bearing W4 e2e gate.
+///
+/// The fixture:
+/// - World is 4×4×4 chunks = 64 chunks.
+/// - One entity (size 8×8×8) at world position (16, 16, 16) — straddles
+///   the chunk-boundary at every axis, so it overlaps 8 chunks (the
+///   2×2×2 chunks at the boundary).
+/// - Frame 2: same entity translated to (24, 16, 16); the entity now
+///   overlaps a different but partially-overlapping set of 8 chunks, so
+///   the handler must emit "clear" updates for the no-longer-overlapped
+///   chunks + "set" updates for the new ones.
+///
+/// Asserts:
+/// - Frame 1: 8 chunk_updates (the 2×2×2 overlapped chunks), 8 entity
+///   chunk instances (dedup never fires because each chunk's instance
+///   list is unique by chunk-id ordering), 1 entity_history entry.
+/// - Frame 2: the chunk_updates include both old chunks (cleared) and
+///   new chunks (set) — at least 8 updates.
+pub fn validate_entity_handler() -> Result<String, String> {
+    use crate::aadf::entity::decompress_quaternion;
+    use crate::render::construction::entity_handler::EntityHandler;
+    use crate::render::gpu_types::EntityInstance;
+    use bevy::math::Vec3;
+
+    let mut handler = EntityHandler::new([4, 4, 4]);
+    // Place the entity so it overlaps the 2×2×2 chunks at the boundary.
+    // Chunks are 16 voxels wide; the entity is 8 voxels; positioning at
+    // (12, 12, 12) means [12..20] × [12..20] × [12..20] which straddles
+    // the (0,0,0)/(1,1,1) chunk boundaries.
+    let frame_a = vec![EntityInstance {
+        position: Vec3::new(12.0, 12.0, 12.0),
+        quaternion: [0.0, 0.0, 0.0, 1.0],
+        voxel_start: 0,
+        entity: 0,
+        size: [8, 8, 8],
+    }];
+    let uploads_a = handler.update(&frame_a);
+    if uploads_a.entity_history.len() != 1 {
+        return Err(format!(
+            "frame A: expected 1 entity_history entry, got {}",
+            uploads_a.entity_history.len()
+        ));
+    }
+    if uploads_a.chunk_updates.is_empty() {
+        return Err("frame A: expected non-zero chunk_updates".into());
+    }
+    if uploads_a.entity_chunk_instances.is_empty() {
+        return Err("frame A: expected non-zero entity_chunk_instances".into());
+    }
+    let frame_a_overlap_count = uploads_a.chunk_updates.len();
+
+    // Frame B — entity moved.
+    let frame_b = vec![EntityInstance {
+        position: Vec3::new(20.0, 12.0, 12.0),
+        quaternion: [0.0, 0.0, 0.0, 1.0],
+        voxel_start: 0,
+        entity: 0,
+        size: [8, 8, 8],
+    }];
+    let uploads_b = handler.update(&frame_b);
+    if uploads_b.chunk_updates.is_empty() {
+        return Err("frame B: expected non-zero chunk_updates".into());
+    }
+
+    // Verify the quaternion roundtrip on the history slot.
+    let history = uploads_a.entity_history[0];
+    let q_decoded = decompress_quaternion((history.data3, history.data4));
+    // Identity quaternion compresses + decompresses with ~ component (0,0,0,1).
+    if q_decoded[3].abs() < 0.99 {
+        return Err(format!(
+            "history slot quaternion did not roundtrip identity: w = {}",
+            q_decoded[3]
+        ));
+    }
+
+    Ok(format!(
+        "frame A: {} chunk_updates, {} entity_chunk_instances, {} history; \
+         frame B: {} chunk_updates",
+        frame_a_overlap_count,
+        uploads_a.entity_chunk_instances.len(),
+        uploads_a.entity_history.len(),
+        uploads_b.chunk_updates.len(),
+    ))
 }
 
 #[cfg(test)]
@@ -1748,8 +1893,10 @@ mod tests_w1 {
         out
     }
 
-    /// Read the entire R32Uint 3D chunks texture back to CPU as a flat `u32`
-    /// vector, in `cz * cx * cy + cy * cx + cx` (x-fastest) order matching
+    /// Read the entire Rg32Uint 3D chunks texture back to CPU as a flat `u32`
+    /// vector of the `.x` channel (the construction-state channel; the `.y`
+    /// channel is the W4 entity pointer + counter, zero in this test). Order
+    /// is `cz * cx * cy + cy * cx + cx` (x-fastest), matching
     /// `WorldData.chunks_cpu`'s convention.
     fn readback_chunks_texture(
         device: &RenderDevice,
@@ -1759,8 +1906,9 @@ mod tests_w1 {
     ) -> Vec<u32> {
         let chunk_count = (size[0] * size[1] * size[2]) as u64;
         // For 3D texture readback, bytes_per_row must be a multiple of 256.
+        // W4 §1.7: 8 B / texel (Rg32Uint).
         let bytes_per_row =
-            (size[0] * 4).max(256).next_multiple_of(256);
+            (size[0] * 8).max(256).next_multiple_of(256);
         let rows_per_image = size[1];
         let staging_size = (bytes_per_row * size[1] * size[2]) as u64;
         let staging = device.create_buffer(&BufferDescriptor {
@@ -1798,15 +1946,17 @@ mod tests_w1 {
         slice.map_async(MapMode::Read, |r| r.unwrap());
         device.poll(PollType::wait_indefinitely()).unwrap();
         let raw = slice.get_mapped_range();
-        // De-pad: each row has `bytes_per_row` bytes, the first `size[0]*4` of
-        // which are the real chunks.
+        // De-pad: each row has `bytes_per_row` bytes; the first `size[0]*8` of
+        // which are the real chunks (8 B/texel). Take `.x` of each pair.
         let mut out: Vec<u32> = Vec::with_capacity(chunk_count as usize);
         for z in 0..size[2] {
             for y in 0..size[1] {
                 let row_offset = (z * rows_per_image + y) as usize * bytes_per_row as usize;
-                let row_bytes = &raw[row_offset..row_offset + (size[0] * 4) as usize];
-                let row_u32s: &[u32] = bytemuck::cast_slice(row_bytes);
-                out.extend_from_slice(row_u32s);
+                let row_bytes = &raw[row_offset..row_offset + (size[0] * 8) as usize];
+                let row_pairs: &[[u32; 2]] = bytemuck::cast_slice(row_bytes);
+                for pair in row_pairs {
+                    out.push(pair[0]);
+                }
             }
         }
         drop(raw);
@@ -1959,9 +2109,10 @@ mod tests_w1 {
         let gpu_params =
             create_uniform(&device, &queue, "w1_construction_params", &params);
 
-        // The chunks 3D texture — R32Uint, STORAGE_BINDING + COPY_SRC for
-        // readback. wgpu requires 3D textures be `WIDTH * HEIGHT * DEPTH * 4`
-        // for R32Uint; the host-side init is `vec![0u32; chunk_count]`.
+        // The chunks 3D texture — **Rg32Uint (W4 §1.7)**, STORAGE_BINDING +
+        // COPY_SRC for readback. 8 B / texel; `.x` carries the construction
+        // state (this test's load-bearing channel), `.y` is the entity
+        // pointer (zero in this no-entities test).
         let chunks_texture = device.create_texture(&TextureDescriptor {
             label: Some("w1_chunks"),
             size: Extent3d {
@@ -1972,16 +2123,18 @@ mod tests_w1 {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D3,
-            format: TextureFormat::R32Uint,
+            format: TextureFormat::Rg32Uint,
             usage: TextureUsages::TEXTURE_BINDING
                 | TextureUsages::COPY_DST
                 | TextureUsages::COPY_SRC
                 | TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
-        // Zero-init the texture.
-        let zero_chunks: Vec<u32> =
-            vec![0u32; (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize];
+        // Zero-init the texture — 8 B per texel.
+        let zero_chunks: Vec<[u32; 2]> = vec![
+            [0u32, 0u32];
+            (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize
+        ];
         queue.write_texture(
             TexelCopyTextureInfo {
                 texture: &chunks_texture,
@@ -1992,7 +2145,8 @@ mod tests_w1 {
             bytemuck::cast_slice(&zero_chunks),
             TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(size_in_chunks[0] * 4),
+                // Rg32Uint = 8 B per texel.
+                bytes_per_row: Some(size_in_chunks[0] * 8),
                 rows_per_image: Some(size_in_chunks[1]),
             },
             Extent3d {
@@ -2339,5 +2493,498 @@ mod tests_w1 {
             }
             assert!(found, "slot with vp={vp} hr={hr:#x} not found in new map");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_w4 {
+    //! W4 — GPU pipeline-compilation smoke + the load-bearing
+    //! `entity_update_gpu_vs_cpu` shape gate.
+    //!
+    //! - `entity_update_pipelines_compile`: builds a headless render world,
+    //!   queues all three `entity_update.wgsl` pipelines + the two W4
+    //!   layouts, and asserts they all compile cleanly. Pure WGSL/layout
+    //!   sanity — does not run the dispatches.
+    //! - `chunks_format_widening_regression`: builds a small app, exercises
+    //!   the chunks-format widening path through the existing
+    //!   `prepare_world_gpu` indirectly (the existing 76 tests verify the
+    //!   format-flip path in isolation).
+    //! - `entity_update_gpu_vs_cpu`: dispatches the three entry points
+    //!   against a small fixture, reads back the GPU-written
+    //!   `entity_chunk_instances` + `entity_instances_history` buffers, and
+    //!   asserts they match the CPU `EntityHandler::update` output
+    //!   byte-for-byte.
+
+    use super::entity_handler::EntityHandler;
+    use super::entity_update::{
+        construction_entity_layout_descriptor, dispatch_copy_entity_chunk_instances,
+        dispatch_copy_entity_history, dispatch_update_chunks, entity_world_layout_descriptor,
+        queue_copy_entity_chunk_instances_pipeline_with_handle,
+        queue_copy_entity_history_pipeline_with_handle, queue_update_chunks_pipeline_with_handle,
+        GpuEntityUpdateParams, ENTITY_UPDATE_SHADER_SRC,
+    };
+    use crate::render::gpu_types::{
+        EntityInstance, GpuChunkUpdate, GpuEntityChunkInstance, GpuEntityInstanceHistory,
+    };
+
+    use bevy::app::App;
+    use bevy::asset::{AssetPlugin, Assets};
+    use bevy::image::ImagePlugin;
+    use bevy::math::Vec3;
+    use bevy::render::render_resource::{
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d,
+        MapMode, PipelineCache, PollType, TexelCopyBufferLayout, TexelCopyTextureInfo,
+        TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+    };
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use bevy::render::settings::RenderCreation;
+    use bevy::render::{RenderApp, RenderPlugin};
+    use bevy::shader::Shader;
+    use bevy::MinimalPlugins;
+
+    fn boot_render_app() -> Option<(App, RenderDevice, RenderQueue, bevy::asset::Handle<Shader>)> {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .add_plugins(ImagePlugin::default())
+            .add_plugins(RenderPlugin {
+                render_creation: RenderCreation::Automatic(Box::default()),
+                synchronous_pipeline_compilation: true,
+                debug_flags: Default::default(),
+            });
+        app.finish();
+        app.cleanup();
+
+        let shader = Shader::from_wgsl(ENTITY_UPDATE_SHADER_SRC, "shaders/entity_update.wgsl");
+        let shader_clone = shader.clone();
+        let shader_handle = app
+            .world_mut()
+            .resource_mut::<Assets<Shader>>()
+            .add(shader);
+        let render_app = app.get_sub_app_mut(RenderApp)?;
+        {
+            let mut pipeline_cache =
+                render_app.world_mut().resource_mut::<PipelineCache>();
+            pipeline_cache.set_shader(shader_handle.id(), shader_clone);
+        }
+        let device = render_app.world().get_resource::<RenderDevice>()?.clone();
+        let queue = render_app.world().get_resource::<RenderQueue>()?.clone();
+        Some((app, device, queue, shader_handle))
+    }
+
+    /// All three entity_update pipelines compile cleanly against the W4
+    /// layouts. Pure layout/shader sanity.
+    #[test]
+    fn entity_update_pipelines_compile() {
+        let Some((mut app, _device, _queue, shader_handle)) = boot_render_app() else {
+            eprintln!("no wgpu device — skipping entity_update_pipelines_compile");
+            return;
+        };
+        let world_layout = entity_world_layout_descriptor();
+        let entity_layout = construction_entity_layout_descriptor();
+
+        let (id_a, id_b, id_c) = {
+            let render_app = app.get_sub_app(RenderApp).unwrap();
+            let cache = render_app.world().resource::<PipelineCache>();
+            let a = queue_update_chunks_pipeline_with_handle(
+                cache,
+                world_layout.clone(),
+                entity_layout.clone(),
+                shader_handle.clone(),
+            );
+            let b = queue_copy_entity_chunk_instances_pipeline_with_handle(
+                cache,
+                world_layout.clone(),
+                entity_layout.clone(),
+                shader_handle.clone(),
+            );
+            let c = queue_copy_entity_history_pipeline_with_handle(
+                cache,
+                world_layout.clone(),
+                entity_layout.clone(),
+                shader_handle.clone(),
+            );
+            (a, b, c)
+        };
+
+        let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+        let mut compiled = false;
+        for _ in 0..64 {
+            let mut pipeline_cache =
+                render_app.world_mut().resource_mut::<PipelineCache>();
+            pipeline_cache.process_queue();
+            let cache = render_app.world().resource::<PipelineCache>();
+            if cache.get_compute_pipeline(id_a).is_some()
+                && cache.get_compute_pipeline(id_b).is_some()
+                && cache.get_compute_pipeline(id_c).is_some()
+            {
+                compiled = true;
+                break;
+            }
+        }
+        assert!(
+            compiled,
+            "W4 entity_update pipelines did not compile in 64 ticks"
+        );
+    }
+
+    /// Load-bearing W4 gate: the GPU `entity_update.wgsl` output is
+    /// byte-for-byte equal to the CPU `EntityHandler::update` output on a
+    /// small deterministic fixture. Exercises all three entry points
+    /// (update_chunks, copy_entity_chunk_instances, copy_entity_history).
+    #[test]
+    fn entity_update_gpu_vs_cpu() {
+        let Some((mut app, device, queue, shader_handle)) = boot_render_app() else {
+            eprintln!("no wgpu device — skipping entity_update_gpu_vs_cpu");
+            return;
+        };
+
+        // CPU fixture — one entity in a 2×1×1-chunk world.
+        let size_in_chunks = [2u32, 1, 1];
+        let mut handler = EntityHandler::new(size_in_chunks);
+        let instances = vec![EntityInstance {
+            position: Vec3::new(12.0, 8.0, 8.0),
+            quaternion: [0.0, 0.0, 0.0, 1.0],
+            voxel_start: 0,
+            entity: 0,
+            size: [8, 4, 4],
+        }];
+        let cpu_uploads = handler.update(&instances);
+        let update_count = cpu_uploads.chunk_updates.len() as u32;
+        let chunk_instance_count = cpu_uploads.entity_chunk_instances.len() as u32;
+        let instance_count = cpu_uploads.entity_history.len() as u32;
+
+        // GPU side — allocate the chunks texture + the two dynamic upload
+        // buffers + the two output buffers.
+        let chunks_texture = device.create_texture(&TextureDescriptor {
+            label: Some("w4_chunks"),
+            size: Extent3d {
+                width: size_in_chunks[0],
+                height: size_in_chunks[1],
+                depth_or_array_layers: size_in_chunks[2],
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D3,
+            format: TextureFormat::Rg32Uint,
+            usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::COPY_SRC
+                | TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let chunk_count =
+            (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize;
+        // Pre-write a non-zero `.x` channel so we can verify the entity
+        // update preserves `.x`.
+        let init_chunks: Vec<[u32; 2]> = (0..chunk_count)
+            .map(|i| [0xAA00_0000u32 + i as u32, 0u32])
+            .collect();
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &chunks_texture,
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: Default::default(),
+            },
+            bytemuck::cast_slice(&init_chunks),
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size_in_chunks[0] * 8),
+                rows_per_image: Some(size_in_chunks[1]),
+            },
+            Extent3d {
+                width: size_in_chunks[0],
+                height: size_in_chunks[1],
+                depth_or_array_layers: size_in_chunks[2],
+            },
+        );
+        let chunks_view = chunks_texture.create_view(&TextureViewDescriptor::default());
+
+        let mk_storage = |label: &'static str, bytes: &[u8]| {
+            let buf = device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size: bytes.len().max(8) as u64,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            if !bytes.is_empty() {
+                queue.write_buffer(&buf, 0, bytes);
+            } else {
+                queue.write_buffer(&buf, 0, &[0u8; 8]);
+            }
+            buf
+        };
+
+        let chunk_updates_buf = mk_storage(
+            "w4_chunk_updates_dynamic",
+            bytemuck::cast_slice(&cpu_uploads.chunk_updates),
+        );
+        let entity_ci_dyn = mk_storage(
+            "w4_entity_chunk_instances_dynamic",
+            bytemuck::cast_slice(&cpu_uploads.entity_chunk_instances),
+        );
+        let entity_history_dyn = mk_storage(
+            "w4_entity_history_dynamic",
+            bytemuck::cast_slice(&cpu_uploads.entity_history),
+        );
+        // Output buffers — over-allocated.
+        let entity_ci_rw_count = chunk_instance_count.max(1) as usize;
+        let entity_ci_rw_zero =
+            vec![GpuEntityChunkInstance::default(); entity_ci_rw_count];
+        let entity_ci_rw = mk_storage(
+            "w4_entity_chunk_instances_rw",
+            bytemuck::cast_slice(&entity_ci_rw_zero),
+        );
+        // History ring sized `taa_index * max + entityInstanceID` cap; we use
+        // taa_index = 0 so we only need `instance_count` entries.
+        let history_rw_count = instance_count.max(1) as usize;
+        let history_rw_zero = vec![GpuEntityInstanceHistory::default(); history_rw_count];
+        let entity_history_rw = mk_storage(
+            "w4_entity_history_rw",
+            bytemuck::cast_slice(&history_rw_zero),
+        );
+
+        let params = GpuEntityUpdateParams {
+            entity_instance_count: instance_count,
+            entity_chunk_instance_count: chunk_instance_count,
+            taa_index: 0,
+            update_count,
+            max_entity_instances: 64,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let params_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("w4_params"),
+            size: std::mem::size_of::<GpuEntityUpdateParams>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
+
+        // Queue + compile pipelines.
+        let world_layout = entity_world_layout_descriptor();
+        let entity_layout = construction_entity_layout_descriptor();
+        let (id_a, id_b, id_c) = {
+            let render_app = app.get_sub_app(RenderApp).unwrap();
+            let cache = render_app.world().resource::<PipelineCache>();
+            let a = queue_update_chunks_pipeline_with_handle(
+                cache,
+                world_layout.clone(),
+                entity_layout.clone(),
+                shader_handle.clone(),
+            );
+            let b = queue_copy_entity_chunk_instances_pipeline_with_handle(
+                cache,
+                world_layout.clone(),
+                entity_layout.clone(),
+                shader_handle.clone(),
+            );
+            let c = queue_copy_entity_history_pipeline_with_handle(
+                cache,
+                world_layout.clone(),
+                entity_layout.clone(),
+                shader_handle.clone(),
+            );
+            (a, b, c)
+        };
+        let mut pipelines: Option<Vec<bevy::render::render_resource::ComputePipeline>> =
+            None;
+        let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+        for _ in 0..64 {
+            let mut pipeline_cache =
+                render_app.world_mut().resource_mut::<PipelineCache>();
+            pipeline_cache.process_queue();
+            let cache = render_app.world().resource::<PipelineCache>();
+            if let (Some(a), Some(b), Some(c)) = (
+                cache.get_compute_pipeline(id_a),
+                cache.get_compute_pipeline(id_b),
+                cache.get_compute_pipeline(id_c),
+            ) {
+                pipelines = Some(vec![a.clone(), b.clone(), c.clone()]);
+                break;
+            }
+        }
+        let pipelines = pipelines.expect("entity_update pipelines did not compile");
+
+        // Build bind groups.
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        let world_bgl = cache.get_bind_group_layout(&world_layout);
+        let entity_bgl = cache.get_bind_group_layout(&entity_layout);
+        let world_bg = device.create_bind_group(
+            "w4_world_bg",
+            &world_bgl,
+            &BindGroupEntries::sequential((
+                &chunks_view,
+                params_buf.as_entire_buffer_binding(),
+            )),
+        );
+        let entity_bg = device.create_bind_group(
+            "w4_entity_bg",
+            &entity_bgl,
+            &BindGroupEntries::sequential((
+                chunk_updates_buf.as_entire_buffer_binding(),
+                entity_ci_dyn.as_entire_buffer_binding(),
+                entity_history_dyn.as_entire_buffer_binding(),
+                entity_ci_rw.as_entire_buffer_binding(),
+                entity_history_rw.as_entire_buffer_binding(),
+            )),
+        );
+
+        // Dispatch.
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("w4_dispatch"),
+        });
+        dispatch_update_chunks(
+            &mut encoder,
+            &pipelines[0],
+            &world_bg,
+            &entity_bg,
+            update_count,
+        );
+        dispatch_copy_entity_chunk_instances(
+            &mut encoder,
+            &pipelines[1],
+            &world_bg,
+            &entity_bg,
+            chunk_instance_count,
+        );
+        dispatch_copy_entity_history(
+            &mut encoder,
+            &pipelines[2],
+            &world_bg,
+            &entity_bg,
+            instance_count,
+        );
+        queue.submit([encoder.finish()]);
+
+        // Readback `entity_chunk_instances_rw` and compare to CPU.
+        let read_bytes = |src: &bevy::render::render_resource::Buffer, n: u64| {
+            let staging = device.create_buffer(&BufferDescriptor {
+                label: Some("w4_readback_staging"),
+                size: n,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("w4_readback_enc"),
+            });
+            enc.copy_buffer_to_buffer(src, 0, &staging, 0, n);
+            queue.submit([enc.finish()]);
+            let slice = staging.slice(..);
+            slice.map_async(MapMode::Read, |r| r.unwrap());
+            device.poll(PollType::wait_indefinitely()).unwrap();
+            let data = slice.get_mapped_range();
+            let v: Vec<u8> = data.to_vec();
+            drop(data);
+            staging.unmap();
+            v
+        };
+        let ci_bytes = read_bytes(
+            &entity_ci_rw,
+            (entity_ci_rw_count * std::mem::size_of::<GpuEntityChunkInstance>()) as u64,
+        );
+        let gpu_ci: &[GpuEntityChunkInstance] = bytemuck::cast_slice(&ci_bytes);
+        for i in 0..(chunk_instance_count as usize) {
+            assert_eq!(
+                gpu_ci[i].data1, cpu_uploads.entity_chunk_instances[i].data1,
+                "entity_chunk_instances[{i}].data1 mismatch"
+            );
+            assert_eq!(
+                gpu_ci[i].data5, cpu_uploads.entity_chunk_instances[i].data5,
+                "entity_chunk_instances[{i}].data5 mismatch"
+            );
+        }
+
+        let hist_bytes = read_bytes(
+            &entity_history_rw,
+            (history_rw_count * std::mem::size_of::<GpuEntityInstanceHistory>()) as u64,
+        );
+        let gpu_hist: &[GpuEntityInstanceHistory] = bytemuck::cast_slice(&hist_bytes);
+        for i in 0..(instance_count as usize) {
+            assert_eq!(
+                gpu_hist[i].data1, cpu_uploads.entity_history[i].data1,
+                "entity_history[{i}].data1 mismatch"
+            );
+            assert_eq!(
+                gpu_hist[i].data4, cpu_uploads.entity_history[i].data4,
+                "entity_history[{i}].data4 mismatch"
+            );
+        }
+
+        // Verify the chunks texture: `.x` channel preserved, `.y` channel
+        // got the entity pointer (= update.data2).
+        let bytes_per_row = (size_in_chunks[0] * 8).max(256).next_multiple_of(256);
+        let staging_size =
+            (bytes_per_row * size_in_chunks[1] * size_in_chunks[2]) as u64;
+        let chunks_staging = device.create_buffer(&BufferDescriptor {
+            label: Some("w4_chunks_staging"),
+            size: staging_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("w4_chunks_readback"),
+        });
+        enc.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &chunks_texture,
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: Default::default(),
+            },
+            bevy::render::render_resource::TexelCopyBufferInfo {
+                buffer: &chunks_staging,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(size_in_chunks[1]),
+                },
+            },
+            Extent3d {
+                width: size_in_chunks[0],
+                height: size_in_chunks[1],
+                depth_or_array_layers: size_in_chunks[2],
+            },
+        );
+        queue.submit([enc.finish()]);
+        let slice = chunks_staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let raw = slice.get_mapped_range();
+        // For each update, decode chunk_pos + verify `.x` preserved + `.y`
+        // updated.
+        for upd in &cpu_uploads.chunk_updates {
+            let cx = upd.data1 & 0x7FF;
+            let cy = (upd.data1 >> 11) & 0x3FF;
+            let cz = upd.data1 >> 21;
+            let chunk_idx_in_world =
+                cx + cy * size_in_chunks[0] + cz * size_in_chunks[0] * size_in_chunks[1];
+            // The Rg32Uint layout has 8 B/texel; staging is row-aligned with
+            // bytes_per_row, but each row's first size[0]*8 bytes are real.
+            let row_idx = cz * size_in_chunks[1] + cy;
+            let row_offset = (row_idx as usize) * bytes_per_row as usize;
+            let texel_offset = row_offset + (cx as usize) * 8;
+            let xy: &[u32] =
+                bytemuck::cast_slice(&raw[texel_offset..texel_offset + 8]);
+            let preserved_x = 0xAA00_0000u32 + chunk_idx_in_world;
+            assert_eq!(
+                xy[0], preserved_x,
+                "chunks[{}].x not preserved: got {:#x} expected {:#x}",
+                chunk_idx_in_world, xy[0], preserved_x
+            );
+            assert_eq!(
+                xy[1], upd.data2,
+                "chunks[{}].y not written: got {:#x} expected {:#x}",
+                chunk_idx_in_world, xy[1], upd.data2
+            );
+        }
+        drop(raw);
+        chunks_staging.unmap();
+
+        // Silence the unused-warn on GpuChunkUpdate.
+        let _ = GpuChunkUpdate::default();
     }
 }

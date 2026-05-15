@@ -15,6 +15,16 @@
 //! W0 plumbed the flag end-to-end with a placeholder body; **W1 fills the
 //! body** with the real bit-exact CPU/GPU oracle gate.
 //!
+//! ## Phase-C W4 flag — `--entities` (`15-design-c.md` §2.1 W4 row)
+//!
+//! Runs the CPU-side `EntityHandler::update` against a small fixed-pose
+//! moving-entity scene and asserts the per-frame uploads are non-empty +
+//! self-consistent (deterministic). Until wave-3 wires the render-side
+//! dispatch, this flag exercises the W4 CPU port (overlap counting +
+//! prefix-sum + dedup-hash + the smallest-three quaternion compression);
+//! the GPU pipelines themselves are exercised by the unit test
+//! `entity_update_gpu_smoke` (compiles them; no full render run).
+//!
 //! When the flag is set, after the normal e2e exits, the binary runs
 //! `bevy_naadf::render::construction::validate_gpu_construction` which boots a
 //! headless render world, runs `chunk_calc.wgsl`'s 3 production entry points
@@ -42,10 +52,11 @@ use std::process::ExitCode;
 use bevy::prelude::AppExit;
 
 fn main() -> ExitCode {
-    // Parse the CLI flag — `--validate-gpu-construction`, default off.
-    let validate_gpu_construction = std::env::args()
-        .skip(1)
-        .any(|a| a == "--validate-gpu-construction");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Parse the CLI flags — `--validate-gpu-construction` (W1) +
+    // `--entities` (W4), default off.
+    let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
+    let entities_mode = args.iter().any(|a| a == "--entities");
 
     let app_exit = bevy_naadf::run_e2e_render();
 
@@ -69,6 +80,18 @@ fn main() -> ExitCode {
             }
             Err(msg) => {
                 eprintln!("GPU construction validation FAILED: {msg}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    if entities_mode {
+        match bevy_naadf::render::construction::validate_entity_handler() {
+            Ok(report) => {
+                eprintln!("entity handler validation PASS: {report}");
+            }
+            Err(msg) => {
+                eprintln!("entity handler validation FAILED: {msg}");
                 return ExitCode::from(1);
             }
         }

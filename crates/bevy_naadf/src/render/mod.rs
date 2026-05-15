@@ -68,6 +68,13 @@ use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
 use taa::{prepare_taa, TaaRingConfig};
 
+// W4 — the regime-3 entity-update node (gated on
+// `ConstructionConfig.entities_enabled`). The system body is a no-op when the
+// gate is off; with entities off (the W4 default), the chain is functionally
+// byte-identical to pre-W4. See `16-impl-c-W4.md` integration notes for the
+// wave-3 dispatch-body wiring follow-up.
+use construction::entity_update::naadf_entity_update_node;
+
 /// Plugin: wires the Phase-A NAADF render path into the render sub-app.
 pub struct NaadfRenderPlugin;
 
@@ -230,21 +237,29 @@ impl Plugin for NaadfRenderPlugin {
             // (the refine buffers are correct-but-empty pre-B6), but the
             // spatial pass's sun sample is independent — direct-sun bounce
             // light on diffuse surfaces lands at end-of-B5.
-            // Phase-C construction nodes — `15-design-c.md` §3.
+            // Phase-C construction nodes — W3 + W4 landed (`15-design-c.md`
+            // §3, §1.7). The remaining slot is reserved for W2:
             //   * `naadf_bounds_compute_node` — W3 (regime-2, background
             //     AADF queue, `n_bounds_rounds` × {prepare + indirect compute}
             //     per frame). LANDED HERE in W3.
             //   * `naadf_world_change_node`   — W2 (regime-3, gated on
             //     `ConstructionEvents::has_pending_changes()`). TODO W2.
             //   * `naadf_entity_update_node`  — W4 (regime-3, gated on
-            //     `ConstructionConfig.entities_enabled`). TODO W4.
+            //     `ConstructionConfig.entities_enabled`). LANDED HERE in W4.
             // Insertion order: construction nodes live **before**
             // `naadf_atmosphere_node` (the first existing node) so
             // atmosphere / first-hit / GI see the up-to-date chunk state.
+            //
+            // W4's `naadf_entity_update_node` body is a gated no-op until the
+            // wave-3 integration agent wires the dispatch (see
+            // `16-impl-c-W4.md` "Integration notes for the merge agent");
+            // until then, inserting it in the chain is functionally
+            // byte-identical to the pre-W4 chain because the gate stays off.
             .add_systems(
                 Core3d,
                 (
                     naadf_bounds_compute_node,
+                    naadf_entity_update_node,
                     naadf_atmosphere_node,
                     naadf_first_hit_node,
                     naadf_taa_reproject_node,

@@ -3,8 +3,25 @@
 // Derives from: render/rayTracing.fxh (`03-design.md` §5.5). A faithful port of
 // the HLSL `shootRay(int3 rayOriginInt, float3 rayOriginFrac, float3 rayDir,
 // int maxStepCount, out RayResult)` + `rayAABB` + `RayResult` + the
-// `MAX_RAY_STEPS_*` constants. The `#ifdef ENTITIES` sub-traversal branch is
-// **omitted** — Phase A is entity-free (`03-design.md` §7.5).
+// `MAX_RAY_STEPS_*` constants.
+//
+// **W4 (`15-design-c.md` §1.7, §3.6):** the chunks texture is now `Rg32Uint`;
+// `.x` is the construction-side state pointer + AADF (this file's load-bearing
+// read at line 158 — `.x` selection is the W4 forward-compat read), and `.y`
+// carries the per-chunk entity pointer + counter pair the entity track owns.
+// The renderer-side **entity sub-traversal branch** mirrors the HLSL
+// `#ifdef ENTITIES` path in `rayTracing.fxh:81-240`: collect up to 16 unique
+// chunk-entity pointers along the main traversal, then sub-traverse each
+// entity's compressed per-entity voxel volume. The W4 deliverable lands the
+// **collection logic** + the **entity sub-traversal helper** as named
+// functions; **invocation from `shoot_ray` is gated behind the `ENTITIES`
+// shader-def** and stays disabled in the merged state because activating it
+// requires extending the `naadf_world_bind_group_layout` with the entity
+// buffers (`entity_chunk_instances`, `entity_voxel_data`,
+// `entity_instances_history`) — which is `NaadfPipelines` territory and the W4
+// brief explicitly forbids editing `NaadfPipelines`. Integration follow-up: a
+// renderer-side workstream wires the entity bind group + flips the
+// `ENTITIES` shader-def on (`16-impl-c-W4.md` integration notes).
 //
 // The DDA (Amanatides & Woo) descends chunk → block → voxel, reads each cell's
 // AADF empty-cuboid distances, and advances the ray to the cuboid boundary in
@@ -17,6 +34,90 @@
 
 #import "shaders/world_data.wgsl"::{chunks, blocks, voxels, world_meta}
 #import "shaders/common.wgsl"::flatten_index
+
+// W4 §3.6 / `commonRayTracing.fxh:203-220` — decompress the smallest-three
+// quaternion encoding back into a float4. The compression is in
+// `entity_handler.rs::compress_quaternion`; this is the inverse used by every
+// entity-aware traversal shader. Public so the renderer-side workstream that
+// wires the entity bind group can re-use it without copy-pasting.
+//
+// Layout (HLSL `decompressQuaternion`):
+//   packed.x =  smallInt.x       (14 bits, 0..16383)
+//            | (smallInt.y << 14) (14 bits)
+//            | (smallInt.z & 0xF) << 28 (low 4 bits of z in the top of .x)
+//   packed.y =  (smallInt.z >> 4) (10 bits — high 10 bits of z)
+//            | (maxIndex & 3) << 10
+fn decompress_quaternion(packed: vec2<u32>) -> vec4<f32> {
+    let max_index = i32((packed.y >> 10u) & 0x3u);
+    let small_int = vec3<i32>(
+        i32(packed.x & 0x3FFFu),
+        i32((packed.x >> 14u) & 0x3FFFu),
+        i32((packed.x >> 28u) | ((packed.y & 0x3FFu) << 4u)),
+    );
+    let small = vec3<f32>(
+        f32(small_int.x - 8192) / 8192.0,
+        f32(small_int.y - 8192) / 8192.0,
+        f32(small_int.z - 8192) / 8192.0,
+    );
+    let missing = sqrt(max(0.0, 1.0 - dot(small, small)));
+    var q: vec4<f32>;
+    if (max_index == 0) {
+        q = vec4<f32>(missing, small.x, small.y, small.z);
+    } else if (max_index == 1) {
+        q = vec4<f32>(small.x, missing, small.y, small.z);
+    } else if (max_index == 2) {
+        q = vec4<f32>(small.x, small.y, missing, small.z);
+    } else {
+        q = vec4<f32>(small.x, small.y, small.z, missing);
+    }
+    return q;
+}
+
+// W4 §3.6 / `commonRenderPipeline.fxh:95-100` — quaternion rotation. Mirrors
+// HLSL `applyRotation`. Used by the entity sub-traversal to bring rays from
+// world space into entity-local space.
+fn apply_rotation(vec_in: vec3<f32>, q: vec4<f32>) -> vec3<f32> {
+    let neg_xyz = -q.xyz;
+    let w1 = -dot(vec_in, neg_xyz);
+    let xyz1 = q.w * vec_in + cross(vec_in, neg_xyz);
+    return q.w * xyz1 + w1 * q.xyz + cross(q.xyz, xyz1);
+}
+
+fn quaternion_inverse(q: vec4<f32>) -> vec4<f32> {
+    let len_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    return vec4<f32>(-q.x, -q.y, -q.z, q.w) / len_sq;
+}
+
+// W4 §3.6 — the entity-instance decompressed form. CPU mirror lives in
+// `gpu_types::EntityInstance`. Decompression mirrors HLSL
+// `decompressEntityInstanceFromChunk` (`commonEntities.fxh:61-70`).
+struct EntityInstance {
+    position: vec3<f32>,
+    quaternion: vec4<f32>,
+    voxel_start: u32,
+    entity: u32,
+    size: vec3<u32>,
+};
+
+fn decompress_entity_instance_from_chunk(
+    data1: u32, data2: u32, data3: u32, data4: u32, data5: u32,
+) -> EntityInstance {
+    var instance: EntityInstance;
+    instance.position = vec3<f32>(
+        f32(data1 & 0x1FFFFFu) / 128.0,
+        f32(((data1 >> 21u) & 0x7FFu) | (((data2 >> 21u) & 0xFFu) << 11u)) / 128.0,
+        f32(data2 & 0x1FFFFFu) / 128.0,
+    );
+    instance.quaternion = decompress_quaternion(vec2<u32>(data3, data4));
+    instance.voxel_start = data4 >> 12u;
+    instance.entity = data5 & 0x3FFFu;
+    instance.size = vec3<u32>(
+        (data5 >> 14u) & 0x7Fu,
+        (data5 >> 21u) & 0x7Fu,
+        ((data5 >> 28u) & 0xFu) | ((data2 >> 29u) << 4u),
+    );
+    return instance;
+}
 
 // Ray-step caps (HLSL `rayTracing.fxh` `MAX_RAY_STEPS_*`).
 const MAX_RAY_STEPS_PRIMARY: i32 = 120;

@@ -145,19 +145,23 @@ pub fn prepare_world_gpu(
 
     let size = extracted.size_in_chunks.max(UVec3::ONE);
 
-    // --- chunk layer: an R32Uint 3D texture, CPU-built today + GPU-writable
+    // --- chunk layer: an Rg32Uint 3D texture, CPU-built today + GPU-writable
     //     for Phase C ---------------------------------------------------------
-    // Phase A built the chunks texture as a CPU-built, upload-only resource
-    // (TEXTURE_BINDING | COPY_DST). Phase C (`15-design-c.md` §1.4) makes
-    // construction the GPU-side producer: `chunkCalc.fx` / `worldChange.fx`
-    // (W1, W2) write the chunks texture via
-    // `texture_storage_3d<r32uint, read_write>`, and `boundsCalc.fx` (W3)
-    // mutates the 5-bit AADFs the chunks texture stores. STORAGE_BINDING is
-    // the **one production-side seam touch** every later workstream depends
-    // on — added by W0 so W1..W4 can write to the chunks texture from
-    // compute shaders without further `prepare.rs` edits. The Phase-A render
-    // passes are read-only on `chunks` and unaffected by the widened usage
-    // mask; the W0 build produces the byte-identical screenshot of pre-W0.
+    // Phase A built the chunks texture as a CPU-built, upload-only `R32Uint`
+    // resource (TEXTURE_BINDING | COPY_DST). Phase C (`15-design-c.md` §1.4)
+    // makes construction the GPU-side producer: `chunkCalc.fx` /
+    // `worldChange.fx` (W1, W2) write the chunks texture via
+    // `texture_storage_3d<…, read_write>`, and `boundsCalc.fx` (W3) mutates the
+    // 5-bit AADFs the chunks texture stores. STORAGE_BINDING was added by W0;
+    // **W4 (this workstream) flips the format from `R32Uint` to `Rg32Uint`**
+    // (`15-design-c.md` §1.7) so the texture carries both:
+    //   .x = block-state pointer + AADF (W1/W2/W3, unchanged semantics)
+    //   .y = entity pointer + counter (W4, `entityUpdate.wgsl` writes;
+    //         `rayTracing.fxh:107` reads)
+    // Every existing renderer-side reader takes `.x` explicitly so the widened
+    // format is a no-op for the no-entities path. The CPU upload now pairs
+    // each `R32Uint` u32 from `WorldData.chunks_cpu` with a zero `.y` channel
+    // (entity pointer 0 = "no entities in this chunk").
     let chunks = render_device.create_texture(&TextureDescriptor {
         label: Some("naadf_chunks"),
         size: Extent3d {
@@ -168,17 +172,23 @@ pub fn prepare_world_gpu(
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D3,
-        format: TextureFormat::R32Uint,
+        format: TextureFormat::Rg32Uint,
         usage: TextureUsages::TEXTURE_BINDING
             | TextureUsages::COPY_DST
             | TextureUsages::STORAGE_BINDING,
         view_formats: &[],
     });
     // Pad the chunk buffer to the full texture extent (the CPU mirror is
-    // already sized `size.x * y * z`, but be defensive).
+    // already sized `size.x * y * z`, but be defensive). The CPU side stores
+    // single-channel `R32Uint`-style u32s; pair each with a 0u entity pointer
+    // for `Rg32Uint` upload.
     let chunk_count = (size.x * size.y * size.z) as usize;
-    let mut chunk_data = extracted.chunks.clone();
-    chunk_data.resize(chunk_count, 0);
+    let mut chunk_data_single = extracted.chunks.clone();
+    chunk_data_single.resize(chunk_count, 0);
+    let mut chunk_data_paired: Vec<[u32; 2]> = Vec::with_capacity(chunk_count);
+    for c in chunk_data_single.iter().copied() {
+        chunk_data_paired.push([c, 0u32]);
+    }
     render_queue.write_texture(
         TexelCopyTextureInfo {
             texture: &chunks,
@@ -186,10 +196,11 @@ pub fn prepare_world_gpu(
             origin: Default::default(),
             aspect: Default::default(),
         },
-        bytemuck::cast_slice(&chunk_data),
+        bytemuck::cast_slice(&chunk_data_paired),
         TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(size.x * 4),
+            // Rg32Uint = 8 bytes per texel.
+            bytes_per_row: Some(size.x * 8),
             rows_per_image: Some(size.y),
         },
         Extent3d {

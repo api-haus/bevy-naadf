@@ -97,6 +97,16 @@ pub struct ConstructionConfig {
     /// this flag (`gpu_construction_enabled` gates everything); W1 flips
     /// the dormant case to "run the full chain".
     pub run_worldgen_only: bool,
+    /// W4 — per-frame entity-instance ring cap (the
+    /// `entityInstanceID < 16384` bound at `entityUpdate.fx:41`,
+    /// `WorldRender.cs:88`). The `entity_instances_history` buffer is sized
+    /// `max_entity_instances * taa_ring_depth`. Doubles as the `chunkUpdate` /
+    /// `entityChunkInstances` upload-buffer cap; NAADF allocates 2_000_000
+    /// slots for each (`EntityHandler.cs:134, 135, 144, 145, 149`) which is
+    /// the per-frame max counted at chunk overlap. The port keeps a smaller
+    /// default suitable for the bevy-naadf test scenes; a runtime knob can
+    /// flip it.
+    pub max_entity_instances: u32,
 }
 
 impl Default for ConstructionConfig {
@@ -124,9 +134,20 @@ impl Default for ConstructionConfig {
             // W5 isolation knob — off by default; unit tests / explicit CLI
             // opt-ins flip it on.
             run_worldgen_only: false,
+            // `WorldRender.cs:88` — `entityInstanceCap = 16384`. The
+            // `entityUpdate.fx:41` `taa_index * 16384` history-ring stride
+            // hard-codes this; keep the default at the C# value so the
+            // history-ring layout matches byte-for-byte when an extracted
+            // entity buffer is uploaded.
+            max_entity_instances: DEFAULT_MAX_ENTITY_INSTANCES,
         }
     }
 }
+
+/// W4 — the per-frame entity-instance cap = `WorldRender.cs:88` /
+/// `entityUpdate.fx:41`'s `taa_index * 16384` stride. Public for shader-side
+/// asserts + the entity-history-ring allocation in `prepare_construction`.
+pub const DEFAULT_MAX_ENTITY_INSTANCES: u32 = 16384;
 
 impl From<&crate::AppArgs> for ConstructionConfig {
     /// Mirror `TaaRingConfig::depth = args.taa_ring_depth` pattern: read the
@@ -166,8 +187,12 @@ const _: () = {
         entities_enabled: false,
         cpu_fallback: true,
         run_worldgen_only: false,
+        // W4: `WorldRender.cs:88` per-frame entity-instance cap.
+        max_entity_instances: DEFAULT_MAX_ENTITY_INSTANCES,
     };
     // Compile-time-only sanity probe — referenced once so the const isn't
     // dead. `ConstructionConfig` is `Copy`, so this is a no-op at runtime.
     let _ = cfg.initial_hash_map_size;
+    // W4 — verify the cap-derived stride for the history-ring buffer.
+    let _ = cfg.max_entity_instances;
 };

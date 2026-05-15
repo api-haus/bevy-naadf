@@ -17,7 +17,7 @@
 //! avoids the std140 16-B-stride waste).
 //!
 //! The 8-binding layout total:
-//!   0: chunks_rw          texture_storage_3d<r32uint, read_write>
+//!   0: chunks_rw          texture_storage_3d<rg32uint, read_write>  (W4-widened)
 //!   1: blocks_rw          storage_buffer<array<u32>>
 //!   2: voxels_rw          storage_buffer<array<u32>>
 //!   3: block_voxel_count  storage_buffer<array<atomic<u32>>>
@@ -65,8 +65,8 @@ pub fn construction_world_layout_descriptor() -> BindGroupLayoutDescriptor {
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                // chunks_rw — `texture_storage_3d<r32uint, read_write>`.
-                texture_storage_3d(TextureFormat::R32Uint, StorageTextureAccess::ReadWrite),
+                // chunks_rw — `texture_storage_3d<rg32uint, read_write>` (W4 §1.7).
+                texture_storage_3d(TextureFormat::Rg32Uint, StorageTextureAccess::ReadWrite),
                 // blocks_rw / voxels_rw / block_voxel_count_rw — rw storage
                 // arrays. Atomic access is on the WGSL side
                 // (`array<atomic<u32>>` for the 2-element counter); the wgpu
