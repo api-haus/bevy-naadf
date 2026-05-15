@@ -295,6 +295,20 @@ impl FromWorld for NaadfPipelines {
         // --- @group(0): world data ------------------------------------------
         // chunks: texture_3d<u32>; blocks / voxels / voxel_types: runtime-sized
         // read-only storage arrays; world_meta: uniform.
+        //
+        // **Phase-C wave-3 integration (`15-design-c.md` §1.7, §3.6):** the
+        // layout grows by 3 read-only storage bindings at slots 5/6/7 — the W4
+        // entity-track buffers that `ray_tracing.wgsl::shoot_ray` consumes when
+        // the entity sub-traversal branch fires. Bindings are present
+        // unconditionally; when `ConstructionConfig.entities_enabled = false`
+        // they point at 1-element placeholder buffers allocated by
+        // `prepare_construction` (the layout is satisfied; the shader's
+        // sub-traversal branch never fires because the gate is checked first).
+        // When `entities_enabled = true` they point at the W4-owned
+        // `ConstructionGpu::entity_chunk_instances` / `entity_voxel_data` /
+        // `entity_instances_history` buffers. The layout extension is the
+        // wave-3 integration agent's load-bearing edit — it lifts W4's
+        // forbid-NaadfPipelines hard rule (`16-impl-c-W4.md` integration notes).
         let world_layout = BindGroupLayoutDescriptor::new(
             "naadf_world_bind_group_layout",
             &BindGroupLayoutEntries::sequential(
@@ -307,6 +321,11 @@ impl FromWorld for NaadfPipelines {
                     storage_buffer_read_only_sized(false, None), // voxels: array<u32>
                     storage_buffer_read_only_sized(false, None), // voxel_types: array<vec4<u32>>
                     uniform_buffer_sized(false, Some(world_meta_size)),
+                    // W4 wave-3 — entity track (read-only in render passes).
+                    // Placeholder-or-real semantics: see module doc above.
+                    storage_buffer_read_only_sized(false, None), // entity_chunk_instances: array<EntityChunkInstance>
+                    storage_buffer_read_only_sized(false, None), // entity_voxel_data: array<u32>
+                    storage_buffer_read_only_sized(false, None), // entity_instances_history: array<vec4<u32>>
                 ),
             ),
         );

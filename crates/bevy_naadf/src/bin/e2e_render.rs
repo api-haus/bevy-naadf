@@ -76,7 +76,21 @@ fn main() -> ExitCode {
     let entities_mode = args.iter().any(|a| a == "--entities");
     let edit_mode = args.iter().any(|a| a == "--edit-mode");
 
-    let app_exit = bevy_naadf::run_e2e_render();
+    // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
+    // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
+    // entity (`spawn_test_entity = true`). The Startup
+    // `spawn_phase_c_test_entity` system populates `MainWorldEntities`; the
+    // render pipeline then dispatches `entity_update.wgsl` per-frame and
+    // `ray_tracing.wgsl::shoot_ray`'s entity sub-traversal renders the
+    // fixture into the framebuffer.
+    let app_exit = if entities_mode {
+        let mut app_args = bevy_naadf::AppArgs::default();
+        app_args.construction_config.entities_enabled = true;
+        app_args.spawn_test_entity = true;
+        bevy_naadf::run_e2e_render_with_args(app_args)
+    } else {
+        bevy_naadf::run_e2e_render()
+    };
 
     let e2e_code = match app_exit {
         AppExit::Success => 0u8,

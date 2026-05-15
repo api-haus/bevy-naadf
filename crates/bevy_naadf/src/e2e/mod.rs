@@ -267,13 +267,14 @@ fn setup_e2e_camera(mut commands: Commands) {
 /// pipeline after the frame budget), unlike the old live smoke-run that aborted
 /// on the first bad shader.
 pub fn run_e2e_render() -> AppExit {
-    let mut app = crate::build_app(crate::AppConfig::e2e());
+    let app = crate::build_app(crate::AppConfig::e2e());
+    run_with_app(app)
+}
 
-    // The winit runner drives the loop; the driver self-terminates after the
-    // bounded frame budget, having run every check and written the verdict
-    // `AppExit`. (A panic inside `app.update()` — a `DeviceLost`, a failed
-    // `queue.submit` — propagates through the winit runner and aborts the
-    // process non-zero with the wgpu message on stderr; that is also a correct
-    // failure, `e2e-render-test.md` §3.2.)
+/// Phase-C wave-3 — run an already-built [`App`] through the windowed e2e
+/// runner. Lets callers customise `AppArgs` before booting (the
+/// `--entities` mode in `e2e_render` does this to flip
+/// `entities_enabled = true` + `spawn_test_entity = true`).
+pub fn run_with_app(mut app: bevy::prelude::App) -> AppExit {
     app.run()
 }

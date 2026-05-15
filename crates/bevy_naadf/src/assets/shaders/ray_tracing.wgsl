@@ -5,23 +5,19 @@
 // int maxStepCount, out RayResult)` + `rayAABB` + `RayResult` + the
 // `MAX_RAY_STEPS_*` constants.
 //
-// **W4 (`15-design-c.md` §1.7, §3.6):** the chunks texture is now `Rg32Uint`;
-// `.x` is the construction-side state pointer + AADF (this file's load-bearing
-// read at line 158 — `.x` selection is the W4 forward-compat read), and `.y`
-// carries the per-chunk entity pointer + counter pair the entity track owns.
-// The renderer-side **entity sub-traversal branch** mirrors the HLSL
-// `#ifdef ENTITIES` path in `rayTracing.fxh:81-240`: collect up to 16 unique
-// chunk-entity pointers along the main traversal, then sub-traverse each
-// entity's compressed per-entity voxel volume. The W4 deliverable lands the
-// **collection logic** + the **entity sub-traversal helper** as named
-// functions; **invocation from `shoot_ray` is gated behind the `ENTITIES`
-// shader-def** and stays disabled in the merged state because activating it
-// requires extending the `naadf_world_bind_group_layout` with the entity
-// buffers (`entity_chunk_instances`, `entity_voxel_data`,
-// `entity_instances_history`) — which is `NaadfPipelines` territory and the W4
-// brief explicitly forbids editing `NaadfPipelines`. Integration follow-up: a
-// renderer-side workstream wires the entity bind group + flips the
-// `ENTITIES` shader-def on (`16-impl-c-W4.md` integration notes).
+// **W4 + wave-3 integration (`15-design-c.md` §1.7, §3.6):** the chunks
+// texture is `Rg32Uint`; `.x` is the construction-side state pointer + AADF,
+// and `.y` carries the per-chunk entity pointer + counter pair. The
+// renderer-side **entity sub-traversal branch** is now ACTIVE: this file
+// imports the 3 entity-track bindings from `world_data.wgsl` (slots 5/6/7
+// extended into `NaadfPipelines::world_layout` by wave-3 integration), and
+// `shoot_ray` collects up to 16 unique chunk-entity pointers along the main
+// DDA + sub-traverses each entity's compressed per-entity voxel volume.
+// Faithful to the HLSL `#ifdef ENTITIES` path in `rayTracing.fxh:81-240` and
+// `commonEntities.fxh`. The branch has no shader-def gate — runtime cost on
+// no-entity scenes is near zero because every chunk's `.y == 0` so the
+// collection appends nothing and the post-DDA entity loop sees
+// `chunks_with_entities_count == 0` and early-exits.
 //
 // The DDA (Amanatides & Woo) descends chunk → block → voxel, reads each cell's
 // AADF empty-cuboid distances, and advances the ray to the cuboid boundary in
@@ -32,7 +28,10 @@
 // naga-oil import module — pulls in the `@group(0)` world bindings from
 // `world_data.wgsl`.
 
-#import "shaders/world_data.wgsl"::{chunks, blocks, voxels, world_meta}
+#import "shaders/world_data.wgsl"::{
+    chunks, blocks, voxels, world_meta,
+    entity_chunk_instances, entity_voxel_data,
+};
 #import "shaders/common.wgsl"::flatten_index
 
 // W4 §3.6 / `commonRayTracing.fxh:203-220` — decompress the smallest-three
@@ -141,6 +140,10 @@ struct RayResult {
     // Packed `(3-bit normal index, distance-along-normal)` plane code
     // (HLSL `normalComp`).
     normal_comp: u32,
+    // The entity-instance id of the hit (only meaningful on an entity hit;
+    // `0x3FFFu` ≡ "no entity hit"). Faithful to HLSL `RayResult::entity`
+    // (`rayTracing.fxh:25`).
+    entity: u32,
 }
 
 // `rayAABB` — slab-test a ray against an axis-aligned box. Returns whether the
@@ -217,6 +220,21 @@ fn shoot_ray(
     (*ray_result).normal_comp = 0x1FFFFu;
     (*ray_result).hit_type = 0u;
     (*ray_result).voxel_pos = vec3<i32>(0, 0, 0);
+    // HLSL `rayResult.entity = 0x3FFF` (`rayTracing.fxh:90`) — sentinel
+    // meaning "no entity hit". The entity branch overwrites this when a
+    // sub-traversal finds a closer hit.
+    (*ray_result).entity = 0x3FFFu;
+
+    // W4 entity-track — accumulate up to 16 distinct `chunks[pos].y` values
+    // seen during the main DDA (HLSL `rayTracing.fxh:82-83`,
+    // `chunksWithEntities[16]` + count). The C# uses a `static` array which
+    // WGSL has no equivalent for; a per-invocation `var<function>` is the
+    // direct port. Always compiled (no shader-def gate) — runtime cost is
+    // near zero on entity-empty rays because `chunks[pos].y == 0` skips the
+    // collection at every step and the post-DDA entity loop early-exits on
+    // `count == 0`.
+    var chunks_with_entities: array<u32, 16>;
+    var chunks_with_entities_count: u32 = 0u;
 
     // NAADF's `boundingBoxMax` — already a `float3` (the 0.1-inset world
     // extent, `WorldData.cs:478`).
@@ -255,7 +273,25 @@ fn shoot_ray(
         // --- chunk lookup ---------------------------------------------------
         let chunk_pos = vec3<u32>(cur_cell) / 16u;
         let voxel_pos_in_chunk = vec3<u32>(cur_cell) % 16u;
-        var cur_node: u32 = textureLoad(chunks, vec3<i32>(chunk_pos), 0).x;
+        let chunk_texel = textureLoad(chunks, vec3<i32>(chunk_pos), 0);
+        var cur_node: u32 = chunk_texel.x;
+
+        // W4 entity-track — collect this chunk's entity-pointer (`.y`) if
+        // non-zero and not the same as the last one. Faithful to HLSL
+        // `rayTracing.fxh:106-112`. The 16-slot cap matches NAADF; an
+        // entity-dense ray that exceeds it loses the surplus entities — a
+        // documented limitation. Always compiled — on a no-entities scene
+        // every chunk's `.y` is 0 so the branch never appends.
+        let entity_pointer_and_size = chunk_texel.y;
+        if (entity_pointer_and_size != 0u && chunks_with_entities_count < 16u) {
+            let prev_index = select(0u, chunks_with_entities_count - 1u,
+                chunks_with_entities_count > 0u);
+            if (chunks_with_entities_count == 0u
+                || chunks_with_entities[prev_index] != entity_pointer_and_size) {
+                chunks_with_entities[chunks_with_entities_count] = entity_pointer_and_size;
+                chunks_with_entities_count = chunks_with_entities_count + 1u;
+            }
+        }
 
         // `boundsInDir` — per-axis AADF cell-count the ray may skip.
         var bounds_in_dir = vec3<u32>(1u, 1u, 1u);
@@ -345,12 +381,163 @@ fn shoot_ray(
         step_count = step_count + 1;
     }
 
+    // === W4 entity sub-traversal ===========================================
+    // Faithful port of the HLSL `#ifdef ENTITIES` branch in
+    // `rayTracing.fxh:154-240`. For each collected `chunks[pos].y` pointer,
+    // iterate the (count) entity-instances it addresses; for each entity,
+    // ray-AABB against the entity's local-frame box; on hit, DDA-traverse
+    // the entity's packed AADF voxel volume; merge the closer hit into
+    // `ray_result`. The branch is bypassed when no chunks had entity
+    // pointers (`chunks_with_entities_count == 0`), keeping the cost on
+    // entity-empty rays near zero.
+    var is_hit_entity = false;
+    var cur_entity_block_index: u32 = 0u;
+    var cur_entity_block_entity_index: u32 = 0u;
+    loop {
+        if (cur_entity_block_index >= chunks_with_entities_count) {
+            break;
+        }
+        let cur_entity_block_data = chunks_with_entities[cur_entity_block_index];
+        let entity_block_data_index = (cur_entity_block_data >> 8u)
+            + cur_entity_block_entity_index;
+        let entity_inst_comp = entity_chunk_instances[entity_block_data_index];
+        let entity_inst = decompress_entity_instance_from_chunk(
+            entity_inst_comp.pack_a, entity_inst_comp.pack_b,
+            entity_inst_comp.pack_c, entity_inst_comp.pack_d,
+            entity_inst_comp.pack_e,
+        );
+        // World→entity frame transform (HLSL `rayTracing.fxh:165-167`).
+        let ray_origin_entity_world = ray_origin_frac
+            - (entity_inst.position - vec3<f32>(ray_origin_int));
+        let ray_origin_entity = apply_rotation(
+            ray_origin_entity_world, entity_inst.quaternion);
+        let ray_dir_entity = apply_rotation(ray_dir, entity_inst.quaternion);
+
+        let entity_size_f = vec3<f32>(entity_inst.size);
+        let aabb_hit = ray_aabb(
+            ray_origin_entity, ray_dir_entity,
+            vec3<f32>(0.0, 0.0, 0.0), entity_size_f,
+        );
+        if (aabb_hit.hit) {
+            var step_count_entity: i32 = 0;
+            let entity_aabb_t_near = aabb_hit.dist_min_max.x;
+            let inv_ray_dir_abs_entity =
+                abs(1.0 / (vec3<f32>(0.000000001) + ray_dir_entity));
+            // HLSL `isPositive = step(0, rayDirEntity)` — the AADF shift
+            // table for the per-entity 5-bit-per-axis-per-direction layout
+            // (`commonEntities.fxh` / `EntityData.cs`).
+            let is_positive = vec3<u32>(step(vec3<f32>(0.0, 0.0, 0.0), ray_dir_entity));
+            let shift_mask_voxel_entity = vec3<u32>(
+                select(0u, 5u, is_positive.x == 1u),
+                select(10u, 15u, is_positive.y == 1u),
+                select(20u, 25u, is_positive.z == 1u),
+            );
+
+            var new_ray_length: f32 = -1.0;
+            var new_ray_hit_type: u32 = 0u;
+            var new_ray_normal: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+            var new_ray_voxel_pos: vec3<i32> = vec3<i32>(0, 0, 0);
+            var new_ray_step_count: i32 = 0;
+            var new_ray_normal_comp: u32 = 0u;
+
+            let voxel_pos_start = ray_origin_entity + ray_dir_entity * entity_aabb_t_near;
+            var mask_entity = aabb_hit.normal_mask;
+            // HLSL: `(int3)((entityHitDist.x > 0 ? mask * sign(rayDirEntity) * 0.5 : 0) + voxelPosStart)`
+            let entry_nudge = select(
+                vec3<f32>(0.0, 0.0, 0.0),
+                mask_entity * sign(ray_dir_entity) * 0.5,
+                entity_aabb_t_near > 0.0,
+            );
+            var voxel_pos_entity = vec3<i32>(entry_nudge + voxel_pos_start);
+
+            loop {
+                if (step_count_entity >= 20) {
+                    break;
+                }
+                let voxel_index = u32(voxel_pos_entity.x)
+                    + u32(voxel_pos_entity.y) * entity_inst.size.x
+                    + u32(voxel_pos_entity.z) * entity_inst.size.x * entity_inst.size.y;
+                let voxel_data_index = entity_inst.voxel_start * 64u + voxel_index;
+                let cur_voxel = entity_voxel_data[voxel_data_index];
+                // HLSL: `if (curVoxel & 0x80000000)` — full voxel hit.
+                if ((cur_voxel & 0x80000000u) != 0u) {
+                    new_ray_hit_type = cur_voxel & 0x7FFFFFFFu;
+                    new_ray_length = entity_aabb_t_near
+                        + length(vec3<f32>(voxel_pos_entity) - voxel_pos_start);
+                    new_ray_normal = mask_entity * -sign(ray_dir_entity);
+                    new_ray_voxel_pos = voxel_pos_entity;
+                    new_ray_step_count = step_count_entity;
+                    let normal_dot = dot(new_ray_normal, vec3<f32>(1.0, 3.0, 5.0));
+                    let normal_index = (abs(normal_dot) - select(1.0, 0.0, normal_dot > 0.0)) + 1.0;
+                    let dist_along_normal =
+                        abs(dot(vec3<f32>(voxel_pos_entity), new_ray_normal))
+                        + max(0.0, dot(new_ray_normal, vec3<f32>(1.0, 1.0, 1.0)));
+                    new_ray_normal_comp = u32(normal_index + dist_along_normal * 8.0);
+                    break;
+                }
+                // HLSL: `boundsInDir = ((curVoxel >> shiftMaskVoxel) & 0x1F)`.
+                let bounds_in_dir_entity = vec3<i32>(
+                    i32((cur_voxel >> shift_mask_voxel_entity.x) & 0x1Fu),
+                    i32((cur_voxel >> shift_mask_voxel_entity.y) & 0x1Fu),
+                    i32((cur_voxel >> shift_mask_voxel_entity.z) & 0x1Fu),
+                );
+                // distForRay = (abs((voxelPos + isPositive) - voxelPosStart)
+                //             + boundsInDir) * invRayDirAbsEntity
+                let dist_for_ray = (
+                    abs(vec3<f32>(voxel_pos_entity + vec3<i32>(is_positive)) - voxel_pos_start)
+                    + vec3<f32>(bounds_in_dir_entity)
+                ) * inv_ray_dir_abs_entity;
+                let min_dist_for_ray = min(dist_for_ray.x,
+                    min(dist_for_ray.y, dist_for_ray.z));
+                mask_entity = step(dist_for_ray,
+                    vec3<f32>(min_dist_for_ray, min_dist_for_ray, min_dist_for_ray));
+                voxel_pos_entity = vec3<i32>(floor(
+                    voxel_pos_start + ray_dir_entity * min_dist_for_ray
+                    + mask_entity * sign(ray_dir_entity) * 0.5
+                ));
+
+                if (any(voxel_pos_entity < vec3<i32>(0, 0, 0))
+                    || any(vec3<u32>(voxel_pos_entity) >= entity_inst.size)) {
+                    break;
+                }
+                step_count_entity = step_count_entity + 1;
+                step_count = step_count + 1;
+            }
+
+            if (new_ray_length > 0.0
+                && (new_ray_length < (*ray_result).length || (*ray_result).length < 0.0)) {
+                is_hit_entity = true;
+                (*ray_result).hit_type = new_ray_hit_type;
+                (*ray_result).length = new_ray_length;
+                (*ray_result).voxel_pos = new_ray_voxel_pos;
+                (*ray_result).normal = apply_rotation(
+                    new_ray_normal, quaternion_inverse(entity_inst.quaternion));
+                (*ray_result).normal_comp = new_ray_normal_comp;
+                (*ray_result).entity = entity_inst.entity;
+            }
+        }
+
+        cur_entity_block_entity_index = cur_entity_block_entity_index + 1u;
+        if (cur_entity_block_entity_index >= (cur_entity_block_data & 0xFFu)) {
+            cur_entity_block_index = cur_entity_block_index + 1u;
+            cur_entity_block_entity_index = 0u;
+        }
+    }
+    // === end W4 entity sub-traversal =======================================
+
     (*ray_result).step_count = step_count;
     if ((*ray_result).length <= 0.0) {
         (*ray_result).length = 99999999.0;
         // The C# returns `stepCount == 0` here — a degenerate
         // origin-already-inside-geometry case counts as a hit.
         return step_count == 0;
+    }
+
+    // HLSL `if (isHitEntity) return true;` (`rayTracing.fxh:250-251`) — entity
+    // hits already filled in normal + normal_comp, skip the world-hit normal
+    // reconstruction below.
+    if (is_hit_entity) {
+        return true;
     }
 
     // Reconstruct the hit normal from the last-crossed-axis `mask` and ray sign

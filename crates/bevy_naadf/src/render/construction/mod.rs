@@ -169,6 +169,16 @@ pub struct ConstructionGpu {
     pub entity_chunk_instances_dynamic: Option<Buffer>,
     /// `entityHistoryDynamic`. W4.
     pub entity_history_dynamic: Option<Buffer>,
+    /// Phase-C wave-3 — `EntityUpdateParams` uniform buffer
+    /// (`entity_update.wgsl::params`). Written every frame the entity dispatch
+    /// fires with the current `entity_instance_count` / `taa_index` /
+    /// `update_count` / `entity_chunk_instance_count` / `max_entity_instances`.
+    pub entity_update_params_buffer: Option<Buffer>,
+    /// Phase-C wave-3 — `true` once the world bind group has been rebuilt to
+    /// reference the *production* W4 entity buffers (not the placeholders
+    /// allocated by `prepare_world_gpu`). Used so the rebuild happens once,
+    /// after all W4 buffers exist + `entities_enabled = true`.
+    pub world_bind_group_has_entities: bool,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -507,6 +517,28 @@ pub struct ConstructionEvents {
     /// CPU-staged `changed_groups_dynamic` payload (`[group_pos_packed,
     /// distance]` per group).
     pub changed_groups: Vec<[u32; 2]>,
+    /// Phase-C wave-3 — W4 per-frame entity-update uploads (mirrors
+    /// `EntityHandler::update`'s output).
+    ///
+    /// Populated by [`extract_world_changes`] when the main world has an
+    /// `EntityHandler` resource + a non-empty entity list. The render-side
+    /// `prepare_construction` uploads these into the dynamic GPU buffers; the
+    /// `naadf_entity_update_node` dispatches the 3 `entity_update.wgsl` entry
+    /// points to fold them into the production `entity_chunk_instances` /
+    /// `entity_instances_history` buffers + the chunks texture's `.y` channel.
+    pub entity_uploads: entity_handler::EntityUpdateUploads,
+    /// W4 — current TAA ring index for the entity history slot
+    /// (`entityUpdate.fx:39` `taaIndex * 16384` stride). Mirrored from the
+    /// renderer's TAA state at extract time.
+    pub entity_taa_index: u32,
+    /// Phase-C wave-3 — per-entity AADF voxel-volume data (`EntityData` from
+    /// `aadf::entity::EntityData::from_types`), one entity's 64-u32 volume
+    /// per entry. Uploaded to the GPU `entity_voxel_data` buffer when
+    /// `entity_voxel_data_dirty` is set. Empty on no-entities frames.
+    pub entity_voxel_data: Vec<u32>,
+    /// Phase-C wave-3 — `true` when `entity_voxel_data` should be re-uploaded.
+    /// Set on first-frame init / when the entity type set changes.
+    pub entity_voxel_data_dirty: bool,
 }
 
 impl ConstructionEvents {
@@ -518,6 +550,15 @@ impl ConstructionEvents {
             || self.changed_block_count > 0
             || self.changed_voxel_count > 0
             || self.changed_group_count > 0
+    }
+
+    /// Phase-C wave-3 — W4 fast-path predicate: `true` iff the entity track
+    /// has uploads to dispatch this frame. Used by `naadf_entity_update_node`
+    /// as the cheap fast-path gate (matches `has_pending_changes` discipline).
+    pub fn has_entity_updates(&self) -> bool {
+        !self.entity_uploads.chunk_updates.is_empty()
+            || !self.entity_uploads.entity_chunk_instances.is_empty()
+            || !self.entity_uploads.entity_history.is_empty()
     }
 }
 
@@ -535,6 +576,65 @@ pub fn clear_world_data_pending_edits(mut world_data: Option<ResMut<crate::world
     }
 }
 
+/// Phase-C wave-3 — main-world resource holding the live entity list + the
+/// `EntityHandler` state (`15-design-c.md` §3.6, `16-impl-c-W4.md` integration
+/// notes).
+///
+/// **Optional**: the resource is absent on the no-entities path (the normal
+/// e2e / baseline render). When present, the per-frame extract calls
+/// `EntityHandler::update(&self.instances)` and forwards the resulting
+/// `EntityUpdateUploads` to the render-world `ConstructionEvents`. The
+/// renderer-side dispatch chain (W4 `entity_update.wgsl` 3 entry points + the
+/// `shoot_ray` entity sub-traversal) fires automatically once the bind groups
+/// are built.
+///
+/// The `--entities` e2e mode inserts one entity here so the rendered
+/// framebuffer carries the entity hit on top of the world geometry.
+#[derive(Resource, Default)]
+pub struct MainWorldEntities {
+    /// Live entity instances for this frame.
+    pub instances: Vec<crate::render::gpu_types::EntityInstance>,
+    /// Per-entity-id voxel-volume builds (`EntityData` from
+    /// `aadf::entity::EntityData::from_types`). Index = entity id; each
+    /// entry's 64 u32s is concatenated into the `entity_voxel_data` GPU
+    /// buffer in upload order. The render path consumes this through
+    /// `EntityInstance::voxel_start` (the C# pre-computes the offset; for
+    /// the test fixture all entities are the same and `voxel_start = 0`).
+    pub voxel_data: Vec<u32>,
+    /// Generation counter — bumped whenever `voxel_data` changes. The
+    /// render-world extract sees the change via the `Last`-set value vs the
+    /// stored render-side mirror and triggers re-upload.
+    pub voxel_data_generation: u32,
+}
+
+/// Phase-C wave-3 — render-world resource holding the W4 `EntityHandler`
+/// state (across-frame: per-chunk entity-count u32 table + last-frame
+/// overlapped chunks list). Lives in the render world so the `ExtractSchedule`
+/// system can `&mut` it (Bevy's `Extract<>` only supports read-only main-world
+/// access; render-world state goes through `Res` / `ResMut`).
+///
+/// Updated each frame by [`extract_world_changes`]: reads main-world
+/// `MainWorldEntities::instances` and calls `handler.update(instances)` to
+/// produce the per-frame uploads. The previous-tracked voxel-data generation
+/// is also stored here so the extract can decide whether to copy the
+/// (potentially large) voxel-data buffer.
+#[derive(Resource)]
+pub struct RenderWorldEntityState {
+    pub handler: Option<entity_handler::EntityHandler>,
+    pub last_uploaded_voxel_data_generation: u32,
+}
+
+impl Default for RenderWorldEntityState {
+    fn default() -> Self {
+        Self {
+            handler: None,
+            // Distinct from MainWorldEntities default (0) so the first frame
+            // with any non-empty voxel_data triggers an upload.
+            last_uploaded_voxel_data_generation: u32::MAX,
+        }
+    }
+}
+
 /// `ExtractSchedule` system: mirror the main-world [`crate::world::data::WorldData::pending_edits`]
 /// into the render-world [`ConstructionEvents`] resource.
 ///
@@ -542,10 +642,16 @@ pub fn clear_world_data_pending_edits(mut world_data: Option<ResMut<crate::world
 /// each frame: aggregates the per-batch `changed_*` arrays into the render-world
 /// resource and runs the CPU flood-fill via
 /// [`change_handler::compute_change_groups`] to produce `changed_groups`.
+///
+/// Phase-C wave-3 — also reads the optional [`MainWorldEntities`] and folds
+/// the per-frame `EntityHandler::update` result into
+/// [`ConstructionEvents::entity_uploads`].
 pub fn extract_world_changes(
     mut commands: Commands,
     main_world_data: Option<bevy::render::Extract<Res<crate::world::data::WorldData>>>,
     construction_config: Option<bevy::render::Extract<Res<crate::AppArgs>>>,
+    main_world_entities: Option<bevy::render::Extract<Res<MainWorldEntities>>>,
+    entity_state: Option<ResMut<RenderWorldEntityState>>,
 ) {
     let Some(world_data) = main_world_data else {
         commands.insert_resource(ConstructionEvents::default());
@@ -596,6 +702,44 @@ pub fn extract_world_changes(
         }
     }
 
+    // === Phase-C wave-3 — entity uploads ====================================
+    // When the main-world `MainWorldEntities` resource exists and carries at
+    // least one instance, run `EntityHandler::update` and fold the result into
+    // `ConstructionEvents.entity_uploads`. The render-side dispatch + the
+    // chunks-texture `.y` write fire next frame.
+    //
+    // The handler may be `None` on first frame; lazily initialise it from the
+    // world's chunk-grid size. This is `Extract<ResMut<...>>` so we can mutate
+    // the handler's across-frame state (the C#'s `EntityHandler` is a
+    // stateful class).
+    if let (Some(me), Some(mut state)) = (main_world_entities, entity_state) {
+        // Mirror voxel-data into `ConstructionEvents` whenever the generation
+        // counter changes — `prepare_construction` then re-uploads the GPU
+        // buffer. This avoids cloning the (potentially large) voxel data
+        // every frame on the steady-state path.
+        if me.voxel_data_generation != state.last_uploaded_voxel_data_generation {
+            events.entity_voxel_data = me.voxel_data.clone();
+            events.entity_voxel_data_dirty = true;
+            state.last_uploaded_voxel_data_generation = me.voxel_data_generation;
+        }
+
+        if !me.instances.is_empty() {
+            // Lazy-init the handler. The fixture-world dimensions are fixed,
+            // so initialising from the current `WorldData::size_in_chunks` is
+            // safe (the test grid never resizes).
+            if state.handler.is_none() {
+                state.handler = Some(entity_handler::EntityHandler::new([
+                    world_data.size_in_chunks.x,
+                    world_data.size_in_chunks.y,
+                    world_data.size_in_chunks.z,
+                ]));
+            }
+            if let Some(handler) = state.handler.as_mut() {
+                events.entity_uploads = handler.update(&me.instances);
+            }
+        }
+    }
+
     commands.insert_resource(events);
 }
 
@@ -622,7 +766,7 @@ pub fn prepare_construction(
     mut commands: Commands,
     gpu: Option<ResMut<ConstructionGpu>>,
     bind_groups: Option<ResMut<ConstructionBindGroups>>,
-    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    world_gpu: Option<ResMut<crate::render::prepare::WorldGpu>>,
     construction_pipelines: Option<Res<ConstructionPipelines>>,
     construction_config: Res<config::ConstructionConfig>,
     pipeline_cache: Res<PipelineCache>,
@@ -647,7 +791,7 @@ pub fn prepare_construction(
 
     let mut gpu = gpu.unwrap();
     let mut bind_groups = bind_groups.unwrap();
-    let Some(world_gpu) = world_gpu else { return; };
+    let Some(mut world_gpu) = world_gpu else { return; };
     let Some(construction_pipelines) = construction_pipelines else { return; };
 
     // === W3 — bound-queue family + bind groups ===============================
@@ -1122,6 +1266,281 @@ pub fn prepare_construction(
             bind_groups.construction_world = Some(bg);
         }
     }
+
+    // === W4 wave-3 — entity-track GPU buffers + bind groups =================
+    //
+    // Allocate / re-upload the 6 W4 buffers when entities are enabled. Mirror
+    // the W2 pattern: fixed-size production buffers + dynamic upload buffers,
+    // both bound on `construction_entity_layout` @group(1). The world bind
+    // group is rebuilt once with the production entity buffers replacing the
+    // placeholders that `prepare_world_gpu` allocated.
+    //
+    // Gate on `construction_config.entities_enabled` so the no-entities path
+    // is a single bool check per frame.
+    if construction_config.entities_enabled {
+        // Storage caps — sized for the 16384-instance default (the same
+        // `WorldRender.cs:88` constant W4 uses). The chunk-update + history
+        // upload buffers are sized for the max per-frame count.
+        let max_entity_instances = construction_config.max_entity_instances.max(1);
+        // 20 B per `GpuEntityChunkInstance`. Cap at 16× max_entity_instances
+        // (one entity may overlap up to ~16 chunks in the worst case for
+        // chunk-straddling entities of size ≤16 voxels).
+        let entity_chunk_instances_cap = (max_entity_instances * 16) as u64;
+        // `entity_voxel_data` size: 64 u32s per entity volume; we don't have
+        // a hard cap on entity-type count, but for the test fixture 16 is
+        // safe (the `EntityData` table is small). The buffer is re-uploaded
+        // whenever `events.entity_voxel_data_dirty` fires.
+        // History ring: `max_entity_instances * taa_ring_depth` slots.
+        let taa_ring_depth = 16u64; // matches `TaaRingConfig::DEFAULT_DEPTH`.
+        let history_ring_size = max_entity_instances as u64 * taa_ring_depth * 16; // 16 B per slot
+
+        if gpu.entity_chunk_instances.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("w4_entity_chunk_instances_rw"),
+                size: entity_chunk_instances_cap * 20,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            gpu.entity_chunk_instances = Some(buf);
+            bind_groups.construction_entity = None;
+            gpu.world_bind_group_has_entities = false;
+        }
+        if gpu.entity_instances_history.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("w4_entity_instances_history_rw"),
+                size: history_ring_size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            gpu.entity_instances_history = Some(buf);
+            bind_groups.construction_entity = None;
+            gpu.world_bind_group_has_entities = false;
+        }
+        // `entity_voxel_data` — sized per the staged `entity_voxel_data` from
+        // `ConstructionEvents`, re-allocated when the dirty flag fires.
+        let voxel_data_size_bytes = (construction_events
+            .as_ref()
+            .map(|e| e.entity_voxel_data.len())
+            .unwrap_or(0)
+            .max(1) as u64)
+            * 4;
+        if gpu.entity_voxel_data.is_none()
+            || construction_events
+                .as_ref()
+                .is_some_and(|e| e.entity_voxel_data_dirty)
+        {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("w4_entity_voxel_data_rw"),
+                size: voxel_data_size_bytes.max(4),
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            // Upload the staged voxel data (if any).
+            if let Some(events) = construction_events.as_ref() {
+                if !events.entity_voxel_data.is_empty() {
+                    render_queue.write_buffer(
+                        &buf,
+                        0,
+                        bytemuck::cast_slice(&events.entity_voxel_data),
+                    );
+                }
+            }
+            gpu.entity_voxel_data = Some(buf);
+            bind_groups.construction_entity = None;
+            gpu.world_bind_group_has_entities = false;
+        }
+
+        // Dynamic upload buffers (3) — re-uploaded every frame the entity
+        // dispatch fires.
+        if gpu.chunk_updates_dynamic.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("w4_chunk_updates_dynamic"),
+                // 8 B per update (vec2<u32>); cap at 16× max_entity_instances.
+                size: (max_entity_instances as u64 * 16) * 8,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.chunk_updates_dynamic = Some(buf);
+            bind_groups.construction_entity = None;
+        }
+        if gpu.entity_chunk_instances_dynamic.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("w4_entity_chunk_instances_dynamic"),
+                size: entity_chunk_instances_cap * 20,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.entity_chunk_instances_dynamic = Some(buf);
+            bind_groups.construction_entity = None;
+        }
+        if gpu.entity_history_dynamic.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("w4_entity_history_dynamic"),
+                size: max_entity_instances as u64 * 16,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.entity_history_dynamic = Some(buf);
+            bind_groups.construction_entity = None;
+        }
+        // Params uniform.
+        if gpu.entity_update_params_buffer.is_none() {
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("w4_entity_update_params"),
+                size: std::mem::size_of::<entity_update::GpuEntityUpdateParams>() as u64,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.entity_update_params_buffer = Some(buf);
+            // The params buffer is referenced by the W4 entity_world bind
+            // group built below — that bind group lives outside the
+            // `construction_entity` bind group (W4 uses `@group(0)` for
+            // `chunks_rw + params`). The dispatch code in
+            // `naadf_entity_update_node` builds the world bind group inline,
+            // so no bind-group invalidation is needed here.
+        }
+
+        // Per-frame uploads — drained from `ConstructionEvents`.
+        let entity_uploads_ready = construction_events
+            .as_ref()
+            .is_some_and(|e| e.has_entity_updates());
+        if entity_uploads_ready {
+            if let Some(events) = construction_events.as_ref() {
+                if !events.entity_uploads.chunk_updates.is_empty() {
+                    if let Some(buf) = gpu.chunk_updates_dynamic.as_ref() {
+                        render_queue.write_buffer(
+                            buf,
+                            0,
+                            bytemuck::cast_slice(&events.entity_uploads.chunk_updates),
+                        );
+                    }
+                }
+                if !events.entity_uploads.entity_chunk_instances.is_empty() {
+                    if let Some(buf) = gpu.entity_chunk_instances_dynamic.as_ref() {
+                        render_queue.write_buffer(
+                            buf,
+                            0,
+                            bytemuck::cast_slice(&events.entity_uploads.entity_chunk_instances),
+                        );
+                    }
+                }
+                if !events.entity_uploads.entity_history.is_empty() {
+                    if let Some(buf) = gpu.entity_history_dynamic.as_ref() {
+                        render_queue.write_buffer(
+                            buf,
+                            0,
+                            bytemuck::cast_slice(&events.entity_uploads.entity_history),
+                        );
+                    }
+                }
+                // Write the `EntityUpdateParams` uniform for this frame.
+                if let Some(params_buf) = gpu.entity_update_params_buffer.as_ref() {
+                    let params = entity_update::GpuEntityUpdateParams {
+                        entity_instance_count: events.entity_uploads.entity_history.len() as u32,
+                        entity_chunk_instance_count: events.entity_uploads.entity_chunk_instances.len() as u32,
+                        taa_index: events.entity_taa_index,
+                        update_count: events.entity_uploads.chunk_updates.len() as u32,
+                        max_entity_instances: construction_config.max_entity_instances,
+                        _pad0: 0,
+                        _pad1: 0,
+                        _pad2: 0,
+                    };
+                    render_queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+                }
+            }
+        }
+
+        // Build the W4 `@group(1)` construction-entity bind group when missing.
+        if bind_groups.construction_entity.is_none() {
+            if let (Some(cu), Some(eci), Some(eh), Some(eci_rw), Some(eih_rw)) = (
+                gpu.chunk_updates_dynamic.as_ref(),
+                gpu.entity_chunk_instances_dynamic.as_ref(),
+                gpu.entity_history_dynamic.as_ref(),
+                gpu.entity_chunk_instances.as_ref(),
+                gpu.entity_instances_history.as_ref(),
+            ) {
+                let bgl = pipeline_cache.get_bind_group_layout(
+                    &construction_pipelines.construction_entity_layout,
+                );
+                let bg = render_device.create_bind_group(
+                    "naadf_construction_entity_bind_group",
+                    &bgl,
+                    &BindGroupEntries::sequential((
+                        cu.as_entire_buffer_binding(),
+                        eci.as_entire_buffer_binding(),
+                        eh.as_entire_buffer_binding(),
+                        eci_rw.as_entire_buffer_binding(),
+                        eih_rw.as_entire_buffer_binding(),
+                    )),
+                );
+                bind_groups.construction_entity = Some(bg);
+            }
+        }
+
+        // Rebuild the renderer-side world bind group with the production W4
+        // entity buffers in place of the `prepare_world_gpu` placeholders
+        // (`15-design-c.md` §1.7 wave-3 integration). The renderer nodes bind
+        // `WorldGpu::bind_group`, so a `world_gpu.bind_group = rebuilt`
+        // mutation here propagates to every downstream pass — the
+        // `ray_tracing.wgsl::shoot_ray` entity sub-traversal now reads the
+        // production buffers. One-shot, guarded by
+        // `gpu.world_bind_group_has_entities`. The layout descriptor is
+        // rebuilt inline because `BindGroupLayoutDescriptor` equality is by
+        // entry-set; the pipeline cache returns the same layout id as
+        // `NaadfPipelines::world_layout`.
+        if !gpu.world_bind_group_has_entities {
+            if let (Some(eci_rw), Some(evd), Some(eih_rw)) = (
+                gpu.entity_chunk_instances.as_ref(),
+                gpu.entity_voxel_data.as_ref(),
+                gpu.entity_instances_history.as_ref(),
+            ) {
+                use bevy::render::render_resource::{
+                    binding_types::{
+                        storage_buffer_read_only_sized, texture_3d, uniform_buffer_sized,
+                    },
+                    BindGroupLayoutEntries, ShaderStages, TextureSampleType,
+                };
+                use std::num::NonZeroU64;
+                let world_meta_size = NonZeroU64::new(
+                    std::mem::size_of::<crate::render::gpu_types::GpuWorldMeta>() as u64,
+                )
+                .unwrap();
+                let world_layout_desc = bevy::render::render_resource::BindGroupLayoutDescriptor::new(
+                    "naadf_world_bind_group_layout",
+                    &BindGroupLayoutEntries::sequential(
+                        ShaderStages::COMPUTE,
+                        (
+                            texture_3d(TextureSampleType::Uint),
+                            storage_buffer_read_only_sized(false, None),
+                            storage_buffer_read_only_sized(false, None),
+                            storage_buffer_read_only_sized(false, None),
+                            uniform_buffer_sized(false, Some(world_meta_size)),
+                            storage_buffer_read_only_sized(false, None),
+                            storage_buffer_read_only_sized(false, None),
+                            storage_buffer_read_only_sized(false, None),
+                        ),
+                    ),
+                );
+                let bgl = pipeline_cache.get_bind_group_layout(&world_layout_desc);
+                let rebuilt = render_device.create_bind_group(
+                    "naadf_world_bind_group_with_entities",
+                    &bgl,
+                    &BindGroupEntries::sequential((
+                        &world_gpu.chunks_view,
+                        world_gpu.blocks.buffer().as_entire_buffer_binding(),
+                        world_gpu.voxels.buffer().as_entire_buffer_binding(),
+                        world_gpu.voxel_types.buffer().as_entire_buffer_binding(),
+                        world_gpu.world_meta.as_entire_buffer_binding(),
+                        eci_rw.as_entire_buffer_binding(),
+                        evd.as_entire_buffer_binding(),
+                        eih_rw.as_entire_buffer_binding(),
+                    )),
+                );
+                world_gpu.bind_group = rebuilt;
+                gpu.world_bind_group_has_entities = true;
+            }
+        }
+    }
 }
 
 /// `Startup`-schedule one-shot driver — the empty Phase-C regime-1 seam
@@ -1199,6 +1618,12 @@ impl Plugin for ConstructionPlugin {
             .map(ConstructionConfig::from)
             .unwrap_or_default();
 
+        // Phase-C wave-3 — main-world resource for the W4 entity track. Empty
+        // by default; e2e binaries / user code that wants to render an entity
+        // populates `instances` + `voxel_data` (and flags `voxel_data_dirty`).
+        // The `extract_world_changes` system reads it.
+        app.init_resource::<MainWorldEntities>();
+
         // Main-world `Startup` driver (regime-1, `15-design-c.md` §1.2). W0
         // body is the gated no-op above; W1 fills it.
         app.add_systems(Startup, run_gpu_construction_startup);
@@ -1221,6 +1646,11 @@ impl Plugin for ConstructionPlugin {
             // W2 — render-world resource mirroring per-frame edit state;
             // populated in `ExtractSchedule` by `extract_world_changes`.
             .init_resource::<ConstructionEvents>()
+            // Phase-C wave-3 — render-world W4 entity-handler state. Lives
+            // in the render world so the extract can mutate the handler's
+            // across-frame state without violating `Extract<>`'s read-only
+            // main-world rule.
+            .init_resource::<RenderWorldEntityState>()
             // Empty prepare seam — `init_resource`-only body.
             .add_systems(
                 Render,

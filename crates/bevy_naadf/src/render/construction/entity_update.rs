@@ -278,27 +278,105 @@ pub fn dispatch_copy_entity_history(
     pass.dispatch_workgroups(workgroups, 1, 1);
 }
 
-/// `Core3d` regime-3 node — placeholder for the W4 `naadf_entity_update_node`.
+/// `Core3d` regime-3 node — W4 entity-update dispatch (Phase-C wave-3).
 ///
-/// Gated on `ConstructionConfig.entities_enabled` AND the presence of
-/// extracted entity-update events. **W4 ships the node as a no-op gated
-/// system** because the full wiring (CPU-side `EntityHandler` event
-/// extraction + GPU-side bind-group construction in `prepare_construction` +
-/// dispatch through the construction pipeline cache) is a wave-3 integration
-/// step. The chain placeholder in `render/mod.rs` references this name; the
-/// chain is byte-identical to pre-W4 because the node is not yet inserted
-/// (`16-impl-c-W4.md` integration notes).
+/// Gated on:
+///   1. `ConstructionConfig.entities_enabled = true`.
+///   2. `ConstructionEvents.has_entity_updates() = true` (regime-3 fast-path —
+///      no-op on no-entity-update frames in microseconds).
+///
+/// Per-frame body: dispatches the 3 `entity_update.wgsl` entry points in
+/// order (`entityUpdate.fx:15-42`):
+///   1. `update_chunks` — writes the chunks-texture `.y` channel with the
+///      per-chunk entity pointer + counter pairs (mirrors HLSL
+///      `entityUpdate.fx:15-24`).
+///   2. `copy_entity_chunk_instances` — bulk copies the per-frame upload
+///      buffer into the GPU production buffer the renderer reads (mirrors
+///      `entityUpdate.fx:26-33`).
+///   3. `copy_entity_history` — writes the current TAA-ring slot of the
+///      entity-instance history buffer (mirrors `entityUpdate.fx:35-42`).
+///
+/// The world bind group built here is a small inline `(chunks_rw, params)`
+/// `@group(0)` bind group; the entity-track buffers live on `@group(1)` =
+/// `ConstructionBindGroups::construction_entity` (built by `prepare_construction`).
 pub fn naadf_entity_update_node(
-    config: Option<Res<crate::render::construction::ConstructionConfig>>,
+    mut render_context: bevy::render::renderer::RenderContext,
+    pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
+    construction_pipelines: Option<Res<crate::render::construction::ConstructionPipelines>>,
+    construction_bind_groups: Option<Res<crate::render::construction::ConstructionBindGroups>>,
+    construction_gpu: Option<Res<crate::render::construction::ConstructionGpu>>,
+    construction_events: Option<Res<crate::render::construction::ConstructionEvents>>,
+    construction_config: Option<Res<crate::render::construction::ConstructionConfig>>,
+    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    render_device: Res<bevy::render::renderer::RenderDevice>,
 ) {
-    let Some(config) = config else {
-        return;
-    };
+    let Some(config) = construction_config else { return; };
     if !config.entities_enabled {
         return;
     }
-    // Wave-3 integration: extract `EntityUpdateUploads` from the main world,
-    // upload them, dispatch the three pipelines. This stub keeps the chain
-    // placeholder live so a future merge can flip the gate on without
-    // touching `render/mod.rs`'s `.chain()`.
+    let Some(events) = construction_events else { return; };
+    if !events.has_entity_updates() {
+        // Regime-3 fast-path: no-op on no-entity-update frames.
+        return;
+    }
+    let Some(construction_pipelines) = construction_pipelines else { return; };
+    let Some(construction_bind_groups) = construction_bind_groups else { return; };
+    let Some(construction_gpu) = construction_gpu else { return; };
+    let Some(world_gpu) = world_gpu else { return; };
+
+    let Some(entity_bg) = construction_bind_groups.construction_entity.as_ref() else {
+        return;
+    };
+    let Some(params_buf) = construction_gpu.entity_update_params_buffer.as_ref() else {
+        return;
+    };
+
+    // Resolve the 3 pipelines.
+    let (Some(p_update), Some(p_copy_ci), Some(p_copy_hist)) = (
+        pipeline_cache.get_compute_pipeline(construction_pipelines.entity_update_pipeline_update_chunks),
+        pipeline_cache.get_compute_pipeline(construction_pipelines.entity_update_pipeline_copy_entity_chunk_instances),
+        pipeline_cache.get_compute_pipeline(construction_pipelines.entity_update_pipeline_copy_entity_history),
+    ) else {
+        return;
+    };
+
+    // Build the entity_world bind group inline (cheap; the bind group is
+    // not stashed because it depends on the per-frame params buffer).
+    let entity_world_bgl = pipeline_cache
+        .get_bind_group_layout(&construction_pipelines.entity_world_layout);
+    let entity_world_bg = render_device.create_bind_group(
+        "naadf_entity_update_world_bind_group",
+        &entity_world_bgl,
+        &bevy::render::render_resource::BindGroupEntries::sequential((
+            &world_gpu.chunks_view,
+            params_buf.as_entire_buffer_binding(),
+        )),
+    );
+
+    let encoder = render_context.command_encoder();
+
+    let update_count = events.entity_uploads.chunk_updates.len() as u32;
+    let entity_chunk_instance_count =
+        events.entity_uploads.entity_chunk_instances.len() as u32;
+    let entity_instance_count = events.entity_uploads.entity_history.len() as u32;
+
+    // Trace-level diagnostic — uncomment when verifying wave-3 plumbing:
+    //   info!("entity dispatch: {} updates, {} ci, {} hist", update_count,
+    //         entity_chunk_instance_count, entity_instance_count);
+
+    dispatch_update_chunks(encoder, p_update, &entity_world_bg, entity_bg, update_count);
+    dispatch_copy_entity_chunk_instances(
+        encoder,
+        p_copy_ci,
+        &entity_world_bg,
+        entity_bg,
+        entity_chunk_instance_count,
+    );
+    dispatch_copy_entity_history(
+        encoder,
+        p_copy_hist,
+        &entity_world_bg,
+        entity_bg,
+        entity_instance_count,
+    );
 }

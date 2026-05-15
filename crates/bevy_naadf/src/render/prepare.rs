@@ -57,8 +57,21 @@ pub struct WorldGpu {
     pub voxel_types: GrowableBuffer<GpuVoxelType>,
     /// The `world_meta` uniform buffer.
     pub world_meta: Buffer,
-    /// `@group(0)` bind group binding all of the above.
+    /// `@group(0)` bind group binding all of the above + the W4 entity bindings
+    /// (production or placeholder — see [`entity_chunk_instances_placeholder`]).
     pub bind_group: BindGroup,
+    /// Phase-C wave-3 — 1-element placeholder buffer for the
+    /// `entity_chunk_instances` slot (5) of `world_layout`. Used when
+    /// `ConstructionConfig.entities_enabled = false` so the layout is
+    /// satisfied without allocating the real entity buffers. When entities are
+    /// enabled `prepare_construction` rebuilds the world bind group binding
+    /// the real `ConstructionGpu::entity_chunk_instances` instead.
+    pub entity_chunk_instances_placeholder: Buffer,
+    /// Phase-C wave-3 — placeholder for `entity_voxel_data` (slot 6). See
+    /// [`entity_chunk_instances_placeholder`].
+    pub entity_voxel_data_placeholder: Buffer,
+    /// Phase-C wave-3 — placeholder for `entity_instances_history` (slot 7).
+    pub entity_instances_history_placeholder: Buffer,
 }
 
 /// The per-frame GPU resources (`03-design.md` §4.4 — render-world `FrameGpu`
@@ -271,7 +284,42 @@ pub fn prepare_world_gpu(
     });
     render_queue.write_buffer(&world_meta, 0, bytemuck::bytes_of(&world_meta_data));
 
+    // --- W4 wave-3 — placeholder entity-track buffers (`15-design-c.md` §1.7)
+    //
+    // `NaadfPipelines::world_layout` carries 3 W4 entity bindings unconditionally
+    // (slots 5/6/7: `entity_chunk_instances`, `entity_voxel_data`,
+    // `entity_instances_history`). On the no-entities path these point at
+    // single-element placeholder storage buffers so the bind group is
+    // well-formed and the WGSL bindings exist — the `shoot_ray` entity
+    // sub-traversal branch never fires (gated by the `ENTITIES_ENABLED`
+    // shader-def). `prepare_construction` rebuilds this bind group with the
+    // real W4 buffers (and the production `WorldGpu` chunks view) once
+    // `ConstructionGpu` has them allocated AND `entities_enabled = true`.
+    let placeholder_entity_chunk_instances = render_device.create_buffer(&BufferDescriptor {
+        label: Some("naadf_world_entity_chunk_instances_placeholder"),
+        // 20 B = one GpuEntityChunkInstance (the layout's expected stride).
+        size: 20,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let placeholder_entity_voxel_data = render_device.create_buffer(&BufferDescriptor {
+        label: Some("naadf_world_entity_voxel_data_placeholder"),
+        size: 4, // one u32
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let placeholder_entity_instances_history = render_device.create_buffer(&BufferDescriptor {
+        label: Some("naadf_world_entity_instances_history_placeholder"),
+        size: 16, // one vec4<u32>
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     // --- @group(0) bind group ----------------------------------------------
+    // Phase-C wave-3 — `world_layout` now has 8 bindings; slots 5/6/7 are the
+    // W4 entity-track read-only buffers. Bound to placeholders here; the
+    // construction-side `prepare_construction` may rebuild this bind group with
+    // the real W4 buffers when `ConstructionConfig.entities_enabled = true`.
     let bind_group = render_device.create_bind_group(
         "naadf_world_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.world_layout),
@@ -281,6 +329,9 @@ pub fn prepare_world_gpu(
             voxels.buffer().as_entire_buffer_binding(),
             voxel_types.buffer().as_entire_buffer_binding(),
             world_meta.as_entire_buffer_binding(),
+            placeholder_entity_chunk_instances.as_entire_buffer_binding(),
+            placeholder_entity_voxel_data.as_entire_buffer_binding(),
+            placeholder_entity_instances_history.as_entire_buffer_binding(),
         )),
     );
 
@@ -292,6 +343,9 @@ pub fn prepare_world_gpu(
         voxel_types,
         world_meta,
         bind_group,
+        entity_chunk_instances_placeholder: placeholder_entity_chunk_instances,
+        entity_voxel_data_placeholder: placeholder_entity_voxel_data,
+        entity_instances_history_placeholder: placeholder_entity_instances_history,
     });
     // Build-once: consumed — clear the flag so this stays a no-op.
     extracted.dirty = false;

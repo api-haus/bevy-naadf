@@ -68,3 +68,47 @@ struct GpuWorldMeta {
 
 // World geometry (HLSL `groupSize*` + `boundingBox*`).
 @group(0) @binding(4) var<uniform> world_meta: GpuWorldMeta;
+
+// === W4 entity track — render-side read-only bindings (Phase-C wave-3) =====
+//
+// The entity track widens `@group(0)` with 3 read-only buffers consumed by the
+// `ray_tracing.wgsl::shoot_ray` entity sub-traversal branch (the HLSL
+// `#ifdef ENTITIES` path in `rayTracing.fxh:81-240` /
+// `commonEntities.fxh`). Layout-wise these bindings are **always present** —
+// wave-3 extended `NaadfPipelines::world_layout` with them so a single
+// `naadf_world_bind_group_layout` covers both the disabled-entities and
+// enabled-entities cases. When `ConstructionConfig.entities_enabled = false`,
+// `prepare_construction` binds 1-element placeholder buffers so the layout is
+// satisfied; the `shoot_ray` entity branch never fires because the gate is
+// checked first (`ENTITIES_ENABLED` shader-def + the runtime `chunks[pos].y`
+// pointer check).
+
+// `EntityChunkInstance` — 20 B, 5 × u32, mirrors `gpu_types::GpuEntityChunkInstance`.
+// Field names avoid trailing `<digit>` (naga-oil composable-module identifier
+// rule: identifiers must not resemble `#{...}` substitution targets, which
+// match e.g. `data1`).
+struct EntityChunkInstance {
+    pack_a: u32,
+    pack_b: u32,
+    pack_c: u32,
+    pack_d: u32,
+    pack_e: u32,
+};
+
+// Per-(chunk × entity) packed instance — indexed by
+// `(chunks[pos].y >> 8) + chunk_entity_index`. HLSL
+// `StructuredBuffer<EntityChunkInstance> entityChunkInstances` (`rayTracing.fxh:41`).
+@group(0) @binding(5) var<storage, read> entity_chunk_instances: array<EntityChunkInstance>;
+
+// Per-entity AADF voxel volume — 64 u32s per entity. Indexed by
+// `entity_instance.voxel_start * 64 + voxel_idx`. HLSL
+// `StructuredBuffer<uint> entityVoxelData` (`rayTracing.fxh:42`).
+@group(0) @binding(6) var<storage, read> entity_voxel_data: array<u32>;
+
+// TAA-history ring of `Uint4` per entity-instance per TAA frame. Indexed by
+// `taa_index * MAX_ENTITY_INSTANCES + entity_instance_id`. HLSL
+// `StructuredBuffer<uint4> entityInstancesHistory` (`rayTracing.fxh:48`).
+// Currently unused by the renderer-side `shoot_ray` traversal (the C# uses it
+// for TAA reprojection of moving entities — Phase-C wave-3 lands the layout
+// binding; the consumer is a Phase-D / paper-gap follow-up).
+@group(0) @binding(7) var<storage, read> entity_instances_history: array<vec4<u32>>;

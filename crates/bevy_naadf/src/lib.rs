@@ -137,6 +137,15 @@ pub struct AppArgs {
     /// green; W4 may flip `entities_enabled`. The CLI flags that mutate
     /// individual fields land per-workstream — W0 only exposes the struct.
     pub construction_config: render::construction::ConstructionConfig,
+    /// Phase-C wave-3 — when `true`, [`build_app`] adds a `Startup` system
+    /// that spawns one fixture entity into [`render::construction::MainWorldEntities`]
+    /// (a 4×4×4 emissive-voxel block at the world centre). Combined with
+    /// `construction_config.entities_enabled = true`, this is the load-bearing
+    /// `--entities` mode of `e2e_render`: the entity is uploaded each frame
+    /// + rendered via `ray_tracing.wgsl::shoot_ray`'s entity sub-traversal
+    /// branch, surfacing in the framebuffer as an extra hit on top of the
+    /// world geometry.
+    pub spawn_test_entity: bool,
 }
 
 impl Default for AppArgs {
@@ -147,6 +156,7 @@ impl Default for AppArgs {
             taa_ring_depth: DEFAULT_TAA_RING_DEPTH,
             gi: GiSettings::default(),
             construction_config: render::construction::ConstructionConfig::default(),
+            spawn_test_entity: false,
         }
     }
 }
@@ -250,7 +260,16 @@ impl AppConfig {
 /// window) in *both* configs; `AppConfig` only flips the four deliberate e2e
 /// deltas (`e2e-render-test.md` §2.2). Caller runs `.run()` on the result.
 pub fn build_app(cfg: AppConfig) -> App {
-    let args = AppArgs::default();
+    build_app_with_args(cfg, AppArgs::default())
+}
+
+/// Build the bevy-naadf `App` with a caller-supplied [`AppArgs`].
+///
+/// Phase-C wave-3 — added to let the e2e binary toggle `--entities`-driven
+/// state (`entities_enabled = true` + `spawn_test_entity = true`) without
+/// having to mutate the global `AppArgs::default()`. Callers that don't need
+/// to override args use [`build_app`] (which forwards to this with the default).
+pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
 
     let mut app = App::new();
 
@@ -378,6 +397,18 @@ pub fn build_app(cfg: AppConfig) -> App {
     // camera instead of the production `setup_camera`; the e2e systems own that
     // (`crate::e2e::add_e2e_systems`).
     app.add_systems(Startup, voxel::grid::setup_test_grid);
+
+    // Phase-C wave-3 — spawn the W4 fixture entity (gated on
+    // `args.spawn_test_entity`). Runs after `setup_test_grid` so the world
+    // dimensions are known; populates `MainWorldEntities` with one entity at
+    // the test grid centre. Per-frame `extract_world_changes` then runs the
+    // `EntityHandler` + uploads the result into `ConstructionEvents`; the
+    // wave-3 dispatch chain (`naadf_entity_update_node` + the
+    // `ray_tracing.wgsl::shoot_ray` entity sub-traversal) folds it into the
+    // framebuffer.
+    if args.spawn_test_entity {
+        app.add_systems(Startup, spawn_phase_c_test_entity.after(voxel::grid::setup_test_grid));
+    }
     if cfg.add_e2e_systems {
         e2e::add_e2e_systems(&mut app);
     } else {
@@ -410,6 +441,68 @@ pub fn build_app(cfg: AppConfig) -> App {
 /// returned `AppExit` (`e2e-render-test.md` §3 / §7 / §8 / §11 step 7).
 pub fn run_e2e_render() -> AppExit {
     e2e::run_e2e_render()
+}
+
+/// Phase-C wave-3 — boot the windowed e2e with caller-supplied [`AppArgs`].
+///
+/// Mirrors [`run_e2e_render`] but lets the `--entities` flag in `e2e_render`'s
+/// `main` toggle `entities_enabled = true` + `spawn_test_entity = true` for
+/// the fixture-entity render path.
+pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
+    let app = build_app_with_args(AppConfig::e2e(), args);
+    e2e::run_with_app(app)
+}
+
+/// Phase-C wave-3 — startup system that spawns one W4 fixture entity into
+/// the main-world [`render::construction::MainWorldEntities`] resource.
+///
+/// Gated on `AppArgs::spawn_test_entity = true` at `build_app_with_args` time
+/// — `e2e_render --entities` sets the flag.
+///
+/// Fixture: a 4×4×4-voxel green-emissive block at the (sky-visible) world
+/// position that the e2e camera frames in front of the look target — the
+/// camera at `(86, 42, 90)` looking at `(32, 16, 32)` sees this entity high
+/// + central in the framebuffer. All voxels are voxel-type 11 (green
+/// emissive, `voxel/grid.rs:192-199`). The entity is at identity rotation;
+/// one entity instance, `entity = 0`, `voxel_start = 0` (the first 64 u32s
+/// of `entity_voxel_data`). The entity sits ~3 voxels above the existing
+/// scene's tallest emissive block so the screen position is distinct.
+fn spawn_phase_c_test_entity(
+    mut entities: ResMut<render::construction::MainWorldEntities>,
+) {
+    use crate::aadf::entity::EntityData;
+    use crate::render::gpu_types::EntityInstance;
+
+    // 4×4×4 green-emissive entity, every voxel type = 11.
+    let size = [4u32, 4, 4];
+    let voxel_count = (size[0] * size[1] * size[2]) as usize;
+    let types: Vec<u32> = vec![11u32; voxel_count];
+    let data = EntityData::from_types(size, &types);
+
+    // Pad to 64 u32s (NAADF `EntityHandler.cs:325-329` indexes
+    // `voxelStart * 64 + voxelIndex`, and a 4×4×4 entity uses 64 voxels).
+    let mut voxel_data = data.voxels.clone();
+    while voxel_data.len() < 64 {
+        voxel_data.push(0);
+    }
+    entities.voxel_data = voxel_data;
+    entities.voxel_data_generation = entities.voxel_data_generation.wrapping_add(1);
+
+    // Place at (30, 24, 30) — chunk (1,1,1) corner area, well above the
+    // ground slab + existing emissive blocks. Identity quaternion.
+    entities.instances = vec![EntityInstance {
+        position: bevy::math::Vec3::new(30.0, 24.0, 30.0),
+        quaternion: [0.0, 0.0, 0.0, 1.0],
+        voxel_start: 0,
+        entity: 0,
+        size,
+    }];
+
+    info!(
+        "phase-c wave-3 — spawned fixture entity: 4×4×4 green-emissive @ (30, 24, 30); \
+         voxel_data {} u32s",
+        entities.voxel_data.len()
+    );
 }
 
 #[cfg(test)]
