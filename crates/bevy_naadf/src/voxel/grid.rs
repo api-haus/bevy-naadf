@@ -27,6 +27,7 @@
 use bevy::prelude::*;
 
 use crate::aadf::construct::{construct, DenseVolume};
+use crate::voxel::vox_import;
 use crate::voxel::{MaterialBase, MaterialLayer, VoxelType, VoxelTypeId};
 use crate::world::data::{IAabb3, VoxelTypes, WorldData};
 use crate::{AppArgs, GridPreset};
@@ -64,9 +65,31 @@ const GRID_SIZE_IN_CHUNKS: [u32; 3] = [4, 2, 4];
 /// Replaces `main::setup_scene_placeholder`. Inserts the `WorldData` and
 /// `VoxelTypes` resources.
 pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
-    let palette = build_palette();
-    let volume = match args.grid_preset {
-        GridPreset::Default => build_default_volume(),
+    // Track A (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`)
+    // — `GridPreset::Vox { path }` loads a MagicaVoxel `.vox` file
+    // synchronously here at `Startup`. On error we log and fall through to the
+    // hard-coded test grid so the e2e harness always boots into a renderable
+    // world (Design `## How loading integrates with setup_test_grid`).
+    let (palette, volume) = match &args.grid_preset {
+        GridPreset::Default => (build_palette(), build_default_volume()),
+        GridPreset::Vox { path } => match vox_import::load_vox(path) {
+            Ok(imp) => {
+                info!(
+                    "NAADF .vox loaded from {}: {} palette entries, {:?} chunks",
+                    path.display(),
+                    imp.palette.len(),
+                    imp.volume.size_in_chunks,
+                );
+                (imp.palette, imp.volume)
+            }
+            Err(e) => {
+                error!(
+                    ".vox load failed ({e}); falling back to default test grid (path: {})",
+                    path.display()
+                );
+                (build_palette(), build_default_volume())
+            }
+        },
     };
 
     let world = construct(&volume);

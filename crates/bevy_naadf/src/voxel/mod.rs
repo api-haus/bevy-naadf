@@ -10,6 +10,7 @@
 //! eventual WGSL traversal port bit-matches the algorithm.
 
 pub mod grid;
+pub mod vox_import;
 
 use bevy::prelude::Vec3;
 

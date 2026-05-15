@@ -44,6 +44,13 @@ bevy = { version = "=0.19.0-rc.1", features = [
 # Pinned to the version Bevy 0.19-rc.1 re-exports so the `Pod`/`Zeroable` traits
 # match across the crate boundary.
 bytemuck = { version = "=1.25.0", features = ["derive"] }
+# dot_vox = MagicaVoxel `.vox` parser. Returns `DotVoxData { models, palette,
+# materials, scenes, ... }` in the same shape NAADF's C# `MagicaVoxel.cs`
+# parser produces; the port runs a flattening pass (`voxel/vox_import.rs`) to
+# fold the scene graph into a `DenseVolume`. Used only by Track A `.vox`
+# loading; pure-Rust nom parser, no native deps. See
+# `docs/orchestrate/feature-completeness/02a-design-vox-loading.md`.
+dot_vox = "5.2"
 # image = PNG encoding for the e2e harness's persistent screenshot-to-disk
 # (`src/e2e/framebuffer.rs` `Framebuffer::save_png`) plus PNG/JPEG *decoding* for
 # the texture-array loader's source maps (`src/texture_array/loader.rs`). Pinned

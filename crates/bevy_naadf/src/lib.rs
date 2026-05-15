@@ -46,12 +46,23 @@ use bevy::{
 use bevy::anti_alias::dlss::DlssProjectId;
 
 /// Which hard-coded Phase-A test grid `voxel::grid::setup_test_grid` builds (D2).
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+///
+/// Track A (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`)
+/// added the [`GridPreset::Vox`] variant — a MagicaVoxel `.vox` file path read
+/// synchronously at `Startup` via [`voxel::vox_import::load_vox`]. `PathBuf` is
+/// not `Copy`, so this enum is now `Clone` only (the
+/// [`AppArgs`] / [`build_app_with_args`] surfaces propagate the move).
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub enum GridPreset {
     /// The default scene: ground slab + axis-aligned boxes + a sphere + one
     /// emissive box.
     #[default]
     Default,
+    /// Load a MagicaVoxel `.vox` file from disk (path relative to repo root or
+    /// absolute). The file is read once at `Startup`; failure logs an error
+    /// and falls back to [`GridPreset::Default`] so the e2e harness still has
+    /// a renderable world. See `voxel/vox_import.rs`.
+    Vox { path: std::path::PathBuf },
 }
 
 /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#
@@ -186,7 +197,13 @@ impl Default for GiSettings {
 pub const DEFAULT_TAA_RING_DEPTH: u32 = 32;
 
 /// Command-line options, parsed once and stored as a resource (`03-design.md` §4.1).
-#[derive(Resource, Clone, Copy)]
+///
+/// Track A (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`
+/// — Assumption #5) dropped `Copy` because [`GridPreset::Vox`] carries a
+/// `PathBuf`. Every internal use is by-ref (`Res<AppArgs>` / `&AppArgs`); the
+/// only by-value site is [`build_app_with_args`], where a single move
+/// suffices.
+#[derive(Resource, Clone)]
 pub struct AppArgs {
     /// Which hard-coded test grid to build (D2).
     pub grid_preset: GridPreset,
@@ -449,7 +466,10 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         primary_window.prevent_default_event_handling = true;
     }
 
-    app.insert_resource(args)
+    // `AppArgs` lost `Copy` in Track A (carries `PathBuf` in
+    // `GridPreset::Vox`). The resource gets a clone — `args` is consumed
+    // afterwards for the `spawn_test_entity` / `resize_test` reads below.
+    app.insert_resource(args.clone())
         // The 128-deep camera-history ring + the monotonic frame counter
         // (`06-design-a2.md` §2.3). Main-world resource, `Default`-seeded,
         // updated each frame by `update_camera_history`.

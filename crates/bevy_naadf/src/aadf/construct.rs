@@ -30,7 +30,7 @@ pub const CHUNK_DIM_VOXELS: usize = CELL_DIM * CELL_DIM;
 
 /// A dense voxel volume — the input to construction. Authored by
 /// `voxel::grid` (D2). Sized in whole chunks.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DenseVolume {
     /// World size in chunks, `[x, y, z]`.
     pub size_in_chunks: [u32; 3],

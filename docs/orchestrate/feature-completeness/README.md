@@ -13,7 +13,7 @@ per `12-alignment-gap.md` rows 17–21).
 | `01-context.md` | Canonical context bundle — every non-review agent reads this first. | **complete** |
 | `02a-design-vox-loading.md` | Track A design — `.vox` import path. | **complete** (delegate-architect, 2026-05-15) |
 | `02b-design-editor.md` | Track B design — paint/cube/sphere + Bevy-UI. | **complete** (delegate-architect, 2026-05-15) |
-| `03a-impl-vox-loading.md` | Track A implementation log. | pending |
+| `03a-impl-vox-loading.md` | Track A implementation log. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
 | `03b-impl-editor.md` | Track B implementation log. | pending |
 | `04a-review-vox-loading.md` | Track A fresh-eyes review brief + verdict. | pending |
 | `04b-review-editor.md` | Track B fresh-eyes review brief + verdict. | pending |
@@ -38,9 +38,9 @@ per `12-alignment-gap.md` rows 17–21).
 - [x] Step 5 — shared-context files (`README.md`, `01-context.md`)
 - [x] **Step 6a** — checkpoint + dispatch `design-vox` (parallel with `design-editor`)
 - [x] **Step 6b** — checkpoint + dispatch `design-editor` (parallel with `design-vox`)
-- [ ] **Step 7a** — synthesis after design phase, hard gate (← we are here)
-- [ ] Step 8a — checkpoint + dispatch `impl-vox`
-- [ ] Step 7b — synthesis after `impl-vox`, hard gate
+- [x] **Step 7a** — synthesis after design phase, hard gate
+- [x] **Step 8a** — checkpoint + dispatch `impl-vox`
+- [ ] **Step 7b** — synthesis after `impl-vox`, hard gate (← we are here)
 - [ ] Step 8b — checkpoint + dispatch `review-vox`
 - [ ] Step 7c — synthesis after `review-vox`, hard gate
 - [ ] Step 8c — checkpoint + dispatch `impl-editor`
