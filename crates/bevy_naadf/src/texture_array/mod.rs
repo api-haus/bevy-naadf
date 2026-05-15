@@ -28,7 +28,7 @@
 //! the render shaders included) through `imported_assets/` and race the
 //! processor against the render pipeline's shader loads. So it is kept out of
 //! the render app entirely and confined to the dedicated `bake` binary
-//! (`cargo run --bin bake` / `just bake`); the production app and the e2e
+//! (`cargo run --bin bake` / `just bake-texarrays`); the production app and the e2e
 //! harness stay `AssetMode::Unprocessed`.
 //!
 //! Basis is **native-only**: the `basis-universal` C++ encoder does not

@@ -34,7 +34,7 @@ dev:
 
 # Bake `*.texarray.ron` definitions → Basis `.basis` arrays under
 # `imported_assets/` (headless AssetProcessor; no GPU/DLSS needed). See README.
-bake:
+bake-texarrays:
     cargo run -p bevy-naadf --bin bake --no-default-features --release
 
 # Run the workspace test suites (incl. the dev-side baker's unit tests).

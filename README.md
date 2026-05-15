@@ -80,7 +80,7 @@ The same definition drives two paths:
 - **Loaded** (default; the only path on wasm) — `TextureArrayLoader` is a normal asset
   loader: `asset_server.load::<Image>("textures/foo.texarray.ron")` bakes it into an
   *uncompressed* RGBA8 2D-array `Image` on load. This is what the production app uses.
-- **Processed** — `just bake` (`cargo run --bin bake`) runs a headless
+- **Processed** — `just bake-texarrays` (`cargo run --bin bake`) runs a headless
   `AssetMode::Processed` app whose `AssetProcessor` Basis-Universal-supercompresses each
   array into a `.basis` file under `imported_assets/`; Bevy's runtime transcoder then
   decodes it per-GPU at load. `AssetMode::Processed` is app-global, so it is confined to
@@ -146,7 +146,7 @@ later without another restructure.
 | `crates/bevy_naadf/src/world/`    | `WorldData` / `VoxelTypes` resources + the `GrowableBuffer` GPU wrapper  |
 | `crates/bevy_naadf/src/render/`   | Render-world extract/prepare, GPU types, pipelines, the render-graph nodes |
 | `crates/bevy_naadf/src/texture_array/` | `*.texarray.ron` channel-combiner / array-packer asset pipeline — loader + Basis `AssetProcessor` |
-| `crates/bevy_naadf/src/bin/bake.rs` | Headless `AssetMode::Processed` runner — `just bake` bakes `*.texarray.ron` → `.basis` arrays |
+| `crates/bevy_naadf/src/bin/bake.rs` | Headless `AssetMode::Processed` runner — `just bake-texarrays` bakes `*.texarray.ron` → `.basis` arrays |
 | `crates/bevy_naadf/src/assets/shaders/` | The WGSL render shaders (ported from NAADF's HLSL `Content/shaders/`) |
 | `crates/bevy_naadf/src/hud.rs`    | Diagnostics overlay                                                     |
 | `crates/bevy_naadf/index.html` / `Trunk.toml` | The Trunk WebGPU (wasm32) web-build entry point             |

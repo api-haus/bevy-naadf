@@ -13,7 +13,7 @@
 //! Native-only: the Basis encoder does not cross-compile to wasm — see the
 //! [`crate::texture_array`](bevy_naadf::texture_array) module docs.
 //!
-//! Run it with `cargo run --bin bake` (or `just bake`).
+//! Run it with `cargo run --bin bake` (or `just bake-texarrays`).
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
