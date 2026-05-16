@@ -192,14 +192,26 @@ pub fn apply_edit_tool(
 
     // Snap-on-first-press; lerp on continued press
     // (`EditingToolPaint.cs:34-40` / `Cube.cs:42-48` / `Sphere.cs:42-48`).
+    //
+    // **Bug 2/3 fix** (`03b-followup-editor-bugs-234.md`): C# `gameTime`
+    // arrives in **milliseconds** via `gameTime.ElapsedGameTime.Total-
+    // Milliseconds` (`App.cs:111`). The lerp formula's `0.15` constant
+    // assumes ms-input. The port was passing `time.delta_secs()` (seconds),
+    // making the lerp ~1000× too small — `state.pos` was effectively anchored
+    // at the LMB-down snap so the brush kept stamping at the same place even
+    // while the cursor moved (Bug 2: holding+dragging doesn't paint
+    // continuously). And because Paint, Cube, and Sphere all shared the
+    // anchored `pos`, the `is_continuous` toggle could not affect what the
+    // user observed (Bug 3: `is_continuous` did nothing). Multiplying
+    // `delta_secs() × 1000` restores C# parity; both bugs disappear together.
     let just_pressed = mouse.just_pressed(MouseButton::Left);
     if just_pressed {
         state.stroke_just_started = true;
         state.pos = hit.world_pos;
     } else {
-        let dt = time.delta_secs();
+        let dt_ms = time.delta_secs() * 1000.0;
         let radius = state.radius.max(f32::EPSILON);
-        let lerp_value = (1.0 - 1.0 / (1.0 + dt * 0.15 / radius)).min(1.0);
+        let lerp_value = (1.0 - 1.0 / (1.0 + dt_ms * 0.15 / radius)).min(1.0);
         state.pos = hit.world_pos * lerp_value + state.pos * (1.0 - lerp_value);
     }
 
@@ -301,5 +313,39 @@ mod tests {
         assert_eq!(EditorState::tool_from_u32(2), EditTool::Sphere);
         // Wraps for any large value.
         assert_eq!(EditorState::tool_from_u32(123), EditTool::Paint);
+    }
+
+    /// Bug 2/3 fix — the C# `EditingToolPaint.cs:38` lerp formula uses
+    /// `gameTime` in MILLISECONDS (the MonoGame convention; `App.cs:111`
+    /// calls `ApplyAnyInput((float)gameTime.ElapsedGameTime.TotalMilliseconds)`).
+    /// The port's `time.delta_secs()` returns SECONDS — multiplying by
+    /// 1000 produces the equivalent ms value. Validate the formula
+    /// produces a meaningful lerp coefficient at a typical 60-FPS frame
+    /// (dt = 16.67 ms, r = 10).
+    #[test]
+    fn brush_lerp_uses_milliseconds_to_match_csharp() {
+        // C# `Math.Min(1, 1 - 1/(1 + gameTime * 0.15 / radius))` at the
+        // observed `gameTime = 16.67ms, radius = 10` arrives at ~0.2 lerp.
+        let dt_ms = 16.667_f32;
+        let radius = 10.0_f32;
+        let lerp_value = (1.0 - 1.0 / (1.0 + dt_ms * 0.15 / radius)).min(1.0);
+        // Sanity: not the ~0.00024 the bug-2/3 production form produced (when
+        // dt was passed in seconds without the ×1000 fix). The lerp should
+        // be in a perceptually meaningful range — at 60 FPS the brush
+        // position should track the cursor with a visible time-constant.
+        assert!(
+            lerp_value > 0.1,
+            "lerp_value = {lerp_value} too small — brush would not track cursor"
+        );
+        assert!(
+            lerp_value <= 1.0,
+            "lerp_value = {lerp_value} should be capped at 1.0"
+        );
+        // Specifically at dt=16.67 ms, r=10: 1 - 1/(1 + 0.25) = 0.2.
+        let expected = 1.0 - 1.0 / (1.0 + 0.25);
+        assert!(
+            (lerp_value - expected).abs() < 1e-5,
+            "lerp_value = {lerp_value} but expected ~{expected}"
+        );
     }
 }

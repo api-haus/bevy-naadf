@@ -194,6 +194,7 @@ impl WorldData {
             crate::aadf::edit::apply_block_edit_cpu(&mut self.blocks_cpu, block_ptr, &raw);
         }
         // Update the chunks CPU buffer entry for this chunk.
+        let mut batch = batch;
         for entry in &batch.changed_chunks {
             let pos_packed = entry[0];
             let new_state = entry[1];
@@ -208,6 +209,50 @@ impl WorldData {
             }
         }
         self.dirty = true;
+
+        // Bug 4 fix — mirror of `set_voxels_batch` recompute path. See the
+        // comment block there for the rationale and for the doc-link to
+        // `03b-followup-editor-bugs-234.md`. The per-voxel `set_voxel`
+        // path also needs the chunk-layer AADF recompute so single-voxel
+        // edits don't leave stale AADFs (Bug 4 affects both paths
+        // identically; the per-voxel path is just slower per edit).
+        let size_arr = [
+            self.size_in_chunks.x,
+            self.size_in_chunks.y,
+            self.size_in_chunks.z,
+        ];
+        let aadf_changed =
+            crate::aadf::edit::recompute_chunk_layer_aadfs(&mut self.chunks_cpu, size_arr);
+        let mut already_in_batch: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for entry in batch.changed_chunks.iter_mut() {
+            let pos_packed = entry[0];
+            let cx = (pos_packed & 0x7FF) as u32;
+            let cy = ((pos_packed >> 11) & 0x3FF) as u32;
+            let cz = (pos_packed >> 21) as u32;
+            let ci = (cx
+                + cy * self.size_in_chunks.x
+                + cz * self.size_in_chunks.x * self.size_in_chunks.y)
+                as usize;
+            if ci < self.chunks_cpu.len() {
+                entry[1] = self.chunks_cpu[ci];
+                already_in_batch.insert(ci);
+            }
+        }
+        let sx = self.size_in_chunks.x;
+        let sy = self.size_in_chunks.y;
+        for ci in aadf_changed {
+            if already_in_batch.contains(&ci) {
+                continue;
+            }
+            let cz = (ci / (sx as usize * sy as usize)) as u32;
+            let rem = ci % (sx as usize * sy as usize);
+            let cy = (rem / sx as usize) as u32;
+            let cx = (rem % sx as usize) as u32;
+            let pos_packed = crate::aadf::edit::pack_chunk_pos([cx, cy, cz]);
+            batch.changed_chunks.push([pos_packed, self.chunks_cpu[ci]]);
+        }
+
         // Stash the edit batch on the resource so the extract pass picks it up.
         self.pending_edits.batches.push(batch);
         self.pending_edits.edited_groups.push([
@@ -602,7 +647,7 @@ impl WorldData {
         // Run process_edit_batch ONCE with all chunks.
         let v_cursor = self.voxels_cpu.len() as u32;
         let b_cursor = self.blocks_cpu.len() as u32;
-        let (batch, _new_v, _new_b) = crate::aadf::edit::process_edit_batch(
+        let (mut batch, _new_v, _new_b) = crate::aadf::edit::process_edit_batch(
             &edit_data,
             &edited_chunks,
             v_cursor,
@@ -641,6 +686,61 @@ impl WorldData {
             }
         }
         self.dirty = true;
+
+        // Bug 4 fix (`docs/orchestrate/feature-completeness/03b-followup-editor-bugs-234.md`):
+        // recompute chunk-layer AADFs over the whole world so the renderer
+        // DDA does not skip OVER newly-painted geometry via stale AADFs on
+        // far-away empty chunks. The CPU mirror becomes authoritative; we
+        // emit synthetic `apply_chunk_change` upload entries for every
+        // chunk whose AADF differs from before, so the GPU chunks texture
+        // stays in sync. Directly-edited chunks have their state in
+        // `batch.changed_chunks` from `process_edit_batch`; we patch those
+        // entries to use the post-recompute `chunks_cpu[ci]` value (which
+        // carries the recomputed AADFs for any chunk that became Empty
+        // due to erase). Indirectly-affected chunks (AADF changed but
+        // state didn't) get appended.
+        let size_arr = [
+            self.size_in_chunks.x,
+            self.size_in_chunks.y,
+            self.size_in_chunks.z,
+        ];
+        let aadf_changed =
+            crate::aadf::edit::recompute_chunk_layer_aadfs(&mut self.chunks_cpu, size_arr);
+
+        // Re-sync `batch.changed_chunks[*][1]` to the post-recompute
+        // chunks_cpu values (for chunks that ARE in the batch, the new
+        // state may carry refreshed AADFs).
+        let mut already_in_batch: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for entry in batch.changed_chunks.iter_mut() {
+            let pos_packed = entry[0];
+            let cx = pos_packed & 0x7FF;
+            let cy = (pos_packed >> 11) & 0x3FF;
+            let cz = pos_packed >> 21;
+            let ci = (cx
+                + cy * self.size_in_chunks.x
+                + cz * self.size_in_chunks.x * self.size_in_chunks.y)
+                as usize;
+            if ci < self.chunks_cpu.len() {
+                entry[1] = self.chunks_cpu[ci];
+                already_in_batch.insert(ci);
+            }
+        }
+        // Append synthetic entries for chunks whose AADFs changed via the
+        // recompute but that weren't directly edited.
+        let sx = self.size_in_chunks.x;
+        let sy = self.size_in_chunks.y;
+        for ci in aadf_changed {
+            if already_in_batch.contains(&ci) {
+                continue;
+            }
+            let cz = (ci / (sx as usize * sy as usize)) as u32;
+            let rem = ci % (sx as usize * sy as usize);
+            let cy = (rem / sx as usize) as u32;
+            let cx = (rem % sx as usize) as u32;
+            let pos_packed = crate::aadf::edit::pack_chunk_pos([cx, cy, cz]);
+            batch.changed_chunks.push([pos_packed, self.chunks_cpu[ci]]);
+        }
 
         // Stash the batch + each edited chunk's group position for the
         // change-handler flood-fill.

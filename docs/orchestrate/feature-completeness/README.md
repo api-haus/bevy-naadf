@@ -19,6 +19,7 @@ per `12-alignment-gap.md` rows 17–21).
 | `03a-v2-impl-sparse-vox.md` | Track A v2 implementation log — sparse VOX ingestion against `02a-v2`; Oasis_Hard_Cover.vox now loads cleanly at 93×34×84 chunks. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
 | `crates/bevy_naadf/src/e2e/vox_e2e.rs` | Track A E2E gate addendum — synthesised-fixture `--vox-e2e` mode + `assert_vox_geometry_visible` non-skybox gate. Logged in `03a-impl-vox-loading.md` `## E2E gate addendum`. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
 | `03b-impl-editor.md` | Track B implementation log — paint/cube/sphere brushes + `KnobKind::Edit` panel extension + top-right tool HUD + `WorldData::ray_traversal`/`set_voxels_batch`/`get_voxel_type`. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
+| `03b-followup-editor-bugs-234.md` | Track B follow-up fix log — Bug 2 (continuous paint) + Bug 3 (`is_continuous` toggle) + Bug 4 (`.vox` chunk-layer AADF stale-on-edit). Lerp ms-vs-s; CPU `chunks_cpu` chunk-AADF recompute on every edit. | **complete** (general-purpose Opus 4.7 (1M context), 2026-05-16) — uncommitted on disk |
 | `04a-review-vox-loading.md` | Track A fresh-eyes review brief + verdict. | pending |
 | `04b-review-editor.md` | Track B fresh-eyes review brief + verdict. | pending |
 
@@ -54,8 +55,10 @@ per `12-alignment-gap.md` rows 17–21).
 - [x] **Step 7b-v2-impl** — synthesis after impl-sparse-vox + camera-init, hard gate. Committed `cb86e53` (sparse VOX) + `03ce9f0` (camera-init). Track A user-verified end-to-end.
 - [x] **Step 8c-impl-editor** — checkpoint + dispatch `impl-editor` (user-confirmed; skipped `review-vox`). Editor sub-tree landed; 170 tests pass; all 5 e2e modes PASS; zero regression on Track A.
 - [x] **Step 7d** — synthesis after `impl-editor`, hard gate. User reported 4 bugs from manual editor verification; Bug 1 (async edits) deferred for consideration; Bugs 2/3/4 to be fixed next.
-- [ ] **Step 8e-editor-fixes** — checkpoint + dispatch `fix-editor-bugs-234` (user-directed; AADF invalidation on .vox + continuous paint wiring; Bug 1 / async edits deferred separately) (← we are here)
-- [ ] Step 8d — checkpoint + dispatch `review-editor`
+- [x] **Step 8e-editor-fixes** — checkpoint + dispatch `fix-editor-bugs-234`. Bug 4 root cause: CPU-mirror parity hole — W2/W3 GPU edit-AADF chain never synced chunk-layer AADFs back to `chunks_cpu` that the CPU ray-traversal reads (v2 Risk #8 missed it). Bug 2/3 root cause: ms-vs-s unit confusion in lerp formula. 173 tests pass; all 5 e2e modes PASS.
+- [x] **Step 7e** — synthesis after editor fixes, hard gate. User reported edits "catastrophically slow" relative to C#'s 130 FPS on 4×4 Oasis grid + continuous brush. Bug 4 fix may itself be the bottleneck.
+- [x] **Step 8f-design-alignment** — design agent investigated C# editing end-to-end + designed re-alignment. Landed `02c-design-edit-pipeline-alignment.md` (687 lines). **Hypothesis refuted**: not "GPU work duplicated on CPU"; actual bottleneck is `recompute_chunk_layer_aadfs` (Bug 4 fix's sledgehammer); plus brush over-iteration + serial per-chunk work. Bug 1 retires.
+- [ ] **Step 7f** — synthesis after design-alignment, hard gate (← we are here)
 - [ ] Step 7e — final synthesis, exit
 
 ## Track order (user-confirmed)

@@ -1223,7 +1223,21 @@ pub fn prepare_construction(
     // correctness. (Were this a production app with bigger edits, a
     // `GrowableBuffer<T>` would be in order; for the test scene the fixed
     // size suffices.)
-    const W2_CHANGED_CHUNKS_INIT: u64 = 256;  // entries; each = 2×u32 = 8 B
+    // Bug 4 fix (`docs/orchestrate/feature-completeness/03b-followup-editor-bugs-234.md`):
+    // `set_voxels_batch` now emits one `changed_chunks` entry per chunk whose
+    // chunk-layer AADF changed via the post-edit recompute. For large
+    // `.vox`-loaded worlds (Oasis_Hard_Cover.vox: 93×34×84 = ~265 k chunks),
+    // a single brush stroke can dirty up to the entire chunks layer. Bump
+    // the static init size from 256 → 524 288 entries (524 288 × 8 B = 4 MiB,
+    // still well inside any wgpu `max_buffer_size`). When the world has
+    // fewer chunks than the cap, the extra bytes are unused — cheap.
+    //
+    // **Future**: switch to a `GrowableBuffer<u32>` when worlds may exceed
+    // 524 k chunks (the chunks 3D texture wgpu `max_texture_dimension_3d`
+    // ceiling is typically ~2048 per axis → 8 G chunks worst case; the
+    // current GrowableBuffer for blocks/voxels is the right pattern). Not
+    // in scope for the bug-2/3/4 fix.
+    const W2_CHANGED_CHUNKS_INIT: u64 = 524_288;  // entries; each = 2×u32 = 8 B
     const W2_CHANGED_BLOCKS_INIT: u64 = 4096; // u32 entries (~63 edits × 65)
     const W2_CHANGED_VOXELS_INIT: u64 = 8192; // u32 entries (~247 edits × 33)
     const W2_CHANGED_GROUPS_INIT: u64 = 256;  // entries; each = 2×u32 = 8 B

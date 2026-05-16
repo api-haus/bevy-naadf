@@ -446,6 +446,101 @@ pub fn set_voxel_in_window(window: &mut [u32], voxel_in_chunk: [u32; 3], ty: u16
     window[u32_offset] = lo | (hi << 16);
 }
 
+/// Recompute chunk-layer AADFs for the entire world, updating empty chunks'
+/// low 30 bits in `chunks_cpu` to reflect the post-edit world state.
+///
+/// **Bug 4 fix (followup-editor-bugs-234):** the W2 GPU regime-3 chain only
+/// updates AADFs for chunks within the BFS reach (~32 chunks of any direct
+/// edit). For large `.vox`-loaded worlds where empty chunks far from the
+/// loaded geometry have construction-time AADFs saturated at `AADF_MAX_CHUNK
+/// = 31`, edits inside that distance hull leave the far-side AADFs correct,
+/// but the AADF cap means **chunks within 30 chunks of any edit can have
+/// stale large AADFs that overshoot the new geometry**. The renderer's DDA
+/// reads those stale AADFs and skips OVER painted voxels — visible as
+/// "painted shapes terminate at some level / depend on view angle".
+///
+/// This recompute walks **the whole chunks layer** via `compute_aadf_layer`
+/// (same algorithm regime-2 implements GPU-side, paper §3.3 form) and
+/// rewrites every empty chunk's AADF to the correct distance to the nearest
+/// non-empty chunk. The CPU mirror becomes authoritative for chunk-layer
+/// AADFs.
+///
+/// `chunks_cpu`: the CPU mirror buffer (one `u32` per chunk in `(cx, cy,
+/// cz)` scan order). State bits 30-31 are preserved; AADF bits (low 30 of
+/// empty chunks) are overwritten.
+///
+/// `size_in_chunks`: the world dimensions in chunks.
+///
+/// Returns the list of flat chunk indices whose encoded value changed —
+/// the caller emits these into the `EditBatch.changed_chunks` upload list
+/// so the GPU chunks texture stays in sync via `apply_chunk_change`.
+///
+/// **Complexity**: O(world chunks × 3 axes × AADF_MAX_CHUNK iterations) =
+/// O(3 · 31 · N) per call. For Oasis_Hard_Cover.vox (93×34×84 = 265 k
+/// chunks), ~25 M ops per edit ≈ ~5 ms CPU (release build). Acceptable
+/// for synchronous editing; Bug 1 (async edits, deferred) would move this
+/// off the main thread.
+pub fn recompute_chunk_layer_aadfs(
+    chunks_cpu: &mut [u32],
+    size_in_chunks: [u32; 3],
+) -> Vec<usize> {
+    let sx = size_in_chunks[0] as usize;
+    let sy = size_in_chunks[1] as usize;
+    let sz = size_in_chunks[2] as usize;
+    if sx == 0 || sy == 0 || sz == 0 {
+        return Vec::new();
+    }
+    if chunks_cpu.len() != sx * sy * sz {
+        // Defensive: dimension mismatch — refuse to recompute (avoid OOB).
+        return Vec::new();
+    }
+    // Snapshot the empty-mask before mutation so the closure reads a stable
+    // pre-recompute classification (Mixed/UniformFull/Empty boundary).
+    let snapshot: Vec<u32> = chunks_cpu.to_vec();
+    let snapshot_ref = &snapshot;
+    let is_empty = |c: [i32; 3]| -> bool {
+        if c[0] < 0 || c[1] < 0 || c[2] < 0 {
+            return false;
+        }
+        let x = c[0] as usize;
+        let y = c[1] as usize;
+        let z = c[2] as usize;
+        if x >= sx || y >= sy || z >= sz {
+            return false;
+        }
+        let idx = x + y * sx + z * sx * sy;
+        // State bits 30-31 == 0 means ChunkCell::Empty (the only state that
+        // carries an AADF in the chunk layer).
+        (snapshot_ref[idx] >> 30) == 0
+    };
+    let aadfs = compute_aadf_layer(
+        [sx, sy, sz],
+        crate::voxel::AADF_MAX_CHUNK,
+        is_empty,
+    );
+
+    let mut changed: Vec<usize> = Vec::new();
+    for z in 0..sz {
+        for y in 0..sy {
+            for x in 0..sx {
+                let idx = x + y * sx + z * sx * sy;
+                // Only empty chunks carry chunk-layer AADFs in their low
+                // 30 bits — Mixed/UniformFull use those bits for ptr/type.
+                if (snapshot_ref[idx] >> 30) != 0 {
+                    continue;
+                }
+                let new_val =
+                    crate::aadf::cell::ChunkCell::Empty(aadfs[idx]).encode();
+                if chunks_cpu[idx] != new_val {
+                    chunks_cpu[idx] = new_val;
+                    changed.push(idx);
+                }
+            }
+        }
+    }
+    changed
+}
+
 // `unpack_voxel` re-export so test code can pull it through this module.
 pub use crate::aadf::cell::unpack_voxel as cell_unpack_voxel;
 // Suppress unused-import warning under cfg(test) — re-export hookup.
@@ -632,5 +727,76 @@ mod tests {
         assert_eq!(high & VOXEL_FULL_FLAG, VOXEL_FULL_FLAG);
         // Low half untouched.
         assert_eq!(pair & 0xFFFF, 0);
+    }
+
+    /// Bug 4 fix — `recompute_chunk_layer_aadfs` shrinks stale AADFs to
+    /// reflect a newly-inserted non-empty chunk.
+    ///
+    /// Set up an 8×1×1 chunks_cpu where every chunk is empty with an
+    /// uninitialised AADF (saturated at 31 — the "construction-time"
+    /// shape for a freshly loaded `.vox` where the empty cells around
+    /// the geometry have AADF=31). Mark chunk 4 as Mixed (the simulated
+    /// post-edit state) and recompute. Verify chunks 0..=3 now carry +X
+    /// AADFs reflecting the distance to chunk 4 (3, 2, 1, 0), and chunks
+    /// 5..=7 carry the same for -X.
+    #[test]
+    fn recompute_chunk_layer_aadfs_shrinks_stale_post_edit() {
+        // 8 chunks in a row, all initially Empty(AADF=31 in every direction)
+        // — encode `ChunkCell::Empty` with saturated AADFs.
+        let saturated_aadf = crate::aadf::cell::Aadf6 { d: [31; 6] };
+        let init_word = crate::aadf::cell::ChunkCell::Empty(saturated_aadf).encode();
+        let mut chunks: Vec<u32> = vec![init_word; 8];
+        // Mark chunk 4 as Mixed (state bits 30-31 = 0b10 = 2 → high bit
+        // 31 set), payload doesn't matter for empty-classification.
+        chunks[4] = (2u32 << 30) | 0x123;
+        // Recompute.
+        let changed =
+            super::recompute_chunk_layer_aadfs(&mut chunks, [8, 1, 1]);
+        // Every empty chunk's encoding changed (the +X / -X AADFs shrunk).
+        // Chunk 4 (Mixed) untouched in `changed`.
+        assert!(!changed.contains(&4), "Mixed chunk should not appear in changed list");
+        // Chunk 0: +X distance to chunk 4 = 3 cells (chunks 1,2,3 empty
+        // between 0 and the non-empty 4). -X AADF = 31 (world edge,
+        // saturated). Decode and inspect.
+        let chunk0 = crate::aadf::cell::ChunkCell::decode(chunks[0]);
+        match chunk0 {
+            crate::aadf::cell::ChunkCell::Empty(a) => {
+                assert_eq!(a.d[1], 3, "chunk 0 +X AADF should be 3 (3 empty chunks before chunk 4)");
+            }
+            _ => panic!("chunk 0 should be Empty after recompute"),
+        }
+        // Chunk 3 — immediately -X of chunk 4. +X AADF = 0 (touching).
+        let chunk3 = crate::aadf::cell::ChunkCell::decode(chunks[3]);
+        match chunk3 {
+            crate::aadf::cell::ChunkCell::Empty(a) => {
+                assert_eq!(a.d[1], 0, "chunk 3 +X AADF should be 0 (touching chunk 4)");
+            }
+            _ => panic!("chunk 3 should be Empty after recompute"),
+        }
+        // Chunk 5 — immediately +X of chunk 4. -X AADF = 0 (touching).
+        let chunk5 = crate::aadf::cell::ChunkCell::decode(chunks[5]);
+        match chunk5 {
+            crate::aadf::cell::ChunkCell::Empty(a) => {
+                assert_eq!(a.d[0], 0, "chunk 5 -X AADF should be 0 (touching chunk 4)");
+            }
+            _ => panic!("chunk 5 should be Empty after recompute"),
+        }
+    }
+
+    /// `recompute_chunk_layer_aadfs` is a no-op when the chunks layer is
+    /// fully empty (every empty cell already has the max-distance AADF
+    /// matching the world extent).
+    #[test]
+    fn recompute_chunk_layer_aadfs_idempotent_on_converged_world() {
+        // 4×1×1 world, every chunk empty. The correct AADFs from
+        // `compute_aadf_layer` produce ChunkCell::Empty encodings; running
+        // recompute twice should produce no further changes.
+        let mut chunks: Vec<u32> = vec![0u32; 4];
+        let _first = super::recompute_chunk_layer_aadfs(&mut chunks, [4, 1, 1]);
+        let second = super::recompute_chunk_layer_aadfs(&mut chunks, [4, 1, 1]);
+        assert!(
+            second.is_empty(),
+            "second recompute call must produce no changes on a converged world"
+        );
     }
 }
