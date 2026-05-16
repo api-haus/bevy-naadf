@@ -122,14 +122,19 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                 dirty: true,
             });
         }
-        GridPreset::Vox { path } => match vox_import::load_vox(path) {
+        GridPreset::Vox { path, tiles } => match vox_import::load_vox_tiled(path, *tiles) {
             Ok(imp) => {
                 let size_in_chunks = imp.world.size_in_chunks;
                 let non_empty_voxels_buf_u32s = imp.world.voxels.len();
                 let non_empty_blocks_buf_u32s = imp.world.blocks.len();
                 let total_chunks = imp.world.chunks.len();
+                let tile_note = if *tiles > 1 {
+                    format!(" (tiled {0}×{0} in XZ)", tiles)
+                } else {
+                    String::new()
+                };
                 info!(
-                    "NAADF .vox loaded from {}: {} palette entries, world bounds {}×{}×{} chunks ({}×{}×{} voxels), {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s (sparse path, GPU producer skipped)",
+                    "NAADF .vox loaded from {}: {} palette entries, world bounds {}×{}×{} chunks ({}×{}×{} voxels), {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s (sparse path, GPU producer skipped){}",
                     path.display(),
                     imp.palette.len(),
                     size_in_chunks[0],
@@ -141,6 +146,7 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                     total_chunks,
                     non_empty_blocks_buf_u32s,
                     non_empty_voxels_buf_u32s,
+                    tile_note,
                 );
                 // C#-faithful camera init (`Common/Camera.cs:95+121`,
                 // `World/Render/WorldRender.cs:48-49`). The C# camera spawns at

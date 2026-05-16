@@ -350,7 +350,7 @@ pub fn run_vox_e2e() -> AppExit {
     //       for `assert_vox_geometry_visible` (driver branch on
     //       `args.vox_e2e_mode`).
     let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path };
+    app_args.grid_preset = crate::GridPreset::Vox { path, tiles: 1 };
     app_args.vox_e2e_mode = true;
 
     // 3) Run the harness the same way `--entities` does (Phase-C wave-3 —

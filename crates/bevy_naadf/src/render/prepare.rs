@@ -173,11 +173,6 @@ pub fn prepare_world_gpu(
         // `setup_test_grid` has not run / extracted yet.
         return;
     }
-    // PERF INSTRUMENTATION (02e investigation, 2026-05-16): start the
-    // upload-cost timer. Total wall time is logged before the early returns
-    // and at the end of the function.
-    let _t_prepare = std::time::Instant::now();
-    let _has_existing = existing.is_some();
 
     let size = extracted.size_in_chunks.max(UVec3::ONE);
 
@@ -443,20 +438,6 @@ pub fn prepare_world_gpu(
     });
     // Build-once: consumed — clear the flag so this stays a no-op.
     extracted.dirty = false;
-    // PERF INSTRUMENTATION (02e investigation, 2026-05-16): log the GPU
-    // upload cost. If this fires per-frame the bug is visible.
-    let elapsed = _t_prepare.elapsed();
-    info!(
-        target: "naadf::perf",
-        "prepare_world_gpu (re)build: {:.3} ms (has_existing={}, chunks {} u32, blocks_alloc {} u32, voxels_alloc {} u32, gpu_producer={}, skip_upload={})",
-        elapsed.as_secs_f64() * 1000.0,
-        _has_existing,
-        chunk_count,
-        blocks_alloc_len,
-        voxels_alloc_len,
-        gpu_producer_enabled,
-        gpu_producer_skip_upload,
-    );
 }
 
 /// `RenderSystems::PrepareBindGroups` system: write the per-frame camera +

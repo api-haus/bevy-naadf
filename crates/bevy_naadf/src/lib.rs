@@ -63,7 +63,19 @@ pub enum GridPreset {
     /// absolute). The file is read once at `Startup`; failure logs an error
     /// and falls back to [`GridPreset::Default`] so the e2e harness still has
     /// a renderable world. See `voxel/vox_import.rs`.
-    Vox { path: std::path::PathBuf },
+    ///
+    /// `tiles`: N×N tiling factor in the XZ plane (default 1 = single load).
+    /// When `tiles > 1`, the parsed `.vox` content is replicated `tiles²`
+    /// times across the XZ plane, expanding the world to
+    /// `(tiles × tile_w, tile_h, tiles × tile_d)` chunks. This mirrors the C#
+    /// startup behaviour that loads multiple `Oasis_Hard_Cover.vox` instances
+    /// in a 4×4 grid; surfaced as a CLI affordance (`--vox-grid N`) rather
+    /// than the C# menu-driven multi-load. **Faithful in effect, divergent in
+    /// interface** — C# has no `--vox-grid` flag.
+    Vox {
+        path: std::path::PathBuf,
+        tiles: u32,
+    },
 }
 
 /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#

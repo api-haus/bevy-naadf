@@ -208,7 +208,13 @@ impl WorldData {
                 self.chunks_cpu[ci] = new_state;
             }
         }
-        self.dirty = true;
+        // NOTE (`02e-perframe-cpu-investigation.md`, 2026-05-16): do NOT set
+        // `self.dirty = true` here. Per-edit changes flow through the W2 delta
+        // chain (`pending_edits.batches.changed_chunks/blocks/voxels` →
+        // `naadf_world_change_node` GPU dispatch); the full-world re-extract +
+        // re-upload that `dirty` triggers is redundant + wasteful on every
+        // edit frame. Only initial-load + size-change events should flip the
+        // flag (see `voxel/grid.rs:115`, `voxel/vox_import.rs:213`).
 
         // Bug 4 fix — mirror of `set_voxels_batch` recompute path. See the
         // comment block there for the rationale and for the doc-link to
@@ -766,7 +772,11 @@ impl WorldData {
                 self.chunks_cpu[ci] = new_state;
             }
         }
-        self.dirty = true;
+        // NOTE (`02e-perframe-cpu-investigation.md`, 2026-05-16): do NOT set
+        // `self.dirty = true` here. The W2 delta chain (above — `pending_edits`
+        // batch + `naadf_world_change_node` GPU dispatch) carries per-edit
+        // changes to the GPU. The full-world re-extract `dirty` triggers is
+        // redundant + caused the per-edit full-world re-upload bottleneck.
 
         // C#'s `WorldData.SetChunk` `AddChangedChunk` gate (`WorldData.cs:392-393`):
         // enqueue the chunk's group only when the empty/non-empty content
@@ -877,7 +887,11 @@ impl WorldData {
         }
         if !batch.changed_chunks.is_empty() {
             self.pending_edits.batches.push(batch);
-            self.dirty = true;
+            // NOTE (`02e-perframe-cpu-investigation.md`, 2026-05-16): do NOT
+            // set `self.dirty = true` here. The pushed batch flows through the
+            // W2 delta chain (`extract_world_changes` → `naadf_world_change_node`)
+            // on the next frame; the full-world re-extract `dirty` triggers
+            // is redundant and was the per-edit bottleneck on Oasis-class worlds.
         }
     }
 
@@ -1005,7 +1019,10 @@ impl WorldData {
                 self.chunks_cpu[ci] = new_state;
             }
         }
-        self.dirty = true;
+        // NOTE (`02e-perframe-cpu-investigation.md`, 2026-05-16): do NOT set
+        // `self.dirty = true` here. Oracle path's synthetic batch flows
+        // through the W2 delta chain (same path as the runtime
+        // `set_voxels_batch`); the full-world re-extract is redundant.
 
         // Whole-world AADF recompute + synthetic chunk uploads — the oracle's
         // bit-exact invariant (pre-`02c` `set_voxels_batch` body).

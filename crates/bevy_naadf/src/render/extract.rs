@@ -14,7 +14,7 @@
 //! `render::prepare` consumes these to build `WorldGpu` / `FrameGpu`.
 
 use bevy::prelude::*;
-use bevy::render::Extract;
+use bevy::render::{Extract, MainWorld};
 
 use crate::camera::PositionSplit;
 use crate::render::taa::{rotation_only_view_proj, CameraHistory, CAMERA_HISTORY_DEPTH};
@@ -77,28 +77,44 @@ pub struct ExtractedCameraData {
 }
 
 /// `ExtractSchedule` system: mirror the main-world [`WorldData`] + [`VoxelTypes`]
-/// into the render-world [`ExtractedWorld`] when they are dirty.
+/// into the render-world [`ExtractedWorld`] when they are dirty, then clear the
+/// main-world `dirty` flags so subsequent frames stay a true no-op.
 ///
 /// Build-once (D2): `setup_test_grid` sets `dirty = true`, this copies the
-/// buffers once, and after `prepare_world_gpu` clears the flag this stays a
-/// no-op. The main-world `dirty` flag is left untouched (the main world does
-/// not re-read it); the render-world copy carries its own flag.
+/// buffers once + clears the main-world flag in the same system, and the
+/// render-world `extracted.dirty` is consumed by `prepare_world_gpu` (which
+/// clears it after the GPU upload).
+///
+/// **Fix (`02e-perframe-cpu-investigation.md`, 2026-05-16):** the main-world
+/// flag was previously left set indefinitely, causing this system to fire
+/// every frame and re-clone the entire ~48 MiB CPU mirror on Oasis-class
+/// worlds (~2.8 ms/frame), in turn re-triggering the ~16.7 ms/frame full-world
+/// GPU re-upload in `prepare_world_gpu`. Mutating the main world via
+/// `ResMut<MainWorld>` restores the originally-intended build-once shape.
+/// Per-edit re-uploads still flow via the W2 delta-upload chain
+/// (`pending_edits.batches` → `naadf_world_change_node`); `world_data.dirty = true`
+/// writes in edit paths were also removed since the delta chain handles
+/// per-edit changes without needing a full-world re-extract.
 pub fn extract_world(
     mut extracted: ResMut<ExtractedWorld>,
-    world_data: Extract<Option<Res<WorldData>>>,
-    voxel_types: Extract<Option<Res<VoxelTypes>>>,
+    mut main_world: ResMut<MainWorld>,
 ) {
-    let (Some(world_data), Some(voxel_types)) = (&*world_data, &*voxel_types) else {
+    // SAFETY note: `ResMut<MainWorld>` is the sanctioned bevy_render pattern
+    // for mutating the main world from an extract system (see e.g.
+    // `bevy_render::erased_render_asset::extract_render_asset`). The
+    // alternative `Extract<Option<Res<_>>>` is read-only by design
+    // (`ReadOnlySystemParam` bound on `Extract`), so we cannot clear the flag
+    // through that path.
+    let world = main_world.as_mut();
+    let world_data = world.get_resource::<WorldData>();
+    let voxel_types = world.get_resource::<VoxelTypes>();
+    let (Some(world_data), Some(voxel_types)) = (world_data, voxel_types) else {
         return;
     };
     // Build-once: only re-copy when the main-world data is flagged dirty.
     if !world_data.dirty && !voxel_types.dirty {
         return;
     }
-    // PERF INSTRUMENTATION (02e investigation, 2026-05-16): measure clone cost
-    // + log buffer sizes whenever this fires. If `dirty` is mis-managed and
-    // this fires per-frame, the smoke output makes the bug visible.
-    let _t0 = std::time::Instant::now();
     extracted.chunks.clone_from(&world_data.chunks_cpu);
     extracted.blocks.clone_from(&world_data.blocks_cpu);
     extracted.voxels.clone_from(&world_data.voxels_cpu);
@@ -107,22 +123,14 @@ pub fn extract_world(
     extracted.bounding_box = world_data.bounding_box;
     extracted.dense_voxel_types.clone_from(&world_data.dense_voxel_types);
     extracted.dirty = true;
-    let elapsed = _t0.elapsed();
-    info!(
-        target: "naadf::perf",
-        "extract_world clone: {:.3} ms (chunks {} u32 = {} KiB, blocks {} u32 = {} KiB, voxels {} u32 = {} KiB, dense_voxel_types {} u16 = {} KiB, world_data.dirty={}, voxel_types.dirty={})",
-        elapsed.as_secs_f64() * 1000.0,
-        world_data.chunks_cpu.len(),
-        world_data.chunks_cpu.len() * 4 / 1024,
-        world_data.blocks_cpu.len(),
-        world_data.blocks_cpu.len() * 4 / 1024,
-        world_data.voxels_cpu.len(),
-        world_data.voxels_cpu.len() * 4 / 1024,
-        world_data.dense_voxel_types.len(),
-        world_data.dense_voxel_types.len() * 2 / 1024,
-        world_data.dirty,
-        voxel_types.dirty,
-    );
+    // Clear the main-world flags AFTER the copy completes so subsequent
+    // frames stay a true no-op.
+    if let Some(mut wd) = world.get_resource_mut::<WorldData>() {
+        wd.dirty = false;
+    }
+    if let Some(mut vt) = world.get_resource_mut::<VoxelTypes>() {
+        vt.dirty = false;
+    }
 }
 
 /// `ExtractSchedule` system: copy the camera's `PositionSplit` + inverse
