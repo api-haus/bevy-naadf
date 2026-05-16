@@ -112,14 +112,12 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                     min: IVec3::ZERO,
                     max: IVec3::new(size[0] as i32 - 1, size[1] as i32 - 1, size[2] as i32 - 1),
                 },
-                dirty: true,
                 pending_edits: Default::default(),
                 dense_voxel_types,
             });
 
             commands.insert_resource(VoxelTypes {
                 types: palette,
-                dirty: true,
             });
         }
         GridPreset::Vox { path, tiles } => match vox_import::load_vox_tiled(path, *tiles) {
@@ -192,13 +190,11 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                             size[2] as i32 - 1,
                         ),
                     },
-                    dirty: true,
                     pending_edits: Default::default(),
                     dense_voxel_types,
                 });
                 commands.insert_resource(VoxelTypes {
                     types: palette,
-                    dirty: true,
                 });
             }
         },

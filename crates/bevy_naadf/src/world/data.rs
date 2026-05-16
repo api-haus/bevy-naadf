@@ -2,9 +2,12 @@
 //! buffer mirrors, world geometry, and the voxel-type palette
 //! (`03-design.md` §4.4).
 //!
-//! These are the CPU side of the world. `voxel::grid::setup_test_grid` (D2)
-//! builds them once at startup; Batch 2's `render::extract` / `render::prepare`
-//! mirror them into the render world (`WorldGpu`) on the `dirty` flag.
+//! These are the CPU side of the world. `voxel::grid::setup_test_grid`
+//! builds them once at startup; `render::extract::stage_world_gpu_buildonce`
+//! hands them off to the render world ONCE for the GPU resource build
+//! (`02f-design-world-container-rearch.md`). Per-edit changes flow via the
+//! W2 delta chain (`pending_edits.batches` → `naadf_world_change_node`); no
+//! whole-world clone or re-upload after startup.
 //!
 //! ## Track B — Editor ray traversal + bulk edits
 //!
@@ -13,6 +16,22 @@
 //! sanctioned-divergence bulk-edit entry point that groups by chunk and runs
 //! `process_edit_batch` once per call (see
 //! `docs/orchestrate/feature-completeness/02b-design-editor.md`).
+//!
+//! ## DIAGNOSTIC-ONLY methods (`02f` rearch)
+//!
+//! [`WorldData::set_voxel`] and [`WorldData::set_voxels_batch_oracle`] run
+//! the slow whole-world `recompute_chunk_layer_aadfs` and emit synthetic
+//! AADF-changed chunk uploads. They are **DIAGNOSTIC-ONLY** — call sites:
+//!
+//! - The `--edit-mode` e2e validation gate (single `set_voxel` call,
+//!   confirms the W2 delta chain emits well-formed records).
+//! - The unit tests in this file and `crate::aadf::edit`.
+//!
+//! **Production code paths NEVER call these methods.** Brushes call
+//! [`WorldData::set_voxels_batch`] (runtime fast path; no whole-world rehash)
+//! or [`WorldData::set_chunks_uniform_batch`] (brush inside-chunk fast path;
+//! one state write per chunk). The diagnostic methods are `#[doc(hidden)]`
+//! and tagged `<!-- DIAGNOSTIC-ONLY -->` in their doc-comments.
 
 use bevy::prelude::*;
 
@@ -30,8 +49,20 @@ pub struct IAabb3 {
 
 /// The CPU mirror of the NAADF three-layer voxel world (`03-design.md` §4.4).
 ///
-/// In Phase A this is built once by `voxel::grid::setup_test_grid` and never
-/// edited; `dirty` triggers the one-time GPU upload (Batch 2).
+/// Built once by `voxel::grid::setup_test_grid` (or `build_world_from_vox`)
+/// and mutated by the W2 delta chain on edits. The GPU resources
+/// (`WorldGpu` / chunks texture + blocks/voxels buffers) are built ONCE from
+/// this CPU mirror at startup by `prepare_world_gpu`; per-edit changes flow
+/// through `pending_edits.batches` → `naadf_world_change_node`'s GPU
+/// dispatches, **never** through a whole-world re-upload (`02f` rearch
+/// deletes the `dirty` flag and the per-frame extract clone).
+///
+/// Single source of truth — matches C# `WorldData.cs:20-218`'s "the CPU
+/// arrays and the GPU resources live on the same object" semantic. The
+/// chunks_cpu/blocks_cpu/voxels_cpu arrays here ARE the CPU half of that
+/// container; the GPU half lives in the render-world `WorldGpu` resource;
+/// the two are kept consistent by the W2 delta chain after the build-once
+/// hand-off.
 #[derive(Resource, Debug)]
 pub struct WorldData {
     /// Chunk buffer mirror — one encoded `ChunkCell` `u32` per chunk.
@@ -44,8 +75,6 @@ pub struct WorldData {
     pub size_in_chunks: UVec3,
     /// Geometry bounding box, in voxels.
     pub bounding_box: IAabb3,
-    /// Set when the CPU mirror has changed and needs (re-)uploading to the GPU.
-    pub dirty: bool,
     /// Phase-C W2 — per-frame edit batches awaiting extract into the render
     /// world. Drained by `extract_world_changes`.
     pub pending_edits: PendingEdits,
@@ -67,7 +96,6 @@ impl Default for WorldData {
             voxels_cpu: Vec::new(),
             size_in_chunks: UVec3::ZERO,
             bounding_box: IAabb3::default(),
-            dirty: false,
             pending_edits: PendingEdits::default(),
             dense_voxel_types: Vec::new(),
         }
@@ -75,34 +103,34 @@ impl Default for WorldData {
 }
 
 impl WorldData {
+    /// **DIAGNOSTIC-ONLY** single-voxel edit (`02f` rearch). Runs the
+    /// whole-world `recompute_chunk_layer_aadfs` + emits synthetic
+    /// AADF-changed chunk uploads — O(N_chunks × 31 × 3) per call. **Do not
+    /// call from production code paths.**
+    ///
+    /// Call sites:
+    /// - The `--edit-mode` e2e validation gate (one call, confirms the W2
+    ///   delta chain emits well-formed records). Cost is irrelevant for a
+    ///   one-shot validation run.
+    /// - Unit tests in this file and `crate::aadf::edit`.
+    ///
+    /// **Production brushes call [`Self::set_voxels_batch`] or
+    /// [`Self::set_chunks_uniform_batch`] instead.** Those skip the
+    /// whole-world AADF rehash (the W3 GPU regime-2 self-perpetuating queue
+    /// refreshes stale AADFs over subsequent frames, matching C# semantics).
+    ///
+    /// ## How it works (for diagnostic understanding)
+    ///
     /// Phase-C W2 — programmatic single-voxel edit entry point
     /// (`15-design-c.md` §2.1 W2, `16-impl-c-W2.md`).
     ///
     /// Sets the voxel at world position `pos` (voxel coords) to `ty`. Walks
-    /// the three-layer hierarchy from the chunk down, **decoding into a
-    /// 2048-u32-per-chunk edit window** + emitting a single edit batch via
-    /// the [`crate::aadf::edit::process_edit_batch`] port. The edit emits a
-    /// `WorldEditEvent` (consumed by `extract_world_changes` to mirror into
-    /// the render-world `ConstructionEvents`).
-    ///
-    /// Out-of-bounds positions are silently ignored (matches NAADF's
-    /// `EditingTool` clamp behaviour).
-    ///
-    /// **Test-helper semantics:** the CPU mirror is updated *in place*; the
-    /// pre-built chunk is decoded into the edit window, mutated, and then
-    /// re-encoded through `process_edit_batch` for the GPU side. This is the
-    /// shape the `--edit-mode` e2e gate needs — a single CPU call → a single
-    /// `WorldEditEvent` → the regime-3 GPU dispatch chain.
-    ///
-    /// **Limitations of this Rust port:**
-    /// - Chunks that were `UniformFull` get expanded into a full mixed chunk
-    ///   on first edit (the C# `EditingHandler.getChunkDataToEdit` does the
-    ///   same — it materialises a 2048-u32 window from the chunk's state).
-    /// - `blocks_cpu` / `voxels_cpu` are *only* updated on chunks-cpu side via
-    ///   the simplified edit path — no hash-dedup; mixed blocks claim fresh
-    ///   voxel/block slots on every edit. Acceptable for the test grid; the
-    ///   GPU side runs the proper W1 hash-dedup at startup, and W2's edit
-    ///   path appends fresh slots.
+    /// the three-layer hierarchy from the chunk down, decoding into a
+    /// 2048-u32 edit window, mutating, re-encoding through
+    /// [`crate::aadf::edit::process_edit_batch`], and pushing the resulting
+    /// `EditBatch` to `pending_edits` for W2 GPU upload. Out-of-bounds
+    /// positions are silently ignored.
+    #[doc(hidden)]
     pub fn set_voxel(&mut self, pos: IVec3, ty: VoxelTypeId) {
         if pos.x < 0 || pos.y < 0 || pos.z < 0 {
             return;
@@ -895,21 +923,24 @@ impl WorldData {
         }
     }
 
-    /// **Oracle path** — slow-but-bit-exact bulk-edit (the pre-`02c` body).
+    /// **DIAGNOSTIC-ONLY** bulk-edit oracle (`02f` rearch). Slow-but-bit-exact
+    /// path — runs `recompute_chunk_layer_aadfs` over the whole world +
+    /// emits synthetic `changed_chunks` entries for every AADF-changed
+    /// chunk. O(N_chunks × 31 × 3) per call. **Do not call from production
+    /// code paths.**
     ///
-    /// Runs `recompute_chunk_layer_aadfs` over the whole world + emits synthetic
-    /// `changed_chunks` entries for every AADF-changed chunk. Reserved for:
-    /// - CPU-fallback rendering (`gpu_construction_enabled = false`, currently
-    ///   not re-enabled; the oracle stays available as the hook).
-    /// - Future regression tests that need byte-exact `chunks_cpu` equality
+    /// Call sites:
+    /// - CPU-fallback rendering (if `gpu_construction_enabled = false`,
+    ///   currently not re-enabled).
+    /// - Future regression tests pinning byte-exact `chunks_cpu` equality
     ///   with the C#-canonical "construct + edit + reconstruct" reference.
+    /// - Unit tests in this file.
     ///
-    /// **Not** the runtime path. Brushes call [`Self::set_voxels_batch`].
-    /// The `--edit-mode` validation gate calls [`Self::set_voxel`] (single-voxel
-    /// oracle).
+    /// **Production brushes call [`Self::set_voxels_batch`] instead.**
     ///
-    /// **Complexity**: O(N_chunks × 31 × 3) per call. For Oasis-class worlds:
-    /// ~75 ms per call. Do not loop this on the per-frame hot path.
+    /// Complexity: O(N_chunks × 31 × 3) per call. For Oasis-class worlds:
+    /// ~75 ms per call. Never on the runtime hot path.
+    #[doc(hidden)]
     pub fn set_voxels_batch_oracle(&mut self, edits: &[(IVec3, VoxelTypeId)]) {
         if edits.is_empty() {
             return;
@@ -1115,12 +1146,14 @@ pub struct PendingEdits {
 ///
 /// Element `0` is the reserved empty placeholder (C# convention) — voxel
 /// 15-bit type ids index into `types`.
+///
+/// **Built once at startup, never mutated at runtime** (`02f` rearch deletes
+/// the `dirty` flag — no code path mutates this resource after the initial
+/// `setup_test_grid` / `build_world_from_vox` insertion).
 #[derive(Resource, Debug)]
 pub struct VoxelTypes {
     /// The palette. `types[0]` is the empty placeholder.
     pub types: Vec<VoxelType>,
-    /// Set when the palette has changed and needs (re-)uploading.
-    pub dirty: bool,
 }
 
 impl Default for VoxelTypes {
@@ -1128,7 +1161,6 @@ impl Default for VoxelTypes {
     fn default() -> Self {
         Self {
             types: vec![VoxelType::default()],
-            dirty: false,
         }
     }
 }
@@ -1152,7 +1184,6 @@ mod tests {
                 min: IVec3::ZERO,
                 max: IVec3::new(size_v.x as i32 - 1, size_v.y as i32 - 1, size_v.z as i32 - 1),
             },
-            dirty: false,
             pending_edits: PendingEdits::default(),
             dense_voxel_types: Vec::new(),
         }

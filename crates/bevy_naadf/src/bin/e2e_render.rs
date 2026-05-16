@@ -81,6 +81,7 @@ fn main() -> ExitCode {
     let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
     let entities_mode = args.iter().any(|a| a == "--entities");
     let edit_mode = args.iter().any(|a| a == "--edit-mode");
+    let runtime_edit_mode = args.iter().any(|a| a == "--runtime-edit-mode");
     let resize_test = args.iter().any(|a| a == "--resize-test");
     let vox_e2e_mode = args.iter().any(|a| a == "--vox-e2e");
 
@@ -238,6 +239,23 @@ fn main() -> ExitCode {
             }
             Err(msg) => {
                 eprintln!("edit-mode validation FAILED: {msg}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // `02f` rearch — runtime-edit gate. Complements `--edit-mode` by
+    // exercising the production brush path (`set_voxels_batch`); closes the
+    // regression hole the pre-`02f` CPU-oracle-only `--edit-mode` left open
+    // (edit-doesn't-reach-W2-batch). See `validate_runtime_edit_mode`'s
+    // module-level doc for what is + isn't asserted by this gate.
+    if runtime_edit_mode {
+        match bevy_naadf::render::construction::validate_runtime_edit_mode() {
+            Ok(report) => {
+                eprintln!("runtime-edit gate PASS: {report}");
+            }
+            Err(msg) => {
+                eprintln!("runtime-edit gate FAILED: {msg}");
                 return ExitCode::from(1);
             }
         }

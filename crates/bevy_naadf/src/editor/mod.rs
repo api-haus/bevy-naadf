@@ -285,7 +285,6 @@ mod tests {
                 min: IVec3::ZERO,
                 max: IVec3::new(31, 31, 31),
             },
-            dirty: false,
             pending_edits: PendingEdits::default(),
             dense_voxel_types: Vec::new(),
         };

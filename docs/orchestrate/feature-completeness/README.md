@@ -64,8 +64,12 @@ per `12-alignment-gap.md` rows 17–21).
 - [x] **Step 7e** — synthesis after editor fixes, hard gate. User reported edits "catastrophically slow" relative to C#'s 130 FPS on 4×4 Oasis grid + continuous brush. Bug 4 fix may itself be the bottleneck.
 - [x] **Step 8f-design-alignment** — design agent investigated C# editing end-to-end + designed re-alignment. Landed `02c-design-edit-pipeline-alignment.md` (687 lines). **Hypothesis refuted**: not "GPU work duplicated on CPU"; actual bottleneck is `recompute_chunk_layer_aadfs` (Bug 4 fix's sledgehammer); plus brush over-iteration + serial per-chunk work. Bug 1 retires.
 - [x] **Step 7f** — synthesis after design-alignment, hard gate. Alignment impl landed; user confirmed "pretty much on par with C# in terms of editing". Bug 1 retired. Committed `5ef2d14`.
-- [x] **Step 8g-render-perf** — checkpoint + dispatch render-perf investigation. Landed `02d-render-perf-investigation.md`. **Headline: 1-LOC config — `sun_shadow_taps = 4 → 1` (C# default) ~25-40% FPS.** Plus `DefaultPlugins` curation ~5-15%. No behavioural divergences detected.
-- [ ] **Step 7g** — synthesis after render-perf investigation, hard gate (← we are here)
+- [x] **Step 8g-render-perf** — checkpoint + dispatch render-perf investigation. Landed `02d-render-perf-investigation.md`. (Algorithmic-cost-inferred ranking was misleading; real bottleneck found below.)
+- [x] **Step 8h-defaults-align** — `sun_shadow_taps = 4 → 1` faithful-port revert (`8d938cf`). Did not move FPS.
+- [x] **Step 8i-perframe-diag** — CPU per-frame diagnostic (`02e`). Found `WorldData.dirty` set on load, never cleared → 19.5 ms/frame wasted full re-clone at Oasis. Smoking gun (`609d364`).
+- [x] **Step 8j-dirty-vox-grid** — dirty-flag fix + `--vox-grid` tiling (`03e`). Idle perf restored; edits regressed (W2 delta channel broken) (`d43f1f1`).
+- [x] **Step 8k-container-rearch** — consolidated dispatch (user-directed: WorldData as container, independent rendering path, no Bevy main-world/render-world idiom). `ExtractedWorld` deleted; `dirty` flag deleted; CPU rebuild marked `#[doc(hidden)]` diagnostic-only; W2 chain preserved; `--runtime-edit-mode` gate added (closes the CPU-oracle-only test hole). All 6 e2e modes PASS. Three R-findings escalated for fresh-eyes review. Landed at `02f-design-world-container-rearch.md`.
+- [ ] **Step 7k** — synthesis after container-rearch, hard gate (← we are here)
 - [ ] Final close-out
 
 ## Track order (user-confirmed)

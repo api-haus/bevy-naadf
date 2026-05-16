@@ -41,8 +41,8 @@ use bevy::render::{
 use atmosphere::prepare_atmosphere;
 use extract::{
     extract_camera, extract_camera_history, extract_gi_config, extract_taa_config,
-    extract_world, ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig,
-    ExtractedTaaConfig, ExtractedWorld,
+    stage_world_gpu_buildonce, ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig,
+    ExtractedTaaConfig, WorldDataMeta,
 };
 use gi::prepare_gi;
 // Phase B Batch 6 (`09-design-b.md` §11 Batch 6 steps 17-18): the `base/` TAA
@@ -114,7 +114,12 @@ impl Plugin for NaadfRenderPlugin {
             .insert_resource(TaaRingConfig {
                 depth: taa_ring_depth,
             })
-            .init_resource::<ExtractedWorld>()
+            // `02f` rearch: no `ExtractedWorld` resource. The build-once
+            // hand-off goes through `WorldGpuStaging` (transient, dropped
+            // after `prepare_world_gpu` consumes it) + `WorldDataMeta`
+            // (long-lived, used by `naadf_gpu_producer_node` after pipelines
+            // compile).
+            .init_resource::<WorldDataMeta>()
             .init_resource::<ExtractedCameraData>()
             .init_resource::<ExtractedCameraHistory>()
             .init_resource::<ExtractedTaaConfig>()
@@ -122,11 +127,12 @@ impl Plugin for NaadfRenderPlugin {
             // Pipelines + bind-group layouts — `FromWorld`, built once in
             // `RenderStartup` (after the render device exists).
             .init_gpu_resource::<NaadfPipelines>()
-            // Extract: main world -> render world mirror.
+            // Extract: build-once world hand-off + per-frame camera/flag
+            // mirrors (`02f` Decision 5).
             .add_systems(
                 ExtractSchedule,
                 (
-                    extract_world,
+                    stage_world_gpu_buildonce,
                     extract_camera,
                     extract_camera_history,
                     extract_taa_config,

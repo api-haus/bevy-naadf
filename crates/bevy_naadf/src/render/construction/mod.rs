@@ -771,8 +771,9 @@ pub fn extract_world_changes(
 // `prepare_frame_gpu`'s allow in `render/prepare.rs:302`).
 #[allow(clippy::too_many_arguments)]
 // Allowing the wide arg list: Phase-C followup #1 added one read-only
-// `ExtractedWorld` parameter (for `dense_voxel_types` GPU upload), pushing
-// the count past clippy's default ceiling. The function is a single
+// world-metadata parameter (originally `ExtractedWorld`, now `WorldDataMeta`
+// post-`02f`) for the `dense_voxel_types` GPU upload, pushing the count past
+// clippy's default ceiling. The function is a single
 // `RenderSystems::PrepareResources` body — every parameter is a Res / ResMut
 // it legitimately needs.
 #[allow(clippy::too_many_arguments)]
@@ -789,8 +790,10 @@ pub fn prepare_construction(
     construction_events: Option<Res<ConstructionEvents>>,
     // Phase-C followup #1 — read the dense voxel-type stream so we can build
     // `segment_voxel_buffer` on the runtime GPU producer path. Empty when the
-    // test scene does not author a dense volume (legacy path).
-    extracted_world: Option<Res<crate::render::extract::ExtractedWorld>>,
+    // test scene does not author a dense volume (legacy path). `02f` rearch:
+    // moved from `ExtractedWorld` (deleted) to `WorldDataMeta` (minimal
+    // metadata-only render-world mirror — see `02f` Decision 4).
+    world_data_meta: Option<Res<crate::render::extract::WorldDataMeta>>,
 ) {
     // W0 seam: ensure-exists for both resources, then W1..W5 fill in their
     // family's allocations + bind groups on subsequent frames (when the
@@ -823,14 +826,14 @@ pub fn prepare_construction(
     // gpu-producer block at the bottom of this function runs.
     //
     // The CPU mirror produced by `setup_test_grid` is still available via
-    // `extracted_world.{chunks,blocks,voxels,dense_voxel_types}` — we use
+    // `world_data_meta.{size_in_chunks, dense_voxel_types}` — we use
     // `dense_voxel_types` to build `segment_voxel_buffer`. When the dense
-    // data is absent (legacy code paths), the GPU producer cannot run and
-    // we fall back to the CPU upload (the upload-skip in `prepare_world_gpu`
-    // is reversed by a follow-up check there — but in practice every code
-    // path that sets `gpu_construction_enabled = true` also authors a
-    // `DenseVolume`).
-    let dense_data_ready = extracted_world
+    // data is absent (sparse `.vox` path / legacy code paths), the GPU
+    // producer cannot run and we fall back to the CPU upload (the
+    // upload-skip in `prepare_world_gpu` is reversed by a follow-up check
+    // there — but in practice every code path that sets
+    // `gpu_construction_enabled = true` also authors a `DenseVolume`).
+    let dense_data_ready = world_data_meta
         .as_deref()
         .is_some_and(|w| !w.dense_voxel_types.is_empty());
     let want_gpu_producer =
@@ -933,7 +936,7 @@ pub fn prepare_construction(
         // iteration is a memory/bandwidth optimisation; collapsing to one
         // dispatch over the cubic extent is functionally equivalent.
         if gpu.segment_voxel_buffer.as_ref().map(|b| b.size()).unwrap_or(0) <= 4 {
-            let dense = &extracted_world.as_deref().unwrap().dense_voxel_types;
+            let dense = &world_data_meta.as_deref().unwrap().dense_voxel_types;
             let size_in_chunks = [
                 world_gpu.chunks.size().width,
                 world_gpu.chunks.size().height,
@@ -1808,7 +1811,7 @@ pub fn prepare_construction(
     //
     // `prepare_construction`'s job is now just to allocate the buffers +
     // build the bind group (above); the node consumes them.
-    let _ = (extracted_world, want_gpu_producer); // referenced in node.
+    let _ = (world_data_meta, want_gpu_producer); // referenced in node.
 }
 
 /// Phase-C followup #1 — runtime GPU producer dispatch (render-graph node).
@@ -1839,7 +1842,9 @@ pub fn naadf_gpu_producer_node(
     construction_bind_groups: Option<Res<ConstructionBindGroups>>,
     construction_gpu: Option<ResMut<ConstructionGpu>>,
     construction_config: Option<Res<config::ConstructionConfig>>,
-    extracted_world: Option<Res<crate::render::extract::ExtractedWorld>>,
+    // `02f` rearch: moved from `ExtractedWorld` (deleted) to `WorldDataMeta`
+    // — the long-lived metadata-only mirror populated once at startup.
+    world_data_meta: Option<Res<crate::render::extract::WorldDataMeta>>,
 ) {
     let Some(config) = construction_config else { return; };
     if !config.gpu_construction_enabled {
@@ -1851,8 +1856,8 @@ pub fn naadf_gpu_producer_node(
     }
     let Some(construction_pipelines) = construction_pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
-    let Some(extracted_world) = extracted_world else { return; };
-    if extracted_world.dense_voxel_types.is_empty() {
+    let Some(meta) = world_data_meta else { return; };
+    if meta.dense_voxel_types.is_empty() {
         // Source scene didn't author a `DenseVolume` — GPU producer is
         // unsafe to run (the segment_voxel_buffer the dispatch needs cannot
         // be built CPU-side). Fall back to the CPU upload path.
@@ -1873,15 +1878,15 @@ pub fn naadf_gpu_producer_node(
         return;
     };
     let size_in_chunks = [
-        extracted_world.size_in_chunks.x,
-        extracted_world.size_in_chunks.y,
-        extracted_world.size_in_chunks.z,
+        meta.size_in_chunks.x,
+        meta.size_in_chunks.y,
+        meta.size_in_chunks.z,
     ];
     // Upper-bound the bound dispatches from the CPU mirror's sizes (each
     // mixed-block produces 32 u32s of voxel data; each mixed-chunk produces
     // 64 u32s of block data — the GPU output sizes match the CPU oracle).
-    let cpu_blocks = extracted_world.blocks.len() as u32;
-    let cpu_voxels = extracted_world.voxels.len() as u32;
+    let cpu_blocks = meta.blocks_cpu_len;
+    let cpu_voxels = meta.voxels_cpu_len;
     let voxel_workgroups = (cpu_voxels / 32 + 1).max(1);
     let block_workgroups = (cpu_blocks / 64 + 1).max(1);
 
@@ -2743,7 +2748,6 @@ pub fn validate_edit_mode() -> Result<String, String> {
                 (size_in_chunks[2] * CELL_DIM as u32 * CELL_DIM as u32) as i32 - 1,
             ),
         },
-        dirty: false,
         pending_edits: Default::default(),
         dense_voxel_types: volume.voxels.iter().map(|t| t.0).collect(),
     };
@@ -2811,6 +2815,188 @@ pub fn validate_edit_mode() -> Result<String, String> {
         flood_groups_len,
         size_in_groups,
     ))
+}
+
+/// `02f` rearch — **runtime-edit gate**. Complements [`validate_edit_mode`]
+/// (which exercises the diagnostic `set_voxel` path) by hitting the
+/// production runtime brush path: [`crate::world::data::WorldData::set_voxels_batch`].
+///
+/// **Why this gate exists.** The pre-`02f` CPU-oracle `--edit-mode` gate
+/// missed the regression mode "edit landed in main-world `pending_edits`
+/// but never crossed to the render world": that gate only exercised
+/// `set_voxel` (the diagnostic oracle path) against a self-built
+/// `WorldData`, with no extract pass + no render-graph dispatch in scope.
+/// The `dirty=true never on edits` failure mode (`02e`/`03e` followup)
+/// slipped through because `set_voxel` produces an edit batch INDEPENDENT
+/// of the dirty flag, and the CPU oracle gate doesn't observe the
+/// extract-to-render-world ferry.
+///
+/// **What this gate asserts.** Builds a minimal in-process world, calls
+/// [`crate::world::data::WorldData::set_voxels_batch`] (the production
+/// brush entry point — same code path the editor's `apply_edit_tool`
+/// invokes), and asserts:
+///
+/// 1. The batch produces a non-empty `pending_edits.batches` AND
+///    non-empty `pending_edits.edited_groups`.
+/// 2. The runtime path's `changed_chunks` array is non-empty (proving
+///    `process_edit_batch` ran and emitted records — the load-bearing W2
+///    delta payload).
+/// 3. The runtime path does NOT emit the synthetic whole-world AADF
+///    refresh records (i.e. `changed_chunks.len()` is in the touched-chunk
+///    range, NOT the whole-world range) — this confirms the runtime path
+///    skips `recompute_chunk_layer_aadfs` (the diagnostic-only CPU rebuild
+///    the `02f` rearch retires from the production hot path).
+///
+/// **What this gate does NOT verify** (out of scope for an in-process
+/// gate): the GPU render-graph dispatch (`naadf_world_change_node` →
+/// `apply_chunk_change.wgsl` + the 3 sibling shaders), the
+/// extract-to-`ConstructionEvents` flow, the GPU buffer mutation, the
+/// framebuffer luminance delta. Those need a windowed harness with
+/// before/after screenshot comparison; out of this dispatch's scope.
+/// **The asymmetric coverage is deliberate** — this gate closes the
+/// regression hole the `02e`/`03e` followup left open (edit-doesn't-reach-
+/// W2-batch) without re-implementing a full integration test.
+pub fn validate_runtime_edit_mode() -> Result<String, String> {
+    use crate::aadf::construct::{construct, DenseVolume};
+    use crate::voxel::{VoxelTypeId, CELL_DIM};
+    use crate::world::data::WorldData;
+    use bevy::prelude::UVec3;
+
+    // 4×4×4-chunk world — bigger than the `--edit-mode` 4×2×4 fixture so
+    // the brush's chunk-AABB distinguishes "touched chunks only" from
+    // "whole-world" (4×4×4 = 64 chunks vs ~125 chunks the brush touches
+    // at r=16 — the 4×4×4 fixture's 64 chunks is the WHOLE world).
+    let size_in_chunks = [4u32, 4, 4];
+    let mut volume = DenseVolume::empty(size_in_chunks);
+    volume.set([16, 16, 16], VoxelTypeId(5));
+    let built = construct(&volume);
+    let total_chunks = (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize;
+
+    let mut world_data = WorldData {
+        chunks_cpu: built.chunks,
+        blocks_cpu: built.blocks,
+        voxels_cpu: built.voxels,
+        size_in_chunks: UVec3::from_array(size_in_chunks),
+        bounding_box: crate::world::data::IAabb3 {
+            min: bevy::prelude::IVec3::ZERO,
+            max: bevy::prelude::IVec3::new(
+                (size_in_chunks[0] * CELL_DIM as u32 * CELL_DIM as u32) as i32 - 1,
+                (size_in_chunks[1] * CELL_DIM as u32 * CELL_DIM as u32) as i32 - 1,
+                (size_in_chunks[2] * CELL_DIM as u32 * CELL_DIM as u32) as i32 - 1,
+            ),
+        },
+        pending_edits: Default::default(),
+        dense_voxel_types: volume.voxels.iter().map(|t| t.0).collect(),
+    };
+
+    // Production brush path — same call shape the editor's brushes use
+    // (`editor/tools.rs::paint_brush` / `cube_brush` / `sphere_brush`).
+    // Three voxels in two adjacent chunks: tests the by-chunk grouping +
+    // the multi-chunk batched dispatch.
+    let new_type = VoxelTypeId(9);
+    let edits = [
+        (bevy::prelude::IVec3::new(20, 12, 20), new_type),
+        (bevy::prelude::IVec3::new(21, 12, 20), new_type),
+        (bevy::prelude::IVec3::new(36, 12, 36), new_type),
+    ];
+    world_data.set_voxels_batch(&edits);
+
+    // Gate 1 — the runtime path produced a non-empty edit batch.
+    if world_data.pending_edits.batches.is_empty() {
+        return Err(
+            "runtime-edit gate FAIL: set_voxels_batch produced no edit batch \
+             — the W2 delta chain has no work; edits would silently never \
+             reach the GPU. This is the regression mode the `02f` rearch \
+             addresses (edit-doesn't-reach-W2-batch)."
+                .into(),
+        );
+    }
+    if world_data.pending_edits.edited_groups.is_empty() {
+        return Err(
+            "runtime-edit gate FAIL: set_voxels_batch produced no \
+             edited_groups — the `compute_change_groups` BFS oracle in \
+             `extract_world_changes` would skip with no work, and the W2 \
+             GPU dispatch's `changed_groups_dynamic` would never populate."
+                .into(),
+        );
+    }
+
+    // Gate 2 — the batch carries `changed_chunks` records.
+    let batch = &world_data.pending_edits.batches[0];
+    if batch.changed_chunks.is_empty() {
+        return Err(
+            "runtime-edit gate FAIL: edit batch has no changed_chunks \
+             records — `process_edit_batch` failed to emit per-touched-\
+             chunk records. The W2 GPU dispatch's `apply_chunk_change` \
+             pass would have no input."
+                .into(),
+        );
+    }
+
+    // Gate 3 — the runtime path is the production fast path, NOT the
+    // diagnostic oracle. The runtime path's `changed_chunks` count is
+    // bounded by the touched-chunk count (~2 here — two edits in chunk
+    // (1,0,1) and one edit in chunk (2,0,2)). The diagnostic oracle path
+    // would emit synthetic AADF-refresh entries for many more chunks
+    // (up to ~total_chunks - touched). Assert the runtime path is NOT
+    // accidentally invoking the oracle's whole-world recompute.
+    let touched_chunks = batch.changed_chunks.len();
+    // The runtime path touches at most the chunks listed in the edit set
+    // (3 edits → at most 2 unique chunks). A whole-world recompute would
+    // emit on the order of `total_chunks` (= 64) records. Assert the
+    // ratio is small (touched / total ≤ 0.5 = 32) — well below the
+    // whole-world threshold.
+    if touched_chunks > total_chunks / 2 {
+        return Err(format!(
+            "runtime-edit gate FAIL: runtime path emitted {touched_chunks} \
+             changed_chunks records for a brush that touched ≤2 chunks (out \
+             of {total_chunks} total) — likely accidentally invoking the \
+             diagnostic `recompute_chunk_layer_aadfs` whole-world rehash on \
+             the runtime hot path, which the `02f` rearch retires."
+        ));
+    }
+
+    // Gate 4 — chunks_cpu was mutated in place (proves the CPU mirror
+    // patch landed; the editor's mouse-pick ray_traversal reads
+    // chunks_cpu and would see stale state if this skipped).
+    let pre_state = built_pre_edit_state(&volume, &edits);
+    let any_chunk_mutated = pre_state.iter().enumerate().any(|(ci, &pre)| {
+        ci < world_data.chunks_cpu.len() && world_data.chunks_cpu[ci] != pre
+    });
+    if !any_chunk_mutated {
+        return Err(
+            "runtime-edit gate FAIL: set_voxels_batch did not mutate any \
+             chunks_cpu entry — the CPU mirror patch (cheap in-place; the \
+             `02f` rearch directive bullet #5) did not land. \
+             `WorldData::ray_traversal` would read stale state."
+                .into(),
+        );
+    }
+
+    Ok(format!(
+        "runtime-edit gate PASS: set_voxels_batch produced {} batch(es) \
+         with {} changed_chunks + {} changed_blocks + {} changed_voxels \
+         records (out of {total_chunks} total chunks — runtime path \
+         touched-only, NOT whole-world rehash); {} edited_groups for the \
+         BFS oracle. CPU mirror patched in-place.",
+        world_data.pending_edits.batches.len(),
+        touched_chunks,
+        batch.changed_blocks.len() / 65,
+        batch.changed_voxels.len() / 33,
+        world_data.pending_edits.edited_groups.len(),
+    ))
+}
+
+/// `02f` runtime-edit gate helper — rebuild the `chunks_cpu` mirror that
+/// `construct(&volume)` would have produced (the pre-edit baseline) so the
+/// gate can diff against post-edit `chunks_cpu`. Implementation: re-run
+/// `construct` and return its `chunks` (cheap; the test fixture is 4×4×4
+/// chunks).
+fn built_pre_edit_state(
+    volume: &crate::aadf::construct::DenseVolume,
+    _edits: &[(bevy::prelude::IVec3, crate::voxel::VoxelTypeId)],
+) -> Vec<u32> {
+    crate::aadf::construct::construct(volume).chunks
 }
 
 pub fn validate_entity_handler() -> Result<String, String> {

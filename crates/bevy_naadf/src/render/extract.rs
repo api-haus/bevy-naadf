@@ -1,33 +1,71 @@
-//! `ExtractSchedule`: `WorldData` / camera → render-world mirror
-//! (`03-design.md` §4.5, §5).
+//! `ExtractSchedule`: build-once world hand-off + per-frame camera mirror
+//! (`03-design.md` §4.5, §5; rearch'd in
+//! `docs/orchestrate/feature-completeness/02f-design-world-container-rearch.md`).
 //!
-//! The render world is a separate ECS world rebuilt every frame from the main
-//! world. These systems run in `ExtractSchedule` and copy the data the Phase-A
-//! render passes need across the world boundary:
+//! ## World data: build-once hand-off (post-`02f`)
 //!
-//! - [`extract_world`] — on `WorldData.dirty`, mirror the three CPU buffers +
-//!   the voxel-type palette into [`ExtractedWorld`]. Build-once: after the
-//!   first frame this is a cheap no-op (the resource already holds the data).
-//! - [`extract_camera`] — every frame, copy the camera's `PositionSplit` +
-//!   inverse view-projection into [`ExtractedCameraData`].
+//! C# NAADF owns `WorldData` as a single object — the CPU mirror arrays
+//! (`dataChunk`/`dataBlock`/`dataVoxel`) and the GPU resources
+//! (`dataChunkGpu`/`dataBlockGpu`/`dataVoxelGpu`) live on the same instance,
+//! mutated by the editor and read by the renderer with no clone/extract layer
+//! (`/mnt/archive4/DEV/NAADF/NAADF/World/Data/WorldData.cs:20-218`). The
+//! port's main↔render sub-app boundary forces a one-time CPU→GPU ferry at
+//! startup; after that, per-edit changes flow through the W2 delta chain
+//! (`pending_edits.batches` → `naadf_world_change_node`) and never through a
+//! whole-world copy. The post-`02f` shape:
 //!
-//! `render::prepare` consumes these to build `WorldGpu` / `FrameGpu`.
+//! - **No `dirty` flag**, no `ExtractedWorld` resource, no per-frame
+//!   `extract_world` clone. (`02e` identified the per-frame 48 MiB clone as a
+//!   ~20 ms/frame cost on Oasis; `03e` patched the flag but the clone path
+//!   remained as a structural failure mode if any future code re-asserted
+//!   `dirty`. `02f` deletes the path entirely.)
+//! - [`stage_world_gpu_buildonce`] runs in `ExtractSchedule` once, gated on
+//!   `Option<Res<WorldGpu>>::is_none()`. It clones the CPU mirror buffers
+//!   into a transient [`WorldGpuStaging`] render-world resource — a single
+//!   per-app hand-off, NOT a per-frame mirror.
+//! - `render::prepare::prepare_world_gpu` consumes `WorldGpuStaging` once,
+//!   builds the chunks 3D texture + blocks/voxels/voxel_types
+//!   `GrowableBuffer`s + world_meta uniform + entity placeholders + the
+//!   world bind group, inserts `WorldGpu`, then **drops** the staging
+//!   resource. After that the build-once gate keeps both systems no-ops.
+//! - W2 delta uploads consume `pending_edits.batches` via
+//!   `extract_world_changes` → `ConstructionEvents` → `naadf_world_change_node`.
+//!   The chunks texture / blocks buffer / voxels buffer are sized with edit
+//!   headroom (`02f` R3) so the W2 dispatch's `block_voxel_count[]`-cursor
+//!   appends land within the allocated capacity for the duration of typical
+//!   editing strokes.
+//!
+//! ## Camera + flag mirrors (every-frame, fixed-size)
+//!
+//! - [`extract_camera`] / [`extract_camera_history`] / [`extract_taa_config`] /
+//!   [`extract_gi_config`] — every frame, cheap fixed-size copies of camera /
+//!   history / runtime-flag state. These are NOT world-data and have no
+//!   bearing on the `02f` rearch — they stay as is.
 
 use bevy::prelude::*;
-use bevy::render::{Extract, MainWorld};
+use bevy::render::Extract;
 
 use crate::camera::PositionSplit;
 use crate::render::taa::{rotation_only_view_proj, CameraHistory, CAMERA_HISTORY_DEPTH};
 use crate::voxel::VoxelType;
 use crate::world::data::{IAabb3, VoxelTypes, WorldData};
 
-/// Render-world mirror of the CPU voxel world (`03-design.md` §4.5).
+/// Transient render-world hand-off resource carrying the CPU mirror buffers +
+/// world metadata from the main-world [`WorldData`] / [`VoxelTypes`] for the
+/// **one-time** GPU resource build (`02f` rearch). Inserted by
+/// [`stage_world_gpu_buildonce`] on the first frame the main-world world data
+/// exists; **consumed and dropped** by `prepare_world_gpu` once the GPU
+/// `WorldGpu` is built.
 ///
-/// Populated by [`extract_world`] from the main-world [`WorldData`] +
-/// [`VoxelTypes`] when they are `dirty`. `render::prepare::prepare_world_gpu`
-/// turns this into the GPU `WorldGpu` resource once.
+/// Not used after frame ≤1 of the app. **No per-frame clone**: the build-once
+/// gate (`Option<Res<WorldGpu>>::is_none()`) ensures the staging clone happens
+/// once and never again.
+///
+/// If a future feature ever needs a whole-world re-upload (e.g. world reload
+/// or live re-import), it re-creates this resource at that boundary — but no
+/// such code path exists today. The W2 delta chain handles per-edit changes.
 #[derive(Resource, Default)]
-pub struct ExtractedWorld {
+pub struct WorldGpuStaging {
     /// Chunk buffer mirror — one encoded `ChunkCell` `u32` per chunk.
     pub chunks: Vec<u32>,
     /// Block buffer mirror — encoded `BlockCell` `u32`s, 64 per mixed chunk.
@@ -40,13 +78,43 @@ pub struct ExtractedWorld {
     pub size_in_chunks: UVec3,
     /// Geometry bounding box, in voxels (inclusive).
     pub bounding_box: IAabb3,
-    /// Set when the contents changed this frame and the GPU needs a re-upload.
-    /// `prepare_world_gpu` clears it after uploading.
-    pub dirty: bool,
     /// Phase-C followup #1 — dense pre-construction voxel-type stream
-    /// (`size_in_voxels.x*y*z` u16s). Used by the runtime GPU producer dispatch
-    /// to build `segment_voxel_buffer` without re-running CPU construction.
-    /// Empty if the source `WorldData` does not carry it.
+    /// (`size_in_voxels.x*y*z` u16s). Used by the runtime GPU producer
+    /// dispatch to build `segment_voxel_buffer`. Empty when the source
+    /// `WorldData` does not carry it (e.g. sparse `.vox` path —
+    /// `02a-v2` Δ-GPUProducer).
+    pub dense_voxel_types: Vec<u16>,
+}
+
+/// Render-world metadata mirror of `WorldData`'s size + dense voxel-type stream
+/// (`02f` rearch). Populated alongside [`WorldGpuStaging`] by
+/// [`stage_world_gpu_buildonce`] but **outlives** the staging resource: the
+/// W1 GPU producer (`naadf_gpu_producer_node`) + `prepare_construction` read
+/// `size_in_chunks` + `dense_voxel_types` to build `segment_voxel_buffer` on
+/// the first frame the producer can dispatch (which may be several frames
+/// after the staging hand-off, depending on pipeline-cache compilation).
+///
+/// Carrying just the size + the dense stream (not the chunks/blocks/voxels
+/// CPU buffers) keeps this resource ~256 KiB for the test grid and ~0 B for
+/// the `.vox` sparse path (which sets `dense_voxel_types = Vec::new()`). The
+/// `02e` per-frame 48 MiB clone is GONE.
+///
+/// **DELIBERATELY MINIMAL.** Adding fields requires re-reading the brief's
+/// "no `ExtractedWorld` resource" deletion directive (`02f` Decision 4). If a
+/// new system needs more world data, prefer `Extract<Res<WorldData>>` from
+/// `ExtractSchedule` instead of growing this resource.
+#[derive(Resource, Default)]
+pub struct WorldDataMeta {
+    /// World size in chunks.
+    pub size_in_chunks: UVec3,
+    /// `WorldData.blocks_cpu.len()` at build time — used by
+    /// `naadf_gpu_producer_node` to size its read of the GPU buffer.
+    pub blocks_cpu_len: u32,
+    /// `WorldData.voxels_cpu.len()` at build time — used by
+    /// `naadf_gpu_producer_node` as above.
+    pub voxels_cpu_len: u32,
+    /// Phase-C followup #1 — dense pre-construction voxel-type stream
+    /// (`size_in_voxels.x*y*z` u16s). Empty on the sparse `.vox` path.
     pub dense_voxel_types: Vec<u16>,
 }
 
@@ -76,61 +144,62 @@ pub struct ExtractedCameraData {
     pub valid: bool,
 }
 
-/// `ExtractSchedule` system: mirror the main-world [`WorldData`] + [`VoxelTypes`]
-/// into the render-world [`ExtractedWorld`] when they are dirty, then clear the
-/// main-world `dirty` flags so subsequent frames stay a true no-op.
+/// `ExtractSchedule` system: **build-once** hand-off of the main-world
+/// [`WorldData`] + [`VoxelTypes`] into the render-world [`WorldGpuStaging`]
+/// resource (`02f` rearch).
 ///
-/// Build-once (D2): `setup_test_grid` sets `dirty = true`, this copies the
-/// buffers once + clears the main-world flag in the same system, and the
-/// render-world `extracted.dirty` is consumed by `prepare_world_gpu` (which
-/// clears it after the GPU upload).
+/// Gated on `Option<Res<WorldGpu>>::is_none()` — once `prepare_world_gpu`
+/// builds the GPU resources from the staging on the first frame, this system
+/// short-circuits on every subsequent frame. **There is no per-frame clone.**
 ///
-/// **Fix (`02e-perframe-cpu-investigation.md`, 2026-05-16):** the main-world
-/// flag was previously left set indefinitely, causing this system to fire
-/// every frame and re-clone the entire ~48 MiB CPU mirror on Oasis-class
-/// worlds (~2.8 ms/frame), in turn re-triggering the ~16.7 ms/frame full-world
-/// GPU re-upload in `prepare_world_gpu`. Mutating the main world via
-/// `ResMut<MainWorld>` restores the originally-intended build-once shape.
-/// Per-edit re-uploads still flow via the W2 delta-upload chain
-/// (`pending_edits.batches` → `naadf_world_change_node`); `world_data.dirty = true`
-/// writes in edit paths were also removed since the delta chain handles
-/// per-edit changes without needing a full-world re-extract.
-pub fn extract_world(
-    mut extracted: ResMut<ExtractedWorld>,
-    mut main_world: ResMut<MainWorld>,
+/// Also (re)populates [`WorldDataMeta`] with the size + dense voxel-type
+/// stream, which the Phase-C followup #1 GPU producer reads on the first
+/// frame all its dependencies (pipelines compiled, bind groups built) are
+/// ready (which may be several frames after the GPU resource build).
+///
+/// Per-edit changes do NOT pass through here — they flow via the W2 delta
+/// chain (`pending_edits.batches` → `extract_world_changes` →
+/// `ConstructionEvents` → `naadf_world_change_node`). The build-once
+/// staging is purely the initial world hand-off.
+///
+/// Replaces the pre-`02f` `extract_world` system (deleted along with
+/// `ExtractedWorld`). The post-`02e` per-frame full-world clone is GONE.
+pub fn stage_world_gpu_buildonce(
+    mut commands: Commands,
+    world_gpu_already_built: Option<Res<crate::render::prepare::WorldGpu>>,
+    staging_existing: Option<Res<WorldGpuStaging>>,
+    mut meta: ResMut<WorldDataMeta>,
+    world_data: Extract<Option<Res<WorldData>>>,
+    voxel_types: Extract<Option<Res<VoxelTypes>>>,
 ) {
-    // SAFETY note: `ResMut<MainWorld>` is the sanctioned bevy_render pattern
-    // for mutating the main world from an extract system (see e.g.
-    // `bevy_render::erased_render_asset::extract_render_asset`). The
-    // alternative `Extract<Option<Res<_>>>` is read-only by design
-    // (`ReadOnlySystemParam` bound on `Extract`), so we cannot clear the flag
-    // through that path.
-    let world = main_world.as_mut();
-    let world_data = world.get_resource::<WorldData>();
-    let voxel_types = world.get_resource::<VoxelTypes>();
-    let (Some(world_data), Some(voxel_types)) = (world_data, voxel_types) else {
+    // Build-once gate: if WorldGpu exists OR staging is already populated
+    // (waiting to be consumed by prepare_world_gpu), do nothing.
+    if world_gpu_already_built.is_some() || staging_existing.is_some() {
+        return;
+    }
+    let (Some(world_data), Some(voxel_types)) = (&*world_data, &*voxel_types) else {
         return;
     };
-    // Build-once: only re-copy when the main-world data is flagged dirty.
-    if !world_data.dirty && !voxel_types.dirty {
-        return;
-    }
-    extracted.chunks.clone_from(&world_data.chunks_cpu);
-    extracted.blocks.clone_from(&world_data.blocks_cpu);
-    extracted.voxels.clone_from(&world_data.voxels_cpu);
-    extracted.voxel_types.clone_from(&voxel_types.types);
-    extracted.size_in_chunks = world_data.size_in_chunks;
-    extracted.bounding_box = world_data.bounding_box;
-    extracted.dense_voxel_types.clone_from(&world_data.dense_voxel_types);
-    extracted.dirty = true;
-    // Clear the main-world flags AFTER the copy completes so subsequent
-    // frames stay a true no-op.
-    if let Some(mut wd) = world.get_resource_mut::<WorldData>() {
-        wd.dirty = false;
-    }
-    if let Some(mut vt) = world.get_resource_mut::<VoxelTypes>() {
-        vt.dirty = false;
-    }
+    // One-time clone — the unavoidable main→render CPU buffer ferry. After
+    // this frame, prepare_world_gpu consumes + drops the staging, and the
+    // build-once gate above keeps both systems no-ops forever.
+    let staging = WorldGpuStaging {
+        chunks: world_data.chunks_cpu.clone(),
+        blocks: world_data.blocks_cpu.clone(),
+        voxels: world_data.voxels_cpu.clone(),
+        voxel_types: voxel_types.types.clone(),
+        size_in_chunks: world_data.size_in_chunks,
+        bounding_box: world_data.bounding_box,
+        dense_voxel_types: world_data.dense_voxel_types.clone(),
+    };
+    // Meta resource carries the size + dense voxel-type stream for the
+    // GPU producer node, which may not run on the same frame as
+    // prepare_world_gpu (pipeline-cache compilation is async).
+    meta.size_in_chunks = world_data.size_in_chunks;
+    meta.blocks_cpu_len = world_data.blocks_cpu.len() as u32;
+    meta.voxels_cpu_len = world_data.voxels_cpu.len() as u32;
+    meta.dense_voxel_types.clone_from(&world_data.dense_voxel_types);
+    commands.insert_resource(staging);
 }
 
 /// `ExtractSchedule` system: copy the camera's `PositionSplit` + inverse

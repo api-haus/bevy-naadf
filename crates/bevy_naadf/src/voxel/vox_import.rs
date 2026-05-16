@@ -305,7 +305,6 @@ pub fn build_world_from_vox(
             min: IVec3::ZERO,
             max: IVec3::new(size[0] as i32 - 1, size[1] as i32 - 1, size[2] as i32 - 1),
         },
-        dirty: true,
         pending_edits: Default::default(),
         // Δ-GPUProducer — sparse path skips the GPU producer chain (which
         // requires a dense voxel-type mirror that would cost ~140 GiB for an
@@ -316,7 +315,6 @@ pub fn build_world_from_vox(
 
     let voxel_types = VoxelTypes {
         types: imported.palette,
-        dirty: true,
     };
 
     (world_data, voxel_types)
@@ -1367,8 +1365,10 @@ mod tests {
             world.dense_voxel_types.is_empty(),
             "sparse .vox path must set dense_voxel_types empty (Δ-GPUProducer)"
         );
-        assert!(world.dirty);
-        assert!(types.dirty);
+        // `02f` rearch — `dirty` flag deleted; the GPU upload is gated by
+        // `WorldGpu`-existence + the build-once `stage_world_gpu_buildonce`
+        // extract path instead.
+        let _ = types;
         assert_eq!(world.bounding_box.min, IVec3::ZERO);
         assert_eq!(world.bounding_box.max, IVec3::new(15, 15, 15));
         assert!(!world.chunks_cpu.is_empty(), "sparse path must produce chunks");

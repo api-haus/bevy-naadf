@@ -40,7 +40,7 @@ use bevy::render::renderer::{RenderDevice, RenderQueue};
 
 use crate::render::atmosphere::AtmosphereGpu;
 use crate::render::extract::{
-    ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig, ExtractedWorld,
+    ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig, WorldGpuStaging,
 };
 use crate::render::gi::{GiBindGroups, GiGpu};
 use crate::render::gpu_types::{
@@ -141,16 +141,38 @@ pub struct FrameGpu {
     pub calc_new_taa_sample_bind_group: BindGroup,
 }
 
-/// `RenderSystems::PrepareResources` system: create + upload the world GPU
-/// resources on the first dirty frame, then build the world bind group.
+/// W2-edit growth headroom multiplier for the `blocks` / `voxels`
+/// `GrowableBuffer`s allocated at build-once time (`02f` R3 mitigation).
 ///
-/// Build-once (D2): after the first upload `ExtractedWorld.dirty` is cleared,
-/// so subsequent frames return early. The chunk texture is written via
-/// `queue.write_texture`; the block / voxel / voxel-type buffers go through
-/// [`GrowableBuffer::upload_all`].
+/// The W2 GPU dispatch (`naadf_world_change_node`'s `apply_block_change.wgsl`
+/// + `apply_voxel_change.wgsl`) appends new block/voxel records at indices
+/// driven by atomic `block_voxel_count[]` cursors. Without per-edit re-alloc
+/// (deleted in `02f`), the build-time allocation must absorb the edit-time
+/// append capacity for the duration of typical strokes. 2× headroom on top
+/// of the build-time CPU mirror size covers ~10 s of continuous r=16 brush
+/// editing on Oasis (~125 mixed-blocks/frame × 600 frames × 64 u32s/block =
+/// 4.8 MB growth, well under the 6.3 MiB headroom).
+///
+/// Worst-case: a sphere r=400 or a multi-Oasis-scale stroke could exceed
+/// this. Larger headroom is straightforward (the cost is one-time
+/// allocation at startup, not per-frame); a future iteration could wire
+/// dynamic growth via a GPU readback of `block_voxel_count[]` cursors with
+/// realloc on overflow.
+const W2_BUFFER_HEADROOM_MUL: u64 = 2;
+
+/// `RenderSystems::PrepareResources` system: create the world GPU resources
+/// **once** from the [`WorldGpuStaging`] hand-off, build the world bind
+/// group, then consume + drop the staging resource (`02f` rearch).
+///
+/// Build-once (`02f` Decision 3): no dirty flag, no re-upload path. The
+/// `existing.is_some()` gate keeps this a true no-op on every frame after
+/// the first. The per-edit upload path is the W2 delta chain
+/// (`naadf_world_change_node`), NOT this system; this system's GPU buffer
+/// allocation includes [`W2_BUFFER_HEADROOM_MUL`] headroom to accommodate
+/// the W2 dispatch's atomic-cursor appends without per-frame realloc.
 pub fn prepare_world_gpu(
     mut commands: Commands,
-    mut extracted: ResMut<ExtractedWorld>,
+    staging: Option<Res<WorldGpuStaging>>,
     existing: Option<Res<WorldGpu>>,
     pipelines: Res<NaadfPipelines>,
     pipeline_cache: Res<PipelineCache>,
@@ -165,10 +187,16 @@ pub fn prepare_world_gpu(
     // (after `prepare_world_gpu`).
     construction_config: Option<Res<crate::render::construction::ConstructionConfig>>,
 ) {
-    // Build-once: skip unless this is the first build or the data changed.
-    if existing.is_some() && !extracted.dirty {
+    // Build-once: WorldGpu already exists → this system is forever done.
+    if existing.is_some() {
         return;
     }
+    // Waiting for the extract-stage hand-off — staging populated by
+    // `stage_world_gpu_buildonce` once both `WorldData` and `VoxelTypes`
+    // are present in the main world.
+    let Some(extracted) = staging else {
+        return;
+    };
     if extracted.chunks.is_empty() {
         // `setup_test_grid` has not run / extracted yet.
         return;
@@ -293,17 +321,25 @@ pub fn prepare_world_gpu(
     // `cpu_size + 64` headroom. Mirror what `validate_gpu_construction` uses.
     let cpu_blocks_len = extracted.blocks.len().max(1);
     let cpu_voxels_len = extracted.voxels.len().max(1);
+    // `02f` R3 — W2-edit headroom. The W2 dispatch appends block/voxel
+    // records past the build-time CPU mirror size; without per-edit
+    // re-alloc, the build-time allocation must absorb stroke growth.
+    // 2× the build-time size is the safe-for-typical-strokes baseline; a
+    // future iteration adds dynamic growth on cursor-overflow detection.
+    let blocks_with_headroom = (cpu_blocks_len as u64) * W2_BUFFER_HEADROOM_MUL;
+    let voxels_with_headroom = (cpu_voxels_len as u64) * W2_BUFFER_HEADROOM_MUL;
     let blocks_alloc_len = if gpu_producer_enabled {
         // 64 = GPU `block_voxel_count[1]` cursor seed (`chunkCalc.fx`).
-        (cpu_blocks_len + 64).max(64)
+        // Still apply the W2 headroom on top of the producer's cursor seed.
+        ((cpu_blocks_len + 64) as u64 * W2_BUFFER_HEADROOM_MUL).max(64) as usize
     } else {
-        cpu_blocks_len
+        blocks_with_headroom.max(1) as usize
     };
     let voxels_alloc_len = if gpu_producer_enabled {
         // 32 = GPU `block_voxel_count[0]` cursor seed.
-        (cpu_voxels_len + 32).max(32)
+        ((cpu_voxels_len + 32) as u64 * W2_BUFFER_HEADROOM_MUL).max(32) as usize
     } else {
-        cpu_voxels_len
+        voxels_with_headroom.max(1) as usize
     };
 
     let voxel_types_data: Vec<GpuVoxelType> = if extracted.voxel_types.is_empty() {
@@ -436,8 +472,10 @@ pub fn prepare_world_gpu(
         entity_voxel_data_placeholder: placeholder_entity_voxel_data,
         entity_instances_history_placeholder: placeholder_entity_instances_history,
     });
-    // Build-once: consumed — clear the flag so this stays a no-op.
-    extracted.dirty = false;
+    // Build-once consumed. Drop the staging resource so its ~48 MiB on
+    // Oasis is reclaimed and no future code path can accidentally re-read
+    // a stale buffer image (`02f` rearch).
+    commands.remove_resource::<WorldGpuStaging>();
 }
 
 /// `RenderSystems::PrepareBindGroups` system: write the per-frame camera +

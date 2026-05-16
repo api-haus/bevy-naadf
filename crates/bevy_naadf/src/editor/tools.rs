@@ -304,7 +304,6 @@ mod tests {
                 min: IVec3::ZERO,
                 max: IVec3::new(size_v.x as i32 - 1, size_v.y as i32 - 1, size_v.z as i32 - 1),
             },
-            dirty: false,
             pending_edits: PendingEdits::default(),
             dense_voxel_types: Vec::new(),
         }

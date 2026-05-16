@@ -215,6 +215,14 @@ pub fn unpack_chunk_pos(packed: u32) -> [u32; 3] {
 
 /// Port of `EditingHandler.processChunks` (`EditingHandler.cs:75-249`).
 ///
+/// **Runs on the runtime path** (`02f` rearch — this is NOT the diagnostic
+/// "CPU rebuild" that the rearch's headline retires). C# runs the equivalent
+/// per-edit-frame via `EditingHandler.processChunks`; same cost shape (per-
+/// touched-chunk encode, not whole-world). The diagnostic-only artefact
+/// `02f` retires is `recompute_chunk_layer_aadfs` (the WHOLE-WORLD
+/// `O(N_chunks × 31 × 3)` AADF rehash), not this function. See
+/// `02f-design-world-container-rearch.md` R5 for the interpretation note.
+///
 /// For each chunk in `edited_chunks`, hashes its 64 new blocks (the
 /// `edit_data[64*32 = 2048]` window per chunk — 64 blocks × 32 packed-voxel-pair
 /// u32s) and produces the `changed_chunks` / `changed_blocks` / `changed_voxels`
@@ -477,9 +485,24 @@ pub fn set_voxel_in_window(window: &mut [u32], voxel_in_chunk: [u32; 3], ty: u16
 ///
 /// **Complexity**: O(world chunks × 3 axes × AADF_MAX_CHUNK iterations) =
 /// O(3 · 31 · N) per call. For Oasis_Hard_Cover.vox (93×34×84 = 265 k
-/// chunks), ~25 M ops per edit ≈ ~5 ms CPU (release build). Acceptable
-/// for synchronous editing; Bug 1 (async edits, deferred) would move this
-/// off the main thread.
+/// chunks), ~25 M ops per edit ≈ ~5 ms CPU (release build). **DO NOT call
+/// from production code paths** — see DIAGNOSTIC-ONLY note below.
+///
+/// ## DIAGNOSTIC-ONLY (`02f` rearch)
+///
+/// This whole-world AADF rehash is **DIAGNOSTIC-ONLY**. Call sites:
+///
+/// - `WorldData::set_voxel` (`set_voxel` is itself DIAGNOSTIC-ONLY — see
+///   `world/data.rs`).
+/// - `WorldData::set_voxels_batch_oracle` (same).
+/// - Unit tests in this file.
+///
+/// **Production brushes call [`WorldData::set_voxels_batch`] or
+/// [`WorldData::set_chunks_uniform_batch`]**, which skip this rehash. The
+/// W3 GPU regime-2 self-perpetuating queue refreshes stale AADFs over
+/// subsequent frames (matches C# `WorldBoundHandler.cs:91-121` semantics —
+/// far-away AADFs converge over many frames, NOT synchronously per edit).
+#[doc(hidden)]
 pub fn recompute_chunk_layer_aadfs(
     chunks_cpu: &mut [u32],
     size_in_chunks: [u32; 3],
