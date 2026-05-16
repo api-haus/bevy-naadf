@@ -13,6 +13,7 @@
 pub mod aadf;
 pub mod camera;
 pub mod e2e;
+pub mod editor;
 pub mod hud;
 pub mod panel;
 pub mod render;
@@ -626,7 +627,12 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         // (`25-design-panel-mouse.md` §6.1).
         app.init_resource::<panel::PanelState>()
             .init_resource::<panel::PanelDrag>()
+            // Track-B editor — `02b-design-editor.md`. Shares the same
+            // `add_hud` gate as panel + HUD so the e2e harness never sees
+            // the editor either (luminance gates unaffected).
+            .init_resource::<editor::EditorState>()
             .add_systems(Startup, panel::setup_panel.after(load_dev_font))
+            .add_systems(Startup, editor::hud::setup_editor_hud.after(load_dev_font))
             .add_systems(
                 Update,
                 (
@@ -634,6 +640,11 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
                     panel::adjust_panel,
                     panel::mouse_interact_panel,
                     panel::update_panel_text,
+                    // apply_edit_tool runs AFTER mouse_interact_panel so the
+                    // panel-press bail-out reads up-to-date Interaction state
+                    // (a panel row LMB-click owns the click).
+                    editor::apply_edit_tool,
+                    editor::hud::update_editor_hud,
                 )
                     .chain(),
             );

@@ -70,6 +70,8 @@ use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, RelativeCursorPosition};
 use bevy::window::PrimaryWindow;
 
+use crate::editor::EditorState;
+use crate::voxel::VoxelTypeId;
 use crate::{AppArgs, DevFont, GiSettings, DEFAULT_TAA_RING_DEPTH};
 use crate::render::gi::{
     BUCKET_STORAGE_COUNT, INVALID_SAMPLE_STORAGE_COUNT, REFINED_BUCKET_STORAGE_COUNT,
@@ -149,7 +151,10 @@ pub struct PanelDrag {
 #[derive(Component)]
 pub struct PanelRoot;
 
-/// Marker + index for each per-row Node. The index maps to [`KNOBS`].
+/// Marker + index for each per-row Node. The index maps to [`KNOBS`]. Also
+/// exported from `panel` so the Track-B editor can query for "is any panel
+/// row hovered or pressed?" (so it can bail before firing a brush on a
+/// panel-row LMB click).
 #[derive(Component, Clone, Copy)]
 pub struct PanelRow {
     /// Index into [`KNOBS`] this row represents.
@@ -222,8 +227,58 @@ enum KnobKind {
     /// `apply` closure-pointer when clicked (or selected via keyboard `R`).
     /// `25-design-panel-mouse.md` §5.2 — used for the "Reset all" row.
     Action {
-        /// Run the action; receives the panel's full AppArgs for mutation.
-        apply: fn(&mut AppArgs),
+        /// Run the action; receives the panel's full AppArgs for mutation +
+        /// the editor's EditorState (so "reset all" also resets the editor
+        /// section's knobs to their declared defaults).
+        apply: fn(&mut AppArgs, &mut EditorState),
+    },
+    /// Track-B editor knob — mutates `EditorState` (the Track-B editor's
+    /// shared resource), not `AppArgs.gi`. Holds the four sub-shapes
+    /// (`U32`/`F32`/`Bool`/`Enum`) under one variant to keep `KnobKind`
+    /// compact (`02b-design-editor.md` Decision 1).
+    Edit {
+        variant: EditKnobVariant,
+    },
+}
+
+/// Sub-shapes of an `EditorState`-targeting `KnobKind::Edit` knob row. Mirrors
+/// `U32`/`F32`/`Bool` of the GI-knob variants, plus an `Enum` form for
+/// tool-selector-style cycling knobs (Paint / Cube / Sphere).
+#[allow(clippy::type_complexity)]
+pub enum EditKnobVariant {
+    /// A `u32`-valued editor knob (e.g. `selected_type`).
+    U32 {
+        getter: fn(&EditorState) -> u32,
+        setter: fn(&mut EditorState, u32),
+        nudge: u32,
+        big_step: u32,
+        min: u32,
+        max: u32,
+        default: u32,
+    },
+    /// An `f32`-valued editor knob (e.g. `radius`).
+    F32 {
+        getter: fn(&EditorState) -> f32,
+        setter: fn(&mut EditorState, f32),
+        nudge: f32,
+        big_step: f32,
+        min: f32,
+        max: f32,
+        default: f32,
+    },
+    /// A boolean editor knob (e.g. `is_erase`, `is_continuous`).
+    Bool {
+        getter: fn(&EditorState) -> bool,
+        setter: fn(&mut EditorState, bool),
+        default: bool,
+    },
+    /// An enum-valued editor knob — Left/Right cycles through `variants`.
+    /// Used for the tool selector (Paint / Cube / Sphere).
+    Enum {
+        getter: fn(&EditorState) -> u32,
+        setter: fn(&mut EditorState, u32),
+        variants: &'static [&'static str],
+        default: u32,
     },
 }
 
@@ -237,6 +292,7 @@ impl KnobKind {
                 | KnobKind::F32 { .. }
                 | KnobKind::Bool { .. }
                 | KnobKind::Action { .. }
+                | KnobKind::Edit { .. }
         )
     }
 }
@@ -248,6 +304,79 @@ impl KnobKind {
 /// `21-design-quality-panel.md` §5 + `25-design-panel-mouse.md` §5.2 panel
 /// layout maps directly to this array.
 const KNOBS: &[Knob] = &[
+    // ── Track-B editor section — `02b-design-editor.md` § Panel extension ──
+    Knob {
+        label: "EDITOR (F2 toggles edit mode)",
+        class: ' ',
+        kind: KnobKind::Section,
+    },
+    Knob {
+        label: "  tool",
+        class: 'E',
+        kind: KnobKind::Edit {
+            variant: EditKnobVariant::Enum {
+                getter: |s| s.tool as u32,
+                setter: |s, v| s.tool = EditorState::tool_from_u32(v),
+                variants: &["Paint", "Cube", "Sphere"],
+                default: 0,
+            },
+        },
+    },
+    Knob {
+        label: "  selected_type",
+        class: 'E',
+        kind: KnobKind::Edit {
+            variant: EditKnobVariant::U32 {
+                getter: |s| s.selected_type.0 as u32,
+                setter: |s, v| {
+                    s.selected_type = VoxelTypeId((v.min(u16::MAX as u32)) as u16);
+                },
+                nudge: 1,
+                big_step: 5,
+                min: 1,
+                max: 4095,
+                default: 1,
+            },
+        },
+    },
+    Knob {
+        label: "  radius",
+        class: 'E',
+        kind: KnobKind::Edit {
+            variant: EditKnobVariant::F32 {
+                getter: |s| s.radius,
+                setter: |s, v| s.radius = v,
+                nudge: 1.0,
+                big_step: 10.0,
+                min: 1.0,
+                max: 400.0,
+                default: 10.0,
+            },
+        },
+    },
+    Knob {
+        label: "  is_erase",
+        class: 'E',
+        kind: KnobKind::Edit {
+            variant: EditKnobVariant::Bool {
+                getter: |s| s.is_erase,
+                setter: |s, v| s.is_erase = v,
+                default: false,
+            },
+        },
+    },
+    Knob {
+        label: "  is_continuous",
+        class: 'E',
+        kind: KnobKind::Edit {
+            variant: EditKnobVariant::Bool {
+                getter: |s| s.is_continuous,
+                setter: |s, v| s.is_continuous = v,
+                default: true,
+            },
+        },
+    },
+    // ── Existing sections (unchanged below) ────────────────────────────────
     Knob {
         label: "RAY STEP CAPS",
         class: ' ',
@@ -530,16 +659,22 @@ const KNOBS: &[Knob] = &[
     },
 ];
 
-/// Apply every knob's `default` to `AppArgs.gi` (preserves field identity by
-/// calling each row's `setter`). Shared by the `Shift+R` keybind, the
-/// `KnobKind::Action` "Reset all" row, and `mouse_interact_panel`'s
-/// button-action edge.
-fn reset_all_knobs(args: &mut AppArgs) {
+/// Apply every knob's `default` to `AppArgs.gi` + the EditorState
+/// (preserves field identity by calling each row's `setter`). Shared by the
+/// `Shift+R` keybind, the `KnobKind::Action` "Reset all" row, and
+/// `mouse_interact_panel`'s button-action edge.
+fn reset_all_knobs(args: &mut AppArgs, editor: &mut EditorState) {
     for row in KNOBS {
         match row.kind {
             KnobKind::U32 { setter, default, .. } => setter(&mut args.gi, default),
             KnobKind::F32 { setter, default, .. } => setter(&mut args.gi, default),
             KnobKind::Bool { setter, default, .. } => setter(&mut args.gi, default),
+            KnobKind::Edit { ref variant } => match *variant {
+                EditKnobVariant::U32 { setter, default, .. } => setter(editor, default),
+                EditKnobVariant::F32 { setter, default, .. } => setter(editor, default),
+                EditKnobVariant::Bool { setter, default, .. } => setter(editor, default),
+                EditKnobVariant::Enum { setter, default, .. } => setter(editor, default),
+            },
             _ => {}
         }
     }
@@ -736,6 +871,7 @@ pub fn adjust_panel(
     drag: Res<PanelDrag>,
     mut state: ResMut<PanelState>,
     mut args: ResMut<AppArgs>,
+    mut editor: ResMut<EditorState>,
 ) {
     if !state.open {
         return;
@@ -765,7 +901,7 @@ pub fn adjust_panel(
     let reset_all = keys.just_pressed(KeyCode::KeyR) && shift;
 
     if reset_all {
-        reset_all_knobs(&mut args);
+        reset_all_knobs(&mut args, &mut editor);
         return;
     }
 
@@ -827,9 +963,96 @@ pub fn adjust_panel(
                 // R while cursored on the action row fires it (the keyboard
                 // mirror of clicking the row).
                 if reset_one {
-                    apply(&mut args);
+                    apply(&mut args, &mut editor);
                 }
             }
+            KnobKind::Edit { ref variant } => match *variant {
+                EditKnobVariant::U32 {
+                    getter,
+                    setter,
+                    nudge,
+                    big_step,
+                    min,
+                    max,
+                    default,
+                } => {
+                    let mut v = getter(&editor);
+                    let n_step = if shift { (nudge / 4).max(1) } else { nudge };
+                    if left {
+                        v = v.saturating_sub(n_step);
+                    }
+                    if right {
+                        v = v.saturating_add(n_step);
+                    }
+                    if big_left {
+                        v = v.saturating_sub(big_step);
+                    }
+                    if big_right {
+                        v = v.saturating_add(big_step);
+                    }
+                    if reset_one {
+                        v = default;
+                    }
+                    setter(&mut editor, v.clamp(min, max));
+                }
+                EditKnobVariant::F32 {
+                    getter,
+                    setter,
+                    nudge,
+                    big_step,
+                    min,
+                    max,
+                    default,
+                } => {
+                    let mut v = getter(&editor);
+                    let n_step = if shift { nudge / 4.0 } else { nudge };
+                    if left {
+                        v -= n_step;
+                    }
+                    if right {
+                        v += n_step;
+                    }
+                    if big_left {
+                        v -= big_step;
+                    }
+                    if big_right {
+                        v += big_step;
+                    }
+                    if reset_one {
+                        v = default;
+                    }
+                    setter(&mut editor, v.clamp(min, max));
+                }
+                EditKnobVariant::Bool { getter, setter, default } => {
+                    let mut v = getter(&editor);
+                    if left || right {
+                        v = !v;
+                    }
+                    if reset_one {
+                        v = default;
+                    }
+                    setter(&mut editor, v);
+                }
+                EditKnobVariant::Enum {
+                    getter,
+                    setter,
+                    variants,
+                    default,
+                } => {
+                    let n = variants.len() as u32;
+                    let mut v = getter(&editor);
+                    if right || big_right {
+                        v = (v + 1) % n.max(1);
+                    }
+                    if left || big_left {
+                        v = (v + n - 1) % n.max(1);
+                    }
+                    if reset_one {
+                        v = default;
+                    }
+                    setter(&mut editor, v);
+                }
+            },
             _ => {}
         }
     }
@@ -845,6 +1068,7 @@ pub fn mouse_interact_panel(
     mut state: ResMut<PanelState>,
     mut drag: ResMut<PanelDrag>,
     mut args: ResMut<AppArgs>,
+    mut editor: ResMut<EditorState>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -908,6 +1132,7 @@ pub fn mouse_interact_panel(
                 };
                 apply_drag_delta(
                     &mut args,
+                    &mut editor,
                     &mut drag,
                     knob_index,
                     raw_dx,
@@ -916,7 +1141,7 @@ pub fn mouse_interact_panel(
                 );
             } else if mouse_buttons.just_released(MouseButton::Left) {
                 // Release-without-drag → click semantics.
-                handle_click_release(&mut args, knob_index);
+                handle_click_release(&mut args, &mut editor, knob_index);
                 drag.state = DragState::Idle;
             } else {
                 drag.state = DragState::Pressed {
@@ -932,6 +1157,7 @@ pub fn mouse_interact_panel(
                 // Apply this frame's motion delta.
                 apply_drag_delta(
                     &mut args,
+                    &mut editor,
                     &mut drag,
                     knob_index,
                     raw_dx,
@@ -962,6 +1188,7 @@ fn window_scale(window: &Query<&Window, With<PrimaryWindow>>) -> f32 {
 /// advance.
 fn apply_drag_delta(
     args: &mut AppArgs,
+    editor: &mut EditorState,
     drag: &mut PanelDrag,
     knob_index: usize,
     raw_dx: f32,
@@ -1006,6 +1233,39 @@ fn apply_drag_delta(
             let new = (cur + delta).clamp(min, max);
             setter(&mut args.gi, new);
         }
+        // Edit { variant }: mirror the GI-side U32 / F32 paths but target the
+        // editor's `EditorState`. Bool / Enum drag-deltas are no-ops (the
+        // release-without-drag path handles their click semantics).
+        KnobKind::Edit { ref variant } => match *variant {
+            EditKnobVariant::U32 { getter, setter, min, max, .. } => {
+                let range = (max as f32 - min as f32).max(1.0);
+                let delta_f = dx * (range / full_range_px);
+                let mut frac_accum = match drag.state {
+                    DragState::Dragging { frac_accum, .. } => frac_accum,
+                    _ => 0.0,
+                };
+                frac_accum += delta_f;
+                let whole = frac_accum.trunc();
+                frac_accum -= whole;
+                let cur = getter(editor) as i64;
+                let new = (cur + whole as i64).clamp(min as i64, max as i64) as u32;
+                setter(editor, new);
+                drag.state = DragState::Dragging {
+                    knob_index,
+                    frac_accum,
+                };
+            }
+            EditKnobVariant::F32 { getter, setter, min, max, .. } => {
+                let range = (max - min).max(f32::EPSILON);
+                let delta = dx * (range / full_range_px);
+                let cur = getter(editor);
+                let new = (cur + delta).clamp(min, max);
+                setter(editor, new);
+            }
+            EditKnobVariant::Bool { .. } | EditKnobVariant::Enum { .. } => {
+                // No drag semantics — release-without-drag handles flips/cycles.
+            }
+        },
         // Bool / Readonly / Section / Action: drag does nothing (release-
         // without-drag handles bool flip + action click; readonly + section
         // are inert).
@@ -1020,7 +1280,7 @@ fn apply_drag_delta(
 /// - `U32` / `F32` row: no-op (cursor already followed hover; the click
 ///   "selects" but doesn't change the value — match the keyboard
 ///   semantics of `↑/↓` to a row).
-fn handle_click_release(args: &mut AppArgs, knob_index: usize) {
+fn handle_click_release(args: &mut AppArgs, editor: &mut EditorState, knob_index: usize) {
     let row = match KNOBS.get(knob_index) {
         Some(r) => r,
         None => return,
@@ -1031,8 +1291,29 @@ fn handle_click_release(args: &mut AppArgs, knob_index: usize) {
             setter(&mut args.gi, !v);
         }
         KnobKind::Action { apply } => {
-            apply(args);
+            apply(args, editor);
         }
+        KnobKind::Edit { ref variant } => match *variant {
+            EditKnobVariant::Bool { getter, setter, .. } => {
+                let v = getter(editor);
+                setter(editor, !v);
+            }
+            EditKnobVariant::Enum {
+                getter,
+                setter,
+                variants,
+                ..
+            } => {
+                let n = variants.len() as u32;
+                if n > 0 {
+                    let v = (getter(editor) + 1) % n;
+                    setter(editor, v);
+                }
+            }
+            EditKnobVariant::U32 { .. } | EditKnobVariant::F32 { .. } => {
+                // Click on a U32/F32 row "selects" but doesn't change value.
+            }
+        },
         _ => {}
     }
 }
@@ -1043,6 +1324,7 @@ fn handle_click_release(args: &mut AppArgs, knob_index: usize) {
 pub fn update_panel_text(
     state: Res<PanelState>,
     args: Res<AppArgs>,
+    editor: Res<EditorState>,
     mut row_texts: Query<(&PanelRowText, &mut Text, &mut TextColor)>,
     mut legend: Query<&mut Text, (With<PanelLegendText>, Without<PanelRowText>)>,
 ) {
@@ -1105,6 +1387,50 @@ pub fn update_panel_text(
             KnobKind::Action { .. } => {
                 // Center-ish — the label already carries its own framing.
                 let _ = write!(s, "{}      {}", marker, row.label);
+                *text_color = row_color(i == state.cursor);
+            }
+            KnobKind::Edit { variant } => {
+                match variant {
+                    EditKnobVariant::U32 { getter, .. } => {
+                        let _ = write!(
+                            s,
+                            "{}{:<22} {:>6} [{}]",
+                            marker,
+                            row.label,
+                            getter(&editor),
+                            row.class,
+                        );
+                    }
+                    EditKnobVariant::F32 { getter, .. } => {
+                        let _ = write!(
+                            s,
+                            "{}{:<22} {:>6.2} [{}]",
+                            marker,
+                            row.label,
+                            getter(&editor),
+                            row.class,
+                        );
+                    }
+                    EditKnobVariant::Bool { getter, .. } => {
+                        let _ = write!(
+                            s,
+                            "{}{:<22} {:>6} [{}]",
+                            marker,
+                            row.label,
+                            if getter(&editor) { "true" } else { "false" },
+                            row.class,
+                        );
+                    }
+                    EditKnobVariant::Enum { getter, variants, .. } => {
+                        let v = getter(&editor) as usize;
+                        let name = variants.get(v).copied().unwrap_or("?");
+                        let _ = write!(
+                            s,
+                            "{}{:<22} {:>6} [{}]",
+                            marker, row.label, name, row.class,
+                        );
+                    }
+                }
                 *text_color = row_color(i == state.cursor);
             }
         }
@@ -1269,18 +1595,24 @@ mod tests {
     #[test]
     fn reset_all_knobs_restores_defaults() {
         let mut args = AppArgs::default();
+        let mut editor = EditorState::default();
         // Mutate a few knobs.
         args.gi.max_ray_steps_primary = 7;
         args.gi.spatial_iter_count = 1;
         args.gi.is_denoise = false;
         args.gi.spatial_resample_size = 1.0;
+        editor.radius = 1.0;
+        editor.is_continuous = false;
         // Apply reset.
-        reset_all_knobs(&mut args);
+        reset_all_knobs(&mut args, &mut editor);
         // Verify the mutated knobs are restored.
         assert_eq!(args.gi.max_ray_steps_primary, 120);
         assert_eq!(args.gi.spatial_iter_count, 12);
         assert!(args.gi.is_denoise);
         assert!((args.gi.spatial_resample_size - 500.0).abs() < f32::EPSILON);
+        // EditorState reset.
+        assert!((editor.radius - 10.0).abs() < f32::EPSILON);
+        assert!(editor.is_continuous);
     }
 
     /// `DragState::default()` is `Idle` — the resource starts in a safe
@@ -1289,5 +1621,89 @@ mod tests {
     #[test]
     fn drag_state_default_is_idle() {
         assert_eq!(PanelDrag::default().state, DragState::Idle);
+    }
+
+    /// Test #15 — the EDITOR section + 5 editor knob rows exist at the TOP
+    /// of `KNOBS`, in the documented order.
+    #[test]
+    fn edit_knob_variants_in_knobs_table() {
+        // First row must be the EDITOR section header.
+        assert!(
+            matches!(KNOBS[0].kind, KnobKind::Section),
+            "row 0 should be a Section header, got {:?}",
+            KNOBS[0].label
+        );
+        assert!(
+            KNOBS[0].label.starts_with("EDITOR"),
+            "row 0 label should start with EDITOR; got {:?}",
+            KNOBS[0].label
+        );
+        // Five Edit { variant } rows in the documented order: tool,
+        // selected_type, radius, is_erase, is_continuous.
+        let expected_labels =
+            ["  tool", "  selected_type", "  radius", "  is_erase", "  is_continuous"];
+        for (i, expected) in expected_labels.iter().enumerate() {
+            let row = &KNOBS[i + 1];
+            assert!(
+                matches!(row.kind, KnobKind::Edit { .. }),
+                "row {} should be a KnobKind::Edit; got label {:?}",
+                i + 1,
+                row.label,
+            );
+            assert_eq!(row.label, *expected, "row {} label mismatch", i + 1);
+        }
+    }
+
+    /// Test #16 — every `Edit { variant }` row's `default` matches
+    /// `EditorState::default()`'s value via the row's getter (mirror of
+    /// `defaults_match_gi_settings_default`).
+    #[test]
+    fn editor_knob_defaults_match_editorstate_default() {
+        let e = EditorState::default();
+        for row in KNOBS {
+            if let KnobKind::Edit { variant } = &row.kind {
+                match variant {
+                    EditKnobVariant::U32 { getter, default, .. } => {
+                        assert_eq!(
+                            getter(&e),
+                            *default,
+                            "Edit::U32 knob {:?} default {} != EditorState::default {}",
+                            row.label,
+                            default,
+                            getter(&e),
+                        );
+                    }
+                    EditKnobVariant::F32 { getter, default, .. } => {
+                        assert!(
+                            (getter(&e) - default).abs() < f32::EPSILON,
+                            "Edit::F32 knob {:?} default {} != EditorState::default {}",
+                            row.label,
+                            default,
+                            getter(&e),
+                        );
+                    }
+                    EditKnobVariant::Bool { getter, default, .. } => {
+                        assert_eq!(
+                            getter(&e),
+                            *default,
+                            "Edit::Bool knob {:?} default {} != EditorState::default {}",
+                            row.label,
+                            default,
+                            getter(&e),
+                        );
+                    }
+                    EditKnobVariant::Enum { getter, default, .. } => {
+                        assert_eq!(
+                            getter(&e),
+                            *default,
+                            "Edit::Enum knob {:?} default {} != EditorState::default {}",
+                            row.label,
+                            default,
+                            getter(&e),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
