@@ -60,8 +60,10 @@ per `12-alignment-gap.md` rows 17–21).
 - [x] **Step 8e-editor-fixes** — checkpoint + dispatch `fix-editor-bugs-234`. Bug 4 root cause: CPU-mirror parity hole — W2/W3 GPU edit-AADF chain never synced chunk-layer AADFs back to `chunks_cpu` that the CPU ray-traversal reads (v2 Risk #8 missed it). Bug 2/3 root cause: ms-vs-s unit confusion in lerp formula. 173 tests pass; all 5 e2e modes PASS.
 - [x] **Step 7e** — synthesis after editor fixes, hard gate. User reported edits "catastrophically slow" relative to C#'s 130 FPS on 4×4 Oasis grid + continuous brush. Bug 4 fix may itself be the bottleneck.
 - [x] **Step 8f-design-alignment** — design agent investigated C# editing end-to-end + designed re-alignment. Landed `02c-design-edit-pipeline-alignment.md` (687 lines). **Hypothesis refuted**: not "GPU work duplicated on CPU"; actual bottleneck is `recompute_chunk_layer_aadfs` (Bug 4 fix's sledgehammer); plus brush over-iteration + serial per-chunk work. Bug 1 retires.
-- [ ] **Step 7f** — synthesis after design-alignment, hard gate (← we are here)
-- [ ] Step 7e — final synthesis, exit
+- [x] **Step 7f** — synthesis after design-alignment, hard gate. Alignment impl landed; user confirmed "pretty much on par with C# in terms of editing". Bug 1 retired. Committed `5ef2d14`.
+- [x] **Step 8g-render-perf** — checkpoint + dispatch render-perf investigation. Landed `02d-render-perf-investigation.md`. **Headline: 1-LOC config — `sun_shadow_taps = 4 → 1` (C# default) ~25-40% FPS.** Plus `DefaultPlugins` curation ~5-15%. No behavioural divergences detected.
+- [ ] **Step 7g** — synthesis after render-perf investigation, hard gate (← we are here)
+- [ ] Final close-out
 
 ## Track order (user-confirmed)
 
