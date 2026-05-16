@@ -51,8 +51,8 @@ per `12-alignment-gap.md` rows 17–21).
 - [x] **Step 7b-v2** — synthesis after redesign, hard gate
 - [x] **Step 8b-v2-impl** — checkpoint + dispatch `impl-sparse-vox`. Sparse path landed; Oasis_Hard_Cover.vox loads at 93×34×84 chunks (~50 MiB sparse vs ~140 GB dense). All 6 Δ-decisions honored; 151 tests pass; 5 e2e modes PASS.
 - [x] **Step 8b-v2-camera-init** — checkpoint + dispatch `impl-camera-init` (user-directed; faithful-port camera-init-on-vox-load). Addendum landed in `03a-v2-impl-sparse-vox.md`; Oasis frames at `(726.56, 850.0, 52.5)` looking +Z; 154 tests pass; 5 e2e modes PASS.
-- [ ] **Step 7b-v2-impl** — synthesis after impl-sparse-vox, hard gate (← we are here)
-- [ ] Step 8c — checkpoint + dispatch `review-vox`
+- [x] **Step 7b-v2-impl** — synthesis after impl-sparse-vox + camera-init, hard gate. Committed `cb86e53` (sparse VOX) + `03ce9f0` (camera-init). Track A user-verified end-to-end.
+- [ ] **Step 8c** — checkpoint + dispatch `review-vox` OR proceed to Track B (← we are here, awaiting user direction)
 - [ ] Step 7c — synthesis after `review-vox`, hard gate
 - [ ] Step 8c — checkpoint + dispatch `impl-editor`
 - [ ] Step 7d — synthesis after `impl-editor`, hard gate
