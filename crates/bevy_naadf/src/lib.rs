@@ -593,7 +593,16 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     if cfg.add_e2e_systems {
         e2e::add_e2e_systems(&mut app);
     } else {
-        app.add_systems(Startup, camera::setup_camera);
+        // `.after(setup_test_grid)` so the `GridPreset::Vox` arm has had a
+        // chance to insert `InitialCameraPose` (the world-sized C#-faithful
+        // camera pose, `crate::camera::InitialCameraPose`); `setup_camera`
+        // then frames the loaded world instead of falling back to the
+        // hard-coded test-grid pose. The e2e harness uses its own
+        // `setup_e2e_camera` and ignores the resource entirely.
+        app.add_systems(
+            Startup,
+            camera::setup_camera.after(voxel::grid::setup_test_grid),
+        );
     }
 
     // The camera-history ring update must run *after* `sync_position_split` so

@@ -142,6 +142,23 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                     non_empty_blocks_buf_u32s,
                     non_empty_voxels_buf_u32s,
                 );
+                // C#-faithful camera init (`Common/Camera.cs:95+121`,
+                // `World/Render/WorldRender.cs:48-49`). The C# camera spawns at
+                // a fixed `(500, 200, 40)` voxels in a fixed `1024×128×1024`
+                // default world; we rescale proportionally so the same vantage
+                // (~half X, above-the-ceiling Y, near-the-near-edge Z, looking
+                // +Z) reproduces in the actually-loaded `.vox` world dimensions.
+                // The e2e `setup_e2e_camera` ignores this resource (it spawns
+                // its own fixed-pose camera), so the `--vox-e2e` gate is
+                // unaffected. See [`crate::camera::InitialCameraPose`].
+                let world_voxels = [
+                    size_in_chunks[0] * 16,
+                    size_in_chunks[1] * 16,
+                    size_in_chunks[2] * 16,
+                ];
+                commands.insert_resource(crate::camera::InitialCameraPose::from_world_voxels(
+                    world_voxels,
+                ));
                 let (world_data, voxel_types) = vox_import::build_world_from_vox(imp);
                 commands.insert_resource(world_data);
                 commands.insert_resource(voxel_types);

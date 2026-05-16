@@ -270,3 +270,167 @@ Either way, all `#[test]`s pass, none flagged as failing, no compile errors. The
 - 14 v1 tests, minus 2 retired = 12 carried forward.
 - 4 new = `sparse_walk_matches_dense_construct_on_small_fixture`, `sparse_walk_handles_mid_sized_world`, `sparse_walk_dedups_identical_blocks`, `build_world_from_vox_skips_dense_voxel_types_on_sparse_path`.
 - 12 + 4 = 16 final, which matches.
+
+---
+
+## Camera-init-on-vox-load addendum (2026-05-15)
+
+**Context.** Track A v2 landed; Oasis_Hard_Cover.vox loads cleanly (93×34×84
+chunks = 1488×544×1344 voxels). User reported the camera was positioned wrong
+— the hardcoded `setup_camera` pose `(11, 7, 17)` voxels is tuned for the
+`GridPreset::Default` 64×32×64 test grid; in a 1488×544×1344 Oasis world it
+puts the camera inside a wall. This addendum ports the C# camera-init
+behaviour to the Rust port so a `.vox` load lands the camera at a world-sized
+analog of the C# default vantage.
+
+### C# canonical
+
+Searched the C# tree for camera-init-on-load logic. The dispositive sites:
+
+**`/mnt/archive4/DEV/NAADF/NAADF/World/Render/WorldRender.cs:48-49`** — the
+only `Camera` construction / position-set site in the C# tree (verified by
+`grep -rn 'camera\.\(SetPos\|SetDir\|GetPos\)' NAADF/`):
+
+```csharp
+camera = new Camera(App.ScreenWidth / (float)App.ScreenHeight, 90, 0.1f, 10000, 0.25f);
+camera.SetPos(new Vector3(500, 200, 40));
+```
+
+**`/mnt/archive4/DEV/NAADF/NAADF/Common/Camera.cs:91-98`** — the `Camera`
+constructor: `camPos = Vector3.Zero`, `rotationTransform =
+Matrix.CreateFromYawPitchRoll(0, 0, 0)` (identity rotation).
+
+**`/mnt/archive4/DEV/NAADF/NAADF/Common/Camera.cs:121`** — applying identity
+rotation to the canonical forward vector: `camDir = Vector3.Transform(new
+Vector3(0, 0, 1), rotationTransform)` → `camDir = (0, 0, 1)` (looking +Z).
+
+**`/mnt/archive4/DEV/NAADF/NAADF/World/WorldHandler.cs:19, 31`** — the default
+world is fixed-size:
+
+```csharp
+public Point3 worldSizeToUseInWorldGenSegments = new Point3(16, 2, 16);
+worldData = new WorldData(worldSizeToUseInWorldGenSegments * worldGenSegmentSizeInGroups * 64, ...);
+// = (16, 2, 16) * 4 * 16 = (1024, 128, 1024) voxels
+```
+
+**`/mnt/archive4/DEV/NAADF/NAADF/Gui/Main/HeaderBar/UiHeaderBar.cs:67-80`** —
+the `Import Vox` menu item:
+
+```csharp
+ModelData modelData = ModelData.ImportFromVox(fileName);
+// ...
+App.worldHandler.ApplyAndGenerateNewWorldData(new WorldData(modelData.size, 4), worldGenerator);
+```
+
+The world is **resized to the model size** on `.vox` import, but the camera
+is **never reset**. C# has no explicit camera-init-on-vox-load — the user's
+camera coords are whatever they last were. For the bundled `oasis.cvox`
+(loaded at startup into the fixed `(1024, 128, 1024)` default world via
+`WorldHandler.cs:34`), the hand-tuned defaults `(500, 200, 40)` happen to be
+a sensible vantage.
+
+**Formula identified.** The C# default camera is a hand-tuned vantage point
+in the default 1024×128×1024 world:
+- pos = `(500, 200, 40)` voxels
+- rotation = identity → forward = `(0, 0, 1)`
+- units: voxels, Y-up (MonoGame Y-up matches Bevy Y-up; the Z↔Y swap in
+  `ImportFromVox.cs:386` is data-side at vox parse time, the camera is in
+  world space and stays Y-up either way).
+
+Normalised against the default world dimensions:
+- `pos.x / W = 500 / 1024 ≈ 0.4883` (near horizontal centre)
+- `pos.y / H = 200 / 128  ≈ 1.5625` (above the world ceiling — bird's-eye)
+- `pos.z / D =  40 / 1024 ≈ 0.0391` (near the -Z edge — looking *into* the world)
+
+### Port-side formula
+
+Faithful translation: rescale the C# magic coords proportionally to the
+loaded world's dimensions. In a generic world of `[W, H, D]` voxels (the same
+`size_in_chunks * 16` the port already produces in `vox_import`):
+
+```rust
+pos.x = W as f32 * (500.0 / 1024.0)
+pos.y = H as f32 * (200.0 / 128.0)
+pos.z = D as f32 * (40.0  / 1024.0)
+look_at = pos + Vec3::Z   // identity rotation, +Z forward, Y-up
+```
+
+For the default 1024×128×1024 world this reproduces exactly `(500, 200, 40)`
+(unit tested). For Oasis 1488×544×1344 it produces `(726.56, 850.0, 52.5)`.
+For the e2e fixture 64×32×64 it produces `(31.25, 50.0, 2.5)`. In each case
+the camera sits above the world ceiling at the same ratio, near the -Z edge
+at the same ratio, looking horizontally toward +Z — the C# vantage scaled
+to the loaded world.
+
+### Changes by file
+
+- **`crates/bevy_naadf/src/camera/mod.rs`** — EDIT, net +~80 LOC.
+  - **NEW** `pub struct InitialCameraPose(pub Transform)` (`Resource`), with
+    a `from_world_voxels([u32; 3]) -> Self` constructor that computes the
+    C#-faithful pose per the formula above. Doc comment cites
+    `WorldRender.cs:48-49` and `Camera.cs:95+121`.
+  - `setup_camera` now takes `Option<Res<InitialCameraPose>>`; when present,
+    uses its `Transform`; otherwise falls back to the original hardcoded
+    `(11, 7, 17)` test-grid pose. Logs the computed position + look-target
+    when the resource is present so the user can sanity-check the framing.
+  - 3 NEW `#[test]`s under `mod tests`:
+    - `from_world_voxels_matches_csharp_default` — `(1024, 128, 1024)` →
+      pose `(500, 200, 40)` ± 1e-3, forward +Z ± 1e-3.
+    - `from_world_voxels_scales_test_grid` — `(64, 32, 64)` → `(31.25, 50.0, 2.5)`.
+    - `from_world_voxels_scales_oasis` — `(1488, 544, 1344)` → `(726.5625, 850.0, 52.5)`.
+- **`crates/bevy_naadf/src/voxel/grid.rs`** — EDIT, net +~15 LOC.
+  - `GridPreset::Vox` arm: after computing `world_voxels = size_in_chunks * 16`,
+    inserts `InitialCameraPose::from_world_voxels(world_voxels)` as a
+    resource. Comment cites the C# faithful-port rationale.
+  - `GridPreset::Default` arm: **unchanged** — no `InitialCameraPose`
+    inserted, so `setup_camera` falls back to the hardcoded `(11, 7, 17)`
+    test-grid pose, preserving the existing-default behaviour byte-for-byte.
+- **`crates/bevy_naadf/src/lib.rs`** — EDIT, +~3 LOC.
+  - `setup_camera` is now scheduled `.after(voxel::grid::setup_test_grid)` so
+    the `Vox` arm has had a chance to insert `InitialCameraPose` before
+    `setup_camera` reads it. Production binary only — the e2e harness uses
+    its own `setup_e2e_camera` and was never touched.
+- **`docs/orchestrate/feature-completeness/03a-v2-impl-sparse-vox.md`** —
+  EDIT (this addendum).
+
+### Verification
+
+All gates run against the current branch with the addendum applied. **PASS
+on every gate.**
+
+| Gate | Result | Notes |
+|---|---|---|
+| `cargo build --workspace` | PASS | clean, 51.06s |
+| `cargo test --workspace --lib` | PASS | 154 passed, 1 ignored (up from 151; +3 new `from_world_voxels_*` tests) |
+| `cargo run --bin e2e_render` (baseline) | PASS | emissive 247.0 / solid 242.0 / sky 145.9 — identical to pre-addendum |
+| `cargo run --bin e2e_render -- --validate-gpu-construction` | PASS | 388 bytes byte-equal; emissive 247.1 / solid 242.0 / sky 145.9 |
+| `cargo run --bin e2e_render -- --edit-mode` | PASS | edit-mode validation green; lum identical |
+| `cargo run --bin e2e_render -- --entities` | PASS | entity handler validation green; lum identical |
+| `cargo run --bin e2e_render -- --vox-e2e` | PASS | vox_geometry region luminance 249.6 (threshold > 160) |
+| Oasis smoke (`cargo run --bin bevy-naadf -- --vox …/Oasis_Hard_Cover.vox`) | PASS | log: `camera::setup_camera: framing loaded world — pos=(726.56, 850.00, 52.50), look_at=(726.56, 850.00, 53.50)` |
+
+**Oasis camera coords sanity check.** World AABB is
+`[0, 1488] × [0, 544] × [0, 1344]` voxels:
+- X = 726.56 ∈ `[0, 1488]` — **inside** along X (≈ 0.488 × W, near horizontal centre). ✓
+- Y = 850.00 ∉ `[0, 544]` — **above** the world ceiling (≈ 1.56 × H, a bird's-eye vantage). ✓ matches C# `200 / 128 = 1.5625` ratio.
+- Z = 52.50 ∈ `[0, 1344]` — **inside** along Z but at the -Z near edge (≈ 0.039 × D), looking +Z into the world. ✓
+- look_at = pos + Z → forward = `(0, 0, 1)`, identity rotation. ✓ matches C# `Camera.cs:95+121` defaults.
+
+Distance from world centre `(744, 272, 672)`: ≈ `sqrt(17.4² + 578² + 619.5²) ≈ 848` voxels. World diagonal ≈ `sqrt(1488² + 544² + 1344²) ≈ 2069` voxels. Camera is ~0.41× world-diagonal away from the centre, on a bird's-eye-from-the-front-edge axis.
+
+### Decisions made during implementation
+
+1. **`InitialCameraPose` Resource, not Event.** Two Bevy patterns considered for the cross-system handoff:
+   - **(a)** `CameraInitEvent { world_aabb }` emitted by the `Vox` arm; a sibling `Update` system consumes it and mutates `Transform` + `PositionSplit`.
+   - **(b)** `Resource` written at Startup by the `Vox` arm; `setup_camera` reads it (also Startup) with explicit `.after()` ordering. **Picked.**
+   - Rationale: the camera entity is not spawned yet at the time the `Vox` arm runs (both are Startup systems); an Event consumer would have to wait at least one frame for the entity to exist *and* then mutate it. The Resource pattern lets `setup_camera` consume the pose *at spawn time* — no per-frame mutation, no `PositionSplit` re-derive (it seeds from `start.translation` automatically), no transient-bad-pose frame. `sync_position_split` runs every `Update` regardless, so once `setup_camera` spawns the camera at the world-sized pose, `PositionSplit` follows from the `Transform` for free.
+2. **Default-arm path unchanged.** The brief explicitly says: "Preserve the test-grid camera pose when `GridPreset::Default` runs." The `Default` arm does not insert `InitialCameraPose`, so `setup_camera` reads `None` and falls back to the prior hardcoded `(11, 7, 17)` look-at `(0, 4, -3)` pose. Verified by the baseline `e2e_render` gate — emissive/solid/sky luminance numbers are bit-identical to pre-addendum.
+3. **C#-faithful magic-number formula, not a "smart" world-diagonal fit.** Considered fitting the camera distance to the world diagonal (e.g. `look_at = world_center, pos = world_center + diag * back_off`) instead of the bare-rescaling C# defaults. Rejected per the brief's "faithful-port rule — the camera formula must match C#". The C# defaults are wonky (Y=1.56× world height, identity rotation, looking +Z horizontally past the world centre) but they reproduce. A "smart" formula would diverge.
+4. **No PositionSplit-write path.** The brief mentions setting `PositionSplit` and `Transform` "consistently from `imp.world.size_in_chunks`". `sync_position_split` already runs every `Update` and derives `PositionSplit` from `Transform.translation` (the load-bearing system the `setup_camera` spawn already exploits — `PositionSplit::from_world(start.translation)` is set at spawn). So writing only `Transform` keeps both in sync automatically. No explicit `PositionSplit` mutation needed.
+
+### Risks / follow-ups
+
+1. **Y-above-world camera depends on identity rotation looking +Z.** With `look_at = pos + Vec3::Z`, the camera looks horizontally — at Y=850 above a world that ends at Y=544, the look ray sweeps over the world and never hits it. The C# Oasis-in-the-default-world configuration has the same property; the C# user presumably tilts the camera down (right-mouse-drag) after spawn to see the world. The port's `FreeCamera` provides identical right-drag look. The user *will* need to tilt down to see the world; that's the faithful behaviour. **No follow-up — matches C#.**
+2. **`GridPreset::Default` pose `(11, 7, 17)` is still unrelated to the world.** The original test-grid camera looks at `(0, 4, -3)` which is outside the world AABB `[0, 64) × [0, 32) × [0, 64)` along -X and -Z. It worked because the test grid's existing geometry happens to be in the frame at this angle. Not in scope to revisit; preserved verbatim per the brief.
+3. **`InitialCameraPose` is not consumed by the e2e camera.** `setup_e2e_camera` (in `e2e/mod.rs`) spawns its own fixed-pose camera using `e2e_motion_start_transform()` and ignores any `InitialCameraPose`. This is intentional — the e2e gates depend on the exact e2e pose and are insensitive to the production camera-init logic. If a future e2e mode wants to exercise vox-world framing, it can opt into reading the resource explicitly.
+4. **Formula assumes 1 Bevy world unit = 1 voxel.** Confirmed by the e2e camera pose `(86, 42, 90)` looking at `(32, 16, 32)` (= test grid centre, voxel coords) in `e2e/gates.rs:49`. If a future change rescales the camera/world ratio, this formula needs to scale accordingly.
