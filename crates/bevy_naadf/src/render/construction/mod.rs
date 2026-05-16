@@ -667,6 +667,12 @@ pub fn extract_world_changes(
     };
     let _ = construction_config; // future: read render config knobs
 
+    // PERF INSTRUMENTATION (02e investigation, 2026-05-16): per-frame wall
+    // clock; if `pending_edits` is empty this should be ~0us.
+    let _t0 = std::time::Instant::now();
+    let _batch_count = world_data.pending_edits.batches.len();
+    let _edited_groups_count = world_data.pending_edits.edited_groups.len();
+
     let mut events = ConstructionEvents::default();
     // Aggregate every batch's per-buffer payload into the render-world resource.
     // (The main-world `WorldData::pending_edits` accumulates per-set_voxel batches;
@@ -748,6 +754,22 @@ pub fn extract_world_changes(
         }
     }
 
+    let _elapsed = _t0.elapsed();
+    // Only log on non-trivial frames OR every ~60 frames to avoid spam. Every
+    // frame is too noisy; the bug shape is the >0 ms cost vs world size.
+    static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let f = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if _batch_count > 0 || _edited_groups_count > 0 || f.is_multiple_of(120) {
+        info!(
+            target: "naadf::perf",
+            "extract_world_changes: {:.3} ms (batches={}, edited_groups={}, frame={})",
+            _elapsed.as_secs_f64() * 1000.0,
+            _batch_count,
+            _edited_groups_count,
+            f,
+        );
+    }
+
     commands.insert_resource(events);
 }
 
@@ -811,6 +833,14 @@ pub fn prepare_construction(
     let mut bind_groups = bind_groups.unwrap();
     let Some(mut world_gpu) = world_gpu else { return; };
     let Some(construction_pipelines) = construction_pipelines else { return; };
+
+    // PERF INSTRUMENTATION (02e investigation, 2026-05-16): coarse wall clock
+    // around the prepare_construction body. The first few frames pay one-time
+    // allocation costs; the steady-state cost is what matters.
+    let _t_prepare = std::time::Instant::now();
+    let _world_chunks_total = world_gpu.chunks.size().width
+        * world_gpu.chunks.size().height
+        * world_gpu.chunks.size().depth_or_array_layers;
 
     // === Phase-C followup #1 — runtime GPU producer pre-allocation ==========
     //
@@ -1809,6 +1839,24 @@ pub fn prepare_construction(
     // `prepare_construction`'s job is now just to allocate the buffers +
     // build the bind group (above); the node consumes them.
     let _ = (extracted_world, want_gpu_producer); // referenced in node.
+
+    let _elapsed = _t_prepare.elapsed();
+    // Frame counter (separate from extract_world_changes; each runs in its own
+    // schedule slot). Log every 120 frames or whenever a real chunk-count
+    // dependency or upload fires (>0.5 ms).
+    static FRAME_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let f = FRAME_PC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if _elapsed.as_millis() > 0 || f.is_multiple_of(120) {
+        info!(
+            target: "naadf::perf",
+            "prepare_construction: {:.3} ms (world_chunks={}, needs_upload={}, want_gpu_producer={}, frame={})",
+            _elapsed.as_secs_f64() * 1000.0,
+            _world_chunks_total,
+            needs_upload,
+            want_gpu_producer,
+            f,
+        );
+    }
 }
 
 /// Phase-C followup #1 — runtime GPU producer dispatch (render-graph node).

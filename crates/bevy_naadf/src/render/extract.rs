@@ -95,6 +95,10 @@ pub fn extract_world(
     if !world_data.dirty && !voxel_types.dirty {
         return;
     }
+    // PERF INSTRUMENTATION (02e investigation, 2026-05-16): measure clone cost
+    // + log buffer sizes whenever this fires. If `dirty` is mis-managed and
+    // this fires per-frame, the smoke output makes the bug visible.
+    let _t0 = std::time::Instant::now();
     extracted.chunks.clone_from(&world_data.chunks_cpu);
     extracted.blocks.clone_from(&world_data.blocks_cpu);
     extracted.voxels.clone_from(&world_data.voxels_cpu);
@@ -103,6 +107,22 @@ pub fn extract_world(
     extracted.bounding_box = world_data.bounding_box;
     extracted.dense_voxel_types.clone_from(&world_data.dense_voxel_types);
     extracted.dirty = true;
+    let elapsed = _t0.elapsed();
+    info!(
+        target: "naadf::perf",
+        "extract_world clone: {:.3} ms (chunks {} u32 = {} KiB, blocks {} u32 = {} KiB, voxels {} u32 = {} KiB, dense_voxel_types {} u16 = {} KiB, world_data.dirty={}, voxel_types.dirty={})",
+        elapsed.as_secs_f64() * 1000.0,
+        world_data.chunks_cpu.len(),
+        world_data.chunks_cpu.len() * 4 / 1024,
+        world_data.blocks_cpu.len(),
+        world_data.blocks_cpu.len() * 4 / 1024,
+        world_data.voxels_cpu.len(),
+        world_data.voxels_cpu.len() * 4 / 1024,
+        world_data.dense_voxel_types.len(),
+        world_data.dense_voxel_types.len() * 2 / 1024,
+        world_data.dirty,
+        voxel_types.dirty,
+    );
 }
 
 /// `ExtractSchedule` system: copy the camera's `PositionSplit` + inverse
