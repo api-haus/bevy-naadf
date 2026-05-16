@@ -156,6 +156,30 @@ pub enum E2ePhase {
     /// Run [`super::oasis_edit_visual::assert_visual_edit_landed`], save
     /// both PNGs, write `AppExit::Success` / `AppExit::error()`.
     OasisAssert,
+    // --- Small-edit-visual phases (`03g` — single-voxel edit gate) -----------
+    //
+    // Selected when `AppArgs.small_edit_visual_mode == true`. The Warmup
+    // branch routes into SmallEditWarmup on tick 0. The camera is pinned
+    // birdseye over the default-grid world centre by
+    // `small_edit_visual::pin_small_edit_camera`.
+    /// Birdseye warmup before snapshot A — TAA + GI convergence.
+    SmallEditWarmup,
+    /// Spawn `Screenshot::primary_window()` for snapshot A.
+    SmallEditShootBefore,
+    /// Wait (bounded) for snapshot A; on arrival count non-empty voxels
+    /// (the CPU pre-condition) and stash into `SmallEditVisualState.before`.
+    SmallEditDrainBefore,
+    /// One-shot: invoke `cube_brush(radius=1.0)` at the configured click
+    /// voxel via the runtime path.
+    SmallEditApply,
+    /// Wait `SMALL_EDIT_POST_EDIT_WAIT_FRAMES` ticks for W2 + W3 + TAA + GI.
+    SmallEditWaitPostEdit,
+    /// Spawn `Screenshot::primary_window()` for snapshot B.
+    SmallEditShootAfter,
+    /// Wait (bounded) for snapshot B; stash into `SmallEditVisualState.after`.
+    SmallEditDrainAfter,
+    /// Run `assert_small_edit_landed`, save PNGs, write the verdict.
+    SmallEditAssert,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -368,6 +392,7 @@ pub fn e2e_driver(
     mut screenshot: ResMut<E2eScreenshot>,
     mut resize_test: ResMut<ResizeTestState>,
     mut oasis: ResMut<super::oasis_edit_visual::OasisEditVisualState>,
+    mut small_edit: ResMut<super::small_edit_visual::SmallEditVisualState>,
     world_data: Option<ResMut<crate::world::data::WorldData>>,
     diagnostics: Res<DiagnosticsStore>,
     pipeline_scan: Res<PipelineScanResult>,
@@ -413,6 +438,17 @@ pub fn e2e_driver(
         .is_some_and(|a| a.oasis_edit_visual_mode);
     if oasis_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::OasisWarmup;
+        state.phase_ticks = 0;
+    }
+
+    // `03g` — small-edit-visual fast-path. Routes into SmallEditWarmup on
+    // tick 0 when the flag is set. Camera pose owned by
+    // `super::small_edit_visual::pin_small_edit_camera`.
+    let small_edit_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.small_edit_visual_mode);
+    if small_edit_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+        state.phase = E2ePhase::SmallEditWarmup;
         state.phase_ticks = 0;
     }
 
@@ -919,6 +955,188 @@ pub fn e2e_driver(
                         super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES,
                         super::oasis_edit_visual::OASIS_ERASE_RADIUS,
                         super::oasis_edit_visual::OASIS_EDIT_DIFF_FLOOR,
+                    );
+                    exit.write(AppExit::Success);
+                }
+                Err(msg) => {
+                    eprintln!("e2e_render: FAIL —\n{msg}");
+                    exit.write(AppExit::error());
+                }
+            }
+            outcome.gate_result = Some(result);
+            state.phase = E2ePhase::Done;
+        }
+        // ---- Small-edit-visual phases (`03g`) ----------------------------
+        E2ePhase::SmallEditWarmup => {
+            let _ = &mut camera;
+            state.phase_ticks += 1;
+            if state.phase_ticks >= super::small_edit_visual::SMALL_EDIT_WARMUP_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::SmallEditShootBefore;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::SmallEditShootBefore => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::SmallEditDrainBefore;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::SmallEditDrainBefore => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        println!(
+                            "e2e_render --small-edit-visual: before-capture {}x{}",
+                            fb.width(),
+                            fb.height()
+                        );
+                        super::small_edit_visual::save_small_edit_screenshot(
+                            &fb,
+                            super::small_edit_visual::SMALL_EDIT_BEFORE_PNG,
+                        );
+                        small_edit.before = Some(fb);
+                        state.phase = E2ePhase::SmallEditApply;
+                        state.phase_ticks = 0;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "small-edit-visual: before-capture decode failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::small_edit_visual::SMALL_EDIT_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "small-edit-visual: before-capture never delivered within \
+                     {} drain frames",
+                    super::small_edit_visual::SMALL_EDIT_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::SmallEditApply => {
+            if small_edit.edit_applied {
+                state.phase = E2ePhase::SmallEditWaitPostEdit;
+                state.phase_ticks = 0;
+            } else if let Some(mut wd) = world_data {
+                super::small_edit_visual::apply_small_cube_edit(&mut wd, &mut small_edit);
+                state.phase = E2ePhase::SmallEditWaitPostEdit;
+                state.phase_ticks = 0;
+            } else {
+                let err = "small-edit-visual: WorldData resource missing at \
+                           SmallEditApply — the world load failed or was \
+                           deferred past the warmup window"
+                    .to_string();
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::SmallEditWaitPostEdit => {
+            state.phase_ticks += 1;
+            if state.phase_ticks
+                >= super::small_edit_visual::SMALL_EDIT_POST_EDIT_WAIT_FRAMES
+            {
+                screenshot.0 = None;
+                state.phase = E2ePhase::SmallEditShootAfter;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::SmallEditShootAfter => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::SmallEditDrainAfter;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::SmallEditDrainAfter => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        println!(
+                            "e2e_render --small-edit-visual: after-capture {}x{}",
+                            fb.width(),
+                            fb.height()
+                        );
+                        super::small_edit_visual::save_small_edit_screenshot(
+                            &fb,
+                            super::small_edit_visual::SMALL_EDIT_AFTER_PNG,
+                        );
+                        small_edit.after = Some(fb);
+                        state.phase = E2ePhase::SmallEditAssert;
+                        state.phase_ticks = 0;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "small-edit-visual: after-capture decode failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::small_edit_visual::SMALL_EDIT_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "small-edit-visual: after-capture never delivered within \
+                     {} drain frames",
+                    super::small_edit_visual::SMALL_EDIT_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::SmallEditAssert => {
+            let before = small_edit.before.take();
+            let after = small_edit.after.take();
+            let count_before = small_edit.voxel_count_before.unwrap_or(0);
+            let count_after = small_edit.voxel_count_after.unwrap_or(0);
+            let world_size = small_edit.world_size_voxels.unwrap_or([0, 0, 0]);
+            let result = match (before, after) {
+                (Some(a), Some(b)) => {
+                    super::small_edit_visual::assert_small_edit_landed(
+                        &a,
+                        &b,
+                        count_before,
+                        count_after,
+                        world_size,
+                    )
+                    .map(|msg| {
+                        println!("e2e_render --small-edit-visual: {msg}");
+                    })
+                }
+                _ => Err(
+                    "small-edit-visual: SmallEditAssert reached without both \
+                     framebuffers stashed (driver bug)"
+                        .to_string(),
+                ),
+            };
+            match &result {
+                Ok(()) => {
+                    println!(
+                        "e2e_render: small-edit-visual PASS — \
+                         {} warmup + {} post-edit wait frames; \
+                         cube_brush radius {} at {:?} produced exactly +1 voxel; \
+                         click rect Δ above {} floor; adjacent rects below {} ceiling.",
+                        super::small_edit_visual::SMALL_EDIT_WARMUP_FRAMES,
+                        super::small_edit_visual::SMALL_EDIT_POST_EDIT_WAIT_FRAMES,
+                        super::small_edit_visual::SMALL_EDIT_RADIUS,
+                        super::small_edit_visual::SMALL_EDIT_CLICK_VOXEL,
+                        super::small_edit_visual::SMALL_EDIT_CLICK_RECT_FLOOR,
+                        super::small_edit_visual::SMALL_EDIT_ADJ_RECT_CEILING,
                     );
                     exit.write(AppExit::Success);
                 }

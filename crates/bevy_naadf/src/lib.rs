@@ -305,6 +305,16 @@ pub struct AppArgs {
     /// W2 batch but never reach the framebuffer (the `81171f9` regression).
     /// See [`crate::e2e::oasis_edit_visual`].
     pub oasis_edit_visual_mode: bool,
+    /// `03g` — when `true`, the e2e driver runs the **small-edit-visual
+    /// gate**: birdseye over the default test grid, screenshot A,
+    /// programmatically place a single 1×1×1 voxel via the runtime
+    /// `cube_brush` path with radius=1, count non-empty voxels before vs
+    /// after (must differ by exactly +1 — catches Mode 2 phantom-voxel
+    /// bugs), wait for W2 / W3 / TAA convergence, screenshot B, assert
+    /// framebuffer changed in the click bbox AND did NOT change in
+    /// adjacent bboxes (catches Mode 1 AADF-skip cross-section bugs). See
+    /// [`crate::e2e::small_edit_visual`].
+    pub small_edit_visual_mode: bool,
 }
 
 impl Default for AppArgs {
@@ -319,6 +329,7 @@ impl Default for AppArgs {
             resize_test: false,
             vox_e2e_mode: false,
             oasis_edit_visual_mode: false,
+            small_edit_visual_mode: false,
         }
     }
 }

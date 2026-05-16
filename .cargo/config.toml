@@ -7,3 +7,13 @@
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# wasm32-unknown-unknown has no OS RNG, so getrandom ≥0.3 refuses to compile
+# unless we explicitly pick a backend. `wasm_js` routes `getrandom_uninit`
+# through the browser's `crypto.getRandomValues`, which is what Trunk's
+# `just web` target needs. The cfg flag pairs with the matching `wasm_js`
+# feature on the direct `getrandom` dep in `crates/bevy_naadf/Cargo.toml`
+# (both are required — the feature alone is insufficient, per the upstream
+# error message).
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

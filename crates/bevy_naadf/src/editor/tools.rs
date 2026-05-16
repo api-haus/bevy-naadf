@@ -331,6 +331,58 @@ mod tests {
         );
     }
 
+    /// `03g` — Mode 2 reproducer at the brush level. cube_brush at
+    /// radius=1 with pos at a voxel centre must emit exactly ONE voxel
+    /// edit, and that voxel must be the target type. Surrounding voxels in
+    /// the same chunk must stay unchanged.
+    #[test]
+    fn cube_brush_radius_one_emits_exactly_one_voxel() {
+        let mut wd = make_empty_world(UVec3::new(2, 2, 2));
+        // Pre-populate two voxels at (4,5,5) and (6,5,5) so the click at
+        // (5,5,5) lands inside a populated chunk (the user's OXO scenario).
+        wd.set_voxels_batch(&[
+            (IVec3::new(4, 5, 5), VoxelTypeId(1)),
+            (IVec3::new(6, 5, 5), VoxelTypeId(1)),
+        ]);
+        // Snapshot all voxels in a 5×3×3 region.
+        let mut around: Vec<(IVec3, Option<VoxelTypeId>)> = Vec::new();
+        for x in 3..=7 {
+            for y in 4..=6 {
+                for z in 4..=6 {
+                    let p = IVec3::new(x, y, z);
+                    around.push((p, wd.get_voxel_type(p)));
+                }
+            }
+        }
+        // Click cube_brush radius=1 at voxel-centre (5.5, 5.5, 5.5).
+        // For radius=1, only voxel (5,5,5) passes cheb < 1.
+        cube_brush(
+            &mut wd,
+            Vec3::new(5.5, 5.5, 5.5),
+            1.0,
+            VoxelTypeId(2),
+            false,
+        );
+        // Centre voxel got the target type.
+        assert_eq!(
+            wd.get_voxel_type(IVec3::new(5, 5, 5)),
+            Some(VoxelTypeId(2)),
+            "clicked voxel must be the target type"
+        );
+        // Every other voxel in the snapshot region must be unchanged.
+        for (p, pre) in &around {
+            if *p == IVec3::new(5, 5, 5) {
+                continue;
+            }
+            let post = wd.get_voxel_type(*p);
+            assert_eq!(
+                pre, &post,
+                "voxel at {p:?} changed unexpectedly: pre={pre:?} post={post:?} \
+                 — phantom (Mode 2)"
+            );
+        }
+    }
+
     /// Test #8 — cube brush produces a Chebyshev cube; corners of the cube
     /// (cheb = r-1) inside, voxels with cheb >= r outside.
     #[test]

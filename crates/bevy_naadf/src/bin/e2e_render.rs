@@ -85,6 +85,7 @@ fn main() -> ExitCode {
     let resize_test = args.iter().any(|a| a == "--resize-test");
     let vox_e2e_mode = args.iter().any(|a| a == "--vox-e2e");
     let oasis_edit_visual_mode = args.iter().any(|a| a == "--oasis-edit-visual");
+    let small_edit_visual_mode = args.iter().any(|a| a == "--small-edit-visual");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -186,6 +187,16 @@ fn main() -> ExitCode {
         // asserts the bounding-box mean per-pixel delta exceeds
         // [`OASIS_EDIT_DIFF_FLOOR`]. See [`bevy_naadf::e2e::oasis_edit_visual`].
         bevy_naadf::e2e::oasis_edit_visual::run_oasis_edit_visual()
+    } else if small_edit_visual_mode {
+        // `03g` — single-voxel-edit gate. Boots the default test grid,
+        // pins a birdseye camera, captures frame A, snapshots non-empty
+        // voxel count, applies a `cube_brush(radius=1.0)` at a known
+        // empty voxel via the runtime path, asserts the voxel count rose
+        // by exactly 1 (CPU pre-condition / Mode 2 catch), waits ~5 s,
+        // captures frame B, asserts the click rect changed and adjacent
+        // rects did not (framebuffer post-condition / Mode 1 catch).
+        // See [`bevy_naadf::e2e::small_edit_visual`].
+        bevy_naadf::e2e::small_edit_visual::run_small_edit_visual()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then

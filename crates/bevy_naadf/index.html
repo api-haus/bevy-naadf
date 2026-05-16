@@ -85,14 +85,42 @@
       data-wasm-opt="0"
     />
 
-    <!-- The NAADF WGSL shaders are loaded at runtime by the Bevy asset server
-         from `src/assets/` (AssetPlugin.file_path). Copy that tree into dist so
-         the dev server serves it at the same path the asset server fetches. -->
+    <!-- The NAADF WGSL shaders / fonts / textures are loaded at runtime by the
+         Bevy asset server from `src/assets/` (AssetPlugin.file_path). Copy
+         each real subdir into dist so the dev server serves them at the same
+         path the asset server fetches.
+
+         `src/assets/materials` is a *directory symlink* into the repo-root
+         `assets/materials/` (Bevy's native asset server follows it fine).
+         Trunk 0.21's `copy-dir` walker, however, does not follow directory
+         symlinks and fails the build with "the source path is neither a
+         regular file nor a symlink to a regular file". The workaround is to
+         enumerate the real `src/assets/*` subdirs explicitly and copy the
+         materials tree from its actual location (`../../assets/materials`,
+         which is the symlink's resolved target relative to this manifest). -->
     <link
       data-trunk
       rel="copy-dir"
-      href="src/assets"
-      data-target-path="src/assets"
+      href="src/assets/fonts"
+      data-target-path="src/assets/fonts"
+    />
+    <link
+      data-trunk
+      rel="copy-dir"
+      href="src/assets/shaders"
+      data-target-path="src/assets/shaders"
+    />
+    <link
+      data-trunk
+      rel="copy-dir"
+      href="src/assets/textures"
+      data-target-path="src/assets/textures"
+    />
+    <link
+      data-trunk
+      rel="copy-dir"
+      href="../../assets/materials"
+      data-target-path="src/assets/materials"
     />
 
     <!-- Cloudflare Pages COOP/COEP headers + cache rules (`_headers`), and the

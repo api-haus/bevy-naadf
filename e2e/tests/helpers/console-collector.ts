@@ -24,8 +24,19 @@ const IGNORED_PATTERNS = [
 
 export interface CollectedError {
   text: string;
-  type: "console.error" | "pageerror";
+  type: "console.error" | "pageerror" | "bevy.error";
 }
+
+/**
+ * Bevy's web build routes the `tracing` macros through `tracing-wasm`, which
+ * emits *every* level (TRACE..ERROR) via `console.log` with CSS styling — the
+ * level is encoded in the message text as `%cERROR%c`/`%cWARN%c`/etc., not in
+ * the Playwright `msg.type()`. Filtering by `type === "error"` therefore loses
+ * every Bevy-side ERROR-level log (including fatal runtime errors like
+ * `DeviceLost`). We detect them by parsing the styled marker out of the
+ * message text instead.
+ */
+const BEVY_ERROR_MARKER = "%cERROR%c";
 
 /**
  * Attaches to a Playwright page and collects console errors + uncaught exceptions.
@@ -38,10 +49,13 @@ export class ConsoleCollector {
   /** Start collecting. Call before page.goto(). */
   attach(page: Page): void {
     page.on("console", (msg: ConsoleMessage) => {
-      if (msg.type() !== "error") return;
       const text = msg.text();
       if (this.isIgnored(text)) return;
-      this.errors.push({ text, type: "console.error" });
+      const isBevyError =
+        msg.type() === "log" && text.includes(BEVY_ERROR_MARKER);
+      if (msg.type() !== "error" && !isBevyError) return;
+      const type = isBevyError ? "bevy.error" : "console.error";
+      this.errors.push({ text, type });
       if (!this._firstPanic && this.isPanic(text)) {
         this._firstPanic = text;
       }

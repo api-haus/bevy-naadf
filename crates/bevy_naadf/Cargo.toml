@@ -102,6 +102,17 @@ bevy = { version = "=0.19.0-rc.1", features = [
 ] }
 basis-universal = "0.3"
 
+# wasm32-only: getrandom ≥0.3 refuses to compile for `wasm32-unknown-unknown`
+# without an explicit backend. `dot_vox`→`ahash` pulls getrandom 0.3.4
+# transitively; we add it here as a direct dep purely to flip the `wasm_js`
+# feature (which routes RNG through `crypto.getRandomValues`). Paired with
+# `--cfg getrandom_backend="wasm_js"` in `.cargo/config.toml` — the upstream
+# error message explicitly says the feature alone is insufficient, both are
+# required. Native targets are unaffected: this entire dep block is gated
+# behind `cfg(target_arch = "wasm32")`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [features]
 default = ["dlss"]
 # DLSS Ray Reconstruction. Forwards to Bevy's `dlss` feature, whose transitive

@@ -1347,4 +1347,147 @@ mod tests {
             hit.world_pos,
         );
     }
+
+    /// `03g` — Mode 2 reproducer variant — single voxel via cube_brush
+    /// emit-shape into populated chunk. Place the voxel at intra-block
+    /// position that is the high half-word of its u32 pair, to flush out
+    /// any `set_voxel_in_window` packing bug.
+    #[test]
+    fn small_edit_high_half_voxel_no_phantoms() {
+        let mut wd = make_empty_world(UVec3::new(2, 2, 2));
+        // Voxel index 1 inside the block (1,0,0) is high-half. To target
+        // an "odd voxel-index" position pick voxel (1, 0, 0) of block (0,0,0).
+        // Pre-populate surrounding voxels so the chunk is Mixed.
+        wd.set_voxels_batch(&[
+            (IVec3::new(0, 0, 0), VoxelTypeId(1)),
+            (IVec3::new(2, 0, 0), VoxelTypeId(1)),
+        ]);
+        // Click on (1, 0, 0) — high half of u32 pair (0, 0, 0).
+        let mut around: Vec<(IVec3, Option<VoxelTypeId>)> = Vec::new();
+        for x in 0..=3 {
+            for y in 0..=3 {
+                for z in 0..=3 {
+                    let p = IVec3::new(x, y, z);
+                    around.push((p, wd.get_voxel_type(p)));
+                }
+            }
+        }
+        wd.set_voxels_batch(&[(IVec3::new(1, 0, 0), VoxelTypeId(2))]);
+        assert_eq!(
+            wd.get_voxel_type(IVec3::new(1, 0, 0)),
+            Some(VoxelTypeId(2)),
+            "clicked voxel must be the target type"
+        );
+        for (p, pre) in &around {
+            if *p == IVec3::new(1, 0, 0) {
+                continue;
+            }
+            let post = wd.get_voxel_type(*p);
+            assert_eq!(
+                pre, &post,
+                "voxel at {p:?} changed unexpectedly: pre={pre:?} post={post:?}"
+            );
+        }
+    }
+
+    /// `03g` — Mode 2 reproducer — placing into a UniformFull chunk.
+    /// The chunk's pre-state is `UniformFull(ty=1)`. Clicking a single
+    /// voxel of a different type should keep all OTHER voxels at type 1,
+    /// not flip any neighbours.
+    #[test]
+    fn small_edit_into_uniform_full_chunk_no_phantoms() {
+        let mut wd = make_empty_world(UVec3::new(2, 2, 2));
+        // Pre-populate chunk (0,0,0) as UniformFull(1) via set_chunks_uniform_batch.
+        wd.set_chunks_uniform_batch(&[([0, 0, 0], Some(VoxelTypeId(1)))]);
+        // Now click voxel (5, 5, 5) to type 2.
+        let mut around: Vec<(IVec3, Option<VoxelTypeId>)> = Vec::new();
+        for x in 3..=7 {
+            for y in 4..=6 {
+                for z in 4..=6 {
+                    let p = IVec3::new(x, y, z);
+                    around.push((p, wd.get_voxel_type(p)));
+                }
+            }
+        }
+        wd.set_voxels_batch(&[(IVec3::new(5, 5, 5), VoxelTypeId(2))]);
+        assert_eq!(
+            wd.get_voxel_type(IVec3::new(5, 5, 5)),
+            Some(VoxelTypeId(2)),
+            "clicked voxel must be the target type"
+        );
+        for (p, pre) in &around {
+            if *p == IVec3::new(5, 5, 5) {
+                continue;
+            }
+            let post = wd.get_voxel_type(*p);
+            assert_eq!(
+                pre, &post,
+                "voxel at {p:?} changed unexpectedly: pre={pre:?} post={post:?}"
+            );
+        }
+    }
+
+    /// `03g` — Mode 2 reproducer (Phase 3 diagnosis).
+    ///
+    /// Single voxel placed via `set_voxels_batch` into a chunk that already
+    /// contains pre-existing voxels (the user's "OXO row in populated world"
+    /// scenario). Asserts that exactly ONE voxel position changed from EMPTY
+    /// to the target type — no phantom voxels at adjacent positions.
+    ///
+    /// If `set_voxels_batch` writes both halves of a packed `u32` when only
+    /// one was intended (`02-research.md` divergence #4 hazard), the sibling
+    /// voxel at the same `u32` storage slot would also become non-empty.
+    ///
+    /// User-reported failure mode: `OXO` row in the middle of a populated
+    /// world; after click, `OXO → ONO` (expected) **plus** an `NN` row one
+    /// position below in the chunk — phantoms at sibling-half-word
+    /// positions.
+    #[test]
+    fn small_edit_one_voxel_into_populated_chunk_emits_exactly_one() {
+        let mut wd = make_empty_world(UVec3::new(2, 2, 2));
+        // Seed a populated context — a 3-voxel row "OXO" around (5, 5, 5)
+        // with the centre EMPTY. Voxels at (4,5,5) and (6,5,5) are full.
+        wd.set_voxels_batch(&[
+            (IVec3::new(4, 5, 5), VoxelTypeId(1)),
+            (IVec3::new(6, 5, 5), VoxelTypeId(1)),
+        ]);
+        // Sanity — middle is empty before the edit.
+        assert_eq!(
+            wd.get_voxel_type(IVec3::new(5, 5, 5)),
+            Some(VoxelTypeId::EMPTY),
+            "pre-edit centre voxel must be empty"
+        );
+        // Snapshot the surrounding 5×3×3 voxel region — every voxel that was
+        // empty must STAY empty after the click except the clicked one.
+        let mut around: Vec<(IVec3, Option<VoxelTypeId>)> = Vec::new();
+        for x in 3..=7 {
+            for y in 4..=6 {
+                for z in 4..=6 {
+                    let p = IVec3::new(x, y, z);
+                    around.push((p, wd.get_voxel_type(p)));
+                }
+            }
+        }
+        // Click in the middle — single voxel set, simulating cube_brush
+        // radius=1 with one emitted edit.
+        wd.set_voxels_batch(&[(IVec3::new(5, 5, 5), VoxelTypeId(2))]);
+        // The clicked voxel is the target type.
+        assert_eq!(
+            wd.get_voxel_type(IVec3::new(5, 5, 5)),
+            Some(VoxelTypeId(2)),
+            "clicked voxel must be the target type"
+        );
+        // EVERY other voxel in the surrounding region must be unchanged.
+        for (p, pre) in &around {
+            if *p == IVec3::new(5, 5, 5) {
+                continue;
+            }
+            let post = wd.get_voxel_type(*p);
+            assert_eq!(
+                pre, &post,
+                "voxel at {p:?} changed unexpectedly: pre={pre:?} post={post:?} \
+                 — phantom voxel (Mode 2)"
+            );
+        }
+    }
 }
