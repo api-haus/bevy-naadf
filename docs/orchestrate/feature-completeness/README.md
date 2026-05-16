@@ -14,7 +14,8 @@ per `12-alignment-gap.md` rows 17–21).
 | `02a-design-vox-loading.md` | Track A design — `.vox` import path. | **complete** (delegate-architect, 2026-05-15) |
 | `02b-design-editor.md` | Track B design — paint/cube/sphere + Bevy-UI. | **complete** (delegate-architect, 2026-05-15) |
 | `03a-impl-vox-loading.md` | Track A implementation log. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
-| `03a-followup-empty-scene-diagnosis.md` | Track A follow-up — diagnose + fix empty-scene + camera-dark on real `.vox` file; lifted Decision-6 identity-only walk. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
+| `03a-followup-empty-scene-diagnosis.md` | Track A follow-up — diagnose + fix empty-scene + camera-dark on real `.vox` file; lifted Decision-6 identity-only walk. | **complete** (general-purpose Opus, 2026-05-15) — committed `44d0599` |
+| `02a-v2-sparse-vox-ingestion.md` | Track A redesign — sparse VOX ingestion (supersedes 02a Decision 3); enables Oasis-scale `.vox` loads. | **complete** (delegate-architect, 2026-05-15) |
 | `crates/bevy_naadf/src/e2e/vox_e2e.rs` | Track A E2E gate addendum — synthesised-fixture `--vox-e2e` mode + `assert_vox_geometry_visible` non-skybox gate. Logged in `03a-impl-vox-loading.md` `## E2E gate addendum`. | **complete** (general-purpose Opus, 2026-05-15) — uncommitted on disk |
 | `03b-impl-editor.md` | Track B implementation log. | pending |
 | `04a-review-vox-loading.md` | Track A fresh-eyes review brief + verdict. | pending |
@@ -45,6 +46,9 @@ per `12-alignment-gap.md` rows 17–21).
 - [x] **Step 7b** — synthesis after `impl-vox`, hard gate
 - [x] **Step 8b-followup** — checkpoint + dispatch `diagnose-empty-scene` (user-directed; scene-graph composition fix landed)
 - [x] **Step 8b-e2e-test** — checkpoint + dispatch `impl-vox-e2e-test` (user-directed; automated .vox-render gate). `--vox-e2e` mode + `assert_vox_geometry_visible` non-skybox gate landed; addendum logged in `03a-impl-vox-loading.md`.
+- [x] **Step 8b-v2-redesign** — checkpoint + dispatch `design-sparse-vox` (user-directed; large-world support — Oasis_Hard_Cover.vox exceeded v1 caps). Architect landed `02a-v2-sparse-vox-ingestion.md`.
+- [ ] **Step 7b-v2** — synthesis after redesign, hard gate (← we are here)
+- [ ] Step 8b-v2-impl — checkpoint + dispatch `impl-sparse-vox`
 - [ ] Step 8c — checkpoint + dispatch `review-vox`
 - [ ] Step 7c — synthesis after `review-vox`, hard gate
 - [ ] Step 8c — checkpoint + dispatch `impl-editor`
