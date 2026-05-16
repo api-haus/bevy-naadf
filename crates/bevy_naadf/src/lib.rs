@@ -165,9 +165,21 @@ impl Default for GiSettings {
             is_sample_leveling: true,
             is_varying_resampling_radius: true,
             is_atmosphere_interaction: true,
-            // Multi-tap sun shadow — paper §5.2 soft-shadow noise mitigation
-            // (Dispatch A — `19-gi-reservoir-scope.md` §3.1). Default 4.
-            sun_shadow_taps: 4,
+            // Sun-shadow tap count — C# default 1 (no loop;
+            // `renderSpatialResampling.fx:322-339` is a single
+            // `getUniformHemisphereSample` + single `shootRay`). The
+            // Phase-D-shadow Dispatch A (`1c35c7f`, 2026-05-15) shipped
+            // N=4 as the paper-§5.2 soft-shadow mitigation; per
+            // `docs/orchestrate/feature-completeness/02d-render-perf-
+            // investigation.md` §1 + user directive 2026-05-15, the
+            // default is reverted to the C# canonical 1 — the multi-tap
+            // path stays available via the quality panel's
+            // `sun_shadow_taps` knob (range 1..32) for users who want
+            // softer penumbras at the perf cost. The shader's
+            // `max(_, 1u)` clamp at `spatial_resampling.wgsl:547`
+            // handles N=1 safely (bit-equivalent to pre-Dispatch-A path
+            // per `20-impl-phase-d-shadow-A.md` §4).
+            sun_shadow_taps: 1,
             // Quality-panel runtime knobs — defaults bit-equivalent to the
             // pre-dispatch WGSL `const`s these promotions replaced (the
             // `MAX_RAY_STEPS_*` consts at `ray_tracing.wgsl:122-126` and the

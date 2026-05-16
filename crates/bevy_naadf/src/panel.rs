@@ -475,7 +475,11 @@ const KNOBS: &[Knob] = &[
             big_step: 4,
             min: 1,
             max: 32,
-            default: 4,
+            // C# canonical default (1, no loop — `renderSpatialResampling.fx:322-339`).
+            // Welded to `GiSettings::default().sun_shadow_taps` by the
+            // `defaults_match_gi_settings_default` test (panel.rs:1509-1546).
+            // Range 1..32 unchanged — soft-shadow path stays opt-in.
+            default: 1,
         },
     },
     Knob {
