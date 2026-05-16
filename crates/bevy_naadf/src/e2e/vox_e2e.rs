@@ -448,7 +448,76 @@ pub fn save_vox_e2e_screenshot(fb: &Framebuffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voxel::{vox_import, VoxelTypeId, MaterialBase};
+    use crate::aadf::cell::{BlockCell, ChunkCell, VoxelCell};
+    use crate::aadf::construct::ConstructedWorld;
+    use crate::voxel::{vox_import, MaterialBase, VoxelTypeId};
+
+    /// Test helper — decode the voxel at NAADF position `[x, y, z]` from a
+    /// [`ConstructedWorld`]. Walks `ChunkCell::decode → BlockCell::decode →
+    /// VoxelCell::decode`. Mirrors the helper in `vox_import::tests`. Used
+    /// by the migrated v1-style position assertions on the sparse path.
+    fn decoded_voxel_at(world: &ConstructedWorld, p: [u32; 3]) -> VoxelTypeId {
+        let cx = p[0] / 16;
+        let cy = p[1] / 16;
+        let cz = p[2] / 16;
+        let lcx = p[0] % 16;
+        let lcy = p[1] % 16;
+        let lcz = p[2] % 16;
+        let bx = lcx / 4;
+        let by = lcy / 4;
+        let bz = lcz / 4;
+        let lbx = lcx % 4;
+        let lby = lcy % 4;
+        let lbz = lcz % 4;
+        let s = world.size_in_chunks;
+        let ci = (cx + cy * s[0] + cz * s[0] * s[1]) as usize;
+        if ci >= world.chunks.len() {
+            return VoxelTypeId::EMPTY;
+        }
+        match ChunkCell::decode(world.chunks[ci]) {
+            ChunkCell::Empty(_) => VoxelTypeId::EMPTY,
+            ChunkCell::UniformFull(ty) => ty,
+            ChunkCell::Mixed(bp) => {
+                let block_idx = (bx + by * 4 + bz * 16) as usize;
+                let block_word = world.blocks[bp.0 as usize + block_idx];
+                match BlockCell::decode(block_word) {
+                    BlockCell::Empty(_) => VoxelTypeId::EMPTY,
+                    BlockCell::UniformFull(ty) => ty,
+                    BlockCell::Mixed(vp) => {
+                        let voxel_idx = (lbx + lby * 4 + lbz * 16) as usize;
+                        let pair = voxel_idx / 2;
+                        let lo = (world.voxels[vp.0 as usize + pair] & 0xFFFF) as u16;
+                        let hi = ((world.voxels[vp.0 as usize + pair] >> 16) & 0xFFFF) as u16;
+                        let half = if voxel_idx % 2 == 0 { lo } else { hi };
+                        match VoxelCell::decode(half) {
+                            VoxelCell::Empty(_) => VoxelTypeId::EMPTY,
+                            VoxelCell::Full(ty) => ty,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Count non-empty voxels by walking every world coord. The fixture is
+    /// 64×32×64 = 131072 voxels so the walk is cheap.
+    fn count_nonempty(world: &ConstructedWorld) -> u32 {
+        let s = world.size_in_chunks;
+        let sx = s[0] * 16;
+        let sy = s[1] * 16;
+        let sz = s[2] * 16;
+        let mut n = 0u32;
+        for z in 0..sz {
+            for y in 0..sy {
+                for x in 0..sx {
+                    if decoded_voxel_at(world, [x, y, z]) != VoxelTypeId::EMPTY {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
 
     /// The synthesised fixture must round-trip cleanly through the
     /// production parser (`parse_vox_bytes`) and produce a non-empty
@@ -470,10 +539,9 @@ mod tests {
 
         // Combined MV bounds: x = (0..59), y = (0..59), z = (0..29) →
         // world MV size (60, 60, 30). Z↔Y swap → NAADF (60, 30, 60) →
-        // chunks (4, 2, 4) → 64 × 32 × 64 voxels (matches default
-        // scene size at `voxel/grid.rs::GRID_SIZE_IN_CHUNKS`).
+        // chunks (4, 2, 4) → 64 × 32 × 64 voxels.
         assert_eq!(
-            imp.volume.size_in_chunks,
+            imp.world.size_in_chunks,
             [4, 2, 4],
             "vox-e2e fixture composed world AABB regressed — expected \
              a (4, 2, 4)-chunks world (60×30×60 MV → 64×32×64 NAADF)"
@@ -481,20 +549,12 @@ mod tests {
 
         // The fixture has a 60×60×4 slab (14400 voxels) + a 20×20×28
         // tower (11200 voxels). Slab spans NAADF (0..59, 0..3, 0..59),
-        // tower spans NAADF (20..39, 2..29, 20..39). Their overlap is
-        // at NAADF y=2..3 (the tower's bottom two layers within the
-        // slab's top two layers, intersected with x=20..39, z=20..39):
-        // = (39-20+1) × (3-2+1) × (39-20+1) = 20 × 2 × 20 = 800 voxels.
-        // So total unique non-empty = 14400 + 11200 - 800 = 24800.
-        // A regression that stacked both models at origin would yield
-        // a different (and lower) count due to the overlap region.
-        let nonempty: usize = imp
-            .volume
-            .voxels
-            .iter()
-            .filter(|t| **t != VoxelTypeId::EMPTY)
-            .count();
-        let expected = 14400 + 11200 - 800;
+        // tower spans NAADF (20..39, 2..29, 20..39). Overlap is 20×2×20
+        // = 800 voxels (`last-write-wins` collapses to a single type, but
+        // they're the same type i=1 so the count is just slab + tower −
+        // overlap).
+        let nonempty = count_nonempty(&imp.world);
+        let expected: u32 = 14400 + 11200 - 800;
         assert_eq!(
             nonempty, expected,
             "vox-e2e fixture expected exactly {} non-empty voxels (slab \
@@ -504,20 +564,17 @@ mod tests {
         );
 
         // Confirm the central tower lands where the e2e camera looks:
-        // NAADF look target is `(32, 16, 32)` per `gates::E2E_LOOK_TARGET`.
-        // The tower interior (NAADF (20..39, 2..29, 20..39)) covers it.
+        // NAADF look target is `(32, 16, 32)`. The tower interior covers it.
         assert_ne!(
-            imp.volume.voxel_at([32, 16, 32]),
+            decoded_voxel_at(&imp.world, [32, 16, 32]),
             VoxelTypeId::EMPTY,
             "vox-e2e fixture tower must contain the e2e camera look target \
              NAADF (32, 16, 32) — otherwise the gate's central rect samples \
              empty space"
         );
-        // And confirm the slab fills the ground (NAADF y=0..3) at NAADF
-        // x and z far from the tower (so the slab assertion isn't
-        // satisfied by tower coverage).
+        // And confirm the slab fills the ground (NAADF y=0..3).
         assert_ne!(
-            imp.volume.voxel_at([5, 0, 5]),
+            decoded_voxel_at(&imp.world, [5, 0, 5]),
             VoxelTypeId::EMPTY,
             "vox-e2e fixture slab must fill the ground plane at a \
              corner location well away from the tower"
@@ -540,12 +597,9 @@ mod tests {
         );
     }
 
-    /// The composed world AABB must be small enough to fit the
-    /// `MAX_CHUNKS_PER_AXIS = 32` GPU producer cap that
-    /// `03a-followup-empty-scene-diagnosis.md` lowered. A fixture that
-    /// composes past the cap would fail to load and fall back to the
-    /// default test grid — the gate would then test the default scene,
-    /// not the .vox path.
+    /// The composed world AABB must fit within `MAX_CHUNKS_PER_AXIS`. v2
+    /// raised this cap from `32 → 1024`; the fixture is `(4, 2, 4)` chunks
+    /// — well within both old and new caps.
     #[test]
     fn fixture_world_size_fits_within_gpu_producer_cap() {
         let data = build_vox_e2e_fixture();
@@ -556,12 +610,12 @@ mod tests {
             vox_import::parse_vox_bytes(&bytes).expect("parse_vox_bytes failed");
         for axis in 0..3 {
             assert!(
-                imp.volume.size_in_chunks[axis] <= vox_import::MAX_CHUNKS_PER_AXIS,
+                imp.world.size_in_chunks[axis] <= vox_import::MAX_CHUNKS_PER_AXIS,
                 "vox-e2e fixture axis {axis} ({} chunks) exceeds \
                  MAX_CHUNKS_PER_AXIS ({}); the fixture would fall back \
                  to the default test grid and the gate would not exercise \
                  the .vox path",
-                imp.volume.size_in_chunks[axis],
+                imp.world.size_in_chunks[axis],
                 vox_import::MAX_CHUNKS_PER_AXIS
             );
         }

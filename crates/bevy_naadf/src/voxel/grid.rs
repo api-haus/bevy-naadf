@@ -64,72 +64,122 @@ const GRID_SIZE_IN_CHUNKS: [u32; 3] = [4, 2, 4];
 ///
 /// Replaces `main::setup_scene_placeholder`. Inserts the `WorldData` and
 /// `VoxelTypes` resources.
+///
+/// **Two paths**:
+/// - `GridPreset::Default` (test grid, Δ-DenseFallback) — builds a
+///   `DenseVolume`, runs `construct()`, installs with a populated
+///   `dense_voxel_types` (so the runtime GPU producer chain can rebuild
+///   `segment_voxel_buffer` per Phase-C followup #1).
+/// - `GridPreset::Vox` (sparse, Track A v2 —
+///   `docs/orchestrate/feature-completeness/02a-v2-sparse-vox-ingestion.md`) —
+///   the sparse walk in `vox_import::parse_vox_bytes` produces a
+///   `ConstructedWorld` directly. We install it via `build_world_from_vox`,
+///   which sets `dense_voxel_types: Vec::new()` (Δ-GPUProducer); the GPU
+///   producer's data-driven gate at `render/construction/mod.rs:833-835`
+///   then skips the dispatch chain and the renderer reads the pre-built CPU
+///   buffers via the existing extract/prepare upload path.
 pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
-    // Track A (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`)
-    // — `GridPreset::Vox { path }` loads a MagicaVoxel `.vox` file
-    // synchronously here at `Startup`. On error we log and fall through to the
-    // hard-coded test grid so the e2e harness always boots into a renderable
-    // world (Design `## How loading integrates with setup_test_grid`).
-    let (palette, volume) = match &args.grid_preset {
-        GridPreset::Default => (build_palette(), build_default_volume()),
+    match &args.grid_preset {
+        GridPreset::Default => {
+            let palette = build_palette();
+            let volume = build_default_volume();
+            let world = construct(&volume);
+            let size = volume.size_in_voxels();
+
+            info!(
+                "NAADF test grid ({:?}): {} chunks, {} blocks, {} voxel-u32s ({}x{}x{} voxels)",
+                args.grid_preset,
+                world.chunks.len(),
+                world.blocks.len(),
+                world.voxels.len(),
+                size[0],
+                size[1],
+                size[2],
+            );
+
+            // Phase-C followup #1 — preserve the dense voxel-type stream so
+            // the runtime GPU construction dispatch can rebuild
+            // `segment_voxel_buffer` without going through a CPU `construct()`
+            // re-run.
+            let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
+
+            commands.insert_resource(WorldData {
+                chunks_cpu: world.chunks,
+                blocks_cpu: world.blocks,
+                voxels_cpu: world.voxels,
+                size_in_chunks: UVec3::from_array(world.size_in_chunks),
+                bounding_box: IAabb3 {
+                    min: IVec3::ZERO,
+                    max: IVec3::new(size[0] as i32 - 1, size[1] as i32 - 1, size[2] as i32 - 1),
+                },
+                dirty: true,
+                pending_edits: Default::default(),
+                dense_voxel_types,
+            });
+
+            commands.insert_resource(VoxelTypes {
+                types: palette,
+                dirty: true,
+            });
+        }
         GridPreset::Vox { path } => match vox_import::load_vox(path) {
             Ok(imp) => {
+                let size_in_chunks = imp.world.size_in_chunks;
+                let non_empty_voxels_buf_u32s = imp.world.voxels.len();
+                let non_empty_blocks_buf_u32s = imp.world.blocks.len();
+                let total_chunks = imp.world.chunks.len();
                 info!(
-                    "NAADF .vox loaded from {}: {} palette entries, {:?} chunks",
+                    "NAADF .vox loaded from {}: {} palette entries, world bounds {}×{}×{} chunks ({}×{}×{} voxels), {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s (sparse path, GPU producer skipped)",
                     path.display(),
                     imp.palette.len(),
-                    imp.volume.size_in_chunks,
+                    size_in_chunks[0],
+                    size_in_chunks[1],
+                    size_in_chunks[2],
+                    size_in_chunks[0] * 16,
+                    size_in_chunks[1] * 16,
+                    size_in_chunks[2] * 16,
+                    total_chunks,
+                    non_empty_blocks_buf_u32s,
+                    non_empty_voxels_buf_u32s,
                 );
-                (imp.palette, imp.volume)
+                let (world_data, voxel_types) = vox_import::build_world_from_vox(imp);
+                commands.insert_resource(world_data);
+                commands.insert_resource(voxel_types);
             }
             Err(e) => {
                 error!(
                     ".vox load failed ({e}); falling back to default test grid (path: {})",
                     path.display()
                 );
-                (build_palette(), build_default_volume())
+                let palette = build_palette();
+                let volume = build_default_volume();
+                let world = construct(&volume);
+                let size = volume.size_in_voxels();
+                let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
+                commands.insert_resource(WorldData {
+                    chunks_cpu: world.chunks,
+                    blocks_cpu: world.blocks,
+                    voxels_cpu: world.voxels,
+                    size_in_chunks: UVec3::from_array(world.size_in_chunks),
+                    bounding_box: IAabb3 {
+                        min: IVec3::ZERO,
+                        max: IVec3::new(
+                            size[0] as i32 - 1,
+                            size[1] as i32 - 1,
+                            size[2] as i32 - 1,
+                        ),
+                    },
+                    dirty: true,
+                    pending_edits: Default::default(),
+                    dense_voxel_types,
+                });
+                commands.insert_resource(VoxelTypes {
+                    types: palette,
+                    dirty: true,
+                });
             }
         },
-    };
-
-    let world = construct(&volume);
-    let size = volume.size_in_voxels();
-
-    info!(
-        "NAADF test grid ({:?}): {} chunks, {} blocks, {} voxel-u32s ({}x{}x{} voxels)",
-        args.grid_preset,
-        world.chunks.len(),
-        world.blocks.len(),
-        world.voxels.len(),
-        size[0],
-        size[1],
-        size[2],
-    );
-
-    // Phase-C followup #1 — preserve the dense voxel-type stream so the
-    // runtime GPU construction dispatch can rebuild `segment_voxel_buffer`
-    // without going through a CPU `construct()` re-run. Each `VoxelTypeId`
-    // is a `u16`; total ~ size_in_voxels.x*y*z * 2 bytes.
-    let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
-
-    commands.insert_resource(WorldData {
-        chunks_cpu: world.chunks,
-        blocks_cpu: world.blocks,
-        voxels_cpu: world.voxels,
-        size_in_chunks: UVec3::from_array(world.size_in_chunks),
-        bounding_box: IAabb3 {
-            min: IVec3::ZERO,
-            max: IVec3::new(size[0] as i32 - 1, size[1] as i32 - 1, size[2] as i32 - 1),
-        },
-        dirty: true,
-        pending_edits: Default::default(),
-        dense_voxel_types,
-    });
-
-    commands.insert_resource(VoxelTypes {
-        types: palette,
-        dirty: true,
-    });
+    }
 }
 
 /// Build the Phase-A voxel-type palette. Index 0 is the empty placeholder; the

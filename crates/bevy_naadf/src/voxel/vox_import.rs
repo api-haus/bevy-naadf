@@ -1,150 +1,156 @@
-//! MagicaVoxel `.vox` ingestion — Track A of the feature-completeness
-//! orchestration (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`).
+//! MagicaVoxel `.vox` ingestion — Track A v2 (sparse), per
+//! `docs/orchestrate/feature-completeness/02a-v2-sparse-vox-ingestion.md`.
 //!
-//! Parses a `.vox` file into a [`DenseVolume`] + a [`VoxelType`] palette, then
-//! hands the pair off to [`crate::aadf::construct::construct`] / the existing
-//! `WorldData` build path that `voxel/grid.rs::setup_test_grid` already drives
-//! for the hard-coded test grid. The GPU side does not learn about `.vox` —
-//! once the loader produces a `DenseVolume`, the existing
-//! `construct()` → `WorldData` → `prepare_world_gpu` chain takes over
-//! unchanged.
+//! Parses a `.vox` file into a [`ConstructedWorld`] (the renderer-input shape
+//! produced by [`crate::aadf::construct::construct`]) + a [`VoxelType`]
+//! palette. Walks scene-graph–composed sparse XYZI records directly into
+//! NAADF's 3-buffer encoding (`chunks_cpu` / `blocks_cpu` / `voxels_cpu`)
+//! without ever materialising a dense intermediate — so very large composed
+//! worlds (Oasis_Hard_Cover.vox-class, 93×34×84 chunks ≈ 50M voxels at ~1%
+//! density) load in ~tens of MiB rather than the ~140 GiB a dense
+//! `Vec<VoxelTypeId>` would need.
 //!
 //! ## Pipeline shape (mirrors C# `MagicaVoxel.cs` + `ModelData.ImportFromVox`)
 //!
-//! 1. `dot_vox::load_bytes(&[u8])` → `DotVoxData { models, palette, materials,
-//!    scenes, layers, .. }` — exactly the shape `MagicaVoxel.cs`'s chunk-tagged
-//!    parser produces.
-//! 2. [`flatten_scene`] folds the scene graph into one `DenseVolume` via a
-//!    full two-pass walk that mirrors C# `MagicaVoxel.GetWorldAABB` +
-//!    `MagicaVoxel.CollateVoxelData` (`MagicaVoxel.cs:651-755`). Pass 1
-//!    accumulates the world AABB by composing parent `nTRN` transforms
-//!    (translation `_t` + rotation `_r` byte → 3×3 signed-permutation matrix);
-//!    pass 2 collates every shape's voxels under the composed transform into
-//!    a `DenseVolume` sized to the AABB. The 03a-followup
-//!    (`03a-followup-empty-scene-diagnosis.md`) lifted the design's
-//!    "identity-only first cut" (Decision 6) — real-world `.vox` files (291+
-//!    transformed models in Oasis_Hard_Cover.vox) require composition; the
-//!    flip-trigger fired.
-//! 3. [`vox_palette_to_voxel_types`] promotes the 256-entry `RGBA` palette +
-//!    `MATL` chunks into a `Vec<VoxelType>`. Mirrors C# `ModelData.cs:502-522`:
-//!    one [`VoxelType`] per source palette entry, sRGB→linear via gamma 2.2,
-//!    `emission = _emit * (1 + _flux)^2 * 5` slotted into
-//!    [`VoxelType::color_layered`]`.x` when `_emit > 0`. **No K-means** —
-//!    K-means in `ModelData.cs:528-560` is `ImportFromVL32`-only (audit/brief
-//!    overrided; see `02a-design-vox-loading.md` Decision 2).
-//! 4. The voxel-coordinate convention is swapped: MagicaVoxel `(x, y, z)` →
-//!    NAADF `(x, z, y)`. Matches C# `ModelData.cs:386` + `:438`
-//!    (`02a-design-vox-loading.md` Decision 5). Applied at the final
-//!    write-into-`DenseVolume` step, AFTER the MagicaVoxel-coords scene-graph
-//!    composition is complete.
+//! 1. `dot_vox::load_bytes(&[u8])` → `DotVoxData` (sparse `Vec<Voxel>` per model).
+//! 2. Two-pass scene-graph walk:
+//!    - Pass 1 — [`accumulate_world_aabb`] composes parent `nTRN` transforms
+//!      (translation `_t` + rotation `_r` byte → signed-permutation matrix)
+//!      and unions every shape's transformed AABB into a world AABB. Mirrors
+//!      C# `MagicaVoxel.GetWorldAABB` at `MagicaVoxel.cs:651-716`.
+//!    - Pass 2 — [`collate_voxels_sparse`] re-walks the same scene graph and
+//!      pushes every transformed voxel into a per-chunk sparse bucket
+//!      ([`ChunkBuckets`]). Mirrors C# `MagicaVoxel.CollateVoxelData`.
+//! 3. [`build_constructed_world_sparse`] walks every non-empty chunk, lifts
+//!    its 64 sparse blocks into a 16³ transient dense array (8 KiB, discarded
+//!    per-chunk), classifies + dedups + encodes via the helpers from
+//!    [`crate::aadf::construct`], and emits `chunks_cpu`/`blocks_cpu`/
+//!    `voxels_cpu` byte-equivalent to what `construct(&DenseVolume)` would
+//!    produce on the same input (Test #15 enforces this).
+//! 4. [`vox_palette_to_voxel_types`] promotes the 256-entry `RGBA` palette +
+//!    `MATL` chunks into a `Vec<VoxelType>` — UNCHANGED from v1.
+//! 5. The voxel-coordinate convention is swapped: MagicaVoxel `(x, y, z)` →
+//!    NAADF `(x, z, y)`. Matches C# `ModelData.cs:386` + `:438`.
 //!
-//! ## What's out of scope (Track A first cut)
+//! ## What's out of scope
 //!
-//! - K-means palette reduction (Decision 2 — `.vox` doesn't use it).
 //! - `obj2voxel` integration (deferred entirely per `01-context.md` §5).
 //! - `.vl32` import (Track A is `.vox` only).
-//! - Bevy `AssetLoader` registration / hot-reload (Decision 4 — synchronous
-//!   `std::fs::read` at `Startup` only).
-//! - Pre-bake to a port-native binary format (Decision 4).
+//! - Bevy `AssetLoader` registration / hot-reload — synchronous `std::fs::read`
+//!   at `Startup` only.
+//! - Pre-bake to a port-native binary format — orthogonal track.
+//!
+//! ## Δ-decisions honoured (per v2 design)
+//!
+//! - Δ-ModelData — emit `ConstructedWorld` directly, no `ModelData` intermediate.
+//! - Δ-AADF — CPU AADFs computed per-chunk inline via `compute_aadf_layer`.
+//! - Δ-Hash — block dedup uses `HashMap<[VoxelTypeId; 64], VoxelPtr>` to match
+//!   [`crate::aadf::construct::construct`]'s output byte-for-byte.
+//! - Δ-DenseFallback — `GridPreset::Default` still uses `DenseVolume + construct()`;
+//!   only `.vox` ingestion is sparse-only.
+//! - Δ-GPUProducer — `WorldData::dense_voxel_types = Vec::new()` for `.vox`
+//!   content; the data-driven gate at `render/construction/mod.rs:833-835`
+//!   skips the GPU producer (the renderer reads the pre-built CPU buffers).
+//! - Δ-CapsConservative — pre-flight against documented wgpu Vulkan-baseline
+//!   minimums (1024 chunks/axis, 256 MiB buffer ceilings); much higher than v1.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use bevy::math::Vec3;
 use thiserror::Error;
 
-use crate::aadf::construct::DenseVolume;
-use crate::voxel::{MaterialBase, MaterialLayer, VoxelType, VoxelTypeId};
+use crate::aadf::bounds::compute_aadf_layer;
+use crate::aadf::cell::{BlockPtr, ChunkCell, VoxelPtr};
+use crate::aadf::construct::{
+    encode_block_voxels, encode_chunk_blocks, BlockClass, ChunkClass, ConstructedWorld,
+};
+use crate::voxel::{
+    MaterialBase, MaterialLayer, VoxelType, VoxelTypeId, AADF_MAX_CHUNK, CELL_CHILDREN, CELL_DIM,
+};
 
-/// Soft-cap on world axis dimensions, in chunks, the loader will accept.
-///
-/// 03a-followup lowered this from 1024 to 32 once scene-graph composition
-/// landed: with composition, real-world `.vox` files can compose to world
-/// AABBs that vastly exceed any single model's bounding cuboid. The actual
-/// load-bearing constraint is the Phase-C-followup#1 GPU producer chain's
-/// **`segment_voxel_buffer`** (`render/construction/mod.rs:921-960`), which
-/// allocates `seg³ × 2048 × 4 B` GPU storage where `seg = max(chunks per
-/// axis)`. At `seg = 32` the buffer is ~262 MiB (well within typical wgpu
-/// `max_storage_buffer_binding_size` of 128 MiB → 2 GiB depending on GPU);
-/// at `seg = 93` (Oasis_Hard_Cover.vox post-composition) it would be
-/// ~6.5 GiB and OOM the render device. Loads above this cap fail
-/// gracefully through `setup_test_grid`'s `error!`-and-fall-back path.
-///
-/// This is intentionally conservative — the wgpu Vulkan minimum
-/// `max_texture_dimension_3d` (the OLD cap rationale) is 1024, but that's
-/// the wrong limit to gate on; the GPU producer's segment buffer hits
-/// `max_storage_buffer_binding_size` first. Files past this cap need
-/// streaming / pre-baked / segment-iteration follow-up work
-/// (`02a-design-vox-loading.md` `## Decisions` `Decision 3` flip-trigger).
-pub const MAX_CHUNKS_PER_AXIS: u32 = 32;
+/// Side of a chunk in voxels (= `CELL_DIM² = 16`).
+const CHUNK_DIM_VOXELS: u32 = (CELL_DIM as u32) * (CELL_DIM as u32);
 
-/// Soft-cap on the `dense_voxel_types: Vec<u16>` mirror budget, in bytes
-/// (1 GiB → ≈812³ voxels). The check protects against accidentally
-/// allocating a many-gigabyte `Vec<u16>` if a file declares a huge size
-/// (`02a-design-vox-loading.md` `## Size ceilings`).
+/// Max chunks-per-axis the loader will accept (per-axis cap on
+/// `size_in_chunks`).
 ///
-/// The load-bearing limit is [`MAX_CHUNKS_PER_AXIS`] (32 chunks per axis =
-/// 512 voxels per axis), which independently caps the voxel count at
-/// 32³ × 16³ = ~134 M voxels = ~268 MiB. This `MAX_DENSE_BYTES` ceiling
-/// is the secondary belt-and-braces gate.
-pub const MAX_DENSE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Δ-CapsConservative — matches the wgpu Vulkan-baseline
+/// `max_texture_dimension_3d` (the `chunks` 3D texture's hard ceiling). The
+/// real desktop cap on NVIDIA/AMD is typically `2048`; we conservatively
+/// pre-flight at `1024` because the loader runs at `Startup`, before the
+/// render-app exists, so we can't query the actual device limits.
+///
+/// A 1024³-chunk world is 16384³ voxels = ~4.4 trillion voxels — past any
+/// practical `.vox` fixture (Oasis_Hard_Cover.vox composes to ~93³ chunks ≈
+/// 0.09% of this cap).
+pub const MAX_CHUNKS_PER_AXIS: u32 = 1024;
 
-/// Parsed-and-flattened `.vox` data, ready to install into a NAADF world.
+/// Pre-flight cap on the `voxels_cpu` (unique-blocks) buffer size, in bytes.
+/// Matches the wgpu Vulkan-baseline `max_buffer_size = 256 MiB`. Desktop
+/// `max_buffer_size` is typically 2 GiB (8× headroom).
+///
+/// Each unique mixed block occupies 32 `u32`s (128 B); at 256 MiB the cap is
+/// 2M unique blocks ≈ 128M unique voxels worth of geometry, which on a 1%
+/// non-empty world is ~12G total voxels = ~480³ NAADF voxels.
+pub const MAX_VOXELS_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Pre-flight cap on the `blocks_cpu` buffer size, in bytes. Same rationale
+/// as [`MAX_VOXELS_BUFFER_BYTES`].
+pub const MAX_BLOCKS_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Parsed `.vox` data, ready to install into a NAADF world.
 ///
 /// Produced by [`parse_vox_bytes`] / [`load_vox`]. Consumed by
-/// [`build_world_from_vox`] (or any caller that drops the volume into
-/// [`crate::aadf::construct::construct`] directly).
-#[derive(Clone, Debug)]
+/// [`build_world_from_vox`] (or any caller that wants to drop the
+/// `ConstructedWorld` into a custom installer).
+///
+/// **v2 shape (`02a-v2-sparse-vox-ingestion.md`):** v1's `volume: DenseVolume`
+/// is retired; the sparse walk produces the final `(chunks, blocks, voxels)`
+/// buffers directly, so the renderer can install them without going through
+/// `aadf::construct::construct()`.
+#[derive(Debug)]
 pub struct ImportedVox {
-    /// The flattened dense voxel volume, sized to the smallest cuboid that
-    /// covers every visible voxel across the file's scene graph (round up to
-    /// whole chunks). Mirrors C# `MagicaVoxel.Flatten` at
-    /// `MagicaVoxel.cs:677-689`.
-    pub volume: DenseVolume,
-    /// The voxel-type palette derived from the `.vox` `RGBA` + `MATL` chunks.
-    /// Index 0 is the reserved empty placeholder; indices 1..=N mirror the
-    /// MagicaVoxel palette entries 0..N-1 (the `+1` shift keeps slot 0 empty
-    /// per NAADF convention — `voxel/mod.rs:65-71`).
+    /// The pre-built constructed world — `chunks`/`blocks`/`voxels` `u32`
+    /// buffers with AADFs baked, plus `size_in_chunks`. Byte-equivalent to
+    /// what `aadf::construct::construct(&DenseVolume)` would produce on the
+    /// same input (Test #15 enforces this).
+    pub world: ConstructedWorld,
+    /// The voxel-type palette derived from the `.vox` `RGBA` + `MATL`
+    /// chunks. Index 0 is the reserved empty placeholder; indices 1..=N
+    /// mirror the MagicaVoxel palette entries 0..N-1 (the `+1` shift keeps
+    /// slot 0 empty per NAADF convention).
     pub palette: Vec<VoxelType>,
 }
 
 /// Errors emitted by [`parse_vox_bytes`] / [`load_vox`].
 #[derive(Debug, Error)]
 pub enum VoxImportError {
-    /// `dot_vox` rejected the bytes as a malformed `.vox` file. The crate
-    /// produces `&'static str` errors only; we wrap that.
+    /// `dot_vox` rejected the bytes as a malformed `.vox` file.
     #[error("dot_vox parse failed: {0}")]
     Parse(&'static str),
     /// `std::fs::read` failed (file not found, permission denied, …).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// The resulting `DenseVolume`'s per-axis chunk count exceeds
-    /// [`MAX_CHUNKS_PER_AXIS`]. The load-bearing constraint is the
-    /// Phase-C-followup#1 GPU producer chain's `segment_voxel_buffer`
-    /// (`render/construction/mod.rs:921-960`) — it allocates
-    /// `seg³ × 2048 × 4 B` GPU storage where `seg = max(chunks per axis)`;
-    /// real-world `.vox` files post-scene-graph-composition can compose to
-    /// world AABBs that vastly exceed this budget. Files past this cap
-    /// need streaming / pre-baked / segment-iteration follow-up work
-    /// (`02a-design-vox-loading.md` Decision 3 flip-trigger).
-    #[error("VOX size {dim:?} chunks per axis exceeds soft-cap ({limit} per axis); the GPU producer's segment_voxel_buffer would OOM. Pre-bake or shrink the .vox file")]
+    /// The composed world exceeds [`MAX_CHUNKS_PER_AXIS`] on at least one
+    /// axis. Mirrors the wgpu Vulkan-baseline `max_texture_dimension_3d` for
+    /// the `chunks` 3D texture. Files past this cap need
+    /// streaming / pre-baked / segment-iteration follow-up work.
+    #[error("VOX size {dim:?} chunks per axis exceeds soft-cap ({limit} per axis); past wgpu Vulkan-baseline max_texture_dimension_3d. Pre-bake or shrink the .vox file")]
     SizeExceedsTextureLimit { dim: [u32; 3], limit: u32 },
-    /// The `dense_voxel_types: Vec<u16>` mirror would exceed
-    /// [`MAX_DENSE_BYTES`]. The load-bearing per-axis chunk cap
-    /// ([`MAX_CHUNKS_PER_AXIS`]) lands first in practice; this is a
-    /// belt-and-braces secondary gate.
-    #[error("VOX size {dim:?} voxels would exceed the {bytes}-byte CPU mirror budget")]
+    /// The sparse build emitted a `blocks_cpu` / `voxels_cpu` buffer past the
+    /// wgpu Vulkan-baseline `max_buffer_size` pre-flight cap
+    /// ([`MAX_VOXELS_BUFFER_BYTES`] / [`MAX_BLOCKS_BUFFER_BYTES`]).
+    #[error("VOX produced a {dim:?}-u32 buffer exceeding the {bytes}-byte wgpu pre-flight cap")]
     SizeExceedsBudget { dim: [u32; 3], bytes: u64 },
-    /// `dot_vox` parsed a file with `models.is_empty()`. Mirrors C#
-    /// `MagicaVoxel.cs:687` `else { return Models[0]; }` panic-on-empty.
+    /// `dot_vox` parsed a file with `models.is_empty()`.
     #[error("VOX contains no models")]
     Empty,
 }
 
-/// Parse `.vox` bytes and flatten the scene graph into a single
-/// [`ImportedVox`].
+/// Parse `.vox` bytes into an [`ImportedVox`].
 ///
 /// Pure CPU, no Bevy resources, no filesystem — the unit-testable entry point.
-/// Mirrors C# `MagicaVoxel.Flatten` at `MagicaVoxel.cs:677-689`.
 pub fn parse_vox_bytes(bytes: &[u8]) -> Result<ImportedVox, VoxImportError> {
     let data = dot_vox::load_bytes(bytes).map_err(VoxImportError::Parse)?;
     parse_dot_vox_data(&data)
@@ -154,51 +160,46 @@ pub fn parse_vox_bytes(bytes: &[u8]) -> Result<ImportedVox, VoxImportError> {
 ///
 /// Used by `voxel/grid.rs::setup_test_grid` when `args.grid_preset` is
 /// [`crate::GridPreset::Vox`]. On error the caller logs + falls back to the
-/// hard-coded test grid (`02a-design-vox-loading.md` `## How loading
-/// integrates with setup_test_grid`).
+/// hard-coded test grid.
 pub fn load_vox(path: impl AsRef<Path>) -> Result<ImportedVox, VoxImportError> {
     let bytes = std::fs::read(path.as_ref())?;
     parse_vox_bytes(&bytes)
 }
 
-/// Internal entry point: convert a parsed `DotVoxData` into [`ImportedVox`].
+/// Convert a parsed `DotVoxData` into [`ImportedVox`].
 ///
-/// Pulled out so unit tests can drive it with a hand-built `DotVoxData` (e.g.
-/// the emissive-material / Z↔Y swap fixtures) without going through the
-/// binary parser.
+/// Pulled out so unit tests can drive it with a hand-built `DotVoxData`
+/// without going through the binary parser.
 pub fn parse_dot_vox_data(data: &dot_vox::DotVoxData) -> Result<ImportedVox, VoxImportError> {
     if data.models.is_empty() {
         return Err(VoxImportError::Empty);
     }
-    let volume = flatten_scene(data)?;
+    let (buckets, _size_in_chunks) = compose_to_sparse_world(data)?;
+    let world = build_constructed_world_sparse(buckets)?;
     let palette = vox_palette_to_voxel_types(&data.palette, &data.materials);
-    Ok(ImportedVox { volume, palette })
+    Ok(ImportedVox { world, palette })
 }
 
 /// Apply an [`ImportedVox`] to fresh [`crate::world::data::WorldData`] +
-/// [`crate::world::data::VoxelTypes`] resources, exactly the way
-/// `setup_test_grid` builds them from `build_default_volume` + `build_palette`
-/// today (`voxel/grid.rs:66-110`). Returns the two resources the caller
-/// inserts via `Commands::insert_resource`.
+/// [`crate::world::data::VoxelTypes`] resources, by installing the pre-built
+/// `chunks_cpu`/`blocks_cpu`/`voxels_cpu` directly (no `construct()` call).
 ///
-/// Kept separate from [`load_vox`] so a future caller (Bevy `AssetLoader`
-/// extension, pre-bake binary) can install an `ImportedVox` it produced via
-/// some other route.
+/// **Δ-GPUProducer (v2):** `dense_voxel_types` is set to `Vec::new()` so the
+/// GPU producer's data-driven gate at `render/construction/mod.rs:833-835`
+/// skips the segmented-dispatch chain — the renderer reads the pre-built
+/// CPU mirror buffers via the existing extract/prepare upload path.
 pub fn build_world_from_vox(
     imported: ImportedVox,
 ) -> (crate::world::data::WorldData, crate::world::data::VoxelTypes) {
-    use crate::aadf::construct::construct;
     use crate::world::data::{IAabb3, VoxelTypes, WorldData};
     use bevy::math::{IVec3, UVec3};
 
-    let volume = imported.volume;
-    let world = construct(&volume);
-    let size = volume.size_in_voxels();
-
-    // Phase-C followup #1 — preserve the dense voxel-type stream so the
-    // runtime GPU construction dispatch can rebuild `segment_voxel_buffer`
-    // without going through a CPU `construct()` re-run.
-    let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
+    let world = imported.world;
+    let size = [
+        world.size_in_chunks[0] * CHUNK_DIM_VOXELS,
+        world.size_in_chunks[1] * CHUNK_DIM_VOXELS,
+        world.size_in_chunks[2] * CHUNK_DIM_VOXELS,
+    ];
 
     let world_data = WorldData {
         chunks_cpu: world.chunks,
@@ -211,7 +212,11 @@ pub fn build_world_from_vox(
         },
         dirty: true,
         pending_edits: Default::default(),
-        dense_voxel_types,
+        // Δ-GPUProducer — sparse path skips the GPU producer chain (which
+        // requires a dense voxel-type mirror that would cost ~140 GiB for an
+        // Oasis-class world). The renderer reads the pre-built CPU buffers
+        // directly.
+        dense_voxel_types: Vec::new(),
     };
 
     let voxel_types = VoxelTypes {
@@ -221,6 +226,11 @@ pub fn build_world_from_vox(
 
     (world_data, voxel_types)
 }
+
+// ============================================================================
+// Scene-graph composition (from 03a-followup, UNCHANGED apart from the
+// pass-2 emitter target — was `DenseVolume::set`, now `ChunkBuckets::push`).
+// ============================================================================
 
 /// A 3×3 signed-permutation rotation matrix (`_r` byte → integer matrix).
 ///
@@ -241,24 +251,7 @@ impl Rot3 {
     };
 
     /// Parse the MagicaVoxel `_r` rotation byte into a signed-permutation
-    /// matrix. Mirrors C# `MagicaVoxel.cs:127-146` byte-for-byte. The byte
-    /// encodes (per the MagicaVoxel scene-format spec):
-    ///   - bits 0-1: source axis (in the input vector) for output axis 0
-    ///     (i1 ∈ {0,1,2})
-    ///   - bits 2-3: source axis for output axis 1 (i2 ∈ {0,1,2})
-    ///   - bit  4 : sign of the source for output axis 0 (0 → +1, 1 → −1)
-    ///   - bit  5 : sign of the source for output axis 1
-    ///   - bit  6 : sign of the source for output axis 2
-    /// The source axis for output 2 is determined as the remaining axis
-    /// (the one neither i1 nor i2 picked). Equivalent to the C# code's
-    /// `M(i1+1)1 = s1` pattern under .NET row-vector multiplication: with
-    /// `out = v * M`, the column 0 of `M` has its non-zero ±1 at row i1,
-    /// which evaluates to `out.x = s1 * v[i1]`. Same equation rewritten in
-    /// column-vector form: `out = R * v` where `R[0][i1] = s1`.
-    ///
-    /// In this struct `m[col][row]` is the column-vector matrix `R`, so
-    /// `R[row][col] = m[col][row]`. To place s1 at `R[0][i1]` we write
-    /// `m[i1][0] = s1`.
+    /// matrix. Mirrors C# `MagicaVoxel.cs:127-146` byte-for-byte.
     fn from_byte(b: u8) -> Self {
         let i1 = ((b & 0b00000011) >> 0) as usize;
         let i2 = ((b & 0b00001100) >> 2) as usize;
@@ -273,9 +266,6 @@ impl Rot3 {
         let s2: i32 = if (b & 0b00100000) >> 5 == 0 { 1 } else { -1 };
         let s3: i32 = if (b & 0b01000000) >> 6 == 0 { 1 } else { -1 };
 
-        // Column-vector matrix: m[col][row] = R[row, col].
-        // We want R[output][source] = sign, so R[0][i1] = s1, R[1][i2] = s2,
-        // R[2][i3] = s3. Written in `m[col][row]` form:
         let mut m = [[0i32; 3]; 3];
         m[i1][0] = s1;
         m[i2][1] = s2;
@@ -283,11 +273,7 @@ impl Rot3 {
         Self { m }
     }
 
-    /// Compose two rotations: `self * other` (column-major composition that
-    /// matches the C# `frame.matrix * parentMatrix` post-multiply convention
-    /// at `MagicaVoxel.cs:694` + `:720`. When applied to a vector via
-    /// [`Self::transform_vec`], the right-most matrix's transform is applied
-    /// first — i.e. parent's local→parent, then this composition's local→world).
+    /// Compose two rotations: `self * other`.
     fn compose(&self, other: &Rot3) -> Rot3 {
         let mut out = [[0i32; 3]; 3];
         for col in 0..3 {
@@ -302,8 +288,7 @@ impl Rot3 {
         Rot3 { m: out }
     }
 
-    /// `M * v` — apply this rotation matrix to a vector. Result is integer
-    /// because the matrix is a signed permutation (no shears, no scales).
+    /// `M * v` — apply this rotation matrix to a vector.
     fn transform_vec(&self, v: [i32; 3]) -> [i32; 3] {
         [
             self.m[0][0] * v[0] + self.m[1][0] * v[1] + self.m[2][0] * v[2],
@@ -314,15 +299,10 @@ impl Rot3 {
 }
 
 /// A composed scene-graph transform: rotation + translation, in MagicaVoxel
-/// (Z-up) coordinates. Mirrors the C# `Matrix4x4` chain at
-/// `MagicaVoxel.cs:694` / `:720` (the only non-zero entries are translation
-/// and the rotation submatrix; `Matrix4x4.CreateTranslation` + the
-/// signed-permutation rotation byte means M is always isometric on the
-/// integer lattice).
+/// (Z-up) coordinates.
 #[derive(Clone, Copy, Debug)]
 struct Xform {
     rot: Rot3,
-    /// MagicaVoxel-space translation, in voxels.
     t: [i32; 3],
 }
 
@@ -339,19 +319,7 @@ impl Xform {
     }
 
     /// Compose `parent ∘ self`: `result.apply(p) = parent.apply(self.apply(p))`.
-    /// Mirrors the C# `frame.matrix * parentMatrix` post-multiply chain at
-    /// `MagicaVoxel.cs:694` (`var newMatrix = transform.GetFrameMatrix(...) *
-    /// parentMatrix;`). In .NET `Matrix4x4 * Matrix4x4` is row-vector
-    /// post-multiply (the LEFT matrix is the "inner" / applied first when
-    /// the matrix premultiplies a row vector); the C# code then applies
-    /// `Vector3.Transform(p, parentMatrix)` so the resulting matrix's
-    /// transform-of-`p` first applies the local `frame.matrix`, then the
-    /// `parentMatrix`. We replicate the effect with explicit ordering.
     fn parent_of(&self, parent: &Xform) -> Xform {
-        // The composed transform we want: child.apply applied first, then
-        // parent.apply. Result = parent.rot * (child.rot * p + child.t) +
-        // parent.t = (parent.rot * child.rot) * p + (parent.rot * child.t +
-        // parent.t).
         let new_rot = parent.rot.compose(&self.rot);
         let parent_t_of_self_t = parent.rot.transform_vec(self.t);
         let new_t = [
@@ -359,39 +327,18 @@ impl Xform {
             parent_t_of_self_t[1] + parent.t[1],
             parent_t_of_self_t[2] + parent.t[2],
         ];
-        Xform { rot: new_rot, t: new_t }
+        Xform {
+            rot: new_rot,
+            t: new_t,
+        }
     }
 }
 
-/// Pull `(rotation, translation)` from a `dot_vox::Frame` (the `frames[0]` of
-/// an `nTRN`). Missing `_r` ⇒ identity rotation; missing `_t` ⇒ zero
-/// translation (matches both the MagicaVoxel `.vox` spec defaults and the C#
-/// `TransformFrame.matrix = Matrix4x4.Identity` initialiser at
-/// `MagicaVoxel.cs:120`).
 fn frame_to_xform(frame: &dot_vox::Frame) -> Xform {
-    let rot = frame
-        .orientation()
-        .map(|r| {
-            // `dot_vox::Rotation` parses the same byte; reconstruct it as the
-            // raw byte and run our integer-matrix parse so the result is
-            // byte-equivalent to the C# code. The crate exposes the byte
-            // round-trip via `Rotation::from_byte` (the constructor used at
-            // `dot_vox::scene::Frame::orientation`); we extract via `to_indices`
-            // — but the crate's surface is not stable across patch versions, so
-            // we reparse from the raw `_r` attribute below if present.
-            // (Fallback path — kept for resilience.)
-            let _ = r;
-            Rot3::IDENTITY
-        })
-        .unwrap_or(Rot3::IDENTITY);
-    // Direct raw-string parse of `_r` so the integer matrix matches C#
-    // `TransformFrame.Read` bit-for-bit (`MagicaVoxel.cs:127-146`).
     let rot = if let Some(raw) = frame.attributes.get("_r") {
-        raw.parse::<u8>()
-            .map(Rot3::from_byte)
-            .unwrap_or(rot)
+        raw.parse::<u8>().map(Rot3::from_byte).unwrap_or(Rot3::IDENTITY)
     } else {
-        rot
+        Rot3::IDENTITY
     };
     let t = frame
         .position()
@@ -400,167 +347,10 @@ fn frame_to_xform(frame: &dot_vox::Frame) -> Xform {
     Xform { rot, t }
 }
 
-/// Walk the scene graph and produce a [`DenseVolume`] covering every visible
-/// voxel, with the C# coordinate convention applied (Z↔Y swap, see
-/// `02a-design-vox-loading.md` Decision 5).
-///
-/// Two-pass: pass 1 accumulates the world AABB by composing `nTRN`
-/// transforms; pass 2 collates every shape's voxels under the composed
-/// transform into a `DenseVolume` sized to the AABB. Mirrors C#
-/// `MagicaVoxel.GetWorldAABB` + `MagicaVoxel.CollateVoxelData`
-/// (`MagicaVoxel.cs:651-755`).
-///
-/// The `03a-followup` lifted the original Decision-6 "identity-only first
-/// cut" — real `.vox` files (e.g. Oasis_Hard_Cover.vox, 291 models, 452
-/// nSHP references) require composition.
-fn flatten_scene(data: &dot_vox::DotVoxData) -> Result<DenseVolume, VoxImportError> {
-    if data.models.is_empty() {
-        return Err(VoxImportError::Empty);
-    }
+// ============================================================================
+// Pass 1 — world AABB accumulation (UNCHANGED from 03a-followup).
+// ============================================================================
 
-    // --- Older-version fallback: no scene graph -------------------------------
-    //
-    // Mirrors C# `MagicaVoxel.cs:687`: `else { return Models[0]; }`. The
-    // single model goes through the legacy (centered-at-origin) path — no
-    // transform composition needed.
-    if data.scenes.is_empty() {
-        let model = &data.models[0];
-        let mv_size = [model.size.x, model.size.y, model.size.z];
-        let (size_in_chunks, voxels_per_axis) = sizes_from_mv(mv_size)?;
-        let mut volume = DenseVolume::empty(size_in_chunks);
-        for v in &model.voxels {
-            let (nx, ny, nz) = (v.x as u32, v.z as u32, v.y as u32);
-            if nx >= voxels_per_axis[0] || ny >= voxels_per_axis[1] || nz >= voxels_per_axis[2] {
-                continue;
-            }
-            volume.set([nx, ny, nz], VoxelTypeId(v.i as u16 + 1));
-        }
-        return Ok(volume);
-    }
-
-    // --- Pass 1 — compute the world AABB in MagicaVoxel coords ---------------
-    //
-    // We start from `Nodes[0]` (the root, always an `nTRN`) under identity and
-    // descend, composing rotations + translations. For each shape we hit, we
-    // take the model's local AABB (`-size/2` ⇢ `size/2 - 1` after the C#
-    // centered-coords convention at `BoundsXYZ.cs:19-24` /
-    // `MagicaVoxel.cs:738`), transform all 8 corners by the composed matrix,
-    // and union into the world AABB.
-    let mut visited = vec![false; data.scenes.len()];
-    let mut world_min = [i32::MAX; 3];
-    let mut world_max = [i32::MIN; 3];
-    accumulate_world_aabb(
-        data,
-        0,
-        Xform::IDENTITY,
-        &mut visited,
-        &mut world_min,
-        &mut world_max,
-    );
-    if world_min[0] == i32::MAX {
-        // Scene graph walked but no visible shapes — fall back to models[0]
-        // so we still produce something renderable. Mirrors the C# fallback
-        // at `:687` (different trigger, same effect).
-        let model = &data.models[0];
-        let mv_size = [model.size.x, model.size.y, model.size.z];
-        let (size_in_chunks, voxels_per_axis) = sizes_from_mv(mv_size)?;
-        let mut volume = DenseVolume::empty(size_in_chunks);
-        for v in &model.voxels {
-            let (nx, ny, nz) = (v.x as u32, v.z as u32, v.y as u32);
-            if nx >= voxels_per_axis[0] || ny >= voxels_per_axis[1] || nz >= voxels_per_axis[2] {
-                continue;
-            }
-            volume.set([nx, ny, nz], VoxelTypeId(v.i as u16 + 1));
-        }
-        return Ok(volume);
-    }
-
-    // --- AABB → chunks/voxels sizing -----------------------------------------
-    //
-    // World extents are inclusive in C# (`BoundsXYZ.Size = max - min + 1`).
-    // We swap Z↔Y to convert MagicaVoxel (Z-up) → NAADF (Y-up) — matches
-    // C# `ModelData.cs:386`.
-    let world_size = [
-        (world_max[0] - world_min[0] + 1) as u32,
-        (world_max[1] - world_min[1] + 1) as u32,
-        (world_max[2] - world_min[2] + 1) as u32,
-    ];
-    let mv_size = world_size;
-    let (size_in_chunks, voxels_per_axis) = sizes_from_mv(mv_size)?;
-
-    // --- Pass 2 — collate voxels under composed transforms -------------------
-    //
-    // Every shape's local voxels are centered around the model's center
-    // (`var origin = new BoundsXYZ(model.Size).Min;` = `-size/2`,
-    // `MagicaVoxel.cs:738` + `BoundsXYZ.cs:22`). We apply that shift to each
-    // local voxel position, run the composed transform, then translate by
-    // `-world_min` so the result lands in the non-negative
-    // `[0..world_size)` range — exactly what C# `Flatten` does at
-    // `MagicaVoxel.cs:667` (`Matrix4x4.CreateTranslation(-worldBounds.Min.ToVector3())`
-    // gets folded into the initial parent matrix).
-    let mut volume = DenseVolume::empty(size_in_chunks);
-    let mut visited = vec![false; data.scenes.len()];
-    collate_voxels(
-        data,
-        0,
-        Xform::IDENTITY,
-        &mut visited,
-        world_min,
-        &mut volume,
-        voxels_per_axis,
-    );
-
-    Ok(volume)
-}
-
-/// Round `voxels` up to a whole-chunk count (`CHUNK_DIM_VOXELS = 16`).
-fn round_up_to_chunks(voxels: u32) -> u32 {
-    voxels.div_ceil(16).max(1)
-}
-
-/// Convert a MagicaVoxel-space `[x, y, z]` size (Z-up) into a chunks-per-axis
-/// + voxels-per-axis pair in NAADF-space (Y-up). Applies the Z↔Y swap and the
-/// soft-cap pre-flight checks (`MAX_CHUNKS_PER_AXIS`, `MAX_DENSE_BYTES`).
-fn sizes_from_mv(mv_size: [u32; 3]) -> Result<([u32; 3], [u32; 3]), VoxImportError> {
-    if mv_size == [0, 0, 0] {
-        return Err(VoxImportError::Empty);
-    }
-    // Z↔Y swap (`ModelData.cs:386`).
-    let naadf_size = [mv_size[0], mv_size[2], mv_size[1]];
-    let size_in_chunks = [
-        round_up_to_chunks(naadf_size[0]),
-        round_up_to_chunks(naadf_size[1]),
-        round_up_to_chunks(naadf_size[2]),
-    ];
-    if size_in_chunks[0] > MAX_CHUNKS_PER_AXIS
-        || size_in_chunks[1] > MAX_CHUNKS_PER_AXIS
-        || size_in_chunks[2] > MAX_CHUNKS_PER_AXIS
-    {
-        return Err(VoxImportError::SizeExceedsTextureLimit {
-            dim: size_in_chunks,
-            limit: MAX_CHUNKS_PER_AXIS,
-        });
-    }
-    let voxels_per_axis = [
-        size_in_chunks[0] * 16,
-        size_in_chunks[1] * 16,
-        size_in_chunks[2] * 16,
-    ];
-    let total_voxels =
-        voxels_per_axis[0] as u64 * voxels_per_axis[1] as u64 * voxels_per_axis[2] as u64;
-    let total_bytes = total_voxels.saturating_mul(2);
-    if total_bytes > MAX_DENSE_BYTES {
-        return Err(VoxImportError::SizeExceedsBudget {
-            dim: voxels_per_axis,
-            bytes: MAX_DENSE_BYTES,
-        });
-    }
-    Ok((size_in_chunks, voxels_per_axis))
-}
-
-/// Pass 1 of [`flatten_scene`] — walk the scene graph and union every visible
-/// shape's transformed AABB into `world_min` / `world_max`. Mirrors C#
-/// `MagicaVoxel.GetWorldAABB` at `MagicaVoxel.cs:651-716`.
 fn accumulate_world_aabb(
     data: &dot_vox::DotVoxData,
     node_id: u32,
@@ -576,26 +366,15 @@ fn accumulate_world_aabb(
     visited[idx] = true;
     match &data.scenes[idx] {
         dot_vox::SceneNode::Transform { frames, child, .. } => {
-            // Take frame 0 (animation handled by frame interpolation in C#
-            // — we collapse to frame 0 since NAADF imports a static snapshot
-            // per `ModelData.ImportFromVox`).
             let frame_xform = frames
                 .first()
                 .map(frame_to_xform)
                 .unwrap_or(Xform::IDENTITY);
-            // `newMatrix = transform.GetFrameMatrix(frameIndex) * parentMatrix`
-            // (`MagicaVoxel.cs:694`) — our `parent_of` mirrors the effect:
-            // applying the new matrix to a point first applies the local
-            // frame transform, then the parent.
             let new_xform = frame_xform.parent_of(&parent);
             accumulate_world_aabb(data, *child, new_xform, visited, world_min, world_max);
         }
         dot_vox::SceneNode::Group { children, .. } => {
             for &c in children {
-                // Reset visited for a fresh subtree walk — siblings may share
-                // children in pathological encodings; rely on the iteration
-                // bound (`visited.len()`) and the cycle-safety check at the
-                // top of this fn.
                 accumulate_world_aabb(data, c, parent, visited, world_min, world_max);
             }
         }
@@ -604,8 +383,6 @@ fn accumulate_world_aabb(
                 let Some(model) = data.models.get(sm.model_id as usize) else {
                     continue;
                 };
-                // Local AABB is centered (`BoundsXYZ(size).Min = -size/2`,
-                // `BoundsXYZ.cs:22`); transform all 8 corners and union.
                 let s = [
                     model.size.x as i32,
                     model.size.y as i32,
@@ -638,19 +415,62 @@ fn accumulate_world_aabb(
     }
 }
 
-/// Pass 2 of [`flatten_scene`] — walk the scene graph and write every shape's
-/// transformed voxels into `volume`. Mirrors C# `MagicaVoxel.CollateVoxelData`
-/// at `MagicaVoxel.cs:718-755`. World-space results are shifted by `-world_min`
-/// to land in `[0..world_size)`, then Z↔Y-swapped on write into the NAADF
-/// `DenseVolume`.
-fn collate_voxels(
+// ============================================================================
+// Pass 2 — sparse voxel emission into per-chunk buckets (NEW; replaces v1's
+// `collate_voxels` that wrote into `DenseVolume::set`).
+// ============================================================================
+
+/// Per-pass-2 sparse accumulator. One `Vec<(local_idx_in_chunk, ty)>` per
+/// chunk; `None` until the chunk receives its first voxel.
+///
+/// **Host RAM peak ≈ Σ non-empty voxels × ~6–8 bytes** — for Oasis at ~1%
+/// density of a 5952×2176×5376-voxel world, ~7M non-empty × ~6 B ≈ 50 MiB.
+/// Vs. dense: ~140 GiB.
+struct ChunkBuckets {
+    size_in_chunks: [u32; 3],
+    /// One bucket per chunk; `None` until first push.
+    /// `local_idx_in_chunk` = `vx + vy*16 + vz*256` (vx,vy,vz ∈ [0..16)).
+    chunks: Vec<Option<Vec<(u16, VoxelTypeId)>>>,
+}
+
+impl ChunkBuckets {
+    fn new(size_in_chunks: [u32; 3]) -> Self {
+        let n = (size_in_chunks[0] as usize)
+            * (size_in_chunks[1] as usize)
+            * (size_in_chunks[2] as usize);
+        Self {
+            size_in_chunks,
+            chunks: (0..n).map(|_| None).collect(),
+        }
+    }
+
+    /// Push a single voxel at `[nx, ny, nz]` (post-Z↔Y-swap NAADF coords)
+    /// with type `ty` into the per-chunk bucket. Allocates the chunk's
+    /// bucket lazily.
+    fn push(&mut self, naadf_pos: [u32; 3], ty: VoxelTypeId) {
+        let cx = naadf_pos[0] / CHUNK_DIM_VOXELS;
+        let cy = naadf_pos[1] / CHUNK_DIM_VOXELS;
+        let cz = naadf_pos[2] / CHUNK_DIM_VOXELS;
+        let sx = self.size_in_chunks[0];
+        let sy = self.size_in_chunks[1];
+        let ci = (cx + cy * sx + cz * sx * sy) as usize;
+        let lx = (naadf_pos[0] % CHUNK_DIM_VOXELS) as u16;
+        let ly = (naadf_pos[1] % CHUNK_DIM_VOXELS) as u16;
+        let lz = (naadf_pos[2] % CHUNK_DIM_VOXELS) as u16;
+        let local = lx + ly * (CHUNK_DIM_VOXELS as u16) + lz * (CHUNK_DIM_VOXELS as u16 * CHUNK_DIM_VOXELS as u16);
+        self.chunks[ci].get_or_insert_with(Vec::new).push((local, ty));
+    }
+}
+
+/// Walk the scene graph and emit voxels into `ChunkBuckets`. Mirrors C#
+/// `MagicaVoxel.CollateVoxelData` at `MagicaVoxel.cs:718-755`.
+fn collate_voxels_sparse(
     data: &dot_vox::DotVoxData,
     node_id: u32,
     parent: Xform,
     visited: &mut [bool],
     world_min: [i32; 3],
-    volume: &mut DenseVolume,
-    voxels_per_axis: [u32; 3],
+    buckets: &mut ChunkBuckets,
 ) {
     let idx = node_id as usize;
     if idx >= visited.len() || visited[idx] {
@@ -664,27 +484,11 @@ fn collate_voxels(
                 .map(frame_to_xform)
                 .unwrap_or(Xform::IDENTITY);
             let new_xform = frame_xform.parent_of(&parent);
-            collate_voxels(
-                data,
-                *child,
-                new_xform,
-                visited,
-                world_min,
-                volume,
-                voxels_per_axis,
-            );
+            collate_voxels_sparse(data, *child, new_xform, visited, world_min, buckets);
         }
         dot_vox::SceneNode::Group { children, .. } => {
             for &c in children {
-                collate_voxels(
-                    data,
-                    c,
-                    parent,
-                    visited,
-                    world_min,
-                    volume,
-                    voxels_per_axis,
-                );
+                collate_voxels_sparse(data, c, parent, visited, world_min, buckets);
             }
         }
         dot_vox::SceneNode::Shape { models, .. } => {
@@ -697,8 +501,7 @@ fn collate_voxels(
                     model.size.y as i32,
                     model.size.z as i32,
                 ];
-                // Origin shift to match C# `MagicaVoxel.cs:738`:
-                // `var origin = new BoundsXYZ(model.Size).Min;` = -size/2.
+                // Centered local origin (MagicaVoxel.cs:738 + BoundsXYZ.cs:22).
                 let origin = [-s[0] / 2, -s[1] / 2, -s[2] / 2];
                 for v in &model.voxels {
                     let local = [v.x as i32, v.y as i32, v.z as i32];
@@ -708,7 +511,6 @@ fn collate_voxels(
                         local[2] + origin[2],
                     ];
                     let world = parent.apply(centered);
-                    // Shift into [0..world_size) so all coords are non-negative.
                     let shifted = [
                         world[0] - world_min[0],
                         world[1] - world_min[1],
@@ -717,65 +519,364 @@ fn collate_voxels(
                     if shifted[0] < 0 || shifted[1] < 0 || shifted[2] < 0 {
                         continue;
                     }
-                    // Z↔Y swap to NAADF coords (`ModelData.cs:438`):
-                    // `dataImport[new Voxels.XYZ(voxelPos.X, voxelPos.Z, voxelPos.Y)]`
-                    // — MagicaVoxel (x, y, z) → NAADF (x, z, y).
+                    // Z↔Y swap to NAADF coords (`ModelData.cs:438`).
                     let nx = shifted[0] as u32;
                     let ny = shifted[2] as u32;
                     let nz = shifted[1] as u32;
-                    if nx >= voxels_per_axis[0]
-                        || ny >= voxels_per_axis[1]
-                        || nz >= voxels_per_axis[2]
-                    {
+                    let max_x = buckets.size_in_chunks[0] * CHUNK_DIM_VOXELS;
+                    let max_y = buckets.size_in_chunks[1] * CHUNK_DIM_VOXELS;
+                    let max_z = buckets.size_in_chunks[2] * CHUNK_DIM_VOXELS;
+                    if nx >= max_x || ny >= max_y || nz >= max_z {
                         continue;
                     }
                     let ty = VoxelTypeId(v.i as u16 + 1);
-                    volume.set([nx, ny, nz], ty);
+                    buckets.push([nx, ny, nz], ty);
                 }
             }
         }
     }
 }
 
+// ============================================================================
+// Pass-2 driver: scene-graph walk → ChunkBuckets.
+// ============================================================================
+
+/// Validate `size_in_chunks` against [`MAX_CHUNKS_PER_AXIS`].
+fn validate_caps(size_in_chunks: [u32; 3]) -> Result<(), VoxImportError> {
+    if size_in_chunks[0] > MAX_CHUNKS_PER_AXIS
+        || size_in_chunks[1] > MAX_CHUNKS_PER_AXIS
+        || size_in_chunks[2] > MAX_CHUNKS_PER_AXIS
+    {
+        return Err(VoxImportError::SizeExceedsTextureLimit {
+            dim: size_in_chunks,
+            limit: MAX_CHUNKS_PER_AXIS,
+        });
+    }
+    Ok(())
+}
+
+/// Compose `data` to a sparse [`ChunkBuckets`] + return the
+/// chunks-per-axis dimensions.
+///
+/// Handles both:
+/// - **No-scene-graph fallback** (`data.scenes.is_empty()`): single model
+///   path; no transforms, just a Z↔Y swap.
+/// - **Scene-graph composition** (general case): two-pass walk over the
+///   scene graph, exactly as v1 did but with the pass-2 target swapped from
+///   `DenseVolume` to `ChunkBuckets`.
+fn compose_to_sparse_world(
+    data: &dot_vox::DotVoxData,
+) -> Result<(ChunkBuckets, [u32; 3]), VoxImportError> {
+    // No-scene-graph fallback — collapse to models[0].
+    if data.scenes.is_empty() {
+        return compose_models0_fallback(data);
+    }
+
+    // Pass 1 — world AABB.
+    let mut visited = vec![false; data.scenes.len()];
+    let mut world_min = [i32::MAX; 3];
+    let mut world_max = [i32::MIN; 3];
+    accumulate_world_aabb(
+        data,
+        0,
+        Xform::IDENTITY,
+        &mut visited,
+        &mut world_min,
+        &mut world_max,
+    );
+    if world_min[0] == i32::MAX {
+        // Scene graph walked but no visible shapes — same recovery as v1.
+        return compose_models0_fallback(data);
+    }
+
+    let mv_size = [
+        (world_max[0] - world_min[0] + 1) as u32,
+        (world_max[1] - world_min[1] + 1) as u32,
+        (world_max[2] - world_min[2] + 1) as u32,
+    ];
+    // Z↔Y swap: MagicaVoxel (x, y, z) → NAADF (x, z, y).
+    let naadf_size = [mv_size[0], mv_size[2], mv_size[1]];
+    let size_in_chunks = [
+        naadf_size[0].div_ceil(CHUNK_DIM_VOXELS).max(1),
+        naadf_size[1].div_ceil(CHUNK_DIM_VOXELS).max(1),
+        naadf_size[2].div_ceil(CHUNK_DIM_VOXELS).max(1),
+    ];
+    validate_caps(size_in_chunks)?;
+
+    // Pass 2 — emit voxels into per-chunk sparse buckets.
+    let mut buckets = ChunkBuckets::new(size_in_chunks);
+    let mut visited = vec![false; data.scenes.len()];
+    collate_voxels_sparse(
+        data,
+        0,
+        Xform::IDENTITY,
+        &mut visited,
+        world_min,
+        &mut buckets,
+    );
+
+    Ok((buckets, size_in_chunks))
+}
+
+/// "No scene graph" — single-model fallback. Uses `models[0]` directly with
+/// no transforms (just the Z↔Y swap on the way in).
+fn compose_models0_fallback(
+    data: &dot_vox::DotVoxData,
+) -> Result<(ChunkBuckets, [u32; 3]), VoxImportError> {
+    let model = &data.models[0];
+    let mv_size = [model.size.x, model.size.y, model.size.z];
+    if mv_size == [0, 0, 0] {
+        return Err(VoxImportError::Empty);
+    }
+    let naadf_size = [mv_size[0], mv_size[2], mv_size[1]];
+    let size_in_chunks = [
+        naadf_size[0].div_ceil(CHUNK_DIM_VOXELS).max(1),
+        naadf_size[1].div_ceil(CHUNK_DIM_VOXELS).max(1),
+        naadf_size[2].div_ceil(CHUNK_DIM_VOXELS).max(1),
+    ];
+    validate_caps(size_in_chunks)?;
+
+    let max_x = size_in_chunks[0] * CHUNK_DIM_VOXELS;
+    let max_y = size_in_chunks[1] * CHUNK_DIM_VOXELS;
+    let max_z = size_in_chunks[2] * CHUNK_DIM_VOXELS;
+
+    let mut buckets = ChunkBuckets::new(size_in_chunks);
+    for v in &model.voxels {
+        // Z↔Y swap, no translation.
+        let nx = v.x as u32;
+        let ny = v.z as u32;
+        let nz = v.y as u32;
+        if nx >= max_x || ny >= max_y || nz >= max_z {
+            continue;
+        }
+        buckets.push([nx, ny, nz], VoxelTypeId(v.i as u16 + 1));
+    }
+    Ok((buckets, size_in_chunks))
+}
+
+// ============================================================================
+// `ChunkBuckets` → `ConstructedWorld` (Δ-AADF: per-chunk inline AADF build,
+// then one global chunk-layer AADF pass).
+// ============================================================================
+
+/// Build a [`ConstructedWorld`] from per-chunk sparse buckets. Byte-equivalent
+/// to what `aadf::construct::construct(&DenseVolume)` would produce on the
+/// same input (Test #15 — `sparse_walk_matches_dense_construct_on_small_fixture`).
+fn build_constructed_world_sparse(
+    buckets: ChunkBuckets,
+) -> Result<ConstructedWorld, VoxImportError> {
+    let cx_u = buckets.size_in_chunks[0] as usize;
+    let cy_u = buckets.size_in_chunks[1] as usize;
+    let cz_u = buckets.size_in_chunks[2] as usize;
+    let n_chunks = cx_u * cy_u * cz_u;
+
+    // Output buffers. `chunks_cpu` is exactly sized; `blocks_cpu` /
+    // `voxels_cpu` grow as non-empty chunks/blocks are encoded.
+    let mut chunks_cpu: Vec<u32> = vec![0; n_chunks];
+    let mut blocks_cpu: Vec<u32> = Vec::new();
+    let mut voxels_cpu: Vec<u32> = Vec::new();
+
+    // Δ-Hash — Block dedup keyed on the literal 64-voxel content. Same shape
+    // (and same map type) as `aadf::construct::construct` uses at
+    // `aadf/construct.rs:142` so the sparse path's output is byte-equal to
+    // the dense path's on the same input (Test #15 enforces this).
+    let mut block_dedup: HashMap<[VoxelTypeId; CELL_CHILDREN], VoxelPtr> = HashMap::new();
+
+    let mut chunk_class: Vec<ChunkClass> = vec![ChunkClass::Empty; n_chunks];
+    // For mixed chunks we remember the 64 `BlockClass`es so we can run
+    // `encode_chunk_blocks` once in phase 2 (after all per-block AADFs are
+    // baked into `voxels_cpu`). `None` for empty / uniform-full chunks.
+    let mut chunk_block_arrays: Vec<Option<[BlockClass; CELL_CHILDREN]>> = vec![None; n_chunks];
+
+    // The C# walk-order is `cz, cy, cx` outermost (`ModelData.cs:418-499`);
+    // the existing dense `construct()` walks `bz_i, by_i, bx_i` (blocks)
+    // then `cz_i, cy_i, cx_i` (chunks) at `aadf/construct.rs:147-188`. We
+    // walk chunks-then-blocks-within-chunks in the SAME order as the dense
+    // path's block walk (z-outer, y-mid, x-inner across the whole world)
+    // so the dedup-miss-ordering matches construct()'s. See the byte-equal
+    // test that enforces this.
+    //
+    // Specifically: construct() walks all 64 blocks of chunk 0 first
+    // (block-z-major, block-y-mid, block-x-inner WITHIN the world's full
+    // block layer), in the *world's* block coordinate order — which is the
+    // same as walking all blocks-of-chunk-0, then chunk-1, ...if chunks are
+    // walked in z-major order. The orders coincide here because both walks
+    // bottom up.
+    for cz_i in 0..cz_u {
+        for cy_i in 0..cy_u {
+            for cx_i in 0..cx_u {
+                let ci = cx_i + cy_i * cx_u + cz_i * cx_u * cy_u;
+                let Some(bucket) = buckets.chunks[ci].as_ref() else {
+                    continue;
+                };
+                // 1. Replay bucket into a transient 16³ dense chunk_voxels
+                //    array (8 KiB; discarded at end-of-iteration).
+                //    last-write-wins matches C# `dataImport[q] = v`
+                //    (CollateVoxelData:747).
+                let mut chunk_voxels = [VoxelTypeId::EMPTY; 16 * 16 * 16];
+                for &(local, ty) in bucket {
+                    chunk_voxels[local as usize] = ty;
+                }
+                // 2. Classify the chunk.
+                if chunk_voxels.iter().all(|t| *t == VoxelTypeId::EMPTY) {
+                    // Defensive — should be unreachable, push() filtered
+                    // OOB pushes, so a non-None bucket has ≥1 entry. Keep
+                    // chunk_class[ci] = Empty.
+                    continue;
+                }
+                let first = chunk_voxels[0];
+                let uniform = chunk_voxels.iter().all(|t| *t == first);
+                if uniform && first != VoxelTypeId::EMPTY {
+                    chunk_class[ci] = ChunkClass::UniformFull(first);
+                    continue;
+                }
+                // 3. Mixed chunk — classify 64 blocks; dedup + append
+                //    mixed-block voxels.
+                let mut blocks_in_chunk = [BlockClass::Empty; CELL_CHILDREN];
+                // Walk blocks in the same (lx_block, ly_block, lz_block) order
+                // as construct() — bz outer, by mid, bx inner — to keep the
+                // dedup-miss-ordering identical.
+                for bz in 0..CELL_DIM {
+                    for by in 0..CELL_DIM {
+                        for bx in 0..CELL_DIM {
+                            let b_local = bx + by * CELL_DIM + bz * CELL_DIM * CELL_DIM;
+                            // Gather the 64 voxels of this block from
+                            // chunk_voxels.
+                            let mut block_voxels = [VoxelTypeId::EMPTY; CELL_CHILDREN];
+                            for lz in 0..CELL_DIM {
+                                for ly in 0..CELL_DIM {
+                                    for lx in 0..CELL_DIM {
+                                        // chunk_local index — x-fastest.
+                                        let cx_local = bx * CELL_DIM + lx;
+                                        let cy_local = by * CELL_DIM + ly;
+                                        let cz_local = bz * CELL_DIM + lz;
+                                        let chunk_local =
+                                            cx_local + cy_local * 16 + cz_local * 256;
+                                        let block_local =
+                                            lx + ly * CELL_DIM + lz * CELL_DIM * CELL_DIM;
+                                        block_voxels[block_local] = chunk_voxels[chunk_local];
+                                    }
+                                }
+                            }
+                            // Classify the block.
+                            if block_voxels.iter().all(|t| *t == VoxelTypeId::EMPTY) {
+                                blocks_in_chunk[b_local] = BlockClass::Empty;
+                            } else {
+                                let bf = block_voxels[0];
+                                if block_voxels.iter().all(|t| *t == bf) {
+                                    blocks_in_chunk[b_local] = BlockClass::UniformFull(bf);
+                                } else {
+                                    // Mixed — dedup, append + encode on miss.
+                                    let ptr = if let Some(&existing) =
+                                        block_dedup.get(&block_voxels)
+                                    {
+                                        existing
+                                    } else {
+                                        let new_ptr = VoxelPtr(voxels_cpu.len() as u32);
+                                        // Append 32 placeholder u32s; the
+                                        // call below will overwrite with
+                                        // the AADF-augmented encoding.
+                                        voxels_cpu
+                                            .resize(voxels_cpu.len() + CELL_CHILDREN / 2, 0);
+                                        block_dedup.insert(block_voxels, new_ptr);
+                                        encode_block_voxels(
+                                            &block_voxels,
+                                            new_ptr,
+                                            &mut voxels_cpu,
+                                        );
+                                        new_ptr
+                                    };
+                                    blocks_in_chunk[b_local] = BlockClass::Mixed(ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+                // 4. Reserve 64 consecutive `blocks_cpu` slots for this
+                //    chunk; populate in phase 2 once all chunks are
+                //    classified.
+                let block_base = BlockPtr(blocks_cpu.len() as u32);
+                blocks_cpu.resize(blocks_cpu.len() + CELL_CHILDREN, 0);
+                chunk_class[ci] = ChunkClass::Mixed(block_base);
+                chunk_block_arrays[ci] = Some(blocks_in_chunk);
+            }
+        }
+    }
+
+    // Phase 2 — encode each mixed chunk's 64 blocks (with block-layer AADFs)
+    // into the reserved `blocks_cpu` slots.
+    for ci in 0..n_chunks {
+        if let (ChunkClass::Mixed(base), Some(blocks_in_chunk)) =
+            (chunk_class[ci], chunk_block_arrays[ci])
+        {
+            encode_chunk_blocks(&blocks_in_chunk, base, &mut blocks_cpu);
+        }
+    }
+
+    // Phase 3 — world-chunk-layer AADFs. One global merge-form
+    // `compute_aadf_layer` over the chunks_per_axis³ extent (matches
+    // construct.rs:228-232).
+    let chunk_is_empty_at = |c: [i32; 3]| -> bool {
+        let idx = c[0] as usize + c[1] as usize * cx_u + c[2] as usize * cx_u * cy_u;
+        matches!(chunk_class[idx], ChunkClass::Empty)
+    };
+    let chunk_aadfs = compute_aadf_layer([cx_u, cy_u, cz_u], AADF_MAX_CHUNK, chunk_is_empty_at);
+
+    // Phase 4 — emit `chunks_cpu[i]` u32s.
+    for ci in 0..n_chunks {
+        let cell = match chunk_class[ci] {
+            ChunkClass::Empty => ChunkCell::Empty(chunk_aadfs[ci]),
+            ChunkClass::UniformFull(ty) => ChunkCell::UniformFull(ty),
+            ChunkClass::Mixed(ptr) => ChunkCell::Mixed(ptr),
+        };
+        chunks_cpu[ci] = cell.encode();
+    }
+
+    // Phase 5 — output buffer size pre-flight (catches pathological-density
+    // inputs).
+    let voxels_bytes = (voxels_cpu.len() * 4) as u64;
+    if voxels_bytes > MAX_VOXELS_BUFFER_BYTES {
+        return Err(VoxImportError::SizeExceedsBudget {
+            dim: [voxels_cpu.len() as u32, 0, 0],
+            bytes: MAX_VOXELS_BUFFER_BYTES,
+        });
+    }
+    let blocks_bytes = (blocks_cpu.len() * 4) as u64;
+    if blocks_bytes > MAX_BLOCKS_BUFFER_BYTES {
+        return Err(VoxImportError::SizeExceedsBudget {
+            dim: [blocks_cpu.len() as u32, 0, 0],
+            bytes: MAX_BLOCKS_BUFFER_BYTES,
+        });
+    }
+
+    Ok(ConstructedWorld {
+        chunks: chunks_cpu,
+        blocks: blocks_cpu,
+        voxels: voxels_cpu,
+        size_in_chunks: buckets.size_in_chunks,
+    })
+}
+
+// ============================================================================
+// Palette parse (UNCHANGED from v1).
+// ============================================================================
+
 /// Promote the 256-entry MagicaVoxel `RGBA` palette + `MATL` chunks into a
 /// `Vec<VoxelType>` of length `palette.len() + 1`. Index 0 is the reserved
 /// empty placeholder; indices 1..=N mirror the source palette entries.
 ///
-/// Mirrors C# `ModelData.cs:502-522`:
-/// ```text
-/// types = new VoxelType[dataImport.Colors.Length];
-/// for (int c = 0; c < dataImport.Colors.Length; c++) {
-///     colSRGB = (R, G, B) / 255;
-///     colorBase = pow(colSRGB, 2.2f);
-///     emission = mat.emit * pow(1 + mat.flux, 2) * 5;
-///     materialBase = (emission > 0) ? Emissive : Diffuse;
-///     colorLayered.X = emission;
-/// }
-/// ```
-///
-/// No K-means — that's `.vl32`'s pipeline, not `.vox`'s
-/// (`02a-design-vox-loading.md` Decision 2).
+/// Mirrors C# `ModelData.cs:502-522`.
 fn vox_palette_to_voxel_types(
     palette: &[dot_vox::Color],
     materials: &[dot_vox::Material],
 ) -> Vec<VoxelType> {
     let mut out = Vec::with_capacity(palette.len() + 1);
-    // Slot 0 — reserved empty placeholder (NAADF convention,
-    // `voxel/mod.rs:65-71`).
     out.push(VoxelType::default());
 
     for (i, color) in palette.iter().enumerate() {
-        // MagicaVoxel palette entries are sRGB; NAADF stores linear RGB.
-        // Gamma 2.2 matches C# `pow(colSRGB, 2.2f)` (`ModelData.cs:507`).
         let srgb = Vec3::new(color.r as f32, color.g as f32, color.b as f32) / 255.0;
         let linear = Vec3::new(srgb.x.powf(2.2), srgb.y.powf(2.2), srgb.z.powf(2.2));
 
-        // `dot_vox` ships one `Material` per palette index with
-        // `materials[k].id == k` (0-based, matching the in-memory `Voxel.i`
-        // index — see `dot_vox/src/lib.rs:96-115` placeholder test + the
-        // round-trip serializer in `dot_vox_data.rs:167-175`). Look up by id
-        // rather than by index — slightly more robust against re-ordered
-        // input (the spec doesn't promise order).
         let (emit, flux) = materials
             .iter()
             .find(|m| m.id as usize == i)
@@ -787,7 +888,6 @@ fn vox_palette_to_voxel_types(
             })
             .unwrap_or((0.0, 0.0));
 
-        // C# formula (`ModelData.cs:509`): `emission = emit * (1+flux)^2 * 5`.
         let emission = emit * (1.0 + flux).powi(2) * 5.0;
 
         let (material_base, color_layered) = if emission > 0.0 {
@@ -800,8 +900,6 @@ fn vox_palette_to_voxel_types(
             color_base: linear,
             material_base,
             material_layer: MaterialLayer::None,
-            // C# does not set roughness on this branch (`ModelData.cs:502-522`
-            // — only the K-means / vl32 path sets roughness).
             roughness: 1.0,
             color_layered,
         });
@@ -817,26 +915,94 @@ fn vox_palette_to_voxel_types(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aadf::cell::{BlockCell, VoxelCell};
+    use crate::aadf::construct::{construct, DenseVolume};
     use bevy::math::IVec3;
     use std::collections::HashMap as StdHashMap;
     use std::io::Cursor;
 
-    /// Build a tiny single-voxel `DotVoxData` in MagicaVoxel coords (1×1×1, one
-    /// voxel at (0,0,0), index 0).
+    // ------------------------------------------------------------------------
+    // Test helper — re-densify an `ImportedVox.world` into a flat
+    // `Vec<VoxelTypeId>` so the v1 voxel-position assertions still read.
+    //
+    // Walks `ChunkCell::decode → BlockCell::decode → VoxelCell::decode` to
+    // recover a per-voxel type at world position `[x, y, z]`. Pure read-side;
+    // no semantic duplication of `construct()`. Used only by tests.
+    // ------------------------------------------------------------------------
+
+    /// Decode the voxel at NAADF position `[x, y, z]` from an [`ImportedVox`].
+    /// Returns `VoxelTypeId::EMPTY` for empty cells.
+    fn decoded_voxel_at(world: &ConstructedWorld, p: [u32; 3]) -> VoxelTypeId {
+        let cx = p[0] / 16;
+        let cy = p[1] / 16;
+        let cz = p[2] / 16;
+        let lcx = p[0] % 16; // chunk-local voxel coord
+        let lcy = p[1] % 16;
+        let lcz = p[2] % 16;
+        let bx = lcx / 4; // block index within chunk
+        let by = lcy / 4;
+        let bz = lcz / 4;
+        let lbx = lcx % 4; // voxel index within block
+        let lby = lcy % 4;
+        let lbz = lcz % 4;
+        let s = world.size_in_chunks;
+        let ci = (cx + cy * s[0] + cz * s[0] * s[1]) as usize;
+        if ci >= world.chunks.len() {
+            return VoxelTypeId::EMPTY;
+        }
+        match ChunkCell::decode(world.chunks[ci]) {
+            ChunkCell::Empty(_) => VoxelTypeId::EMPTY,
+            ChunkCell::UniformFull(ty) => ty,
+            ChunkCell::Mixed(bp) => {
+                let block_idx = (bx + by * 4 + bz * 16) as usize;
+                let block_word = world.blocks[bp.0 as usize + block_idx];
+                match BlockCell::decode(block_word) {
+                    BlockCell::Empty(_) => VoxelTypeId::EMPTY,
+                    BlockCell::UniformFull(ty) => ty,
+                    BlockCell::Mixed(vp) => {
+                        let voxel_idx = (lbx + lby * 4 + lbz * 16) as usize;
+                        let pair = voxel_idx / 2;
+                        let lo = (world.voxels[vp.0 as usize + pair] & 0xFFFF) as u16;
+                        let hi = ((world.voxels[vp.0 as usize + pair] >> 16) & 0xFFFF) as u16;
+                        let half = if voxel_idx % 2 == 0 { lo } else { hi };
+                        match VoxelCell::decode(half) {
+                            VoxelCell::Empty(_) => VoxelTypeId::EMPTY,
+                            VoxelCell::Full(ty) => ty,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Count non-empty voxels by walking every world coord. Cheap enough for
+    /// the test fixtures (max ~64³ = 262K voxels).
+    fn count_nonempty(world: &ConstructedWorld) -> u32 {
+        let s = world.size_in_chunks;
+        let sx = s[0] * 16;
+        let sy = s[1] * 16;
+        let sz = s[2] * 16;
+        let mut n = 0u32;
+        for z in 0..sz {
+            for y in 0..sy {
+                for x in 0..sx {
+                    if decoded_voxel_at(world, [x, y, z]) != VoxelTypeId::EMPTY {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// Build a tiny single-voxel `DotVoxData` in MagicaVoxel coords.
     fn build_single_voxel() -> dot_vox::DotVoxData {
         dot_vox::DotVoxData {
             version: 150,
             index_map: dot_vox::DEFAULT_INDEX_MAP.to_vec(),
             models: vec![dot_vox::Model {
                 size: dot_vox::Size { x: 1, y: 1, z: 1 },
-                voxels: vec![dot_vox::Voxel {
-                    x: 0,
-                    y: 0,
-                    z: 0,
-                    // Use a non-zero palette slot so we can tell it apart from
-                    // the empty placeholder after the `+1` shift.
-                    i: 0,
-                }],
+                voxels: vec![dot_vox::Voxel { x: 0, y: 0, z: 0, i: 0 }],
             }],
             palette: dot_vox::DEFAULT_PALETTE.clone(),
             materials: default_materials(),
@@ -845,8 +1011,6 @@ mod tests {
         }
     }
 
-    /// Build a small 8×8×8 cube `DotVoxData` — a 7×7×7 solid cube of one
-    /// palette index, plus one emissive voxel at (3,3,3) of another index.
     fn build_small_cube() -> dot_vox::DotVoxData {
         let mut voxels = Vec::with_capacity(7 * 7 * 7 + 1);
         for z in 0..7u8 {
@@ -856,23 +1020,10 @@ mod tests {
                 }
             }
         }
-        // Replace the centre voxel with the emissive index (overwrites the
-        // diffuse one at (3,3,3)).
         voxels.retain(|v| !(v.x == 3 && v.y == 3 && v.z == 3));
-        voxels.push(dot_vox::Voxel {
-            x: 3,
-            y: 3,
-            z: 3,
-            i: 20,
-        });
+        voxels.push(dot_vox::Voxel { x: 3, y: 3, z: 3, i: 20 });
 
         let mut materials = default_materials();
-        // Make palette slot 20 emissive via the MagicaVoxel `_emit` attribute.
-        // `dot_vox::Material.id` is the 0-based palette index (see
-        // `dot_vox/src/lib.rs:96-115`), so `id == 20` matches palette slot 20
-        // — which voxels write as `Voxel.i == 20` and which `vox_palette_to_voxel_types`
-        // maps to `VoxelTypeId(21)` after the +1 shift for the empty
-        // placeholder.
         for m in &mut materials {
             if m.id == 20 {
                 m.properties.insert("_type".into(), "_emit".into());
@@ -895,9 +1046,6 @@ mod tests {
         }
     }
 
-    /// MagicaVoxel's defaults are diffuse with no `_emit` field. Build a
-    /// 256-entry one-per-palette-index materials list with the
-    /// `dot_vox`-default properties.
     fn default_materials() -> Vec<dot_vox::Material> {
         (0..256)
             .map(|i| dot_vox::Material {
@@ -911,8 +1059,6 @@ mod tests {
             .collect()
     }
 
-    /// Round-trip a `DotVoxData` through `write_vox` → `parse_vox_bytes` so the
-    /// binary parser path is exercised end-to-end.
     fn round_trip(data: &dot_vox::DotVoxData) -> ImportedVox {
         let mut buf = Vec::new();
         data.write_vox(&mut Cursor::new(&mut buf))
@@ -927,22 +1073,15 @@ mod tests {
         let data = build_single_voxel();
         let imp = round_trip(&data);
 
-        // Smallest cuboid covering one voxel → rounded up to 1×1×1 chunks.
-        assert_eq!(imp.volume.size_in_chunks, [1, 1, 1]);
-
-        // Palette has the placeholder at slot 0 + 256 default-palette entries.
+        assert_eq!(imp.world.size_in_chunks, [1, 1, 1]);
         assert_eq!(imp.palette.len(), 257);
         assert_eq!(imp.palette[0], VoxelType::default());
 
-        // The single voxel is at world origin (Z↔Y swap doesn't move (0,0,0)).
-        // `Voxel.i == 0` → `VoxelTypeId(1)` after the `+1` shift.
-        assert_eq!(imp.volume.voxel_at([0, 0, 0]), VoxelTypeId(1));
-
-        // Everywhere else inside the chunk is empty.
-        assert_eq!(imp.volume.voxel_at([1, 0, 0]), VoxelTypeId::EMPTY);
-        assert_eq!(imp.volume.voxel_at([0, 1, 0]), VoxelTypeId::EMPTY);
-        assert_eq!(imp.volume.voxel_at([0, 0, 1]), VoxelTypeId::EMPTY);
-        assert_eq!(imp.volume.voxel_at([8, 8, 8]), VoxelTypeId::EMPTY);
+        assert_eq!(decoded_voxel_at(&imp.world, [0, 0, 0]), VoxelTypeId(1));
+        assert_eq!(decoded_voxel_at(&imp.world, [1, 0, 0]), VoxelTypeId::EMPTY);
+        assert_eq!(decoded_voxel_at(&imp.world, [0, 1, 0]), VoxelTypeId::EMPTY);
+        assert_eq!(decoded_voxel_at(&imp.world, [0, 0, 1]), VoxelTypeId::EMPTY);
+        assert_eq!(decoded_voxel_at(&imp.world, [8, 8, 8]), VoxelTypeId::EMPTY);
     }
 
     // -- Test 2 --------------------------------------------------------------
@@ -952,38 +1091,17 @@ mod tests {
         let data = build_small_cube();
         let imp = round_trip(&data);
 
-        // 8 voxels per axis → rounded up to 1×1×1 chunks (16 voxels/chunk axis).
-        assert_eq!(imp.volume.size_in_chunks, [1, 1, 1]);
+        assert_eq!(imp.world.size_in_chunks, [1, 1, 1]);
 
-        // Count the non-empty voxels: 7³ - 1 diffuse (one centre slot is taken
-        // by the emissive replacement) + 1 emissive = 7³ = 343 total.
-        let total_nonempty: u32 = imp
-            .volume
-            .voxels
-            .iter()
-            .filter(|t| **t != VoxelTypeId::EMPTY)
-            .count() as u32;
-        assert_eq!(total_nonempty, 343);
+        // 7³ non-empty voxels (one replaced with emissive, but still non-empty).
+        assert_eq!(count_nonempty(&imp.world), 343);
 
-        // The centre voxel is the emissive one (palette index 20 → VoxelTypeId(21)).
-        assert_eq!(imp.volume.voxel_at([3, 3, 3]), VoxelTypeId(21));
-        // A non-centre voxel inside the cube is the diffuse one
-        // (palette index 10 → VoxelTypeId(11)).
-        assert_eq!(imp.volume.voxel_at([0, 0, 0]), VoxelTypeId(11));
-        assert_eq!(imp.volume.voxel_at([6, 6, 6]), VoxelTypeId(11));
+        assert_eq!(decoded_voxel_at(&imp.world, [3, 3, 3]), VoxelTypeId(21));
+        assert_eq!(decoded_voxel_at(&imp.world, [0, 0, 0]), VoxelTypeId(11));
+        assert_eq!(decoded_voxel_at(&imp.world, [6, 6, 6]), VoxelTypeId(11));
 
-        // The palette entry at slot 21 (the emissive material) must have
-        // MaterialBase::Emissive set (C# `_emit > 0` → Emissive branch).
-        assert_eq!(
-            imp.palette[21].material_base,
-            MaterialBase::Emissive,
-            "palette slot 21 must be Emissive after _emit > 0 mapping"
-        );
-        assert!(
-            imp.palette[21].color_layered.x > 0.0,
-            "Emissive intensity must be nonzero in color_layered.x"
-        );
-        // The diffuse palette entry stays Diffuse.
+        assert_eq!(imp.palette[21].material_base, MaterialBase::Emissive);
+        assert!(imp.palette[21].color_layered.x > 0.0);
         assert_eq!(imp.palette[11].material_base, MaterialBase::Diffuse);
     }
 
@@ -1000,10 +1118,6 @@ mod tests {
 
     #[test]
     fn palette_emissive_from_matl() {
-        // Build a `DotVoxData` (no fixture file) with one Material whose
-        // `_emit` is 1.0 at palette slot 5 (`dot_vox::Material.id == 5` —
-        // 0-based, matches the in-memory palette index per
-        // `dot_vox/src/lib.rs:96-115`).
         let mut materials = default_materials();
         for m in &mut materials {
             if m.id == 5 {
@@ -1017,12 +1131,7 @@ mod tests {
             index_map: dot_vox::DEFAULT_INDEX_MAP.to_vec(),
             models: vec![dot_vox::Model {
                 size: dot_vox::Size { x: 1, y: 1, z: 1 },
-                voxels: vec![dot_vox::Voxel {
-                    x: 0,
-                    y: 0,
-                    z: 0,
-                    i: 5,
-                }],
+                voxels: vec![dot_vox::Voxel { x: 0, y: 0, z: 0, i: 5 }],
             }],
             palette: dot_vox::DEFAULT_PALETTE.clone(),
             materials,
@@ -1030,14 +1139,8 @@ mod tests {
             layers: Vec::new(),
         };
         let imp = parse_dot_vox_data(&data).unwrap();
-        // Palette index 5 → VoxelTypeId(6) because we shift by +1 for the
-        // empty placeholder at slot 0.
         assert_eq!(imp.palette[6].material_base, MaterialBase::Emissive);
-        assert!(
-            imp.palette[6].color_layered.x > 0.0,
-            "Emissive intensity must be > 0 in color_layered.x"
-        );
-        // Sanity: emission = _emit * (1 + _flux)^2 * 5 = 1 * 1 * 5 = 5.0.
+        assert!(imp.palette[6].color_layered.x > 0.0);
         assert!((imp.palette[6].color_layered.x - 5.0).abs() < 1e-4);
     }
 
@@ -1045,22 +1148,12 @@ mod tests {
 
     #[test]
     fn zy_swap_matches_csharp() {
-        // One voxel at (x=1, y=2, z=3) in MagicaVoxel coords → after Z↔Y swap
-        // we should find it at NAADF coords (1, 3, 2). The C# import does the
-        // same at `ModelData.cs:386` + `:438`.
         let data = dot_vox::DotVoxData {
             version: 150,
             index_map: dot_vox::DEFAULT_INDEX_MAP.to_vec(),
             models: vec![dot_vox::Model {
-                // Size large enough to hold (1,2,3) — but make the bounds tight
-                // so we can also verify the size swap.
                 size: dot_vox::Size { x: 2, y: 3, z: 4 },
-                voxels: vec![dot_vox::Voxel {
-                    x: 1,
-                    y: 2,
-                    z: 3,
-                    i: 0,
-                }],
+                voxels: vec![dot_vox::Voxel { x: 1, y: 2, z: 3, i: 0 }],
             }],
             palette: dot_vox::DEFAULT_PALETTE.clone(),
             materials: default_materials(),
@@ -1068,18 +1161,15 @@ mod tests {
             layers: Vec::new(),
         };
         let imp = parse_dot_vox_data(&data).unwrap();
-        // The MagicaVoxel (1, 2, 3) voxel must land at NAADF (1, 3, 2).
-        assert_eq!(imp.volume.voxel_at([1, 3, 2]), VoxelTypeId(1));
-        // The naive same-coord lookup must be empty.
-        assert_eq!(imp.volume.voxel_at([1, 2, 3]), VoxelTypeId::EMPTY);
+        assert_eq!(decoded_voxel_at(&imp.world, [1, 3, 2]), VoxelTypeId(1));
+        assert_eq!(decoded_voxel_at(&imp.world, [1, 2, 3]), VoxelTypeId::EMPTY);
     }
 
     // -- Test 6 --------------------------------------------------------------
 
     #[test]
     fn size_exceeds_texture_limit_errors() {
-        // A model with size = 16_400 × 1 × 1 → after div_ceil(16) = 1025
-        // chunks per x axis → exceeds MAX_CHUNKS_PER_AXIS = 1024.
+        // model x size = 16400 → div_ceil(16) = 1025 chunks → exceeds 1024.
         let data = dot_vox::DotVoxData {
             version: 150,
             index_map: dot_vox::DEFAULT_INDEX_MAP.to_vec(),
@@ -1089,7 +1179,6 @@ mod tests {
                     y: 1,
                     z: 1,
                 },
-                // No voxels — size is independent of voxel count.
                 voxels: Vec::new(),
             }],
             palette: dot_vox::DEFAULT_PALETTE.clone(),
@@ -1101,12 +1190,7 @@ mod tests {
         match result {
             Err(VoxImportError::SizeExceedsTextureLimit { dim, limit }) => {
                 assert_eq!(limit, MAX_CHUNKS_PER_AXIS);
-                assert!(
-                    dim[0] > MAX_CHUNKS_PER_AXIS,
-                    "expected x dim > {} chunks, got {:?}",
-                    MAX_CHUNKS_PER_AXIS,
-                    dim
-                );
+                assert!(dim[0] > MAX_CHUNKS_PER_AXIS);
             }
             other => panic!("expected SizeExceedsTextureLimit, got {:?}", other),
         }
@@ -1126,80 +1210,87 @@ mod tests {
             layers: Vec::new(),
         };
         let result = parse_dot_vox_data(&data);
-        assert!(
-            matches!(result, Err(VoxImportError::Empty)),
-            "expected VoxImportError::Empty, got {:?}",
-            result
-        );
+        assert!(matches!(result, Err(VoxImportError::Empty)));
     }
 
-    // -- Test 8 --------------------------------------------------------------
+    // -- Test 8 (v2) — byte-equality of sparse output with dense construct() --
 
     #[test]
-    fn construct_runs_on_imported_volume() {
-        // End-to-end: imported volume must feed the existing CPU `construct()`
-        // oracle without spinning up Bevy or a GPU.
+    fn sparse_walk_matches_dense_construct_on_small_fixture() {
+        // Build the small-cube fixture; drive it through (a) the sparse path
+        // (parse_dot_vox_data), and (b) the v1-style dense path (manually
+        // build a DenseVolume, call construct()). Assert byte-equality on
+        // the resulting (chunks, blocks, voxels) buffers — this is the
+        // strongest possible migration safety check.
         let data = build_small_cube();
         let imp = round_trip(&data);
 
-        let world = crate::aadf::construct::construct(&imp.volume);
-        // 1×1×1 chunks → exactly 1 chunk in the output.
-        assert_eq!(world.chunks.len(), 1);
-        // The chunk has geometry → it's mixed → blocks/voxels must be non-empty.
-        assert!(
-            !world.blocks.is_empty(),
-            "construct() must emit a non-empty blocks buffer for a mixed chunk"
+        // Build the equivalent DenseVolume by walking the same data the
+        // sparse path walks (single model, no scene graph; Z↔Y swap on
+        // write). 8×8×8 MV → after Z↔Y swap NAADF 8×8×8 (cube) → 1×1×1
+        // chunks (rounded up from 8 to 16 per axis).
+        let mut volume = DenseVolume::empty([1, 1, 1]);
+        let model = &data.models[0];
+        for v in &model.voxels {
+            let nx = v.x as u32;
+            let ny = v.z as u32;
+            let nz = v.y as u32;
+            volume.set([nx, ny, nz], VoxelTypeId(v.i as u16 + 1));
+        }
+        let oracle = construct(&volume);
+
+        assert_eq!(
+            imp.world.size_in_chunks, oracle.size_in_chunks,
+            "sparse vs. dense: size_in_chunks must match"
         );
-        assert!(
-            !world.voxels.is_empty(),
-            "construct() must emit a non-empty voxels buffer for a mixed chunk"
+        assert_eq!(
+            imp.world.chunks, oracle.chunks,
+            "sparse vs. dense: chunks_cpu must be byte-equal"
+        );
+        assert_eq!(
+            imp.world.blocks, oracle.blocks,
+            "sparse vs. dense: blocks_cpu must be byte-equal"
+        );
+        assert_eq!(
+            imp.world.voxels, oracle.voxels,
+            "sparse vs. dense: voxels_cpu must be byte-equal"
         );
     }
 
-    // -- Bonus tests --------------------------------------------------------
+    // -- Test 9 (v2) — `build_world_from_vox` sets dense_voxel_types empty ----
 
     #[test]
-    fn build_world_from_vox_inserts_dense_voxel_types() {
+    fn build_world_from_vox_skips_dense_voxel_types_on_sparse_path() {
+        // v2 semantics — sparse `.vox` path installs `dense_voxel_types =
+        // Vec::new()` (Δ-GPUProducer); the data-driven gate at
+        // `render/construction/mod.rs:833-835` skips the GPU producer chain
+        // and the renderer reads the pre-built CPU buffers.
         let data = build_small_cube();
         let imp = round_trip(&data);
         let (world, types) = build_world_from_vox(imp);
-        assert!(!world.dense_voxel_types.is_empty());
-        // 1×1×1 chunks = 16³ = 4096 voxels.
-        assert_eq!(world.dense_voxel_types.len(), 16 * 16 * 16);
+        assert!(
+            world.dense_voxel_types.is_empty(),
+            "sparse .vox path must set dense_voxel_types empty (Δ-GPUProducer)"
+        );
         assert!(world.dirty);
         assert!(types.dirty);
-        // BBox covers the 16³ volume.
         assert_eq!(world.bounding_box.min, IVec3::ZERO);
         assert_eq!(world.bounding_box.max, IVec3::new(15, 15, 15));
+        assert!(!world.chunks_cpu.is_empty(), "sparse path must produce chunks");
     }
+
+    // -- Test 10 -------------------------------------------------------------
 
     #[test]
     fn load_vox_propagates_io_error() {
         let result = load_vox("/this/path/does/not/exist.vox");
-        assert!(
-            matches!(result, Err(VoxImportError::Io(_))),
-            "expected Io error, got {:?}",
-            result
-        );
+        assert!(matches!(result, Err(VoxImportError::Io(_))));
     }
 
-    // -- 03a-followup scene-graph composition tests -------------------------
-    //
-    // Added in `03a-followup-empty-scene-diagnosis.md` to lock in the lifted
-    // Decision-6 "identity-only first cut" — real `.vox` files with
-    // transformed models stack their geometry at the origin under the
-    // identity walk, so the camera spawns inside solid voxel material →
-    // user sees "empty scene". The two tests below cover (a) two models
-    // separated by translation land at distinct world positions, (b) the
-    // rotation byte parse matches the C# `TransformFrame.Read` integer
-    // matrix at `MagicaVoxel.cs:127-146`.
+    // -- Scene-graph composition tests (from 03a-followup, migrated) ---------
 
-    /// Build a tiny `DotVoxData` with two 1-voxel models, each referenced by
-    /// its own `nSHP`/`nTRN` pair under a single `nGRP` root. The two
-    /// transforms translate the models to distinct positions.
     fn build_two_models_translated() -> dot_vox::DotVoxData {
         let mut materials = default_materials();
-        // Distinct emissive on slot 1 so the two voxels are distinguishable.
         for m in &mut materials {
             if m.id == 1 {
                 m.properties.insert("_type".into(), "_emit".into());
@@ -1210,12 +1301,10 @@ mod tests {
             version: 200,
             index_map: dot_vox::DEFAULT_INDEX_MAP.to_vec(),
             models: vec![
-                // Model 0 — single voxel of palette index 0 at local (0,0,0).
                 dot_vox::Model {
                     size: dot_vox::Size { x: 1, y: 1, z: 1 },
                     voxels: vec![dot_vox::Voxel { x: 0, y: 0, z: 0, i: 0 }],
                 },
-                // Model 1 — single voxel of palette index 1 at local (0,0,0).
                 dot_vox::Model {
                     size: dot_vox::Size { x: 1, y: 1, z: 1 },
                     voxels: vec![dot_vox::Voxel { x: 0, y: 0, z: 0, i: 1 }],
@@ -1224,26 +1313,22 @@ mod tests {
             palette: dot_vox::DEFAULT_PALETTE.clone(),
             materials,
             scenes: vec![
-                // 0: root nTRN under identity (no _t, no _r).
                 dot_vox::SceneNode::Transform {
                     attributes: dict_default(),
                     frames: vec![dot_vox::Frame::new(dict_default())],
                     child: 1,
                     layer_id: 0,
                 },
-                // 1: root group, two children.
                 dot_vox::SceneNode::Group {
                     attributes: dict_default(),
                     children: vec![2, 4],
                 },
-                // 2: nTRN — model 0 translated to MagicaVoxel (10, 0, 0).
                 dot_vox::SceneNode::Transform {
                     attributes: dict_default(),
                     frames: vec![dot_vox::Frame::new(dict_with("_t", "10 0 0"))],
                     child: 3,
                     layer_id: 0,
                 },
-                // 3: nSHP for model 0.
                 dot_vox::SceneNode::Shape {
                     attributes: dict_default(),
                     models: vec![dot_vox::ShapeModel {
@@ -1251,14 +1336,12 @@ mod tests {
                         attributes: dict_default(),
                     }],
                 },
-                // 4: nTRN — model 1 translated to MagicaVoxel (0, 20, 0).
                 dot_vox::SceneNode::Transform {
                     attributes: dict_default(),
                     frames: vec![dot_vox::Frame::new(dict_with("_t", "0 20 0"))],
                     child: 5,
                     layer_id: 0,
                 },
-                // 5: nSHP for model 1.
                 dot_vox::SceneNode::Shape {
                     attributes: dict_default(),
                     models: vec![dot_vox::ShapeModel {
@@ -1281,74 +1364,23 @@ mod tests {
         d
     }
 
-    /// 03a-followup gate — two models with distinct `_t` translations land at
-    /// distinct world positions (i.e. the identity-only walk regression that
-    /// caused the empty-scene symptom is fixed). The model centers in
-    /// MagicaVoxel coords were `(10, 0, 0)` and `(0, 20, 0)`; the centered
-    /// origin shift (`-size/2` for size 1 = 0) leaves them at those world
-    /// positions; after Z↔Y swap and `-world_min` shift they end up at
-    /// distinct cells in the NAADF DenseVolume.
     #[test]
     fn scene_graph_translations_separate_models() {
         let data = build_two_models_translated();
         let imp = parse_dot_vox_data(&data).unwrap();
 
-        // World bounds: world_min = (0, 0, 0), world_max = (10, 20, 0) in MV
-        // coords. World size MV = (11, 21, 1). After Z↔Y swap → NAADF (11, 1, 21).
-        // Rounded up to chunks → (1, 1, 2) chunks → (16, 16, 32) voxels.
-        assert_eq!(imp.volume.size_in_chunks, [1, 1, 2]);
+        // World MV bounds: world_min=(0,0,0), world_max=(10,20,0). MV size
+        // (11,21,1). After Z↔Y swap NAADF (11,1,21). Chunks (1,1,2).
+        assert_eq!(imp.world.size_in_chunks, [1, 1, 2]);
 
-        // Count non-empty voxels — must be exactly 2 (one per model).
-        let nonempty: usize = imp
-            .volume
-            .voxels
-            .iter()
-            .filter(|t| **t != VoxelTypeId::EMPTY)
-            .count();
-        assert_eq!(
-            nonempty, 2,
-            "two translated models must occupy two distinct cells (was {})",
-            nonempty
-        );
-
-        // Model 0 is at MV (10, 0, 0) → NAADF (10, 0, 0). VoxelTypeId(1).
-        // Model 1 is at MV (0, 20, 0) → NAADF (0, 0, 20). VoxelTypeId(2).
-        assert_eq!(imp.volume.voxel_at([10, 0, 0]), VoxelTypeId(1));
-        assert_eq!(imp.volume.voxel_at([0, 0, 20]), VoxelTypeId(2));
-        // The naïve identity-only walk would write both models at (0,0,0) —
-        // verify that's NOT what happened (the origin cell holds at most one
-        // voxel and the other model is elsewhere).
-        let origin_filled = imp.volume.voxel_at([0, 0, 0]) != VoxelTypeId::EMPTY;
-        let m0_at_correct_pos = imp.volume.voxel_at([10, 0, 0]) == VoxelTypeId(1);
-        assert!(
-            !origin_filled || m0_at_correct_pos,
-            "regression: both models collapsed to the origin (identity-only walk regressed)"
-        );
+        assert_eq!(count_nonempty(&imp.world), 2);
+        assert_eq!(decoded_voxel_at(&imp.world, [10, 0, 0]), VoxelTypeId(1));
+        assert_eq!(decoded_voxel_at(&imp.world, [0, 0, 20]), VoxelTypeId(2));
     }
 
-    /// 03a-followup gate — the rotation-byte parse + composition matches the
-    /// C# convention. Encode a 90° rotation about the Z axis (the canonical
-    /// `(x,y,z) → (-y, x, z)` byte) and verify a voxel at MV (1, 0, 0) lands
-    /// at MV (0, 1, 0) after rotation.
     #[test]
     fn scene_graph_rotation_applies() {
-        // Rotation byte for "x → y, y → -x, z → z" (90° CCW about Z when
-        // viewed looking down −z, MagicaVoxel's right-handed convention).
-        //
-        // Per the C# matrix structure: output.x = ±v.{i1}, output.y =
-        // ±v.{i2}, output.z = ±v.{i3}. For (x,y,z) → (-y, x, z):
-        //   output.x = -v.y  → i1=1, s1=-1
-        //   output.y = +v.x  → i2=0, s2=+1
-        //   output.z = +v.z  → i3=2, s3=+1
-        // Byte: (s3=0)(s2=0)(s1=1)(i2=00)(i1=01) = bits 6,5,4,3,2,1,0
-        //   bit 4 (s1=-1) = 1 → +0b10000
-        //   bit 5 (s2=+1) = 0
-        //   bit 6 (s3=+1) = 0
-        //   bits 0..1 (i1=1) = 01 → +1
-        //   bits 2..3 (i2=0) = 00 → +0
-        //   = 0b00010001 = 0x11 = 17
         let r_byte = "17";
-
         let data = dot_vox::DotVoxData {
             version: 200,
             index_map: dot_vox::DEFAULT_INDEX_MAP.to_vec(),
@@ -1359,21 +1391,18 @@ mod tests {
             palette: dot_vox::DEFAULT_PALETTE.clone(),
             materials: default_materials(),
             scenes: vec![
-                // 0: root nTRN identity.
                 dot_vox::SceneNode::Transform {
                     attributes: dict_default(),
                     frames: vec![dot_vox::Frame::new(dict_default())],
                     child: 1,
                     layer_id: 0,
                 },
-                // 1: nTRN — rotation byte 17 (90° about Z).
                 dot_vox::SceneNode::Transform {
                     attributes: dict_default(),
                     frames: vec![dot_vox::Frame::new(dict_with("_r", r_byte))],
                     child: 2,
                     layer_id: 0,
                 },
-                // 2: nSHP for model 0.
                 dot_vox::SceneNode::Shape {
                     attributes: dict_default(),
                     models: vec![dot_vox::ShapeModel {
@@ -1386,99 +1415,157 @@ mod tests {
         };
 
         let imp = parse_dot_vox_data(&data).unwrap();
-
-        // Sanity: the volume holds exactly one voxel.
-        let nonempty: usize = imp
-            .volume
-            .voxels
-            .iter()
-            .filter(|t| **t != VoxelTypeId::EMPTY)
-            .count();
-        assert_eq!(nonempty, 1, "exactly one voxel must survive rotation");
-
-        // The model's voxel is at local (2,1,0). Model size is (3,3,1) so the
-        // origin shift is (-1, -1, 0). Centered local: (1, 0, 0).
-        // Rotated by 17 → (-0, 1, 0) = (0, 1, 0). World position: (0, 1, 0).
-        //
-        // World AABB after rotating the 8 model corners (centered at
-        // (-1,-1,0)..(1,1,0)) by the same rotation → (-1,-1,0)..(1,1,0)
-        // (a rotation around Z preserves the AABB of a Z-flat box).
-        // world_min = (-1, -1, 0). After shifting by -world_min: (1, 2, 0).
-        // After Z↔Y swap: NAADF (1, 0, 2).
-        //
-        // Recompute concretely below.
+        assert_eq!(count_nonempty(&imp.world), 1, "exactly one voxel must survive rotation");
     }
 
-    /// 03a-followup gate — the rotation byte parse alone (no scene-graph
-    /// composition). Tests every encoding bit independently.
     #[test]
     fn rotation_byte_identity_and_axis_swap() {
-        // Byte 4 = 0b00000100 = i1=0, i2=1, i3=2, s1=s2=s3=+1 → identity.
         let r = Rot3::from_byte(4);
         assert_eq!(r.transform_vec([1, 0, 0]), [1, 0, 0]);
         assert_eq!(r.transform_vec([0, 1, 0]), [0, 1, 0]);
         assert_eq!(r.transform_vec([0, 0, 1]), [0, 0, 1]);
 
-        // Byte 0 = 0b00000000 = i1=0, i2=0, i3 forced to (not 0 and not 0) →
-        // i3=1. So out.x = v.x, out.y = v.x (??? — that's a degenerate matrix).
-        // The .vox spec says "i1 != i2 always" for valid bytes; out-of-spec
-        // bytes are undefined. Skip pathological encodings.
-
-        // Byte 17 = 0b00010001 = i1=1, s1=-1, i2=0, s2=+1, s3=+1, i3=2 →
-        // out.x = -v.y, out.y = +v.x, out.z = +v.z (90° about Z).
         let r = Rot3::from_byte(17);
-        assert_eq!(
-            r.transform_vec([1, 0, 0]),
-            [0, 1, 0],
-            "90° about Z must rotate +x → +y"
-        );
-        assert_eq!(
-            r.transform_vec([0, 1, 0]),
-            [-1, 0, 0],
-            "90° about Z must rotate +y → -x"
-        );
-        assert_eq!(
-            r.transform_vec([0, 0, 1]),
-            [0, 0, 1],
-            "90° about Z must preserve +z"
-        );
+        assert_eq!(r.transform_vec([1, 0, 0]), [0, 1, 0]);
+        assert_eq!(r.transform_vec([0, 1, 0]), [-1, 0, 0]);
+        assert_eq!(r.transform_vec([0, 0, 1]), [0, 0, 1]);
     }
 
-    /// 03a-followup — composition order matches C# `frame * parent` so
-    /// applying the composed transform first applies the child, then the
-    /// parent. Two translations compose additively under identity rotation;
-    /// translation + rotation composes correctly.
     #[test]
     fn xform_compose_matches_csharp_order() {
-        // Parent: translate +x by 5. Child: translate +y by 3.
-        // Applied to (0,0,0): child.apply → (0,3,0); parent.apply → (5,3,0).
-        // Composed: composed.apply(p) = parent.apply(child.apply(p)).
-        let parent = Xform {
-            rot: Rot3::IDENTITY,
-            t: [5, 0, 0],
-        };
-        let child = Xform {
-            rot: Rot3::IDENTITY,
-            t: [0, 3, 0],
-        };
+        let parent = Xform { rot: Rot3::IDENTITY, t: [5, 0, 0] };
+        let child = Xform { rot: Rot3::IDENTITY, t: [0, 3, 0] };
         let composed = child.parent_of(&parent);
         assert_eq!(composed.apply([0, 0, 0]), [5, 3, 0]);
 
-        // With rotation: parent rotates 90° about Z, child translates +x by 1.
-        // child.apply(p=(0,0,0)) = (1,0,0). Then parent.rot @ (1,0,0) = (0,1,0).
-        let parent = Xform {
-            rot: Rot3::from_byte(17), // 90° about Z (verified above)
-            t: [0, 0, 0],
-        };
-        let child = Xform {
-            rot: Rot3::IDENTITY,
-            t: [1, 0, 0],
-        };
+        let parent = Xform { rot: Rot3::from_byte(17), t: [0, 0, 0] };
+        let child = Xform { rot: Rot3::IDENTITY, t: [1, 0, 0] };
         let composed = child.parent_of(&parent);
+        assert_eq!(composed.apply([0, 0, 0]), [0, 1, 0]);
+    }
+
+    // -- NEW v2 sparse-walk-specific tests -----------------------------------
+
+    /// Test #16 — drive a 64×64×64-voxel scene (4×4×4 chunks) at ~1% density
+    /// through the sparse walk. Verifies the path handles mid-sized worlds
+    /// cleanly + the sparse code path is exercised (not just the trivial
+    /// single-chunk fixtures).
+    #[test]
+    fn sparse_walk_handles_mid_sized_world() {
+        // Single model 64×64×64 MV. Deterministic sparse fill — every 100th
+        // voxel.
+        let mut voxels = Vec::new();
+        for z in 0..64u8 {
+            for y in 0..64u8 {
+                for x in 0..64u8 {
+                    let idx = (x as u32) + (y as u32) * 64 + (z as u32) * 64 * 64;
+                    if idx % 100 == 0 {
+                        voxels.push(dot_vox::Voxel { x, y, z, i: 7 });
+                    }
+                }
+            }
+        }
+        let expected_nonempty = voxels.len() as u32;
+
+        let data = dot_vox::DotVoxData {
+            version: 150,
+            index_map: dot_vox::DEFAULT_INDEX_MAP.to_vec(),
+            models: vec![dot_vox::Model {
+                size: dot_vox::Size { x: 64, y: 64, z: 64 },
+                voxels,
+            }],
+            palette: dot_vox::DEFAULT_PALETTE.clone(),
+            materials: default_materials(),
+            scenes: Vec::new(),
+            layers: Vec::new(),
+        };
+
+        let imp = parse_dot_vox_data(&data).unwrap();
+        assert_eq!(imp.world.size_in_chunks, [4, 4, 4]);
+        assert_eq!(imp.world.chunks.len(), 64);
+        // Some non-empty voxels must round-trip exactly. (Mostly emptyish
+        // chunks give us non-empty `blocks` / `voxels`.)
+        assert!(!imp.world.blocks.is_empty());
+        assert!(!imp.world.voxels.is_empty());
+        assert_eq!(count_nonempty(&imp.world), expected_nonempty);
+    }
+
+    /// Test #18 — two voxels at identical chunk-local positions in two
+    /// different chunks (same 4³ block contents) ⇒ exactly one unique block
+    /// in `voxels`. Verifies HashMap dedup fires on the sparse path.
+    /// Mirrors `aadf::construct::tests::identical_blocks_dedup`.
+    #[test]
+    fn sparse_walk_dedups_identical_blocks() {
+        // Two single-voxel models translated to MV (0,0,0) and (16,0,0),
+        // each at local (0,0,0). After Z↔Y swap the two voxels sit at
+        // NAADF (0,0,0) and (16,0,0) — distinct chunks (chunk-x = 0 and 1).
+        // Their block-0 content (one voxel at block-local (0,0,0), of the
+        // same type) is identical, so the dedup must fire.
+        let data = dot_vox::DotVoxData {
+            version: 200,
+            index_map: dot_vox::DEFAULT_INDEX_MAP.to_vec(),
+            models: vec![
+                dot_vox::Model {
+                    size: dot_vox::Size { x: 1, y: 1, z: 1 },
+                    voxels: vec![dot_vox::Voxel { x: 0, y: 0, z: 0, i: 7 }],
+                },
+                dot_vox::Model {
+                    size: dot_vox::Size { x: 1, y: 1, z: 1 },
+                    voxels: vec![dot_vox::Voxel { x: 0, y: 0, z: 0, i: 7 }],
+                },
+            ],
+            palette: dot_vox::DEFAULT_PALETTE.clone(),
+            materials: default_materials(),
+            scenes: vec![
+                dot_vox::SceneNode::Transform {
+                    attributes: dict_default(),
+                    frames: vec![dot_vox::Frame::new(dict_default())],
+                    child: 1,
+                    layer_id: 0,
+                },
+                dot_vox::SceneNode::Group {
+                    attributes: dict_default(),
+                    children: vec![2, 4],
+                },
+                dot_vox::SceneNode::Transform {
+                    attributes: dict_default(),
+                    frames: vec![dot_vox::Frame::new(dict_default())],
+                    child: 3,
+                    layer_id: 0,
+                },
+                dot_vox::SceneNode::Shape {
+                    attributes: dict_default(),
+                    models: vec![dot_vox::ShapeModel {
+                        model_id: 0,
+                        attributes: dict_default(),
+                    }],
+                },
+                dot_vox::SceneNode::Transform {
+                    attributes: dict_default(),
+                    frames: vec![dot_vox::Frame::new(dict_with("_t", "16 0 0"))],
+                    child: 5,
+                    layer_id: 0,
+                },
+                dot_vox::SceneNode::Shape {
+                    attributes: dict_default(),
+                    models: vec![dot_vox::ShapeModel {
+                        model_id: 1,
+                        attributes: dict_default(),
+                    }],
+                },
+            ],
+            layers: Vec::new(),
+        };
+
+        let imp = parse_dot_vox_data(&data).unwrap();
+        // Two voxels in two distinct chunks, but their block-0 content is
+        // identical → dedup must produce exactly 32 u32s in voxels_cpu
+        // (one unique block, not two).
         assert_eq!(
-            composed.apply([0, 0, 0]),
-            [0, 1, 0],
-            "child translates first then parent rotates"
+            imp.world.voxels.len(),
+            CELL_CHILDREN / 2,
+            "expected exactly one unique 32-u32 block (dedup hit); got {} u32s",
+            imp.world.voxels.len(),
         );
     }
 }

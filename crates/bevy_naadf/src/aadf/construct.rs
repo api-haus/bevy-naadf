@@ -91,6 +91,7 @@ impl DenseVolume {
 
 /// The three-layer buffers produced by [`construct`] — bit-identical in layout
 /// to what NAADF's GPU construction emits.
+#[derive(Debug)]
 pub struct ConstructedWorld {
     /// Chunk buffer: one encoded [`ChunkCell`] `u32` per chunk, indexed
     /// `x + y * cx + z * cx * cy`.
@@ -107,8 +108,12 @@ pub struct ConstructedWorld {
 
 /// Typed classification of a block before encoding (needs the typed form so
 /// AADFs can be computed across same-chunk blocks).
+///
+/// Promoted to `pub(crate)` so `voxel::vox_import::build_constructed_world_sparse`
+/// (Track A v2, `docs/orchestrate/feature-completeness/02a-v2-sparse-vox-ingestion.md`)
+/// can reuse it without re-deriving the equivalent enum.
 #[derive(Clone, Copy)]
-enum BlockClass {
+pub(crate) enum BlockClass {
     Empty,
     UniformFull(VoxelTypeId),
     /// Mixed — points at a 64-voxel group already appended to the voxel buffer.
@@ -116,8 +121,10 @@ enum BlockClass {
 }
 
 /// Typed classification of a chunk before encoding.
+///
+/// Promoted to `pub(crate)` for the same reason as [`BlockClass`].
 #[derive(Clone, Copy)]
-enum ChunkClass {
+pub(crate) enum ChunkClass {
     Empty,
     UniformFull(VoxelTypeId),
     /// Mixed — `BlockPtr` is the base of this chunk's 64-block group.
@@ -251,7 +258,7 @@ pub fn construct(volume: &DenseVolume) -> ConstructedWorld {
 
 /// Gather the 64 voxel types of block `[bx, by, bz]` in child-cell order
 /// (`x + y * 4 + z * 16`, x-fastest).
-fn gather_block_voxels(volume: &DenseVolume, b: [usize; 3]) -> [VoxelTypeId; CELL_CHILDREN] {
+pub(crate) fn gather_block_voxels(volume: &DenseVolume, b: [usize; 3]) -> [VoxelTypeId; CELL_CHILDREN] {
     let mut out = [VoxelTypeId::EMPTY; CELL_CHILDREN];
     for lz in 0..CELL_DIM {
         for ly in 0..CELL_DIM {
@@ -269,7 +276,7 @@ fn gather_block_voxels(volume: &DenseVolume, b: [usize; 3]) -> [VoxelTypeId; CEL
 }
 
 /// Gather the 64 block classes of chunk `[cx, cy, cz]` in child-cell order.
-fn gather_chunk_blocks(
+pub(crate) fn gather_chunk_blocks(
     block_class: &[BlockClass],
     block_dims: [usize; 3],
     c: [usize; 3],
@@ -298,7 +305,7 @@ fn gather_chunk_blocks(
 /// On a dedup *miss* the 64 voxels are appended to `voxels_buf` as raw type
 /// words (a placeholder — Phase 3's [`encode_block_voxels`] overwrites them
 /// with the AADF-augmented encoding).
-fn classify_block(
+pub(crate) fn classify_block(
     group: &[VoxelTypeId; CELL_CHILDREN],
     dedup: &mut HashMap<[VoxelTypeId; CELL_CHILDREN], VoxelPtr>,
     voxels_buf: &mut Vec<u32>,
@@ -325,7 +332,7 @@ fn classify_block(
 
 /// Whether all 64 blocks of a chunk are the same uniform-full type → the
 /// chunk's uniform type, else `None`.
-fn uniform_chunk_type(blocks: &[BlockClass; CELL_CHILDREN]) -> Option<VoxelTypeId> {
+pub(crate) fn uniform_chunk_type(blocks: &[BlockClass; CELL_CHILDREN]) -> Option<VoxelTypeId> {
     let mut ty: Option<VoxelTypeId> = None;
     for b in blocks {
         match b {
@@ -345,7 +352,7 @@ fn uniform_chunk_type(blocks: &[BlockClass; CELL_CHILDREN]) -> Option<VoxelTypeI
 ///
 /// AADFs computed by [`compute_aadf_layer`] (one synchronised
 /// `O(3·d·n)`-style pass over the 4³ voxel layer — paper §3.3).
-fn encode_block_voxels(
+pub(crate) fn encode_block_voxels(
     group: &[VoxelTypeId; CELL_CHILDREN],
     ptr: VoxelPtr,
     voxels_buf: &mut [u32],
@@ -383,7 +390,7 @@ fn encode_block_voxels(
 ///
 /// AADFs computed by [`compute_aadf_layer`] (one synchronised
 /// `O(3·d·n)`-style pass over the 4³ block layer — paper §3.3).
-fn encode_chunk_blocks(
+pub(crate) fn encode_chunk_blocks(
     blocks: &[BlockClass; CELL_CHILDREN],
     base: BlockPtr,
     blocks_buf: &mut [u32],
