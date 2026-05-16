@@ -25,6 +25,7 @@ pub mod checks;
 pub mod driver;
 pub mod framebuffer;
 pub mod gates;
+pub mod oasis_edit_visual;
 pub mod readback;
 pub mod vox_e2e;
 
@@ -217,6 +218,7 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<driver::E2eState>()
         .init_resource::<driver::E2eOutcome>()
         .init_resource::<driver::ResizeTestState>()
+        .init_resource::<oasis_edit_visual::OasisEditVisualState>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
         // camera `Transform` + `PositionSplit` during the `MOTION` / `SETTLE`
@@ -225,7 +227,19 @@ pub fn add_e2e_systems(app: &mut App) {
         // this frame's first-hit / TAA-reproject / camera-history all see the
         // new pose the same frame the driver sets it — no one-frame lag
         // between the camera rotation and its `PositionSplit` origin.
-        .add_systems(Update, driver::e2e_driver.before(crate::camera::sync_position_split));
+        //
+        // `02f-followup` — `pin_oasis_camera` runs `.after(driver::e2e_driver)`
+        // so the birdseye pose overrides whatever the driver wrote, but
+        // still BEFORE `sync_position_split` so the rest of the frame sees
+        // the pinned pose.
+        .add_systems(
+            Update,
+            (
+                driver::e2e_driver,
+                oasis_edit_visual::pin_oasis_camera.after(driver::e2e_driver),
+            )
+                .before(crate::camera::sync_position_split),
+        );
 
     // The render-world half of the pipeline scan: the scan system runs every
     // render frame in the `Render` schedule (after all the prepare/queue

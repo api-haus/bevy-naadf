@@ -379,6 +379,16 @@ pub fn naadf_world_change_node(
         // Regime-3 fast-path: no-op on no-edit frames (single bool check).
         return;
     }
+    // `02f-followup` — debug-log when the W2 GPU dispatch fires. Useful for
+    // regression diagnosis (if a future change leaves `extract_world_changes`
+    // draining but the dispatch silent, the trace surfaces the gap).
+    bevy::log::debug!(
+        "naadf_world_change_node dispatch: chunks={}, blocks={}, voxels={}, groups={}",
+        construction_events.changed_chunk_count,
+        construction_events.changed_block_count,
+        construction_events.changed_voxel_count,
+        construction_events.changed_group_count,
+    );
 
     // Pull the three bind groups.
     let (Some(world_bg), Some(change_bg), Some(bounds_bg)) = (

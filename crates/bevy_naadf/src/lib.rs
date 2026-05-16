@@ -295,6 +295,16 @@ pub struct AppArgs {
     /// `.vox` file through the production `--vox` path. See
     /// [`crate::e2e::vox_e2e`].
     pub vox_e2e_mode: bool,
+    /// `02f-followup` — when `true`, the e2e driver runs the
+    /// **oasis-edit-visual gate**: birdseye over a loaded Oasis VOX scene,
+    /// screenshot A, programmatically erase a sphere at world centre via the
+    /// runtime brush path, wait 5 s for the W2 GPU dispatch + GI / TAA to
+    /// converge, screenshot B, assert framebuffer pixels around the erase
+    /// projection meaningfully changed. Catches the regression class
+    /// `--runtime-edit-mode`'s record-counter gate misses: edits land in the
+    /// W2 batch but never reach the framebuffer (the `81171f9` regression).
+    /// See [`crate::e2e::oasis_edit_visual`].
+    pub oasis_edit_visual_mode: bool,
 }
 
 impl Default for AppArgs {
@@ -308,6 +318,7 @@ impl Default for AppArgs {
             spawn_test_entity: false,
             resize_test: false,
             vox_e2e_mode: false,
+            oasis_edit_visual_mode: false,
         }
     }
 }

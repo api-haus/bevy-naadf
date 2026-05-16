@@ -84,6 +84,7 @@ fn main() -> ExitCode {
     let runtime_edit_mode = args.iter().any(|a| a == "--runtime-edit-mode");
     let resize_test = args.iter().any(|a| a == "--resize-test");
     let vox_e2e_mode = args.iter().any(|a| a == "--vox-e2e");
+    let oasis_edit_visual_mode = args.iter().any(|a| a == "--oasis-edit-visual");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -174,6 +175,17 @@ fn main() -> ExitCode {
         }
 
         exit
+    } else if oasis_edit_visual_mode {
+        // `02f-followup` — visual-diff edit-pipeline gate. Loads the
+        // Oasis VOX fixture from
+        // `crates/bevy_naadf/assets/test/oasis_hard_cover.vox` (Git LFS
+        // tracked), pins a birdseye camera over the world centre,
+        // captures frame A, programmatically erases a sphere via the
+        // production `sphere_brush` (runtime path), waits ~5 s for the
+        // W2 GPU dispatch + GI / TAA to converge, captures frame B, and
+        // asserts the bounding-box mean per-pixel delta exceeds
+        // [`OASIS_EDIT_DIFF_FLOOR`]. See [`bevy_naadf::e2e::oasis_edit_visual`].
+        bevy_naadf::e2e::oasis_edit_visual::run_oasis_edit_visual()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then

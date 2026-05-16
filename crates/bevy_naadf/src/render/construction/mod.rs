@@ -570,18 +570,25 @@ impl ConstructionEvents {
     }
 }
 
-/// Main-world `Last` schedule system: clear the per-frame edit staging on
-/// [`crate::world::data::WorldData::pending_edits`] after the render world has
-/// consumed it via [`extract_world_changes`]. Runs after `RenderApp::run_app`
-/// in the schedule order — every `set_voxel` call in the next main-world tick
-/// starts with a clean queue.
+/// **Deprecated (`02f-followup`).** The post-`02f` rearch landed this as a
+/// main-world `Last` system, but the standard Bevy schedule order runs
+/// `Last` BEFORE the render sub-app's `ExtractSchedule` (whether or not
+/// pipelined rendering is on). That cleared `WorldData::pending_edits` on
+/// the same frame the brush appended to it, BEFORE [`extract_world_changes`]
+/// could read it — so the W2 GPU dispatch never saw the edit. The
+/// `--runtime-edit-mode` gate didn't surface this because it inspects
+/// `WorldData` in-process without driving the schedule.
 ///
-/// **Idempotent** — clearing an already-empty queue is a no-op.
-pub fn clear_world_data_pending_edits(mut world_data: Option<ResMut<crate::world::data::WorldData>>) {
-    if let Some(wd) = world_data.as_mut() {
-        wd.pending_edits.batches.clear();
-        wd.pending_edits.edited_groups.clear();
-    }
+/// **The drain now lives inside [`extract_world_changes`] itself**, via
+/// `ResMut<MainWorld>` access — the Bevy-sanctioned pattern for a render
+/// system to mutate a main-world resource. This co-locates produce + consume,
+/// eliminating the schedule race. See `02f-followup` doc.
+///
+/// This function is kept (now a no-op stub) so the system registration in
+/// `ConstructionPlugin::build` need not be ripped out in this dispatch; the
+/// orchestrator's follow-up may delete the registration entirely.
+pub fn clear_world_data_pending_edits(_world_data: Option<ResMut<crate::world::data::WorldData>>) {
+    // No-op — drain moved into `extract_world_changes` (see doc above).
 }
 
 /// Phase-C wave-3 — main-world resource holding the live entity list + the
@@ -656,22 +663,50 @@ impl Default for RenderWorldEntityState {
 /// [`ConstructionEvents::entity_uploads`].
 pub fn extract_world_changes(
     mut commands: Commands,
-    main_world_data: Option<bevy::render::Extract<Res<crate::world::data::WorldData>>>,
-    construction_config: Option<bevy::render::Extract<Res<crate::AppArgs>>>,
-    main_world_entities: Option<bevy::render::Extract<Res<MainWorldEntities>>>,
+    main_world: ResMut<bevy::render::MainWorld>,
     entity_state: Option<ResMut<RenderWorldEntityState>>,
 ) {
-    let Some(world_data) = main_world_data else {
+    // `02f-followup` — pull `WorldData` mutably from the main world via the
+    // `ResMut<MainWorld>` pattern. The previous `Extract<Res<WorldData>>`
+    // read-only path coexisted with a separate `clear_world_data_pending_edits`
+    // system in main-world `Last`, but `Last` runs BEFORE the render sub-app's
+    // ExtractSchedule in the standard Bevy schedule order (both with and
+    // without pipelined rendering — see bevy_render-0.19's
+    // `pipelined_rendering.rs` lines 75-92 schedule diagram). So the clear
+    // raced ahead of the extract, the queue was empty by the time this system
+    // ran, and the W2 GPU dispatch never fired on user-driven edits. Mutating
+    // main-world from `ExtractSchedule` via `MainWorld` is the
+    // Bevy-sanctioned pattern (`bevy::render::MainWorld` doc); it folds the
+    // drain into the consume site, eliminating the race.
+    let main_world: &mut bevy::ecs::world::World = &mut **main_world.into_inner();
+
+    // Read `MainWorldEntities` (optional, read-only) before we take a mut
+    // borrow on `WorldData`. Clone the small struct so we can drop the
+    // borrow.
+    let main_world_entities: Option<(
+        Vec<crate::render::gpu_types::EntityInstance>,
+        Vec<u32>,
+        u32,
+    )> = main_world
+        .get_resource::<MainWorldEntities>()
+        .map(|me| (me.instances.clone(), me.voxel_data.clone(), me.voxel_data_generation));
+
+    // Now take the mutable WorldData borrow + drain.
+    let Some(mut world_data) = main_world.get_resource_mut::<crate::world::data::WorldData>() else {
         commands.insert_resource(ConstructionEvents::default());
         return;
     };
-    let _ = construction_config; // future: read render config knobs
 
     let mut events = ConstructionEvents::default();
-    // Aggregate every batch's per-buffer payload into the render-world resource.
-    // (The main-world `WorldData::pending_edits` accumulates per-set_voxel batches;
-    // the extract drains them all per frame.)
-    for batch in &world_data.pending_edits.batches {
+    // Drain every batch's per-buffer payload into the render-world resource.
+    // The main-world `WorldData::pending_edits` accumulates per-set_voxel
+    // batches; we move them out here so the next main-world tick starts
+    // with an empty queue — no separate `Last`-schedule clear needed.
+    let drained_batches: Vec<crate::aadf::edit::EditBatch> =
+        std::mem::take(&mut world_data.pending_edits.batches);
+    let drained_groups: Vec<[u32; 3]> =
+        std::mem::take(&mut world_data.pending_edits.edited_groups);
+    for batch in &drained_batches {
         events.changed_chunks.extend_from_slice(&batch.changed_chunks);
         events.changed_blocks.extend_from_slice(&batch.changed_blocks);
         events.changed_voxels.extend_from_slice(&batch.changed_voxels);
@@ -681,16 +716,34 @@ pub fn extract_world_changes(
     events.changed_block_count = (events.changed_blocks.len() / 65) as u32;
     events.changed_voxel_count = (events.changed_voxels.len() / 33) as u32;
 
+    // `02f-followup` — debug-log when the extract sees a non-trivial edit
+    // batch. Useful for regression diagnosis (if a future change re-breaks
+    // the drain, this trace surfaces it in `RUST_LOG=debug` runs). Cheap
+    // when empty — the `if` guard means no log allocation on no-edit frames
+    // (the steady state).
+    if !drained_batches.is_empty() {
+        bevy::log::debug!(
+            "extract_world_changes drained: {} batches, {} changed_chunks, \
+             {} changed_blocks, {} changed_voxels, {} edited_groups",
+            drained_batches.len(),
+            events.changed_chunk_count,
+            events.changed_block_count,
+            events.changed_voxel_count,
+            drained_groups.len(),
+        );
+    }
+
     // CPU flood-fill — produce `changed_groups_dynamic`.
-    if !world_data.pending_edits.edited_groups.is_empty()
-        && world_data.size_in_chunks.x > 0
-        && world_data.size_in_chunks.y > 0
-        && world_data.size_in_chunks.z > 0
+    let size_in_chunks = world_data.size_in_chunks;
+    if !drained_groups.is_empty()
+        && size_in_chunks.x > 0
+        && size_in_chunks.y > 0
+        && size_in_chunks.z > 0
     {
         let size_in_groups = [
-            world_data.size_in_chunks.x / 4,
-            world_data.size_in_chunks.y / 4,
-            world_data.size_in_chunks.z / 4,
+            size_in_chunks.x / 4,
+            size_in_chunks.y / 4,
+            size_in_chunks.z / 4,
         ];
         // Skip the flood fill if any axis would be 0 groups (test grid sizes
         // smaller than 4 chunks have no bound groups at all — W3 layout is
@@ -699,7 +752,7 @@ pub fn extract_world_changes(
             // Dedup directly-edited groups (multiple voxel edits in the same
             // group count once).
             let mut uniq: Vec<[u32; 3]> = Vec::new();
-            for &g in &world_data.pending_edits.edited_groups {
+            for &g in &drained_groups {
                 if !uniq.contains(&g) {
                     uniq.push(g);
                 }
@@ -710,40 +763,37 @@ pub fn extract_world_changes(
         }
     }
 
+    // Drop the WorldData borrow so the entity handler logic can run without
+    // borrow conflicts (it reads world_data size_in_chunks which we cached
+    // above).
+    drop(world_data);
+
     // === Phase-C wave-3 — entity uploads ====================================
     // When the main-world `MainWorldEntities` resource exists and carries at
     // least one instance, run `EntityHandler::update` and fold the result into
     // `ConstructionEvents.entity_uploads`. The render-side dispatch + the
     // chunks-texture `.y` write fire next frame.
-    //
-    // The handler may be `None` on first frame; lazily initialise it from the
-    // world's chunk-grid size. This is `Extract<ResMut<...>>` so we can mutate
-    // the handler's across-frame state (the C#'s `EntityHandler` is a
-    // stateful class).
-    if let (Some(me), Some(mut state)) = (main_world_entities, entity_state) {
+    if let (Some((instances, voxel_data, voxel_data_generation)), Some(mut state)) =
+        (main_world_entities, entity_state)
+    {
         // Mirror voxel-data into `ConstructionEvents` whenever the generation
-        // counter changes — `prepare_construction` then re-uploads the GPU
-        // buffer. This avoids cloning the (potentially large) voxel data
-        // every frame on the steady-state path.
-        if me.voxel_data_generation != state.last_uploaded_voxel_data_generation {
-            events.entity_voxel_data = me.voxel_data.clone();
+        // counter changes.
+        if voxel_data_generation != state.last_uploaded_voxel_data_generation {
+            events.entity_voxel_data = voxel_data;
             events.entity_voxel_data_dirty = true;
-            state.last_uploaded_voxel_data_generation = me.voxel_data_generation;
+            state.last_uploaded_voxel_data_generation = voxel_data_generation;
         }
 
-        if !me.instances.is_empty() {
-            // Lazy-init the handler. The fixture-world dimensions are fixed,
-            // so initialising from the current `WorldData::size_in_chunks` is
-            // safe (the test grid never resizes).
+        if !instances.is_empty() {
             if state.handler.is_none() {
                 state.handler = Some(entity_handler::EntityHandler::new([
-                    world_data.size_in_chunks.x,
-                    world_data.size_in_chunks.y,
-                    world_data.size_in_chunks.z,
+                    size_in_chunks.x,
+                    size_in_chunks.y,
+                    size_in_chunks.z,
                 ]));
             }
             if let Some(handler) = state.handler.as_mut() {
-                events.entity_uploads = handler.update(&me.instances);
+                events.entity_uploads = handler.update(&instances);
             }
         }
     }
@@ -1240,10 +1290,30 @@ pub fn prepare_construction(
     // ceiling is typically ~2048 per axis → 8 G chunks worst case; the
     // current GrowableBuffer for blocks/voxels is the right pattern). Not
     // in scope for the bug-2/3/4 fix.
-    const W2_CHANGED_CHUNKS_INIT: u64 = 524_288;  // entries; each = 2×u32 = 8 B
-    const W2_CHANGED_BLOCKS_INIT: u64 = 4096; // u32 entries (~63 edits × 65)
-    const W2_CHANGED_VOXELS_INIT: u64 = 8192; // u32 entries (~247 edits × 33)
-    const W2_CHANGED_GROUPS_INIT: u64 = 256;  // entries; each = 2×u32 = 8 B
+    // `02f-followup` — Oasis-scale brush capacity. The pre-`02f-followup`
+    // sizes (8192 u32s voxels / 4096 u32s blocks / 256 entries groups) were
+    // calibrated for ≤63 voxel records / ≤63 block records / ≤32 groups per
+    // frame. An r=30 erase sphere on Oasis (1488×544×1344) produces 72 chunks
+    // + 63 blocks + 1823 voxels per frame, with the BFS group sweep expanding
+    // 9 edited groups to ~2300 changed groups — every one of these
+    // overshoots the old cap.
+    //
+    // Bumped to capacities that absorb a typical full-screen continuous
+    // stroke without per-edit `Queue::write_buffer` OOB errors (which silently
+    // dropped the W2 dispatch payload on Oasis pre-followup). Total static
+    // VRAM ~28 MiB across the four buffers — trivial against an Oasis-scale
+    // workload's existing 1.6 GiB voxels alloc.
+    //
+    // **Future**: as called out pre-followup, switch to `GrowableBuffer<u32>`
+    // for unbounded stroke sizes. Static caps work for typical edits (the
+    // empirical observation: a single brush frame on Oasis at r=400 produces
+    // ~50k voxel records ≈ 200 KiB voxels payload, comfortably under the
+    // new 16 MiB voxels cap). The OOB error mode below is the only correctness
+    // failure; cap-overflow recovery is a future polish item.
+    const W2_CHANGED_CHUNKS_INIT: u64 = 524_288;     // entries; 2×u32 = 8 B  → 4 MiB
+    const W2_CHANGED_BLOCKS_INIT: u64 = 1_048_576;   // u32 entries           → 4 MiB
+    const W2_CHANGED_VOXELS_INIT: u64 = 4_194_304;   // u32 entries           → 16 MiB
+    const W2_CHANGED_GROUPS_INIT: u64 = 524_288;     // entries; 2×u32 = 8 B  → 4 MiB
 
     let render_world_changes = construction_events.as_ref();
     let needs_upload =

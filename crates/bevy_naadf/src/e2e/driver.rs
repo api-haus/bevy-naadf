@@ -120,6 +120,42 @@ pub enum E2ePhase {
     /// either post-resize capture's full-frame luma falls below the threshold
     /// ratio vs the initial.
     ResizeAssert,
+    // --- Oasis-edit-visual phases
+    // (`crate::e2e::oasis_edit_visual` — `02f-followup`,
+    //  the visual-diff edit-pipeline gate) -----------------------------------
+    //
+    // Selected when `AppArgs.oasis_edit_visual_mode == true`. The Warmup
+    // branch routes straight into OasisWarmup on tick 0. The camera is pinned
+    // birdseye over the loaded Oasis VOX scene's world centre for the entire
+    // sequence; `pin_oasis_camera` overrides whatever pose the standard
+    // driver writes.
+    /// Warmup at the birdseye pose — let TAA + GI converge before the first
+    /// screenshot.
+    OasisWarmup,
+    /// Spawn `Screenshot::primary_window()` for the **pre-edit** capture
+    /// (frame A).
+    OasisShootBefore,
+    /// Wait (bounded) for the pre-edit capture to deliver, then stash its
+    /// framebuffer into `OasisEditVisualState.before`.
+    OasisDrainBefore,
+    /// One-shot tick: invoke
+    /// [`crate::editor::tools::sphere_brush`] with `is_erase = true` at the
+    /// world centre via a deferred `Commands`-spawned system. After this
+    /// tick the brush has fired exactly once.
+    OasisApplyEdit,
+    /// Wait `OASIS_POST_EDIT_WAIT_FRAMES` ticks (~5 s) — the W2 GPU
+    /// dispatch propagates + W3 regime-2 background AADF chain converges +
+    /// TAA / GI re-stabilise around the new geometry.
+    OasisWaitPostEdit,
+    /// Spawn `Screenshot::primary_window()` for the **post-edit** capture
+    /// (frame B).
+    OasisShootAfter,
+    /// Wait (bounded) for the post-edit capture to deliver, then stash into
+    /// `OasisEditVisualState.after`.
+    OasisDrainAfter,
+    /// Run [`super::oasis_edit_visual::assert_visual_edit_landed`], save
+    /// both PNGs, write `AppExit::Success` / `AppExit::error()`.
+    OasisAssert,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -331,6 +367,8 @@ pub fn e2e_driver(
     mut outcome: ResMut<E2eOutcome>,
     mut screenshot: ResMut<E2eScreenshot>,
     mut resize_test: ResMut<ResizeTestState>,
+    mut oasis: ResMut<super::oasis_edit_visual::OasisEditVisualState>,
+    world_data: Option<ResMut<crate::world::data::WorldData>>,
     diagnostics: Res<DiagnosticsStore>,
     pipeline_scan: Res<PipelineScanResult>,
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
@@ -362,6 +400,19 @@ pub fn e2e_driver(
             return;
         }
         state.phase = E2ePhase::LaunchSettle;
+        state.phase_ticks = 0;
+    }
+
+    // `02f-followup` — oasis-edit-visual fast-path. Routes the driver into
+    // the alternate state machine on tick 0 when `AppArgs.oasis_edit_visual_mode`
+    // is set. The camera pose is overwritten every tick by
+    // `super::oasis_edit_visual::pin_oasis_camera` (Update system,
+    // `.after(e2e_driver)`), so whatever pose this driver writes is harmless.
+    let oasis_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.oasis_edit_visual_mode);
+    if oasis_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+        state.phase = E2ePhase::OasisWarmup;
         state.phase_ticks = 0;
     }
 
@@ -689,6 +740,185 @@ pub fn e2e_driver(
                         E2E_RESIZE_A_HEIGHT,
                         E2E_RESIZE_B_WIDTH,
                         E2E_RESIZE_B_HEIGHT,
+                    );
+                    exit.write(AppExit::Success);
+                }
+                Err(msg) => {
+                    eprintln!("e2e_render: FAIL —\n{msg}");
+                    exit.write(AppExit::error());
+                }
+            }
+            outcome.gate_result = Some(result);
+            state.phase = E2ePhase::Done;
+        }
+        // ---- Oasis-edit-visual phases (`02f-followup`) -------------------
+        E2ePhase::OasisWarmup => {
+            // Camera pose is owned by `pin_oasis_camera`; do not touch
+            // `camera` here (any write would race with the post-driver
+            // override).
+            let _ = &mut camera;
+            state.phase_ticks += 1;
+            if state.phase_ticks >= super::oasis_edit_visual::OASIS_WARMUP_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::OasisShootBefore;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::OasisShootBefore => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::OasisDrainBefore;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::OasisDrainBefore => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        println!(
+                            "e2e_render --oasis-edit-visual: before-capture {}x{}",
+                            fb.width(),
+                            fb.height()
+                        );
+                        super::oasis_edit_visual::save_oasis_screenshot(
+                            &fb,
+                            super::oasis_edit_visual::OASIS_EDIT_BEFORE_PNG,
+                        );
+                        oasis.before = Some(fb);
+                        state.phase = E2ePhase::OasisApplyEdit;
+                        state.phase_ticks = 0;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "oasis-edit-visual: before-capture decode failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::oasis_edit_visual::OASIS_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "oasis-edit-visual: before-capture never delivered within \
+                     {} drain frames",
+                    super::oasis_edit_visual::OASIS_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::OasisApplyEdit => {
+            // Apply the brush exactly once. The `world_data` resource ref is
+            // optional because the driver may run before `setup_test_grid`
+            // inserts it on the first frame — but by OasisWarmup completion
+            // (120 frames) the resource is guaranteed present.
+            if oasis.edit_applied {
+                state.phase = E2ePhase::OasisWaitPostEdit;
+                state.phase_ticks = 0;
+            } else if let Some(mut wd) = world_data {
+                super::oasis_edit_visual::apply_erase_brush(&mut wd);
+                oasis.edit_applied = true;
+                state.phase = E2ePhase::OasisWaitPostEdit;
+                state.phase_ticks = 0;
+            } else {
+                let err = "oasis-edit-visual: WorldData resource missing at \
+                           OasisApplyEdit — the Oasis VOX load failed or \
+                           was deferred past the warmup window"
+                    .to_string();
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::OasisWaitPostEdit => {
+            state.phase_ticks += 1;
+            if state.phase_ticks
+                >= super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES
+            {
+                screenshot.0 = None;
+                state.phase = E2ePhase::OasisShootAfter;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::OasisShootAfter => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::OasisDrainAfter;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::OasisDrainAfter => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        println!(
+                            "e2e_render --oasis-edit-visual: after-capture {}x{}",
+                            fb.width(),
+                            fb.height()
+                        );
+                        super::oasis_edit_visual::save_oasis_screenshot(
+                            &fb,
+                            super::oasis_edit_visual::OASIS_EDIT_AFTER_PNG,
+                        );
+                        oasis.after = Some(fb);
+                        state.phase = E2ePhase::OasisAssert;
+                        state.phase_ticks = 0;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "oasis-edit-visual: after-capture decode failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::oasis_edit_visual::OASIS_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "oasis-edit-visual: after-capture never delivered within \
+                     {} drain frames",
+                    super::oasis_edit_visual::OASIS_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::OasisAssert => {
+            let before = oasis.before.take();
+            let after = oasis.after.take();
+            let result = match (before, after) {
+                (Some(a), Some(b)) => {
+                    super::oasis_edit_visual::assert_visual_edit_landed(&a, &b)
+                        .map(|msg| {
+                            println!("e2e_render --oasis-edit-visual: {msg}");
+                        })
+                }
+                _ => Err(
+                    "oasis-edit-visual: OasisAssert reached without both \
+                     framebuffers stashed (driver bug)"
+                        .to_string(),
+                ),
+            };
+            match &result {
+                Ok(()) => {
+                    println!(
+                        "e2e_render: oasis-edit-visual PASS — \
+                         {} warmup + {} post-edit wait frames; erase \
+                         sphere @ r={:.1} voxels produced rect mean per-\
+                         pixel RGB Δ above {:.2} floor.",
+                        super::oasis_edit_visual::OASIS_WARMUP_FRAMES,
+                        super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES,
+                        super::oasis_edit_visual::OASIS_ERASE_RADIUS,
+                        super::oasis_edit_visual::OASIS_EDIT_DIFF_FLOOR,
                     );
                     exit.write(AppExit::Success);
                 }
