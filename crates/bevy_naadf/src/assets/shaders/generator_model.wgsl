@@ -1,7 +1,11 @@
 // Phase-C W5 — `generatorModel.fx` ported to WGSL (`15-design-c.md` §4.5).
 //
 // Faithful port of NAADF's `Content/shaders/world/generator/generatorModel.fx`
-// (80 lines). One entry point `fill_chunk_data_with_model_data_16`,
+// (80 lines). One entry point `fill_chunk_data_with_model_data` (HLSL named
+// it `fill_chunk_data_with_model_data_16`; the `_16` suffix was dropped per
+// `docs/orchestrate/web-chunks-storage-buffer/02-design-impl.md` because
+// trailing-digit identifiers can collide with naga/naga-oil internal
+// rewriting rules on the WebGPU code path),
 // `numthreads(4,4,4)`. Per-thread 32 iterations × 2 voxels per iteration → 64
 // voxels per thread → 2048 u32s per workgroup. The CPU oracle
 // `crate::aadf::generator::generate_segment_cpu` produces byte-identical
@@ -115,7 +119,7 @@ fn get_voxel_data_in_model(voxel_pos: vec3<u32>) -> u32 {
 }
 
 @compute @workgroup_size(4, 4, 4)
-fn fill_chunk_data_with_model_data_16(
+fn fill_chunk_data_with_model_data(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) group_id: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,

@@ -253,7 +253,7 @@ pub struct ConstructionPipelines {
     /// happens in the W5 unit test (or in W1's regime-1 driver once W1 lands).
     pub generator_model_layout: BindGroupLayoutDescriptor,
     /// W5 — cached compute pipeline ID for `generator_model.wgsl`'s
-    /// `fill_chunk_data_with_model_data_16` entry point.
+    /// `fill_chunk_data_with_model_data` entry point.
     pub generator_model_pipeline: CachedComputePipelineId,
 
     // === W1 (Algorithm 1) =====================================================

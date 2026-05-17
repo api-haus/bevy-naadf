@@ -66,7 +66,15 @@ pub fn map_copy_layout_descriptor() -> BindGroupLayoutDescriptor {
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer_read_only_sized(false, None), // old_map
+                // Web-WebGPU (`docs/orchestrate/web-chunks-storage-buffer/`):
+                // `old_map` was originally `storage_buffer_read_only_sized` to
+                // match the WGSL `var<storage, read>` access. But the WGSL
+                // spec forbids atomic types in a `read`-mode storage; Dawn
+                // rejects the resulting ShaderModule on web. Promoted to
+                // `storage_buffer_sized` (rw) to match the corrected WGSL
+                // binding access mode; kernel never writes `old_map` so this
+                // is a layout-level change with no semantic effect.
+                storage_buffer_sized(false, None),           // old_map (rw on web; never written)
                 storage_buffer_sized(false, None),           // new_map
                 uniform_buffer_sized(false, Some(params_size)), // params
                 storage_buffer_read_only_sized(false, None), // hash_coefficients

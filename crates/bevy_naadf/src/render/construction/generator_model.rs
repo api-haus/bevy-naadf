@@ -24,7 +24,7 @@
 //!   (`chunk_data_rw`, `model_data_chunk_ro`, `model_data_block_ro`,
 //!   `model_data_voxel_ro`, `params_uniform`).
 //! - `generator_model_pipeline` — the `CachedComputePipelineId` for
-//!   `generator_model.wgsl`'s `fill_chunk_data_with_model_data_16` entry point.
+//!   `generator_model.wgsl`'s `fill_chunk_data_with_model_data` entry point.
 //!
 //! W1 will later extend the same resource with `chunk_calc_*_pipeline` and
 //! `map_copy_*_pipeline` fields plus a `construction_world_layout` that
@@ -171,7 +171,7 @@ pub fn queue_generator_model_pipeline_with_handle(
         label: Some("naadf_generator_model_pipeline".into()),
         layout: vec![layout],
         shader,
-        entry_point: Some(Cow::from("fill_chunk_data_with_model_data_16")),
+        entry_point: Some(Cow::from("fill_chunk_data_with_model_data")),
         ..default()
     })
 }

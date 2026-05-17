@@ -45,8 +45,18 @@ struct MapCopyParams {
     _pad1: u32,
 };
 
+// Web-WebGPU (`docs/orchestrate/web-chunks-storage-buffer/`) — `old_map` was
+// originally declared `var<storage, read>`, but the WGSL spec forbids atomic
+// types in a storage variable unless the access mode is `read_write`. Dawn
+// (Chrome's WebGPU) enforces this strictly; naga (native wgpu) accepts the
+// read-mode variant leniently. Promoting the access mode to `read_write` is
+// semantically identical for our use (this kernel never writes `old_map`;
+// the regrow holds the only handle, so there's no concurrent-writer hazard),
+// and it keeps the WGSL spec-compliant on web. The bind-group-layout slot in
+// `map_copy.rs::map_copy_layout_descriptor` is flipped to `storage_buffer_sized`
+// to match (was `storage_buffer_read_only_sized`).
 @group(0) @binding(0)
-var<storage, read> old_map: array<HashValueSlot>;
+var<storage, read_write> old_map: array<HashValueSlot>;
 @group(0) @binding(1)
 var<storage, read_write> new_map: array<HashValueSlot>;
 @group(0) @binding(2)

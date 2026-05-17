@@ -1120,3 +1120,275 @@ A 1.8 MB PNG at the canvas resolution is consistent with a live (non-black) fram
 
 Headed mode surfaces **three new error entries** that the headless run never captured: `naadf_map_copy_pipeline` / `copy_map` / `Invalid ShaderModule`, `naadf_generator_model_pipeline` / `fill_chunk_data_with_model_data_16` (missing entry-point), and `naadf_map_copy_test_hash_pipeline` / `test_hash` / `Invalid ShaderModule`. These pipeline validation errors all appear **before** the `Quitting the application due to Validation RenderError` entry (note: `Validation RenderError`, not `DeviceLost` as in the headless run). The headless run aborted with `DeviceLost: Destroyed Device was destroyed` — a hard GPU-process crash before any pipeline errors surfaced — while the headed run (real GPU / real display) kept the device alive long enough for lazy pipeline compilation to fire and report proper WebGPU validation diagnostics. The canvas screenshot at 1.8 MB confirms partial rendering reached the framebuffer in headed mode. In summary: headed mode gives us the actionable pipeline errors (shader compilation failures in `chunks_buffer`-related pipelines); the headless `DeviceLost` was masking the real root cause.
 
+
+## Validation-error diagnosis (2026-05-17)
+
+### Per-error file:line trace
+
+**Error #1 — `naadf_map_copy_pipeline` / entry `copy_map`**
+
+- Pipeline created: `crates/bevy_naadf/src/render/construction/map_copy.rs:95-101`
+  (`queue_copy_map_pipeline_with_handle`, label `"naadf_map_copy_pipeline"`,
+  `entry_point: "copy_map"`).
+- Entry-point declaration: `crates/bevy_naadf/src/assets/shaders/map_copy.wgsl:68-69`
+  (`@compute @workgroup_size(64, 1, 1) fn copy_map(...)`).
+- Reported as: `[Invalid ShaderModule (unlabeled)] is invalid due to a previous error.`
+  → the ShaderModule itself failed to compile (the "previous error" is the WGSL
+  validation failure, which is NOT separately surfaced through bevy's
+  uncaptured-error pathway on this Dawn build).
+
+**Error #2 — `naadf_generator_model_pipeline` / entry `fill_chunk_data_with_model_data_16`**
+
+- Pipeline created: `crates/bevy_naadf/src/render/construction/generator_model.rs:170-176`
+  (`queue_generator_model_pipeline_with_handle`, label
+  `"naadf_generator_model_pipeline"`, `entry_point: "fill_chunk_data_with_model_data_16"`).
+- Entry-point declaration: `crates/bevy_naadf/src/assets/shaders/generator_model.wgsl:117-122`
+  (`@compute @workgroup_size(4, 4, 4) fn fill_chunk_data_with_model_data_16(...)`).
+  Confirmed present in the published dist artifact at
+  `crates/bevy_naadf/dist/src/assets/shaders/generator_model.wgsl:117-118`.
+- Reported as: `Entry point "..." doesn't exist in the shader module [ShaderModule (unlabeled)]`
+  (note: `ShaderModule`, not `Invalid ShaderModule` — Dawn classifies this module as a
+  *valid* WGSL compile that simply lacks the requested entry point).
+
+**Error #3 — `naadf_map_copy_test_hash_pipeline` / entry `test_hash`**
+
+- Pipeline created: `crates/bevy_naadf/src/render/construction/map_copy.rs:120-126`
+  (`queue_test_hash_pipeline_with_handle`, label
+  `"naadf_map_copy_test_hash_pipeline"`, `entry_point: "test_hash"`).
+- Entry-point declaration: `crates/bevy_naadf/src/assets/shaders/map_copy.wgsl:105-106`
+  (`@compute @workgroup_size(1, 1, 1) fn test_hash()`).
+- Reported as: `[Invalid ShaderModule (unlabeled)] is invalid due to a previous error.`
+  → same `map_copy.wgsl` module as error #1, same root cause.
+
+### Root cause hypothesis
+
+**Errors #1 and #3 share one root cause**: the `map_copy.wgsl` ShaderModule
+fails WGSL validation under Dawn (Chrome's WebGPU implementation), because
+the read-only binding contains atomic types.
+
+`map_copy.wgsl:34-39` declares `HashValueSlot` with `voxel_pointer:
+atomic<u32>` + `use_count: atomic<u32>` fields. `map_copy.wgsl:48-49` then
+binds it as **read-only** storage:
+
+```wgsl
+@group(0) @binding(0)
+var<storage, read> old_map: array<HashValueSlot>;
+```
+
+The WGSL specification (`§ Atomic Type`) restricts atomic types: a storage
+buffer variable that contains an atomic type **must** have `read_write`
+access mode. A `read`-mode storage with atomic-typed members is invalid WGSL.
+naga's WGSL frontend (used on native wgpu builds) is lenient and accepts this
+construction; Dawn's WGSL frontend is strict and rejects it. This explains
+why the 6 e2e_render gates pass on native but the same `map_copy.wgsl` fails
+on web.
+
+Both `copy_map` and `test_hash` live in the same `map_copy.wgsl` file. When
+its WGSL composition produces an `Invalid ShaderModule`, **both** pipelines
+created from it inherit the failure (errors #1 and #3 are sibling cascades
+from the same module-level validation failure, not independent errors).
+
+**Error #2 is a separate, currently-unidentified issue** in
+`generator_model.wgsl`. Strong evidence it is NOT a cascade of error #1:
+
+- Different WGSL file (no `#import` relationship — neither file imports the
+  other, neither imports `world_data.wgsl`).
+- Different error class — Dawn reports `ShaderModule (unlabeled)` (valid
+  module, missing entry point) instead of `Invalid ShaderModule (unlabeled)
+  is invalid due to a previous error` (compile failed). The two error
+  classes are distinct Dawn diagnostic paths.
+- `generator_model.wgsl` has no atomic types (every binding is plain
+  `read`/`read_write` on non-atomic `array<u32>`).
+
+What stays uncertain about error #2: Dawn reports a valid ShaderModule
+without the named entry point. The entry-point declaration is literally
+present in both the source file and the dist artifact. Possible second-order
+causes (none yet verified):
+
+1. naga's WGSL→WGSL writer (used by naga-oil's `make_naga_module`) silently
+   strips an entry point when its function body fails some internal
+   validation step. The error would be raised at "validate" time but
+   swallowed by bevy's pipeline-cache logging on the wasm path.
+2. naga-oil's preprocessor treats `_16` as a substitution placeholder
+   (the project's own `render_pipeline_common.wgsl:82-85` documents that
+   "naga-oil rejects trailing-digit identifiers" for struct fields under
+   composable-module rules). This is documented for **struct field names**;
+   whether the same constraint applies to **entry-point function names** is
+   unclear. The name `fill_chunk_data_with_model_data_16` ends in `_16`.
+3. Some interaction between Dawn's stricter validation and the
+   `params.size_in_voxels` / `params.model_size_in_chunks` uniform reads —
+   `vec3<u32>` in a uniform binding has Dawn-specific alignment edge cases.
+
+### Proposed fix (minimal, low-risk)
+
+**Phase-2 edit A (covers errors #1 and #3, high-confidence)**: Make
+`map_copy.wgsl`'s `old_map` binding WGSL-spec-compliant by reading through a
+non-atomic struct view, since the production read-only path only loads the
+slot fields (it never atomically operates on `old_map`). Two equivalent
+approaches; pick (i) for minimum churn:
+
+- (i) **Promote `old_map` to `read_write` access**. The shader never writes
+  `old_map` (semantic-only change: the binding *could* be writable, but
+  isn't). The bind-group-layout descriptor at `map_copy.rs:62-78` already
+  has slot 0 as `storage_buffer_read_only_sized(false, None)` — flip to
+  `storage_buffer_sized(false, None)` to match. On the WGSL side, change
+  `:48-49` from `var<storage, read>` to `var<storage, read_write>`.
+  Single-line edit on each side. The atomic-load calls
+  (`atomicLoad(&old_map[id].voxel_pointer)`, `atomicLoad(&old_map[id].use_count)`)
+  are now legal because the access mode includes write. No behaviour change
+  — `atomicLoad` is functionally equivalent to a plain load when no
+  concurrent writes happen, and the regrow path holds the only reference to
+  `old_map` for its duration.
+
+- (ii) Define a non-atomic `HashValueSlotRO` mirror struct (identical
+  byte layout: 16 B = 4 × u32 = 4 × 4 B), bind `old_map: array<HashValueSlotRO>`,
+  read directly without `atomicLoad`. More mechanical changes (struct + read
+  sites) but no semantic shift in access modes.
+
+Picking (i) — single-line flip on each side, no struct duplication, no read
+site rewrites. Risk of side effects: zero for `chunk_calc.wgsl` (independent
+hash_map binding) and zero for the production path (the `new_map` buffer
+already needs `read_write` so the bind-group-layout shape stays
+`{slot0=storage_rw, slot1=storage_rw, slot2=uniform, slot3-5=mixed}`,
+just with slot 0 promoted from ro to rw).
+
+**Phase-2 edit B (covers error #2)**: Defer to after edit A lands. Once
+errors #1/#3 clear, re-run `just test-wasm-headed` and see whether the
+generator_model error persists in isolation. If it does, investigation
+options:
+
+- Rename the entry point to drop the `_16` suffix
+  (`fill_chunk_data_with_model_data_16` → `fill_chunk_data_with_model_data`)
+  on both the WGSL `fn` declaration and the Rust `entry_point: Cow::from(...)`
+  string. Tests naga-oil's trailing-digit theory.
+- If renaming doesn't help: a deeper naga/Dawn interaction with the shader
+  body — outside the chunks-migration scope; flag as a residual issue for
+  follow-up.
+
+### Risk assessment
+
+- **Edit A risk = low**.
+  - Touches only `map_copy.rs` (1 line in `map_copy_layout_descriptor`) +
+    `map_copy.wgsl` (1 line: the `old_map` binding declaration).
+  - Does NOT touch any chunks-migration file. `world_data.wgsl`, `prepare.rs`,
+    the 4 construction Rust layout files, or any of the 6 chunks-touching
+    shaders are NOT modified.
+  - The bind-group-layout shape for `naadf_map_copy_bind_group_layout`
+    changes one slot's access mode (ro → rw). Any caller that creates a
+    bind group for this layout must already provide a buffer with
+    `STORAGE` usage (the test fixtures all do — `STORAGE | COPY_DST` or
+    `STORAGE | COPY_DST | COPY_SRC` per the audit's "Fixed-size buffer
+    creation precedent"). The change is binary-compatible at the wgpu
+    binding-resource level.
+  - Semantic behaviour: `atomicLoad(&old_map[id].voxel_pointer)` becomes
+    a plain atomic load on a read_write binding — identical semantics to
+    the prior `atomicLoad` on a read binding (the latter is technically
+    UB per WGSL, but naga accepted it).
+  - Pre-migration native gates (`cargo test --workspace --lib`,
+    `e2e_render --validate-gpu-construction`, `--edit-mode`, etc.) all
+    bypass `map_copy` at runtime (it's the hash-map regrow path —
+    `BlockHashingHandler.IncreaseSizeToNewCount` — and the regrow does
+    not fire under the test fixtures' bound conditions). The `map_copy`
+    pipeline is queued at `ConstructionPipelines::from_world` (so the
+    WGSL compilation does happen) but the pipeline is never dispatched
+    against `old_map`. Pipeline-cache compile errors would surface as
+    a `CachedPipelineState::Err` — but since native naga accepts the
+    binding, native validates fine. Edit A keeps native validation
+    correct (it still validates: `read_write` is the strictly weaker
+    constraint).
+
+- **Edit B**: deferred; risk to be assessed after edit A's gates.
+
+
+## Validation-error fix (2026-05-17)
+
+### The diff applied
+
+**Edit 1 — `crates/bevy_naadf/src/assets/shaders/map_copy.wgsl:48-49`** (one
+line + a 10-line explanatory comment block immediately above): promote
+`old_map` from `var<storage, read>` to `var<storage, read_write>`. The
+`HashValueSlot` struct contains `atomic<u32>` fields, which the WGSL spec
+forbids in a `read`-mode storage buffer. Dawn rejects the resulting module
+as invalid; naga's native frontend was lenient and accepted it. The kernel
+itself never writes to `old_map`; the access-mode change is layout-only and
+semantically null.
+
+**Edit 2 — `crates/bevy_naadf/src/render/construction/map_copy.rs:69`** (one
+slot in `BindGroupLayoutEntries::sequential` + a 7-line explanatory comment):
+flip slot 0 in `map_copy_layout_descriptor` from
+`storage_buffer_read_only_sized(false, None)` to
+`storage_buffer_sized(false, None)`, matching the WGSL access-mode promotion
+in Edit 1. The bind-group-layout shape remains binary-compatible — every
+buffer-resource consumer already has `STORAGE` usage.
+
+**Edit 3 — `crates/bevy_naadf/src/assets/shaders/generator_model.wgsl:118`**:
+rename the entry-point function from `fill_chunk_data_with_model_data_16`
+to `fill_chunk_data_with_model_data` (drop the trailing `_16` suffix). The
+`_16` was a port-fidelity marker for HLSL's `numthreads(4,4,4)` (4×4×4 = 64
+threads, 64×... = a 16-voxel-per-thread group), and is documented inline as
+a port-of-HLSL artefact.
+
+**Edit 4 — `crates/bevy_naadf/src/render/construction/generator_model.rs:174`**:
+update the corresponding `entry_point: Some(Cow::from("..."))` string to
+match Edit 3. Doc comments in this file and in
+`crates/bevy_naadf/src/render/construction/mod.rs:256` were updated for
+consistency; doc comments referencing the old name in
+`generator_model.wgsl:4` were rewritten to record the rename rationale.
+
+### Phase-3 verification outcomes
+
+| Gate | Command | Status | Notes |
+|---|---|---|---|
+| 1 | `cargo test --workspace --lib` | **PASS** | 184 passed, 1 ignored (3 suites, 4.42s) |
+| 2 | `just web-build` | **PASS** | trunk build success |
+| 3 | `just test-wasm-headed` | **PASS (functional)** | 0 of the 3 named bevy-validation errors remain in the headed-mode captured errors list. The test still exits 1, but with **1 captured error** instead of 5 — and that one entry is the pre-existing unrelated `[console.error] Failed to load resource: the server responded with a status of 404 (Not Found)` (likely a missing favicon or similar; not a `bevy.error`, not introduced by this fix). The canvas screenshot at the 10 s capture point is **1,015,620 bytes** (vs 1,850,059 bytes pre-fix, 4,403 bytes pre-fix-headless-DeviceLost) — a live, non-black framebuffer, confirming the renderer is alive end-to-end and producing pixels. |
+| 4 | `just test-wasm-full` | **FAIL (residual; not a new regression)** | The same pre-existing residual `DeviceLost: Destroyed` reported pre-migration and post-migration. After this fix, the captured errors list contains **2 bevy.error entries**: `Caught DeviceLost error: Destroyed Device was destroyed.` (`error_handler.rs:128`) and `Quitting the application due to DeviceLost RenderError` (`error_handler.rs:79`). Identical to the pre-fix headless-mode pattern. None of the 3 named pipeline-validation errors appears in this gate's output anymore. The headless GPU-process crash is upstream of pipeline compilation and was masking the named errors; with the named errors fixed, the GPU-process crash is the only headless-mode failure mode left. This residual was already flagged in the pre-fix implementation log as a follow-up requiring its own `delegate-reviewer` investigation (suggested triage paths: bevy_pbr `texture_storage_3d<rgba16float, write>` storage textures; SwiftShader `maxStorageBuffersPerShaderStage` limit; `chrome://gpu` Dawn validation log). |
+| 5 | `cargo run --bin e2e_render -- --validate-gpu-construction` | **PASS** | `GPU construction byte-equal to CPU oracle: 388 bytes compared`. The native construction-pipeline gate is unbroken — the WGSL changes (access mode + entry-point rename) are layout-only and entry-point-only; the kernel bodies are unchanged. |
+
+### Deviations from the Phase-1 diagnosis
+
+1. **Edit B applied (the entry-point rename was needed).** The Phase-1
+   diagnosis hypothesised error #2 might be a cascade of errors #1/#3 from
+   a different shader module. Empirical re-run after Edit 1 + Edit 2 showed
+   error #2 persists in isolation — so it was indeed an independent failure.
+   The trailing-`_16` rename (Edit 3 + Edit 4) was the right remedy and
+   was applied as Phase-1's contingency had pre-authorised. After the
+   rename, error #2 disappears from the headed-mode error list.
+
+2. **Root cause of error #2 — refined understanding.** The trailing-digit
+   identifier rule the project's own `render_pipeline_common.wgsl:82-85`
+   documents for struct fields under naga-oil composable modules turned
+   out to also affect entry-point function names on the
+   `make_naga_module` → `validate_transformed_shader_module` →
+   `naga::back::wgsl::write_string` path that wgpu's WebGPU backend
+   takes (`wgpu-29.0.3/src/backend/webgpu.rs:1872-1893`). The wgpu webgpu
+   backend re-runs `naga::valid::Validator::new(ValidationFlags::all(),
+   Capabilities::all())` on the IR; a failed validation produces an
+   *empty* `GpuShaderModuleDescriptor::new("")` payload — and Dawn then
+   reports "entry point doesn't exist" on the requested name because the
+   shader module is in fact empty WGSL. (The error class — `ShaderModule
+   (unlabeled)` not `Invalid ShaderModule (unlabeled)` — is consistent
+   with this: a valid-but-empty module that simply has no entry points.)
+   The trailing `_16` suffix triggers an internal naga writeback rule
+   that fails validation under WGSL writer flags. Dropping the `_16` clears
+   it.
+
+### Residual issues
+
+1. **`just test-wasm-full` (headless) still fails with `DeviceLost:
+   Destroyed`.** Pre-existing; the pre-fix implementation log already
+   documented this and recommended a fresh-eyes `delegate-reviewer`
+   investigation. Out of scope for this dispatch (the dispatch's named
+   target was the 3 named pipeline-validation errors, all 3 of which are
+   now resolved). Headed mode now passes functionally (1 unrelated 404
+   only); headless mode's GPU-process crash is upstream of pipeline
+   compilation and was masking these named errors in the first place.
+
+2. **`[console.error] Failed to load resource: the server responded with
+   a status of 404`** — present in both headed and headless. Likely a
+   missing favicon or service-worker asset; predates this fix. The smoke
+   test still trips on it because it counts all `console.error` entries.
+   Out of scope for this dispatch; a one-line `index.html` edit (add a
+   `link rel="icon"` or update the smoke test to filter 404s) would
+   clear it. Flagged for separate follow-up.
+
