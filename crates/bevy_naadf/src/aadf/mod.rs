@@ -9,6 +9,7 @@
 //! - [`generator`] — Phase-C W5 CPU oracle for `generatorModel.fx` (the GPU
 //!   world generator that produces the input to Algorithm 1).
 
+pub mod block_hash;
 pub mod bounds;
 pub mod cell;
 pub mod construct;

@@ -315,6 +315,15 @@ pub struct AppArgs {
     /// adjacent bboxes (catches Mode 1 AADF-skip cross-section bugs). See
     /// [`crate::e2e::small_edit_visual`].
     pub small_edit_visual_mode: bool,
+    /// `2026-05-17` — when `true`, the e2e driver runs the
+    /// **small-edit-repro gate**: load the Oasis VOX fixture, pin the camera
+    /// to a user-captured pose, programmatically place a single 1×1×1 voxel
+    /// at the user-captured brush position, then assert the post-edit
+    /// framebuffer contains NO pitch-black (RGB == 0,0,0) pixels. Catches
+    /// the user-reported "small edits render as inverted black shapes"
+    /// regression that `--small-edit-visual` does not catch. See
+    /// [`crate::e2e::small_edit_repro`].
+    pub small_edit_repro_mode: bool,
 }
 
 impl Default for AppArgs {
@@ -330,6 +339,7 @@ impl Default for AppArgs {
             vox_e2e_mode: false,
             oasis_edit_visual_mode: false,
             small_edit_visual_mode: false,
+            small_edit_repro_mode: false,
         }
     }
 }
@@ -724,6 +734,21 @@ pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
     let mut cfg = AppConfig::e2e();
     if args.resize_test {
         cfg.window = WindowConfig::e2e_resize_test();
+    }
+    // `--small-edit-repro` runs at the user's screen size (1920×1080) so the
+    // bug-or-fix signal matches what the user observes in the live binary.
+    // The pitch-black-pixel assertion is resolution-independent in principle,
+    // but the user's report specifies this size; reproduce verbatim.
+    if args.small_edit_repro_mode {
+        cfg.window = WindowConfig {
+            resolution: Some((
+                crate::e2e::small_edit_repro::SMALL_EDIT_REPRO_WIDTH as f32,
+                crate::e2e::small_edit_repro::SMALL_EDIT_REPRO_HEIGHT as f32,
+            )),
+            resizable: false,
+            title: "bevy-naadf e2e_render small-edit-repro",
+            name: None,
+        };
     }
     let app = build_app_with_args(cfg, args);
     e2e::run_with_app(app)

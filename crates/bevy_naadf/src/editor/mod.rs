@@ -238,6 +238,31 @@ pub fn apply_edit_tool(
     let radius = state.radius;
     let ty = state.selected_type;
     let is_erase = state.is_erase;
+
+    // Reproduction log — every click that fires the brush emits a single line
+    // with the camera transform + brush params, sufficient to re-stage the
+    // exact edit in an e2e gate. Prefix `EDIT_REPRO` so it's grep-able from
+    // the binary's stdout. `info!` level — visible by default in release.
+    let cam_pos = cam_gxf.translation();
+    let cam_quat = cam_gxf.rotation();
+    let hit_world = hit.world_pos;
+    let hit_voxel = hit.voxel_pos;
+    let hit_normal = hit.normal;
+    info!(
+        target: "edit_repro",
+        "EDIT_REPRO cam_pos=({:.6},{:.6},{:.6}) cam_quat=({:.6},{:.6},{:.6},{:.6}) \
+         tool={:?} radius={:.6} pos=({:.6},{:.6},{:.6}) ty={} is_erase={} \
+         hit_world=({:.6},{:.6},{:.6}) hit_voxel=({},{},{}) hit_normal=({:.3},{:.3},{:.3}) \
+         just_pressed={}",
+        cam_pos.x, cam_pos.y, cam_pos.z,
+        cam_quat.x, cam_quat.y, cam_quat.z, cam_quat.w,
+        state.tool, radius, pos.x, pos.y, pos.z, ty.raw(), is_erase,
+        hit_world.x, hit_world.y, hit_world.z,
+        hit_voxel.x, hit_voxel.y, hit_voxel.z,
+        hit_normal.x, hit_normal.y, hit_normal.z,
+        just_pressed,
+    );
+
     match state.tool {
         EditTool::Paint => tools::paint_brush(&mut world_data, pos, radius, ty),
         EditTool::Cube => tools::cube_brush(&mut world_data, pos, radius, ty, is_erase),
@@ -287,6 +312,7 @@ mod tests {
             },
             pending_edits: PendingEdits::default(),
             dense_voxel_types: Vec::new(),
+            block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
         };
         app.insert_resource(wd);
         app.init_resource::<EditorState>(); // edit_active = false

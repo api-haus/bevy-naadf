@@ -473,8 +473,17 @@ fn apply_block_change(
 ) {
     let edit_base = group_id.x * (64u + 1u);
     let change_pointer = changed_blocks_dynamic[edit_base];
-    // Load the block this thread owns into both `cur_block` and `cached_cell`.
-    var cur_block = changed_blocks_dynamic[edit_base + 1u + local_index];
+    // Load the block this thread owns. **Empty-block AADF reset**:
+    // `compute_bounds_4` is *additive* on bits 0-11 and assumes empty input
+    // has AADF = 0; if the caller's upload buffer carries already-augmented
+    // AADFs (e.g. from a previous edit's recompute), repeated growth
+    // overflows the 2-bit fields and corrupts the cell. Zeroing empty cells
+    // here makes the kernel idempotent — output depends only on the local
+    // 4³ non-empty topology, not on prior AADF state. Non-empty blocks
+    // (state bits 30-31 nonzero) pass through unchanged; the "non-empty
+    // pass-through" branch below restores their original word anyway.
+    let raw_block = changed_blocks_dynamic[edit_base + 1u + local_index];
+    var cur_block = select(0u, raw_block, (raw_block >> 30u) != 0u);
     cached_cell[local_index] = cur_block;
 
     let block_pos_in_chunk = vec3<i32>(
@@ -522,7 +531,16 @@ fn apply_voxel_change(
     // reads high 16 bits.
     let pair_u32 = changed_voxels_dynamic[edit_base + 1u + (local_index / 2u)];
     let is_high = (local_index & 1u) == 1u;
-    var cur_voxel = select(pair_u32 & 0xFFFFu, pair_u32 >> 16u, is_high);
+    let raw_voxel = select(pair_u32 & 0xFFFFu, pair_u32 >> 16u, is_high);
+    // **Empty-voxel AADF reset** (matches the same fix in `apply_block_change`):
+    // `compute_bounds_4` is additive on bits 0-11; zeroing empty cells here
+    // keeps the kernel idempotent across re-runs (the C# `applyVoxelChange`
+    // has the same algorithmic shape but C# avoids re-running on the same
+    // block via `BlockHashingHandler` hash dedup — the Bevy port has dedup
+    // too now, but this safety net keeps the shader behaviour independent
+    // of input AADF state). Non-empty voxels (bit 15 set) pass through; the
+    // restore branch below preserves their TYPE word regardless.
+    var cur_voxel = select(0u, raw_voxel, (raw_voxel >> 15u) != 0u);
     cached_cell[local_index] = cur_voxel;
 
     let voxel_pos_in_block = vec3<i32>(

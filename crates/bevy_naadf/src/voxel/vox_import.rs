@@ -296,7 +296,7 @@ pub fn build_world_from_vox(
         world.size_in_chunks[2] * CHUNK_DIM_VOXELS,
     ];
 
-    let world_data = WorldData {
+    let mut world_data = WorldData {
         chunks_cpu: world.chunks,
         blocks_cpu: world.blocks,
         voxels_cpu: world.voxels,
@@ -311,7 +311,9 @@ pub fn build_world_from_vox(
         // Oasis-class world). The renderer reads the pre-built CPU buffers
         // directly.
         dense_voxel_types: Vec::new(),
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
     };
+    world_data.seed_block_hashing();
 
     let voxel_types = VoxelTypes {
         types: imported.palette,

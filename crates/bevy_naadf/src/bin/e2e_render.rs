@@ -86,6 +86,7 @@ fn main() -> ExitCode {
     let vox_e2e_mode = args.iter().any(|a| a == "--vox-e2e");
     let oasis_edit_visual_mode = args.iter().any(|a| a == "--oasis-edit-visual");
     let small_edit_visual_mode = args.iter().any(|a| a == "--small-edit-visual");
+    let small_edit_repro_mode = args.iter().any(|a| a == "--small-edit-repro");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -197,6 +198,15 @@ fn main() -> ExitCode {
         // rects did not (framebuffer post-condition / Mode 1 catch).
         // See [`bevy_naadf::e2e::small_edit_visual`].
         bevy_naadf::e2e::small_edit_visual::run_small_edit_visual()
+    } else if small_edit_repro_mode {
+        // `2026-05-17` — user-captured single-voxel-edit reproduction.
+        // Loads the Oasis VOX fixture, pins the camera to the user's
+        // EDIT_REPRO-logged pose, runs the exact `cube_brush(radius=1)`
+        // call the user made, then asserts no pitch-black pixels in the
+        // 1920×1080 post-edit framebuffer. Catches the regression the
+        // standard `--small-edit-visual` gate misses. See
+        // [`bevy_naadf::e2e::small_edit_repro`].
+        bevy_naadf::e2e::small_edit_repro::run_small_edit_repro()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then

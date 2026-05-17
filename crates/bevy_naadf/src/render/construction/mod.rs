@@ -2762,7 +2762,9 @@ pub fn validate_edit_mode() -> Result<String, String> {
         },
         pending_edits: Default::default(),
         dense_voxel_types: volume.voxels.iter().map(|t| t.0).collect(),
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
     };
+    world_data.seed_block_hashing();
     // The pre-edit chunks_cpu — record its bytes to verify the edit changed
     // something.
     let pre_edit_chunks = world_data.chunks_cpu.clone();
@@ -2899,7 +2901,9 @@ pub fn validate_runtime_edit_mode() -> Result<String, String> {
         },
         pending_edits: Default::default(),
         dense_voxel_types: volume.voxels.iter().map(|t| t.0).collect(),
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
     };
+    world_data.seed_block_hashing();
 
     // Production brush path — same call shape the editor's brushes use
     // (`editor/tools.rs::paint_brush` / `cube_brush` / `sphere_brush`).

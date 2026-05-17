@@ -103,7 +103,7 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
             // re-run.
             let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
 
-            commands.insert_resource(WorldData {
+            let mut world_data = WorldData {
                 chunks_cpu: world.chunks,
                 blocks_cpu: world.blocks,
                 voxels_cpu: world.voxels,
@@ -114,7 +114,10 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                 },
                 pending_edits: Default::default(),
                 dense_voxel_types,
-            });
+                block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+            };
+            world_data.seed_block_hashing();
+            commands.insert_resource(world_data);
 
             commands.insert_resource(VoxelTypes {
                 types: palette,
@@ -177,7 +180,7 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                 let world = construct(&volume);
                 let size = volume.size_in_voxels();
                 let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
-                commands.insert_resource(WorldData {
+                let mut world_data = WorldData {
                     chunks_cpu: world.chunks,
                     blocks_cpu: world.blocks,
                     voxels_cpu: world.voxels,
@@ -192,7 +195,10 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                     },
                     pending_edits: Default::default(),
                     dense_voxel_types,
-                });
+                    block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+                };
+                world_data.seed_block_hashing();
+                commands.insert_resource(world_data);
                 commands.insert_resource(VoxelTypes {
                     types: palette,
                 });

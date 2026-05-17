@@ -27,6 +27,7 @@ pub mod framebuffer;
 pub mod gates;
 pub mod oasis_edit_visual;
 pub mod readback;
+pub mod small_edit_repro;
 pub mod small_edit_visual;
 pub mod vox_e2e;
 
@@ -221,6 +222,7 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<driver::ResizeTestState>()
         .init_resource::<oasis_edit_visual::OasisEditVisualState>()
         .init_resource::<small_edit_visual::SmallEditVisualState>()
+        .init_resource::<small_edit_repro::SmallEditReproState>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
         // camera `Transform` + `PositionSplit` during the `MOTION` / `SETTLE`
@@ -240,6 +242,7 @@ pub fn add_e2e_systems(app: &mut App) {
                 driver::e2e_driver,
                 oasis_edit_visual::pin_oasis_camera.after(driver::e2e_driver),
                 small_edit_visual::pin_small_edit_camera.after(driver::e2e_driver),
+                small_edit_repro::pin_small_edit_repro_camera.after(driver::e2e_driver),
             )
                 .before(crate::camera::sync_position_split),
         );

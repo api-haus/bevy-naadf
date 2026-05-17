@@ -306,6 +306,7 @@ mod tests {
             },
             pending_edits: PendingEdits::default(),
             dense_voxel_types: Vec::new(),
+            block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
         }
     }
 

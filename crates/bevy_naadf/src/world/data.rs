@@ -85,6 +85,13 @@ pub struct WorldData {
     /// authored from a `DenseVolume` (e.g. legacy code paths); the GPU
     /// dispatch falls back to its existing producer chain in that case.
     pub dense_voxel_types: Vec<u16>,
+    /// Content-addressable storage for mixed-block voxel payloads (port of
+    /// C# `BlockHashingHandler`). Maps each unique 32-u32 voxel block to a
+    /// single `voxels_cpu` slot via refcounting + a free list. Eliminates
+    /// the redundant re-uploads the simplified port did on every edit (see
+    /// `aadf::block_hash` for the AADF-overflow correctness story).
+    /// Seeded by [`Self::seed_block_hashing`] after construction.
+    pub block_hashing: crate::aadf::block_hash::BlockHashingHandler,
 }
 
 impl Default for WorldData {
@@ -98,11 +105,82 @@ impl Default for WorldData {
             bounding_box: IAabb3::default(),
             pending_edits: PendingEdits::default(),
             dense_voxel_types: Vec::new(),
+            block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
         }
     }
 }
 
 impl WorldData {
+    /// Walk the freshly-constructed world and register every mixed block's
+    /// voxel slot in [`Self::block_hashing`]. **Must be called after
+    /// construction (or `.vox` load) and before the first edit** so that
+    /// the on-edit `add_block` / `delete_block` calls see the correct
+    /// initial refcounts.
+    ///
+    /// Iteration: chunks_cpu → blocks_cpu (for Mixed chunks) → register each
+    /// Mixed block's `voxel_ptr`. The handler's `add_block` is content-keyed,
+    /// so identical voxel content across chunks shares a single slot — but
+    /// construction-time `voxels_cpu` already allocated unique slots per
+    /// block, so the seed pass intentionally bumps `use_count` for each
+    /// block that points to an existing slot rather than allocating fresh.
+    ///
+    /// O(chunks × 64) mixed-block hashes + O(unique-blocks) hashmap inserts.
+    /// For Oasis (~265 k chunks, ~10 M u32 voxels): ~200 k mixed blocks ⇒
+    /// ~10 ms CPU on release builds. One-shot at load.
+    pub fn seed_block_hashing(&mut self) {
+        let n_chunks = self.chunks_cpu.len();
+        for ci in 0..n_chunks {
+            let chunk_raw = self.chunks_cpu[ci];
+            if (chunk_raw >> 30) != 2 {
+                // Empty / UniformFull — no block storage.
+                continue;
+            }
+            let block_base = (chunk_raw & 0x3FFF_FFFF) as usize;
+            for b in 0..crate::voxel::CELL_CHILDREN {
+                let block_idx = block_base + b;
+                if block_idx >= self.blocks_cpu.len() {
+                    break;
+                }
+                let block_raw = self.blocks_cpu[block_idx];
+                if (block_raw >> 30) != 2 {
+                    // Empty / UniformFull block — no voxel-slot ref.
+                    continue;
+                }
+                let voxel_ptr = block_raw & 0x3FFF_FFFF;
+                let vbase = voxel_ptr as usize;
+                if vbase + crate::aadf::block_hash::BLOCK_VOXEL_PAIRS
+                    > self.voxels_cpu.len()
+                {
+                    continue;
+                }
+                // Hash the existing voxel content and register the slot.
+                // `add_block` will dedup if multiple block positions
+                // already happen to share content (rare; construction
+                // allocates fresh slots so the first occurrence of each
+                // unique content gets its own slot, and subsequent
+                // identical content increments use_count).
+                let pairs = {
+                    let slice = &self.voxels_cpu
+                        [vbase..vbase + crate::aadf::block_hash::BLOCK_VOXEL_PAIRS];
+                    // Copy into a stack array so add_block's &mut voxels_cpu
+                    // borrow doesn't conflict with this read.
+                    let mut buf = [0u32; crate::aadf::block_hash::BLOCK_VOXEL_PAIRS];
+                    buf.copy_from_slice(slice);
+                    buf
+                };
+                let hash = self.block_hashing.compute_hash(&pairs);
+                let (registered_ptr, is_new) =
+                    self.block_hashing.add_block(hash, &pairs, &mut self.voxels_cpu);
+                // If the seed produced a different pointer (because content
+                // matched an earlier seed and was deduped), patch the block
+                // word to point at the canonical slot.
+                if !is_new && registered_ptr != voxel_ptr {
+                    self.blocks_cpu[block_idx] = (block_raw & !0x3FFF_FFFF) | registered_ptr;
+                }
+            }
+        }
+    }
+
     /// **DIAGNOSTIC-ONLY** single-voxel edit (`02f` rearch). Runs the
     /// whole-world `recompute_chunk_layer_aadfs` + emits synthetic
     /// AADF-changed chunk uploads — O(N_chunks × 31 × 3) per call. **Do not
@@ -759,46 +837,182 @@ impl WorldData {
             edit_data[off..off + 2048].copy_from_slice(&window);
         }
 
-        // Run process_edit_batch ONCE with all chunks.
-        let v_cursor = self.voxels_cpu.len() as u32;
-        let b_cursor = self.blocks_cpu.len() as u32;
-        let (batch, _new_v, _new_b) = crate::aadf::edit::process_edit_batch(
-            &edit_data,
-            &edited_chunks,
-            v_cursor,
-            b_cursor,
-        );
-
-        // Apply to CPU buffers — mirrors `set_voxel:158-187`. Two passes: (1)
-        // append voxel slots, (2) append + re-encode AADFs on block slots.
-        let mut v_iter = batch.changed_voxels.chunks_exact(33);
-        while let Some(chunk_vox) = v_iter.next() {
-            for &v in &chunk_vox[1..33] {
-                self.voxels_cpu.push(v);
-            }
-        }
-        for (idx, edit_block) in batch.changed_blocks.chunks_exact(65).enumerate() {
-            let block_ptr = b_cursor + (idx as u32) * 64;
-            let target_len = (block_ptr + 64) as usize;
-            if self.blocks_cpu.len() < target_len {
-                self.blocks_cpu.resize(target_len, 0);
-            }
-            let mut raw = [0u32; 64];
-            raw[..64].copy_from_slice(&edit_block[1..65]);
-            crate::aadf::edit::apply_block_edit_cpu(&mut self.blocks_cpu, block_ptr, &raw);
-        }
-        for entry in &batch.changed_chunks {
-            let pos_packed = entry[0];
-            let new_state = entry[1];
-            let cx = pos_packed & 0x7FF;
-            let cy = (pos_packed >> 11) & 0x3FF;
-            let cz = pos_packed >> 21;
-            let ci = (cx
+        // Per-chunk encode with hash-dedup (port of C#
+        // `EditingHandler.processChunks` — `EditingHandler.cs:75-180`):
+        // for each edited chunk, walk its 64 new blocks; for mixed blocks,
+        // dedup the 32-u32 voxel payload through `block_hashing.add_block`
+        // (which reuses an existing slot when content matches, or allocates
+        // a fresh slot from the free list / extends `voxels_cpu`). Then
+        // decrement the OLD mixed blocks' refcounts via `delete_block`,
+        // freeing slots that drop to zero.
+        //
+        // Order matches C# `processChunks:82-167`: AddBlock pass (Stage A)
+        // runs BEFORE the DeleteBlock pass (Stage B). If an old block's
+        // content survived the edit (no voxel positions inside it were
+        // touched), Stage A bumps its `use_count` and Stage B decrements
+        // it — net zero, no spurious free.
+        let mut batch = crate::aadf::edit::EditBatch::default();
+        for &(chunk_pos, edit_offset) in &edited_chunks {
+            let cx = chunk_pos[0];
+            let cy = chunk_pos[1];
+            let cz = chunk_pos[2];
+            let chunk_idx = (cx
                 + cy * self.size_in_chunks.x
-                + cz * self.size_in_chunks.x * self.size_in_chunks.y) as usize;
-            if ci < self.chunks_cpu.len() {
-                self.chunks_cpu[ci] = new_state;
+                + cz * self.size_in_chunks.x * self.size_in_chunks.y)
+                as usize;
+            let edit_base = edit_offset as usize;
+            let old_chunk_state = self.chunks_cpu[chunk_idx];
+            let old_chunk_was_mixed = (old_chunk_state >> 30) == 2;
+            let old_block_ptr = if old_chunk_was_mixed {
+                Some((old_chunk_state & 0x3FFF_FFFF) as usize)
+            } else {
+                None
+            };
+
+            // Stage A — build new_blocks via hash dedup on mixed blocks.
+            let mut new_blocks = [0u32; crate::voxel::CELL_CHILDREN];
+            let mut all_blocks_same = true;
+            let mut reference_block: u32 = 0;
+            for b in 0..crate::voxel::CELL_CHILDREN {
+                let block_base = edit_base + b * 32;
+                let first_pair = edit_data[block_base];
+                let lo0 = first_pair & 0xFFFF;
+                let hi0 = first_pair >> 16;
+                let mut is_uniform = lo0 == hi0;
+                if is_uniform {
+                    for i in 0..32 {
+                        let pair = edit_data[block_base + i];
+                        if (pair & 0xFFFF) != lo0 || (pair >> 16) != lo0 {
+                            is_uniform = false;
+                            break;
+                        }
+                    }
+                }
+                if is_uniform {
+                    let first_type =
+                        (lo0 & crate::voxel::VOXEL_PAYLOAD_MASK as u32) as u16;
+                    let state = if first_type == 0 { 0u32 } else { 1u32 };
+                    new_blocks[b] = (first_type as u32) | (state << 30);
+                } else {
+                    // Mixed — pass the verbatim voxel data through hash dedup.
+                    // The AADF bits of empty voxels are preserved here (no
+                    // CPU-side zeroing); the GPU `apply_voxel_change` shader
+                    // resets them locally before its additive AADF recompute,
+                    // so its output is idempotent independent of input AADF
+                    // state. This means the seed pass at construction time
+                    // (which registered hashes computed over construction-
+                    // time AADFs) and this edit pass produce matching hashes
+                    // for unchanged blocks → `add_block` returns `is_new=false`
+                    // and we skip the upload.
+                    let mut payload = [0u32; 32];
+                    for i in 0..32 {
+                        payload[i] = edit_data[block_base + i];
+                    }
+                    let hash = self.block_hashing.compute_hash(&payload);
+                    let (voxel_ptr, is_new) = self
+                        .block_hashing
+                        .add_block(hash, &payload, &mut self.voxels_cpu);
+                    if is_new {
+                        batch.changed_voxels.push(voxel_ptr);
+                        for &v in &payload {
+                            batch.changed_voxels.push(v);
+                        }
+                    }
+                    new_blocks[b] = voxel_ptr | (2u32 << 30); // Mixed
+                }
+                if b == 0 {
+                    reference_block = new_blocks[0];
+                }
+                if new_blocks[b] != reference_block {
+                    all_blocks_same = false;
+                }
             }
+
+            // Stage B — free OLD voxel slots (C# processChunks:127-144).
+            // Walk the OLD chunk's blocks, decrement refcount for each old
+            // mixed block. If any drop to 0 they get queued for reuse.
+            if let Some(old_bptr) = old_block_ptr {
+                for b in 0..crate::voxel::CELL_CHILDREN {
+                    let bi = old_bptr + b;
+                    if bi >= self.blocks_cpu.len() {
+                        break;
+                    }
+                    let old_block = self.blocks_cpu[bi];
+                    if (old_block >> 30) != 2 {
+                        continue;
+                    }
+                    let old_voxel_ptr = old_block & 0x3FFF_FFFF;
+                    let vbase = old_voxel_ptr as usize;
+                    if vbase + crate::aadf::block_hash::BLOCK_VOXEL_PAIRS
+                        > self.voxels_cpu.len()
+                    {
+                        continue;
+                    }
+                    let mut buf = [0u32; crate::aadf::block_hash::BLOCK_VOXEL_PAIRS];
+                    buf.copy_from_slice(
+                        &self.voxels_cpu
+                            [vbase..vbase + crate::aadf::block_hash::BLOCK_VOXEL_PAIRS],
+                    );
+                    let hash = self.block_hashing.compute_hash(&buf);
+                    let _freed = self.block_hashing.delete_block(hash, old_voxel_ptr);
+                }
+            }
+
+            // Stage C — write new blocks to blocks_cpu, allocate/reuse the
+            // chunk's block pointer. C# `SetBlocks:332-342` reuses the
+            // existing block slot when the chunk was already Mixed;
+            // matching that here avoids a fresh 64-block allocation per
+            // edit on an already-mixed chunk (and the corresponding
+            // block-slot leak the simplified port had).
+            let new_chunk_value: u32;
+            if all_blocks_same {
+                new_chunk_value = reference_block;
+                // Note: when the chunk transitions Mixed → Empty/UniformFull,
+                // the old 64-block slot is leaked here (no block-slot free
+                // list yet — a future port adds `freeBlockSlots` matching
+                // `WorldData.cs:39`). Voxel slots were already freed in
+                // Stage B above.
+            } else {
+                let block_ptr = if let Some(old_bptr) = old_block_ptr {
+                    // Reuse — write the new 64 blocks at the same offset.
+                    old_bptr as u32
+                } else {
+                    // Allocate fresh — extend blocks_cpu by 64.
+                    let p = self.blocks_cpu.len() as u32;
+                    self.blocks_cpu.resize(self.blocks_cpu.len() + 64, 0);
+                    p
+                };
+                // Always emit the 65-u32 changed_blocks record so the GPU
+                // apply_block_change dispatch updates the block layer
+                // (and recomputes BLOCK-layer AADFs on empty blocks).
+                batch.changed_blocks.push(block_ptr);
+                for b in 0..crate::voxel::CELL_CHILDREN {
+                    batch.changed_blocks.push(new_blocks[b]);
+                }
+                let block_ptr_usize = block_ptr as usize;
+                let target_len = block_ptr_usize + 64;
+                if self.blocks_cpu.len() < target_len {
+                    self.blocks_cpu.resize(target_len, 0);
+                }
+                // Mirror the GPU `apply_block_change` AADF computation on the
+                // CPU mirror so `blocks_cpu` stays consistent with what the
+                // renderer reads from `world_gpu.blocks`. Empty blocks get
+                // their 2-bit AADFs recomputed; non-empty pass through.
+                let mut raw = [0u32; 64];
+                raw[..64].copy_from_slice(&new_blocks);
+                crate::aadf::edit::apply_block_edit_cpu(
+                    &mut self.blocks_cpu,
+                    block_ptr,
+                    &raw,
+                );
+                new_chunk_value = block_ptr | (2u32 << 30);
+            }
+
+            batch.changed_chunks.push([
+                crate::aadf::edit::pack_chunk_pos(chunk_pos),
+                new_chunk_value,
+            ]);
+            self.chunks_cpu[chunk_idx] = new_chunk_value;
         }
         // NOTE (`02e-perframe-cpu-investigation.md`, 2026-05-16): do NOT set
         // `self.dirty = true` here. The W2 delta chain (above — `pending_edits`
@@ -1186,6 +1400,7 @@ mod tests {
             },
             pending_edits: PendingEdits::default(),
             dense_voxel_types: Vec::new(),
+            block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
         }
     }
 

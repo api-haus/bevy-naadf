@@ -291,11 +291,14 @@ pub fn process_edit_batch(
                 new_blocks[b] = (first_type as u32) | (state << 30);
             } else {
                 // Mixed — append the 32 packed-voxel-pair u32s to
-                // `changed_voxels` (one new voxel slot per mixed block, no
-                // dedup in this simplified port).
+                // `changed_voxels`. **Diagnostic-only path** (only
+                // `WorldData::set_voxel` / unit tests use this `process_edit_batch`
+                // function now). The production runtime path
+                // [`WorldData::set_voxels_batch`] is the hashing-dedup'd
+                // port of C# `EditingHandler.processChunks` and handles
+                // the AADF-zero-input requirement itself.
                 let voxel_ptr = v_cursor;
                 v_cursor += 32;
-                // `changedVoxels[i*33] = pointer`; `[i*33+1..i*33+33] = 32 u32s`.
                 batch.changed_voxels.push(voxel_ptr);
                 for i in 0..32 {
                     batch.changed_voxels.push(edit_data[block_base + i]);
