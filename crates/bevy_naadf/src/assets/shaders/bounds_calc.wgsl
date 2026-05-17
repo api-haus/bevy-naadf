@@ -88,14 +88,13 @@ struct ConstructionParams {
 // `chunk_calc`'s 8-binding layout means: (a) the W3 prepare system does not
 // need W1's hash buffers to exist, and (b) the bind-group construction is
 // 2-binding instead of 8-binding (cheaper, lower-conflict at prepare time).
-// W4 widened the chunks texture from `R32Uint` to `Rg32Uint`. The W3 reads
-// still take `.x` (forward-compat — `15-design-c.md` §1.7), and the chunk
-// state writes (`textureStore(chunks, ..., vec4<u32>(state, 0u, 0u, 0u))`)
-// would zero the `.y` channel. The `bounds_calc.wgsl` write at line 382 is
-// the `compute_group_bounds` AADF-expansion write — we update it to preserve
-// `.y` (entity-pointer) like the W2 shaders do.
+// W4 widened the chunk-pair from `R32Uint` to `(x,y)`. The W3 reads still
+// take `.x`, and the AADF-expansion write at line 394 preserves `.y` (the
+// entity-pointer channel) like the W2 shaders do.
+// Web-WebGPU migration: chunks is now `array<vec2<u32>>` (was
+// `texture_storage_3d<rg32uint, read_write>`).
 @group(0) @binding(0)
-var chunks: texture_storage_3d<rg32uint, read_write>;
+var<storage, read_write> chunks: array<vec2<u32>>;
 @group(0) @binding(1)
 var<uniform> params: ConstructionParams;
 
@@ -206,8 +205,14 @@ fn add_bounds_group(
         }
         return cur_chunk;
     }
-    // `textureLoad` on a `texture_storage_3d` returns vec4<u32>; we use `.x`.
-    let neighbour_x = textureLoad(chunks, neighbour_chunk_pos).x;
+    // Web-WebGPU migration: chunks is `array<vec2<u32>>`; we use `.x`.
+    // After the out-of-bounds gate above, `neighbour_chunk_pos` is in
+    // `[0, size_in_chunks)` per axis, safe to cast to `vec3<u32>`.
+    let neighbour_pos_u = vec3<u32>(neighbour_chunk_pos);
+    let neighbour_idx = neighbour_pos_u.x
+        + neighbour_pos_u.y * params.size_in_chunks.x
+        + neighbour_pos_u.z * params.size_in_chunks.x * params.size_in_chunks.y;
+    let neighbour_x = chunks[neighbour_idx].x;
     // `(neighbour.x >> 30) == BLOCK_STATE_UNIFORM_EMPTY && neighbour.y == 0`
     // — the non-`#ifdef ENTITIES` path collapses `.y` to 0 (W4 owns the
     // widening; until then we have no entity counts and the test is just
@@ -353,8 +358,14 @@ fn compute_group_bounds(
         i32(gp.y * 4u + local_id.y),
         i32(gp.z * 4u + local_id.z),
     );
-    // `boundsCalc.fx:140-144` — forward-compat `.x` (W4 widens to `Rg32Uint`).
-    let cur_chunk_full = textureLoad(chunks, chunk_pos);
+    // Web-WebGPU migration: chunks is `array<vec2<u32>>`. `chunk_pos` is
+    // `vec3<i32>` constructed from `gp * 4 + local_id` (both non-negative);
+    // safe to cast for flatten.
+    let chunk_pos_u = vec3<u32>(chunk_pos);
+    let chunk_idx = chunk_pos_u.x
+        + chunk_pos_u.y * params.size_in_chunks.x
+        + chunk_pos_u.z * params.size_in_chunks.x * params.size_in_chunks.y;
+    let cur_chunk_full = chunks[chunk_idx];
     let cur_chunk_load = cur_chunk_full.x;
     // W4 — preserve `.y` (entity pointer channel) on the write below.
     let entity_y = cur_chunk_full.y;
@@ -391,7 +402,9 @@ fn compute_group_bounds(
     // the W3 background queue would silently zero the entity pointer on
     // every AADF expansion.
     if (is_group_active && cur_chunk_copy != cur_chunk) {
-        textureStore(chunks, chunk_pos, vec4<u32>(cur_chunk, entity_y, 0u, 0u));
+        // Web-WebGPU migration: write to the flat chunks buffer. `chunk_idx`
+        // was computed alongside the load above (same chunk-pos).
+        chunks[chunk_idx] = vec2<u32>(cur_chunk, entity_y);
         atomicStore(&any_bounds_increase, 1u);
     }
 

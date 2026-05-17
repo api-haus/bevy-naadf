@@ -90,7 +90,9 @@ struct ConstructionParams {
 // W2 declares only what it consumes; the unused slots (segment_voxel_buffer,
 // hash_map, hash_coefficients, block_voxel_count) are bound but never read.
 //
-//   0: chunks_rw            — `texture_storage_3d<rg32uint, read_write>` (W4-widened)
+//   0: chunks_rw            — `array<vec2<u32>>` (W4-widened pair, storage rw;
+//                              web-WebGPU migration replaced the previous
+//                              `texture_storage_3d<rg32uint, read_write>`)
 //   1: blocks_rw            — `array<u32>` (rw storage)
 //   2: voxels_rw            — `array<u32>` (rw storage)
 //   3: block_voxel_count_rw — `array<atomic<u32>>` (unused by W2 but layout-shared)
@@ -107,7 +109,7 @@ struct HashValueSlot {
 };
 
 @group(0) @binding(0)
-var chunks: texture_storage_3d<rg32uint, read_write>;
+var<storage, read_write> chunks: array<vec2<u32>>;
 @group(0) @binding(1)
 var<storage, read_write> blocks: array<u32>;
 @group(0) @binding(2)
@@ -306,15 +308,19 @@ fn apply_group_change(
         group_position.x
         + group_position.y * params.group_size_in_groups.x
         + group_position.z * params.group_size_in_groups.x * params.group_size_in_groups.y;
-    let chunk_pos = vec3<i32>(
-        i32(group_position.x * 4u + local_id.x),
-        i32(group_position.y * 4u + local_id.y),
-        i32(group_position.z * 4u + local_id.z),
+    let chunk_pos = vec3<u32>(
+        group_position.x * 4u + local_id.x,
+        group_position.y * 4u + local_id.y,
+        group_position.z * 4u + local_id.z,
     );
     // `worldChange.fx:44` — `CHUNKTYPE curChunk = chunks[chunkPos];`. With W4's
-    // `Rg32Uint` widening, the chunk texel is a `vec2<u32>`; `.x` carries the
-    // construction state + AADF, `.y` carries the entity pointer / counter.
-    let cur_chunk_load = textureLoad(chunks, chunk_pos);
+    // chunks-pair, `.x` carries the construction state + AADF, `.y` carries
+    // the entity pointer / counter. Web-WebGPU migration: chunks is
+    // `array<vec2<u32>>` indexed by `flatten_index(chunk_pos, sx, sx*sy)`.
+    let chunk_idx = chunk_pos.x
+        + chunk_pos.y * params.size_in_chunks.x
+        + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
+    let cur_chunk_load = chunks[chunk_idx];
     let cur_chunk_x = cur_chunk_load.x;
     let cur_chunk_y = cur_chunk_load.y;
 
@@ -373,7 +379,7 @@ fn apply_group_change(
         lowest_z = min(lowest_z, min(new_bound_zm, new_bound_zp));
 
         // **Preserve the `.y` entity-pointer channel** — W2 contract.
-        textureStore(chunks, chunk_pos, vec4<u32>(new_chunk_x, cur_chunk_y, 0u, 0u));
+        chunks[chunk_idx] = vec2<u32>(new_chunk_x, cur_chunk_y);
     }
 
     workgroupBarrier();
@@ -434,15 +440,18 @@ fn apply_chunk_change(
         return;
     }
     let change = changed_chunks_dynamic[global_id.x];
-    let chunk_pos = vec3<i32>(
-        i32(change.x & 0x7FFu),
-        i32((change.x >> 11u) & 0x3FFu),
-        i32(change.x >> 21u),
+    let chunk_pos = vec3<u32>(
+        change.x & 0x7FFu,
+        (change.x >> 11u) & 0x3FFu,
+        change.x >> 21u,
     );
-    // Load only to preserve `.y`.
-    let cur = textureLoad(chunks, chunk_pos);
-    // **Preserve `.y` (entity pointer channel)** — W2 contract.
-    textureStore(chunks, chunk_pos, vec4<u32>(change.y, cur.y, 0u, 0u));
+    // Web-WebGPU migration: chunks is `array<vec2<u32>>`. Load to preserve
+    // `.y` (entity pointer channel) — W2 contract — then write the pair.
+    let chunk_idx = chunk_pos.x
+        + chunk_pos.y * params.size_in_chunks.x
+        + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
+    let cur = chunks[chunk_idx];
+    chunks[chunk_idx] = vec2<u32>(change.y, cur.y);
 }
 
 // ─── Entry point 3: apply_block_change — fx:130-147 ───────────────────────────

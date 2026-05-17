@@ -26,10 +26,10 @@ design↔impl coupling.
 - [x] Mode selection — consolidated (Step 2.5, user-confirmed at Step 4)
 - [x] Architectural Q&A (Step 4) — 4 decisions captured in `01-context.md`
 - [x] Context bundle (`01-context.md`)
-- [ ] Checkpoint commit (Sonnet, commit-only)
-- [ ] Consolidated dispatch (`delegate-consolidated`) — design + self-review + implement + log
-- [ ] Hard-gate user review of `## Implementation log`
-- [ ] (Conditional) Fresh-eyes `delegate-reviewer` if the self-review escalated any high-risk findings
+- [x] Checkpoint commit (`8c2fd63`)
+- [x] Consolidated dispatch — design + self-review + implement + log written to `02-design-impl.md`; 9 of 10 verification gates PASS, 1 FAIL (`just test-wasm-full`, residual `DeviceLost` with no surfaced WebGPU validation error)
+- [ ] **Hard-gate user review of `## Implementation log`** ← pending
+- [ ] (Conditional) Fresh-eyes `delegate-reviewer` for the residual web-runtime `DeviceLost` — the consolidated agent's self-review escalated this as a new high-risk follow-up; the chunks-binding goal is complete and correct, but a second, deeper failure is latent in the wasm runtime
 
 ## Decisions captured
 

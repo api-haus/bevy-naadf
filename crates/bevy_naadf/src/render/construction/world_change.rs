@@ -482,9 +482,7 @@ mod tests {
     use bevy::image::ImagePlugin;
     use bevy::render::render_resource::{
         BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
-        Extent3d, MapMode, PipelineCache, PollType, TexelCopyBufferInfo, TexelCopyBufferLayout,
-        TexelCopyTextureInfo, TextureDescriptor, TextureDimension, TextureFormat,
-        TextureUsages, TextureViewDescriptor,
+        MapMode, PipelineCache, PollType,
     };
     use bevy::render::renderer::{RenderDevice, RenderQueue};
     use bevy::render::settings::RenderCreation;
@@ -575,18 +573,17 @@ mod tests {
         out
     }
 
-    fn read_chunks_texture(
+    fn read_chunks_buffer(
         device: &RenderDevice,
         queue: &RenderQueue,
-        tex: &bevy::render::render_resource::Texture,
+        chunks: &bevy::render::render_resource::Buffer,
         size_in_chunks: [u32; 3],
     ) -> Vec<[u32; 2]> {
-        // Rg32Uint = 8 B per texel. wgpu requires bytes_per_row >= padded for
-        // small textures, but 1×1×1 already satisfies the 256-byte alignment
-        // for COPY_BUFFER_ROW_PITCH_ALIGNMENT. We allocate enough.
-        let bytes_per_row =
-            ((size_in_chunks[0] * 8 + 255) / 256) * 256;
-        let total = bytes_per_row as u64 * size_in_chunks[1] as u64 * size_in_chunks[2] as u64;
+        // Web-WebGPU migration: chunks is `array<vec2<u32>>` (8 B per pair).
+        // Flat buffer→buffer copy; returns the pairs directly.
+        let total_chunks =
+            (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as u64;
+        let total = total_chunks * 8;
         let staging = device.create_buffer(&BufferDescriptor {
             label: Some("w2_chunks_readback"),
             size: total,
@@ -596,55 +593,14 @@ mod tests {
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("w2_chunks_enc"),
         });
-        encoder.copy_texture_to_buffer(
-            TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: Default::default(),
-                aspect: Default::default(),
-            },
-            TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(size_in_chunks[1]),
-                },
-            },
-            Extent3d {
-                width: size_in_chunks[0],
-                height: size_in_chunks[1],
-                depth_or_array_layers: size_in_chunks[2],
-            },
-        );
+        encoder.copy_buffer_to_buffer(chunks, 0, &staging, 0, total);
         queue.submit([encoder.finish()]);
         let slice = staging.slice(..);
         slice.map_async(MapMode::Read, |r| r.unwrap());
         device.poll(PollType::wait_indefinitely()).unwrap();
         let data = slice.get_mapped_range();
-        let mut out: Vec<[u32; 2]> = Vec::new();
-        let bpr = bytes_per_row as usize;
-        for z in 0..size_in_chunks[2] as usize {
-            for y in 0..size_in_chunks[1] as usize {
-                let row_off = z * (bpr * size_in_chunks[1] as usize) + y * bpr;
-                for x in 0..size_in_chunks[0] as usize {
-                    let off = row_off + x * 8;
-                    let xv = u32::from_le_bytes([
-                        data[off + 0],
-                        data[off + 1],
-                        data[off + 2],
-                        data[off + 3],
-                    ]);
-                    let yv = u32::from_le_bytes([
-                        data[off + 4],
-                        data[off + 5],
-                        data[off + 6],
-                        data[off + 7],
-                    ]);
-                    out.push([xv, yv]);
-                }
-            }
-        }
+        let pairs: &[[u32; 2]] = bytemuck::cast_slice(&data);
+        let out: Vec<[u32; 2]> = pairs.to_vec();
         drop(data);
         staging.unmap();
         out
@@ -658,44 +614,16 @@ mod tests {
         let size_in_chunks = [4u32, 4, 4];
         let total_chunks = (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as u64;
 
-        // chunks texture — Rg32Uint, all zero (empty Aadf6 == 0 == EmptyAADF).
-        let chunks_texture = device.create_texture(&TextureDescriptor {
-            label: Some("w2_chunks"),
-            size: Extent3d {
-                width: size_in_chunks[0],
-                height: size_in_chunks[1],
-                depth_or_array_layers: size_in_chunks[2],
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D3,
-            format: TextureFormat::Rg32Uint,
-            usage: TextureUsages::STORAGE_BINDING
-                | TextureUsages::COPY_DST
-                | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let chunks_view = chunks_texture.create_view(&TextureViewDescriptor::default());
+        // Web-WebGPU migration: chunks is `array<vec2<u32>>` storage buffer
+        // (was `Rg32Uint` 3D texture). All-zero seed (empty Aadf6 == 0).
         let zero_chunks: Vec<[u32; 2]> = vec![[0, 0]; total_chunks as usize];
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &chunks_texture,
-                mip_level: 0,
-                origin: Default::default(),
-                aspect: Default::default(),
-            },
-            bytemuck::cast_slice(&zero_chunks),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(size_in_chunks[0] * 8),
-                rows_per_image: Some(size_in_chunks[1]),
-            },
-            Extent3d {
-                width: size_in_chunks[0],
-                height: size_in_chunks[1],
-                depth_or_array_layers: size_in_chunks[2],
-            },
-        );
+        let chunks_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("w2_chunks"),
+            size: total_chunks * 8,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&zero_chunks));
 
         // blocks/voxels buffers — pre-populated with 1024 zero u32s each (big
         // enough for the small-test edits).
@@ -823,7 +751,7 @@ mod tests {
             "w2_world_bg",
             &bgl_world,
             &BindGroupEntries::sequential((
-                &chunks_view,
+                chunks_buffer.as_entire_buffer_binding(),
                 blocks_buf.as_entire_buffer_binding(),
                 voxels_buf.as_entire_buffer_binding(),
                 bvc_buf.as_entire_buffer_binding(),
@@ -858,7 +786,7 @@ mod tests {
             app,
             device,
             queue,
-            chunks_texture,
+            chunks_buffer,
             blocks_buf,
             voxels_buf,
             bqi,
@@ -884,7 +812,8 @@ mod tests {
         app: App,
         device: RenderDevice,
         queue: RenderQueue,
-        chunks_texture: bevy::render::render_resource::Texture,
+        // Web-WebGPU migration: chunks is `array<vec2<u32>>` storage buffer.
+        chunks_buffer: bevy::render::render_resource::Buffer,
         blocks_buf: bevy::render::render_resource::Buffer,
         voxels_buf: bevy::render::render_resource::Buffer,
         bqi: bevy::render::render_resource::Buffer,
@@ -914,28 +843,17 @@ mod tests {
             eprintln!("no wgpu adapter — skipping W2 chunk-edit bit-exact test");
             return;
         };
-        // Pre-populate chunk (2,1,0)'s `.y` with a sentinel via `write_texture`.
+        // Pre-populate chunk (2,1,0)'s `.y` with a sentinel via
+        // `write_buffer`. Web-WebGPU migration: chunks is `array<vec2<u32>>`
+        // indexed by `x + y*sx + z*sx*sy` (x-fastest). Chunk (2,1,0) in a
+        // 4×4×4 world → flat index 2 + 1*4 + 0*16 = 6; byte offset 6*8 = 48.
         let sentinel_y: u32 = 0xABCD_1234;
-        // We need to write only one texel; write a 1×1×1 slab at (2,1,0).
-        let single_texel = [0u32, sentinel_y];
-        fx.queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &fx.chunks_texture,
-                mip_level: 0,
-                origin: bevy::render::render_resource::Origin3d { x: 2, y: 1, z: 0 },
-                aspect: Default::default(),
-            },
-            bytemuck::bytes_of(&single_texel),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(8),
-                rows_per_image: Some(1),
-            },
-            Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
+        let target_idx: usize = 2 + 1 * 4 + 0 * 16;
+        let sentinel_pair = [0u32, sentinel_y];
+        fx.queue.write_buffer(
+            &fx.chunks_buffer,
+            (target_idx as u64) * 8,
+            bytemuck::bytes_of(&sentinel_pair),
         );
 
         // Build the edit: chunk (2,1,0), new state 0xDEAD_BEEF.
@@ -980,13 +898,13 @@ mod tests {
         );
         fx.queue.submit([encoder.finish()]);
 
-        // Read back chunks texture.
-        let gpu_chunks = read_chunks_texture(&fx.device, &fx.queue, &fx.chunks_texture, fx.size_in_chunks);
+        // Read back chunks buffer.
+        let gpu_chunks = read_chunks_buffer(&fx.device, &fx.queue, &fx.chunks_buffer, fx.size_in_chunks);
 
         // CPU oracle.
         let mut cpu_chunks = vec![[0u32; 2]; gpu_chunks.len()];
-        // Pre-set the .y sentinel on chunk (2,1,0).
-        let target_idx = (2 + 1 * 4 + 0 * 16) as usize;
+        // Pre-set the .y sentinel on chunk (2,1,0) — same flat index as the
+        // GPU-side `write_buffer` above.
         cpu_chunks[target_idx][1] = sentinel_y;
         apply_chunk_edit_cpu(&mut cpu_chunks, fx.size_in_chunks, pos_packed, new_state);
 
@@ -1001,7 +919,6 @@ mod tests {
             gpu_chunks[target_idx][1], sentinel_y,
             "GPU `apply_chunk_change` must preserve the .y entity-pointer channel"
         );
-        let _ = single_texel;
         let _ = &mut params;
     }
 

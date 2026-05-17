@@ -48,7 +48,8 @@
 // ─── Bindings ─────────────────────────────────────────────────────────────────
 //
 // `@group(0)` = `construction_world_layout` per `15-design-c.md` §1.3:
-//   0: chunks_rw       — `texture_storage_3d<r32uint, read_write>`
+//   0: chunks_rw       — `array<vec2<u32>>` (web-WebGPU migration; was
+//                        `texture_storage_3d<rg32uint, read_write>`)
 //   1: blocks_rw       — `array<u32>` (rw storage)
 //   2: voxels_rw       — `array<u32>` (rw storage)
 //   3: block_voxel_count_rw — `array<atomic<u32>>` (2 elements: [0]=voxels
@@ -90,11 +91,14 @@ struct ConstructionParams {
 };
 
 // `chunkCalc.fx:13-20` HashValue struct.
-// W4 (`15-design-c.md` §1.7) — chunks texture format widened to `rg32uint`.
-// The chunk_calc write site stores into `.x` only (`.y` stays 0 here; the
-// entity pointer in `.y` is owned by `entity_update.wgsl`).
+// W4 (`15-design-c.md` §1.7) — chunk pair carries `(state, entity_y)`.
+// Web-WebGPU migration: chunks is `array<vec2<u32>>` (was
+// `texture_storage_3d<rg32uint, read_write>`) — the spec disallows
+// `read_write` on `rg32uint`. The chunk_calc write site stores into `.x`
+// only (`.y = 0` here; the entity pointer is W4-owned in
+// `entity_update.wgsl`).
 @group(0) @binding(0)
-var chunks: texture_storage_3d<rg32uint, read_write>;
+var<storage, read_write> chunks: array<vec2<u32>>;
 @group(0) @binding(1)
 var<storage, read_write> blocks: array<u32>;
 @group(0) @binding(2)
@@ -409,9 +413,18 @@ fn calc_block_from_raw_data(
             atomicStore(&insert_block_index, new_base);
             state = new_base | (BLOCK_STATE_CHILD << 30u);
         }
-        // R32Uint single-channel write — no `#ifdef ENTITIES` (`15-design-c.md`
-        // §1.7; W4 owns the format flip).
-        textureStore(chunks, vec3<i32>(chunk_pos), vec4<u32>(state, 0u, 0u, 0u));
+        // Web-WebGPU migration: chunks is `array<vec2<u32>>`. Write `.x =
+        // state`, `.y = 0u` (no `#ifdef ENTITIES` here; W4's `entity_update`
+        // owns the `.y` channel — `15-design-c.md` §1.7). Indexing uses the
+        // x-fastest flatten over the full world chunk extent (`size_in_chunks`),
+        // inlined to match the codebase pattern (`chunk_index_in_segment`
+        // above is also inlined; `common.wgsl::flatten_index` is the canonical
+        // form, naga-oil composable imports are inconsistent across versions
+        // — see file header comment block).
+        let chunk_idx = chunk_pos.x
+            + chunk_pos.y * params.size_in_chunks.x
+            + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
+        chunks[chunk_idx] = vec2<u32>(state, 0u);
     }
 
     workgroupBarrier();

@@ -37,10 +37,10 @@ use std::num::NonZeroU64;
 use bevy::prelude::*;
 use bevy::render::diagnostic::RecordDiagnostics;
 use bevy::render::render_resource::{
-    binding_types::{storage_buffer_sized, texture_storage_3d, uniform_buffer_sized},
+    binding_types::{storage_buffer_sized, uniform_buffer_sized},
     BindGroupLayoutDescriptor, BindGroupLayoutEntries, CachedComputePipelineId,
     CommandEncoder, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
-    ShaderStages, StorageTextureAccess, TextureFormat,
+    ShaderStages,
 };
 use bevy::render::renderer::RenderContext;
 use bevy::shader::Shader;
@@ -75,12 +75,12 @@ pub fn construction_bounds_world_layout_descriptor() -> BindGroupLayoutDescripto
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                // chunks_rw — `texture_storage_3d<rg32uint, read_write>` (W4
-                // widened the chunks texture to `Rg32Uint`; the W3 WGSL still
-                // takes `.x` from the loaded vec4<u32>, so the W4 flip is a
-                // no-op at the shader source level — only the binding-layout
-                // format declaration changes).
-                texture_storage_3d(TextureFormat::Rg32Uint, StorageTextureAccess::ReadWrite),
+                // chunks_rw — `array<vec2<u32>>` storage buffer (W4 widened
+                // the chunk pair; web-WebGPU migration replaced the original
+                // `texture_storage_3d<rg32uint, read_write>` because WebGPU
+                // forbids `read_write` storage textures on non-r32 formats).
+                // The W3 WGSL still reads `.x` and writes preserving `.y`.
+                storage_buffer_sized(false, None),
                 // params — uniform.
                 uniform_buffer_sized(false, Some(params_size)),
             ),

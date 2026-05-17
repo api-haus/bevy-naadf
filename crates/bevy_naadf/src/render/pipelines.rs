@@ -10,8 +10,9 @@
 //! (`03-design.md` §2.6):
 //!
 //! - `@group(0)` — world data (read-only in render passes): `chunks`
-//!   (`texture_3d<u32>`), `blocks` / `voxels` / `voxel_types` (read-only
-//!   storage), `world_meta` (uniform).
+//!   (`array<vec2<u32>>` storage — was `texture_3d<u32>` pre-web-WebGPU
+//!   migration), `blocks` / `voxels` / `voxel_types` (read-only storage),
+//!   `world_meta` (uniform).
 //! - `@group(1)` — frame data: `camera` + `render_params` uniforms,
 //!   `first_hit_data` + `taa_sample_accum` read-write storage.
 //!
@@ -40,12 +41,12 @@ use bevy::prelude::*;
 use bevy::render::camera::ExtractedCamera;
 use bevy::render::render_resource::{
     binding_types::{
-        storage_buffer_read_only_sized, storage_buffer_sized, texture_3d, uniform_buffer_sized,
+        storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized,
     },
     BindGroup, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
     CachedComputePipelineId, CachedRenderPipelineId, ColorTargetState, ColorWrites,
     ComputePipelineDescriptor, FragmentState, PipelineCache, RenderPipelineDescriptor,
-    ShaderStages, TextureFormat, TextureSampleType, VertexState,
+    ShaderStages, TextureFormat, VertexState,
 };
 use bevy::render::renderer::RenderDevice;
 use bevy::render::view::ExtractedView;
@@ -314,7 +315,14 @@ impl FromWorld for NaadfPipelines {
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
                 (
-                    texture_3d(TextureSampleType::Uint),
+                    // Web-WebGPU migration: chunks is `array<vec2<u32>>`
+                    // (read-only on the renderer side). Was
+                    // `texture_3d(TextureSampleType::Uint)` — flipped to a
+                    // storage buffer to share one allocation with the
+                    // construction sub-graph's `read_write` access (the
+                    // WebGPU spec forbids `read_write` storage textures on
+                    // `Rg32Uint`).
+                    storage_buffer_read_only_sized(false, None), // chunks: array<vec2<u32>>
                     // blocks / voxels / voxel_types are `var<storage, read>` in
                     // `world_data.wgsl` — read-only in every render pass.
                     storage_buffer_read_only_sized(false, None), // blocks: array<u32>

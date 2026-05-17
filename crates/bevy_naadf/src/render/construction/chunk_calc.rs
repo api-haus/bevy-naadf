@@ -17,7 +17,9 @@
 //! avoids the std140 16-B-stride waste).
 //!
 //! The 8-binding layout total:
-//!   0: chunks_rw          texture_storage_3d<rg32uint, read_write>  (W4-widened)
+//!   0: chunks_rw          storage_buffer<array<vec2<u32>>>          (W4-widened
+//!                         pair; was `texture_storage_3d<rg32uint, read_write>`
+//!                         pre-web-WebGPU migration)
 //!   1: blocks_rw          storage_buffer<array<u32>>
 //!   2: voxels_rw          storage_buffer<array<u32>>
 //!   3: block_voxel_count  storage_buffer<array<atomic<u32>>>
@@ -32,12 +34,11 @@ use std::num::NonZeroU64;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     binding_types::{
-        storage_buffer_read_only_sized, storage_buffer_sized, texture_storage_3d,
-        uniform_buffer_sized,
+        storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized,
     },
     BindGroupLayoutDescriptor, BindGroupLayoutEntries, CachedComputePipelineId,
     CommandEncoder, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
-    ShaderStages, StorageTextureAccess, TextureFormat,
+    ShaderStages,
 };
 use bevy::shader::Shader;
 
@@ -65,8 +66,11 @@ pub fn construction_world_layout_descriptor() -> BindGroupLayoutDescriptor {
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                // chunks_rw — `texture_storage_3d<rg32uint, read_write>` (W4 §1.7).
-                texture_storage_3d(TextureFormat::Rg32Uint, StorageTextureAccess::ReadWrite),
+                // chunks_rw — `array<vec2<u32>>` storage buffer (W4 §1.7;
+                // web-WebGPU migration replaced
+                // `texture_storage_3d<rg32uint, read_write>` because WebGPU
+                // forbids `read_write` storage textures on non-r32 formats).
+                storage_buffer_sized(false, None),
                 // blocks_rw / voxels_rw / block_voxel_count_rw — rw storage
                 // arrays. Atomic access is on the WGSL side
                 // (`array<atomic<u32>>` for the 2-element counter); the wgpu

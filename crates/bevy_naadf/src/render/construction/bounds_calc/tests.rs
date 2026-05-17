@@ -23,9 +23,7 @@ use bevy::asset::{AssetPlugin, Assets, Handle};
 use bevy::image::ImagePlugin;
 use bevy::render::render_resource::{
     BindGroupEntries, Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
-    ComputePipeline, Extent3d, MapMode, PipelineCache, PollType, TexelCopyBufferInfo,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureUsages, TextureViewDescriptor,
+    ComputePipeline, MapMode, PipelineCache, PollType,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::settings::RenderCreation;
@@ -327,17 +325,16 @@ fn readback_u32(device: &RenderDevice, queue: &RenderQueue, src: &Buffer, count:
     out
 }
 
-fn readback_chunks_texture(
+fn readback_chunks_buffer(
     device: &RenderDevice,
     queue: &RenderQueue,
-    chunks: &bevy::render::render_resource::Texture,
+    chunks: &Buffer,
     size: [u32; 3],
 ) -> Vec<u32> {
+    // Web-WebGPU migration: chunks is `array<vec2<u32>>` (8 B per pair).
+    // Flat buffer→buffer copy; no row-padding needed. Returns `.x` per chunk.
     let chunk_count = (size[0] * size[1] * size[2]) as u64;
-    // W2 — chunks texture is `Rg32Uint` (8 B per texel); take `.x` only.
-    let bytes_per_row = (size[0] * 8).max(256).next_multiple_of(256);
-    let rows_per_image = size[1];
-    let staging_size = (bytes_per_row * size[1] * size[2]) as u64;
+    let staging_size = chunk_count * 8;
     let staging = device.create_buffer(&BufferDescriptor {
         label: Some("w3_chunks_readback_staging"),
         size: staging_size,
@@ -347,50 +344,14 @@ fn readback_chunks_texture(
     let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("w3_chunks_readback"),
     });
-    encoder.copy_texture_to_buffer(
-        TexelCopyTextureInfo {
-            texture: chunks,
-            mip_level: 0,
-            origin: Default::default(),
-            aspect: Default::default(),
-        },
-        TexelCopyBufferInfo {
-            buffer: &staging,
-            layout: TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(rows_per_image),
-            },
-        },
-        Extent3d {
-            width: size[0],
-            height: size[1],
-            depth_or_array_layers: size[2],
-        },
-    );
+    encoder.copy_buffer_to_buffer(chunks, 0, &staging, 0, staging_size);
     queue.submit([encoder.finish()]);
     let slice = staging.slice(..);
     slice.map_async(MapMode::Read, |r| r.unwrap());
     device.poll(PollType::wait_indefinitely()).unwrap();
     let raw = slice.get_mapped_range();
-    let mut out: Vec<u32> = Vec::with_capacity(chunk_count as usize);
-    for z in 0..size[2] {
-        for y in 0..size[1] {
-            let row_offset = (z * rows_per_image + y) as usize * bytes_per_row as usize;
-            // Read `.x` only — each texel is 8 B (`[u32; 2]`), step by 8.
-            let row_bytes = &raw[row_offset..row_offset + (size[0] * 8) as usize];
-            for x in 0..size[0] as usize {
-                let off = x * 8;
-                let xv = u32::from_le_bytes([
-                    row_bytes[off + 0],
-                    row_bytes[off + 1],
-                    row_bytes[off + 2],
-                    row_bytes[off + 3],
-                ]);
-                out.push(xv);
-            }
-        }
-    }
+    let pairs: &[[u32; 2]] = bytemuck::cast_slice(&raw);
+    let out: Vec<u32> = pairs.iter().map(|p| p[0]).collect();
     drop(raw);
     staging.unmap();
     out
@@ -448,8 +409,8 @@ fn build_test_chunk_world() -> ([u32; 3], Vec<u32>, Vec<bool>) {
 }
 
 struct W3Fixture {
-    chunks_texture: bevy::render::render_resource::Texture,
-    chunks_view: bevy::render::render_resource::TextureView,
+    // Web-WebGPU migration: chunks is `array<vec2<u32>>` storage buffer.
+    chunks_buffer: Buffer,
     bound_queue_info: Buffer,
     bound_group_queues: Buffer,
     bound_group_masks: Buffer,
@@ -477,50 +438,19 @@ fn build_w3_fixture(
     let bound_group_count = bound_group_count_of(size_in_chunks);
     assert!(bound_group_count > 0, "test grid must support >= 1 bound group");
 
-    let chunks_texture = device.create_texture(&TextureDescriptor {
-        label: Some("w3_chunks"),
-        size: Extent3d {
-            width: size_in_chunks[0],
-            height: size_in_chunks[1],
-            depth_or_array_layers: size_in_chunks[2],
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D3,
-        // W2 — matches production chunks texture format (`Rg32Uint`); the
-        // shader takes `.x` from the loaded vec4, writes preserve `.y`.
-        format: TextureFormat::Rg32Uint,
-        usage: TextureUsages::TEXTURE_BINDING
-            | TextureUsages::COPY_DST
-            | TextureUsages::COPY_SRC
-            | TextureUsages::STORAGE_BINDING,
-        view_formats: &[],
-    });
-    // Upload as `[u32; 2]` per chunk — `.x` = the `initial_chunks` value,
-    // `.y` = 0 (no entity pointers in the W3 fixture).
+    // Web-WebGPU migration: chunks is an `array<vec2<u32>>` storage buffer
+    // (was an `Rg32Uint` 3D texture). 8 B per pair; the shader reads `.x`
+    // and writes preserving `.y`.
+    let total_chunks = (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize;
     let paired_chunks: Vec<[u32; 2]> =
         initial_chunks.iter().map(|&x| [x, 0u32]).collect();
-    queue.write_texture(
-        TexelCopyTextureInfo {
-            texture: &chunks_texture,
-            mip_level: 0,
-            origin: Default::default(),
-            aspect: Default::default(),
-        },
-        bytemuck::cast_slice(&paired_chunks),
-        TexelCopyBufferLayout {
-            offset: 0,
-            // Rg32Uint = 8 B per texel.
-            bytes_per_row: Some(size_in_chunks[0] * 8),
-            rows_per_image: Some(size_in_chunks[1]),
-        },
-        Extent3d {
-            width: size_in_chunks[0],
-            height: size_in_chunks[1],
-            depth_or_array_layers: size_in_chunks[2],
-        },
-    );
-    let chunks_view = chunks_texture.create_view(&TextureViewDescriptor::default());
+    let chunks_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("w3_chunks"),
+        size: (total_chunks as u64) * 8,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&paired_chunks));
 
     let mut info_seed: Vec<GpuBoundQueueInfo> = Vec::with_capacity(32 * 3);
     for i in 0..32u32 {
@@ -610,7 +540,7 @@ fn build_w3_fixture(
         "w3_world_bg",
         &world_bgl,
         &BindGroupEntries::sequential((
-            &chunks_view,
+            chunks_buffer.as_entire_buffer_binding(),
             params_buffer.as_entire_buffer_binding(),
         )),
     );
@@ -633,8 +563,7 @@ fn build_w3_fixture(
     let _ = Cow::<'_, str>::from("w3");
 
     Some(W3Fixture {
-        chunks_texture,
-        chunks_view,
+        chunks_buffer,
         bound_queue_info,
         bound_group_queues,
         bound_group_masks,
@@ -722,7 +651,7 @@ fn bounds_calc_convergence_matches_cpu_oracle() {
         queue.submit([encoder.finish()]);
     }
 
-    let gpu_chunks = readback_chunks_texture(&device, &queue, &fixture.chunks_texture, size);
+    let gpu_chunks = readback_chunks_buffer(&device, &queue, &fixture.chunks_buffer, size);
 
     // Compare GPU to CPU oracle, chunk-by-chunk.
     let dx = size[0] as usize;
@@ -773,7 +702,7 @@ fn bounds_calc_convergence_matches_cpu_oracle() {
         &fixture.bound_group_masks,
         &fixture.bound_refined_info,
         &fixture.params_buffer,
-        &fixture.chunks_view,
+        &fixture.chunks_buffer,
         &fixture.size_in_chunks,
     );
 }
@@ -868,7 +797,7 @@ fn bounds_queue_no_overrun() {
         &fixture.bound_refined_info,
         &fixture.bound_dispatch_indirect,
         &fixture.params_buffer,
-        &fixture.chunks_view,
+        &fixture.chunks_buffer,
         &fixture.size_in_chunks,
     );
 }
@@ -961,7 +890,7 @@ fn bounds_per_axis_atomic_correctness() {
         &fixture.bound_refined_info,
         &fixture.bound_dispatch_indirect,
         &fixture.params_buffer,
-        &fixture.chunks_view,
+        &fixture.chunks_buffer,
         &fixture.size_in_chunks,
     );
 }

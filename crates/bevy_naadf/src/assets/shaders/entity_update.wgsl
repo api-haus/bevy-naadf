@@ -18,12 +18,14 @@
 //
 // MonoGame → wgpu deviations:
 // - HLSL `RWTexture3D<uint2> chunks` becomes WGSL
-//   `texture_storage_3d<rg32uint, read_write>` (the W4 chunks-format flip —
-//   `15-design-c.md` §1.7). Reads come back as `vec4<u32>(x, y, 0, 0)`; only
-//   `.x` (the construction state) + `.y` (the entity pointer+counter) are
-//   meaningful.
+//   `array<vec2<u32>>` (the W4 chunks-format chunk-pair carries
+//   `(state, entity_y)`). Web-WebGPU migration replaces the original
+//   `texture_storage_3d<rg32uint, read_write>` with a storage buffer:
+//   `Rg32Uint` `read_write` is not in the WebGPU spec allow-list. Reads come
+//   back as `vec2<u32>(x, y)`; field-selector discipline is preserved.
 // - HLSL `chunks[chunkPos] = uint2(chunks[chunkPos].x, update.y)` (line 23)
-//   becomes WGSL `textureStore(chunks, chunkPos, vec4<u32>(old.x, update.y, 0, 0))`.
+//   becomes WGSL `chunks[chunk_idx] = vec2<u32>(old.x, update.y)`, where
+//   `chunk_idx = flatten_index(chunk_pos, size_in_chunks.x, sx*sy)`.
 //
 // Bindings (parallel to W1's `construction_world_layout`, only the chunks
 // texture is needed from `@group(0)`; the entity-track buffers live on
@@ -70,10 +72,15 @@ struct EntityUpdateParams {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    // Web-WebGPU migration — world size in chunks, needed by `update_chunks`
+    // to flatten the chunk position into a buffer index (chunks is now
+    // `array<vec2<u32>>`, not a 3D texture). 16 B row (vec3 + pad).
+    size_in_chunks: vec3<u32>,
+    _pad3: u32,
 };
 
 @group(0) @binding(0)
-var chunks: texture_storage_3d<rg32uint, read_write>;
+var<storage, read_write> chunks: array<vec2<u32>>;
 @group(0) @binding(1)
 var<uniform> params: EntityUpdateParams;
 
@@ -96,16 +103,20 @@ fn update_chunks(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     let update = chunk_updates_dynamic[global_id.x];
     // chunkPos = (update.x & 0x7FF, (update.x >> 11) & 0x3FF, update.x >> 21)
-    let chunk_pos = vec3<i32>(
-        i32(update.x & 0x7FFu),
-        i32((update.x >> 11u) & 0x3FFu),
-        i32(update.x >> 21u),
+    let chunk_pos = vec3<u32>(
+        update.x & 0x7FFu,
+        (update.x >> 11u) & 0x3FFu,
+        update.x >> 21u,
     );
-    // chunks[chunkPos] = uint2(chunks[chunkPos].x, update.y) — preserve `.x`
-    // (the W1 construction-side state), overwrite `.y` (the entity pointer +
-    // counter pair packed into a single u32).
-    let old = textureLoad(chunks, chunk_pos);
-    textureStore(chunks, chunk_pos, vec4<u32>(old.x, update.y, 0u, 0u));
+    // Web-WebGPU migration: flatten the chunk position into the
+    // `array<vec2<u32>>` buffer. `chunks[idx] = vec2<u32>(old.x, update.y)` —
+    // preserve `.x` (W1 construction-side state), overwrite `.y` (the entity
+    // pointer + counter packed into one u32). W4 contract.
+    let chunk_idx = chunk_pos.x
+        + chunk_pos.y * params.size_in_chunks.x
+        + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
+    let old = chunks[chunk_idx];
+    chunks[chunk_idx] = vec2<u32>(old.x, update.y);
 }
 
 @compute @workgroup_size(64, 1, 1)

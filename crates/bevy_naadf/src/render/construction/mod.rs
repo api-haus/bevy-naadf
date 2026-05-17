@@ -894,9 +894,9 @@ pub fn prepare_construction(
         // 1-element W2 placeholders the placeholder block below would
         // otherwise install. If these already exist (e.g. from a previous
         // partial dispatch), reuse them.
-        let world_chunk_count = world_gpu.chunks.size().width
-            * world_gpu.chunks.size().height
-            * world_gpu.chunks.size().depth_or_array_layers;
+        let world_chunk_count = world_gpu.chunks_size_in_chunks.x
+            * world_gpu.chunks_size_in_chunks.y
+            * world_gpu.chunks_size_in_chunks.z;
         // hash-map: initial size from config; `BlockHashingHandler.cs:32`
         // = `1 << 18 = 262_144` slots, 16 B per slot.
         let hash_map_slots = construction_config.initial_hash_map_size as u64;
@@ -988,9 +988,9 @@ pub fn prepare_construction(
         if gpu.segment_voxel_buffer.as_ref().map(|b| b.size()).unwrap_or(0) <= 4 {
             let dense = &world_data_meta.as_deref().unwrap().dense_voxel_types;
             let size_in_chunks = [
-                world_gpu.chunks.size().width,
-                world_gpu.chunks.size().height,
-                world_gpu.chunks.size().depth_or_array_layers,
+                world_gpu.chunks_size_in_chunks.x,
+                world_gpu.chunks_size_in_chunks.y,
+                world_gpu.chunks_size_in_chunks.z,
             ];
             // Pad to cubic extent so the over-dispatch reads stay in bounds.
             let seg = size_in_chunks[0].max(size_in_chunks[1]).max(size_in_chunks[2]).max(1);
@@ -1031,13 +1031,13 @@ pub fn prepare_construction(
     // Build-once: only allocate when the buffers do not exist yet. The
     // size is fixed for the lifetime of the world (the C# allocates once at
     // `WorldBoundHandler::new` — `WorldBoundHandler.cs:38-51`).
-    let chunk_count = world_gpu.chunks.size().width
-        * world_gpu.chunks.size().height
-        * world_gpu.chunks.size().depth_or_array_layers;
+    let chunk_count = world_gpu.chunks_size_in_chunks.x
+        * world_gpu.chunks_size_in_chunks.y
+        * world_gpu.chunks_size_in_chunks.z;
     let bound_group_count = bounds_calc::bound_group_count_of([
-        world_gpu.chunks.size().width,
-        world_gpu.chunks.size().height,
-        world_gpu.chunks.size().depth_or_array_layers,
+        world_gpu.chunks_size_in_chunks.x,
+        world_gpu.chunks_size_in_chunks.y,
+        world_gpu.chunks_size_in_chunks.z,
     ]);
 
     if gpu.bound_queue_info.is_none() {
@@ -1128,15 +1128,15 @@ pub fn prepare_construction(
     if gpu.bounds_params_buffer.is_none() {
         let params = crate::render::gpu_types::GpuConstructionParams {
             size_in_chunks: [
-                world_gpu.chunks.size().width,
-                world_gpu.chunks.size().height,
-                world_gpu.chunks.size().depth_or_array_layers,
+                world_gpu.chunks_size_in_chunks.x,
+                world_gpu.chunks_size_in_chunks.y,
+                world_gpu.chunks_size_in_chunks.z,
             ],
             _pad0: 0,
             group_size_in_groups: bounds_calc::group_size_in_groups_of([
-                world_gpu.chunks.size().width,
-                world_gpu.chunks.size().height,
-                world_gpu.chunks.size().depth_or_array_layers,
+                world_gpu.chunks_size_in_chunks.x,
+                world_gpu.chunks_size_in_chunks.y,
+                world_gpu.chunks_size_in_chunks.z,
             ]),
             _pad1: 0,
             bound_group_queue_max_size: bound_group_count.max(1),
@@ -1172,7 +1172,7 @@ pub fn prepare_construction(
                 "naadf_construction_bounds_world_bind_group",
                 &bgl,
                 &BindGroupEntries::sequential((
-                    &world_gpu.chunks_view,
+                    world_gpu.chunks_buffer.as_entire_buffer_binding(),
                     params_buf.as_entire_buffer_binding(),
                 )),
             );
@@ -1409,15 +1409,15 @@ pub fn prepare_construction(
         {
             let params = crate::render::gpu_types::GpuConstructionParams {
                 size_in_chunks: [
-                    world_gpu.chunks.size().width,
-                    world_gpu.chunks.size().height,
-                    world_gpu.chunks.size().depth_or_array_layers,
+                    world_gpu.chunks_size_in_chunks.x,
+                    world_gpu.chunks_size_in_chunks.y,
+                    world_gpu.chunks_size_in_chunks.z,
                 ],
                 _pad0: 0,
                 group_size_in_groups: bounds_calc::group_size_in_groups_of([
-                    world_gpu.chunks.size().width,
-                    world_gpu.chunks.size().height,
-                    world_gpu.chunks.size().depth_or_array_layers,
+                    world_gpu.chunks_size_in_chunks.x,
+                    world_gpu.chunks_size_in_chunks.y,
+                    world_gpu.chunks_size_in_chunks.z,
                 ]),
                 _pad1: 0,
                 bound_group_queue_max_size: bound_group_count.max(1),
@@ -1518,26 +1518,23 @@ pub fn prepare_construction(
             gpu.hash_map.as_ref(),
             gpu.hash_coefficients.as_ref(),
         ) {
-            // Phase-C followup #1 — create a separate `TextureView` for the
-            // construction storage-write binding. Sharing the renderer-side
-            // `world_gpu.chunks_view` (created as a read-only TEXTURE_BINDING
-            // view) between a read-only `texture_3d` bind in `world_layout`
-            // and a `texture_storage_3d<read_write>` bind in
-            // `construction_world_layout` is technically legal but, on some
-            // wgpu/Vulkan paths, the view's recorded access type gets stuck
-            // to its first observed binding (read-only). A dedicated storage
-            // view lets the construction writes land.
-            use bevy::render::render_resource::TextureViewDescriptor;
-            let chunks_storage_view = world_gpu
-                .chunks
-                .create_view(&TextureViewDescriptor::default());
+            // Web-WebGPU migration: chunks is now a storage buffer, not a
+            // 3D texture, so there is no `TextureView` to mediate the
+            // read-only vs read-write aliasing. Both the render-side
+            // `world_layout` (ro) and the construction-side
+            // `construction_world_layout` (rw) bind the same
+            // `world_gpu.chunks_buffer` resource directly — wgpu inserts the
+            // necessary STORAGE→STORAGE barriers between dispatches. (The
+            // historical Phase-C followup #1 comment about separate
+            // TextureViews is moot because storage buffers do not have
+            // view-recorded access types.)
             let bgl = pipeline_cache
                 .get_bind_group_layout(&construction_pipelines.construction_world_layout);
             let bg = render_device.create_bind_group(
                 "naadf_construction_world_bind_group",
                 &bgl,
                 &BindGroupEntries::sequential((
-                    &chunks_storage_view,
+                    world_gpu.chunks_buffer.as_entire_buffer_binding(),
                     world_gpu.blocks.buffer().as_entire_buffer_binding(),
                     world_gpu.voxels.buffer().as_entire_buffer_binding(),
                     bvc.as_entire_buffer_binding(),
@@ -1760,6 +1757,15 @@ pub fn prepare_construction(
                         _pad0: 0,
                         _pad1: 0,
                         _pad2: 0,
+                        // Web-WebGPU migration: chunks is a flat
+                        // `array<vec2<u32>>` buffer; `update_chunks` needs
+                        // the world's chunk extent to flatten chunk_pos.
+                        size_in_chunks: [
+                            world_gpu.chunks_size_in_chunks.x,
+                            world_gpu.chunks_size_in_chunks.y,
+                            world_gpu.chunks_size_in_chunks.z,
+                        ],
+                        _pad3: 0,
                     };
                     render_queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
                 }
@@ -1812,9 +1818,9 @@ pub fn prepare_construction(
             ) {
                 use bevy::render::render_resource::{
                     binding_types::{
-                        storage_buffer_read_only_sized, texture_3d, uniform_buffer_sized,
+                        storage_buffer_read_only_sized, uniform_buffer_sized,
                     },
-                    BindGroupLayoutEntries, ShaderStages, TextureSampleType,
+                    BindGroupLayoutEntries, ShaderStages,
                 };
                 use std::num::NonZeroU64;
                 let world_meta_size = NonZeroU64::new(
@@ -1826,7 +1832,9 @@ pub fn prepare_construction(
                     &BindGroupLayoutEntries::sequential(
                         ShaderStages::COMPUTE,
                         (
-                            texture_3d(TextureSampleType::Uint),
+                            // Web-WebGPU migration: chunks is `array<vec2<u32>>`
+                            // (ro on render-side).
+                            storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
@@ -1842,7 +1850,7 @@ pub fn prepare_construction(
                     "naadf_world_bind_group_with_entities",
                     &bgl,
                     &BindGroupEntries::sequential((
-                        &world_gpu.chunks_view,
+                        world_gpu.chunks_buffer.as_entire_buffer_binding(),
                         world_gpu.blocks.buffer().as_entire_buffer_binding(),
                         world_gpu.voxels.buffer().as_entire_buffer_binding(),
                         world_gpu.voxel_types.buffer().as_entire_buffer_binding(),
@@ -1869,15 +1877,13 @@ pub fn prepare_construction(
     // The dispatch lives in `naadf_gpu_producer_node` in the render-graph,
     // NOT here in `prepare_construction`. Reason: a render-graph node
     // uses the same `CommandEncoder` the renderer's reads come from, so
-    // the wgpu/Vulkan-side STORAGE-write → SAMPLED-read texture barrier
-    // is auto-inserted. Submitting the dispatch in a separate encoder
-    // from `prepare_construction` (the pattern the W3 bounds-init seed
-    // uses) does NOT propagate `texture_storage_3d<rg32uint, read_write>`
-    // writes through to the renderer's `texture_3d<u32>` reads on the
-    // same texture cleanly — empirically the writes "vanish" between
-    // submits even though the same writes-to-storage-buffers do
-    // propagate. Putting the dispatch in the render-graph encoder
-    // sidesteps the issue.
+    // wgpu auto-inserts the STORAGE→STORAGE barrier between the
+    // producer's writes and the renderer's reads. (Historical note:
+    // before the web-WebGPU migration, this comment block flagged a
+    // texture-aliasing hazard — `texture_storage_3d<rg32uint, read_write>`
+    // writes not propagating to `texture_3d<u32>` reads across separate
+    // submits; that hazard is moot now that both bindings reference the
+    // same storage buffer.)
     //
     // `prepare_construction`'s job is now just to allocate the buffers +
     // build the bind group (above); the node consumes them.
@@ -2349,9 +2355,7 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     use bevy::shader::Shader;
     use bevy::render::render_resource::{
         BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
-        Extent3d, MapMode, PipelineCache, PollType, TexelCopyBufferInfo,
-        TexelCopyBufferLayout, TexelCopyTextureInfo, TextureDescriptor, TextureDimension,
-        TextureFormat, TextureUsages, TextureViewDescriptor,
+        MapMode, PipelineCache, PollType,
     };
     use bevy::render::renderer::{RenderDevice, RenderQueue};
     use bevy::render::settings::RenderCreation;
@@ -2470,49 +2474,19 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     });
     queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
 
-    let chunks_texture = device.create_texture(&TextureDescriptor {
-        label: Some("validate_chunks"),
-        size: Extent3d {
-            width: size_in_chunks[0],
-            height: size_in_chunks[1],
-            depth_or_array_layers: size_in_chunks[2],
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D3,
-        // W4 §1.7 — chunks texture widened to `Rg32Uint`; readers take `.x`.
-        format: TextureFormat::Rg32Uint,
-        usage: TextureUsages::TEXTURE_BINDING
-            | TextureUsages::COPY_DST
-            | TextureUsages::COPY_SRC
-            | TextureUsages::STORAGE_BINDING,
-        view_formats: &[],
-    });
+    // Web-WebGPU migration: chunks is an `array<vec2<u32>>` storage buffer
+    // (was `Rg32Uint` 3D texture). 8 B per chunk pair; the W1 validation
+    // path zeros every channel.
     let chunk_count_total =
         (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize;
-    // Rg32Uint = 8 B per texel; the W1 validation path zeros every channel.
     let zero_chunks: Vec<[u32; 2]> = vec![[0u32, 0u32]; chunk_count_total];
-    queue.write_texture(
-        TexelCopyTextureInfo {
-            texture: &chunks_texture,
-            mip_level: 0,
-            origin: Default::default(),
-            aspect: Default::default(),
-        },
-        bytemuck::cast_slice(&zero_chunks),
-        TexelCopyBufferLayout {
-            offset: 0,
-            // Rg32Uint = 8 B per texel.
-            bytes_per_row: Some(size_in_chunks[0] * 8),
-            rows_per_image: Some(size_in_chunks[1]),
-        },
-        Extent3d {
-            width: size_in_chunks[0],
-            height: size_in_chunks[1],
-            depth_or_array_layers: size_in_chunks[2],
-        },
-    );
-    let chunks_view = chunks_texture.create_view(&TextureViewDescriptor::default());
+    let chunks_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("validate_chunks"),
+        size: (chunk_count_total as u64) * 8,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&zero_chunks));
 
     // ── Queue + compile pipelines ─────────────────────────────────────────────
     let layout = construction_world_layout_descriptor();
@@ -2562,7 +2536,7 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
         "validate_bind_group",
         &bgl,
         &BindGroupEntries::sequential((
-            &chunks_view,
+            chunks_buffer.as_entire_buffer_binding(),
             gpu_blocks.as_entire_buffer_binding(),
             gpu_voxels.as_entire_buffer_binding(),
             gpu_block_voxel_count.as_entire_buffer_binding(),
@@ -2645,13 +2619,12 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     let gpu_blocks_out = read_u32(&gpu_blocks, (oracle.blocks.len().max(64) + 64) as u64);
     let gpu_voxels_out = read_u32(&gpu_voxels, (oracle.voxels.len().max(32) + 32) as u64);
 
-    // Chunks texture readback. W4 §1.7 — texture is `Rg32Uint` (8 B / texel);
-    // the validation gate compares the `.x` (state) channel only, which is
-    // what W1 writes. The `.y` (entity pointer) stays zero in the no-entities
-    // validation path.
+    // Web-WebGPU migration: chunks is a flat `array<vec2<u32>>` storage
+    // buffer (8 B per pair). The validation gate compares the `.x` (state)
+    // channel only — that's what W1 writes; `.y` (entity pointer) stays zero.
+    // Buffer→buffer copy doesn't need bytes_per_row padding.
     let chunk_count = size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2];
-    let bytes_per_row = (size_in_chunks[0] * 8).max(256).next_multiple_of(256);
-    let staging_size = (bytes_per_row * size_in_chunks[1] * size_in_chunks[2]) as u64;
+    let staging_size = (chunk_count as u64) * 8;
     let staging = device.create_buffer(&BufferDescriptor {
         label: Some("validate_chunks_readback"),
         size: staging_size,
@@ -2661,45 +2634,14 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("validate_chunks_readback_enc"),
     });
-    enc.copy_texture_to_buffer(
-        TexelCopyTextureInfo {
-            texture: &chunks_texture,
-            mip_level: 0,
-            origin: Default::default(),
-            aspect: Default::default(),
-        },
-        TexelCopyBufferInfo {
-            buffer: &staging,
-            layout: TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(size_in_chunks[1]),
-            },
-        },
-        Extent3d {
-            width: size_in_chunks[0],
-            height: size_in_chunks[1],
-            depth_or_array_layers: size_in_chunks[2],
-        },
-    );
+    enc.copy_buffer_to_buffer(&chunks_buffer, 0, &staging, 0, staging_size);
     queue.submit([enc.finish()]);
     let slice = staging.slice(..);
     slice.map_async(MapMode::Read, |r| r.unwrap());
     device.poll(PollType::wait_indefinitely()).unwrap();
     let raw = slice.get_mapped_range();
-    let mut gpu_chunks_out: Vec<u32> = Vec::with_capacity(chunk_count as usize);
-    for z in 0..size_in_chunks[2] {
-        for y in 0..size_in_chunks[1] {
-            let row_offset = (z * size_in_chunks[1] + y) as usize * bytes_per_row as usize;
-            // 8 B / texel; we only care about `.x` for the W1 validation.
-            let row_bytes =
-                &raw[row_offset..row_offset + (size_in_chunks[0] * 8) as usize];
-            let row_pairs: &[[u32; 2]] = bytemuck::cast_slice(row_bytes);
-            for pair in row_pairs {
-                gpu_chunks_out.push(pair[0]);
-            }
-        }
-    }
+    let pairs: &[[u32; 2]] = bytemuck::cast_slice(&raw);
+    let gpu_chunks_out: Vec<u32> = pairs.iter().map(|p| p[0]).collect();
     drop(raw);
     staging.unmap();
 
@@ -3476,9 +3418,7 @@ mod tests_w1 {
     use bevy::shader::Shader;
     use bevy::render::render_resource::{
         BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
-        Extent3d, MapMode, PipelineCache, PollType, TexelCopyBufferInfo,
-        TexelCopyBufferLayout, TexelCopyTextureInfo, TextureDescriptor, TextureDimension,
-        TextureFormat, TextureUsages, TextureViewDescriptor,
+        MapMode, PipelineCache, PollType,
     };
     use bevy::render::renderer::{RenderDevice, RenderQueue};
     use bevy::render::settings::RenderCreation;
@@ -3601,19 +3541,17 @@ mod tests_w1 {
     /// channel is the W4 entity pointer + counter, zero in this test). Order
     /// is `cz * cx * cy + cy * cx + cx` (x-fastest), matching
     /// `WorldData.chunks_cpu`'s convention.
-    fn readback_chunks_texture(
+    fn readback_chunks_buffer(
         device: &RenderDevice,
         queue: &RenderQueue,
-        chunks: &bevy::render::render_resource::Texture,
+        chunks: &bevy::render::render_resource::Buffer,
         size: [u32; 3],
     ) -> Vec<u32> {
+        // Web-WebGPU migration: chunks is an `array<vec2<u32>>` storage
+        // buffer (8 B per pair). Buffer→buffer copy doesn't need the
+        // 256-byte row alignment a 3D-texture readback required.
         let chunk_count = (size[0] * size[1] * size[2]) as u64;
-        // For 3D texture readback, bytes_per_row must be a multiple of 256.
-        // W4 §1.7: 8 B / texel (Rg32Uint).
-        let bytes_per_row =
-            (size[0] * 8).max(256).next_multiple_of(256);
-        let rows_per_image = size[1];
-        let staging_size = (bytes_per_row * size[1] * size[2]) as u64;
+        let staging_size = chunk_count * 8;
         let staging = device.create_buffer(&BufferDescriptor {
             label: Some("w1_chunks_readback_staging"),
             size: staging_size,
@@ -3623,45 +3561,14 @@ mod tests_w1 {
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("w1_chunks_readback"),
         });
-        encoder.copy_texture_to_buffer(
-            TexelCopyTextureInfo {
-                texture: chunks,
-                mip_level: 0,
-                origin: Default::default(),
-                aspect: Default::default(),
-            },
-            TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(rows_per_image),
-                },
-            },
-            Extent3d {
-                width: size[0],
-                height: size[1],
-                depth_or_array_layers: size[2],
-            },
-        );
+        encoder.copy_buffer_to_buffer(chunks, 0, &staging, 0, staging_size);
         queue.submit([encoder.finish()]);
         let slice = staging.slice(..);
         slice.map_async(MapMode::Read, |r| r.unwrap());
         device.poll(PollType::wait_indefinitely()).unwrap();
         let raw = slice.get_mapped_range();
-        // De-pad: each row has `bytes_per_row` bytes; the first `size[0]*8` of
-        // which are the real chunks (8 B/texel). Take `.x` of each pair.
-        let mut out: Vec<u32> = Vec::with_capacity(chunk_count as usize);
-        for z in 0..size[2] {
-            for y in 0..size[1] {
-                let row_offset = (z * rows_per_image + y) as usize * bytes_per_row as usize;
-                let row_bytes = &raw[row_offset..row_offset + (size[0] * 8) as usize];
-                let row_pairs: &[[u32; 2]] = bytemuck::cast_slice(row_bytes);
-                for pair in row_pairs {
-                    out.push(pair[0]);
-                }
-            }
-        }
+        let pairs: &[[u32; 2]] = bytemuck::cast_slice(&raw);
+        let out: Vec<u32> = pairs.iter().map(|p| p[0]).collect();
         drop(raw);
         staging.unmap();
         assert_eq!(out.len() as u64, chunk_count);
@@ -3812,53 +3719,21 @@ mod tests_w1 {
         let gpu_params =
             create_uniform(&device, &queue, "w1_construction_params", &params);
 
-        // The chunks 3D texture — **Rg32Uint (W4 §1.7)**, STORAGE_BINDING +
-        // COPY_SRC for readback. 8 B / texel; `.x` carries the construction
-        // state (this test's load-bearing channel), `.y` is the entity
-        // pointer (zero in this no-entities test).
-        let chunks_texture = device.create_texture(&TextureDescriptor {
+        // The chunks resource — `array<vec2<u32>>` storage buffer
+        // (web-WebGPU migration; was `Rg32Uint` 3D texture). 8 B per pair;
+        // `.x` carries the construction state (this test's load-bearing
+        // channel), `.y` is the entity pointer (zero in this no-entities
+        // test). STORAGE | COPY_DST | COPY_SRC — COPY_SRC for readback.
+        let chunk_count_total =
+            (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize;
+        let zero_chunks: Vec<[u32; 2]> = vec![[0u32, 0u32]; chunk_count_total];
+        let chunks_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("w1_chunks"),
-            size: Extent3d {
-                width: size_in_chunks[0],
-                height: size_in_chunks[1],
-                depth_or_array_layers: size_in_chunks[2],
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D3,
-            format: TextureFormat::Rg32Uint,
-            usage: TextureUsages::TEXTURE_BINDING
-                | TextureUsages::COPY_DST
-                | TextureUsages::COPY_SRC
-                | TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
+            size: (chunk_count_total as u64) * 8,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
         });
-        // Zero-init the texture — 8 B per texel.
-        let zero_chunks: Vec<[u32; 2]> = vec![
-            [0u32, 0u32];
-            (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize
-        ];
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &chunks_texture,
-                mip_level: 0,
-                origin: Default::default(),
-                aspect: Default::default(),
-            },
-            bytemuck::cast_slice(&zero_chunks),
-            TexelCopyBufferLayout {
-                offset: 0,
-                // Rg32Uint = 8 B per texel.
-                bytes_per_row: Some(size_in_chunks[0] * 8),
-                rows_per_image: Some(size_in_chunks[1]),
-            },
-            Extent3d {
-                width: size_in_chunks[0],
-                height: size_in_chunks[1],
-                depth_or_array_layers: size_in_chunks[2],
-            },
-        );
-        let chunks_view = chunks_texture.create_view(&TextureViewDescriptor::default());
+        queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&zero_chunks));
 
         // === Queue the three pipelines ======================================
         let layout = construction_world_layout_descriptor();
@@ -3897,7 +3772,7 @@ mod tests_w1 {
             "w1_construction_world_bind_group",
             &bgl,
             &BindGroupEntries::sequential((
-                &chunks_view,
+                chunks_buffer.as_entire_buffer_binding(),
                 gpu_blocks.as_entire_buffer_binding(),
                 gpu_voxels.as_entire_buffer_binding(),
                 gpu_block_voxel_count.as_entire_buffer_binding(),
@@ -3980,10 +3855,10 @@ mod tests_w1 {
             &gpu_voxels,
             (oracle.voxels.len().max(32) + 32) as u64,
         );
-        let gpu_chunks_out = readback_chunks_texture(
+        let gpu_chunks_out = readback_chunks_buffer(
             &device,
             &queue,
-            &chunks_texture,
+            &chunks_buffer,
             size_in_chunks,
         );
 
@@ -4326,9 +4201,8 @@ mod tests_w4 {
     use bevy::image::ImagePlugin;
     use bevy::math::Vec3;
     use bevy::render::render_resource::{
-        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d,
-        MapMode, PipelineCache, PollType, TexelCopyBufferLayout, TexelCopyTextureInfo,
-        TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+        MapMode, PipelineCache, PollType,
     };
     use bevy::render::renderer::{RenderDevice, RenderQueue};
     use bevy::render::settings::RenderCreation;
@@ -4448,25 +4322,9 @@ mod tests_w4 {
         let chunk_instance_count = cpu_uploads.entity_chunk_instances.len() as u32;
         let instance_count = cpu_uploads.entity_history.len() as u32;
 
-        // GPU side — allocate the chunks texture + the two dynamic upload
-        // buffers + the two output buffers.
-        let chunks_texture = device.create_texture(&TextureDescriptor {
-            label: Some("w4_chunks"),
-            size: Extent3d {
-                width: size_in_chunks[0],
-                height: size_in_chunks[1],
-                depth_or_array_layers: size_in_chunks[2],
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D3,
-            format: TextureFormat::Rg32Uint,
-            usage: TextureUsages::TEXTURE_BINDING
-                | TextureUsages::COPY_DST
-                | TextureUsages::COPY_SRC
-                | TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
-        });
+        // GPU side — allocate the chunks buffer + the two dynamic upload
+        // buffers + the two output buffers. Web-WebGPU migration: chunks is
+        // an `array<vec2<u32>>` storage buffer (was `Rg32Uint` 3D texture).
         let chunk_count =
             (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize;
         // Pre-write a non-zero `.x` channel so we can verify the entity
@@ -4474,26 +4332,13 @@ mod tests_w4 {
         let init_chunks: Vec<[u32; 2]> = (0..chunk_count)
             .map(|i| [0xAA00_0000u32 + i as u32, 0u32])
             .collect();
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &chunks_texture,
-                mip_level: 0,
-                origin: Default::default(),
-                aspect: Default::default(),
-            },
-            bytemuck::cast_slice(&init_chunks),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(size_in_chunks[0] * 8),
-                rows_per_image: Some(size_in_chunks[1]),
-            },
-            Extent3d {
-                width: size_in_chunks[0],
-                height: size_in_chunks[1],
-                depth_or_array_layers: size_in_chunks[2],
-            },
-        );
-        let chunks_view = chunks_texture.create_view(&TextureViewDescriptor::default());
+        let chunks_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("w4_chunks"),
+            size: (chunk_count as u64) * 8,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&init_chunks));
 
         let mk_storage = |label: &'static str, bytes: &[u8]| {
             let buf = device.create_buffer(&BufferDescriptor {
@@ -4548,6 +4393,10 @@ mod tests_w4 {
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
+            // Web-WebGPU migration: chunks is `array<vec2<u32>>`; the kernel
+            // flattens chunk_pos with `size_in_chunks` as the stride basis.
+            size_in_chunks,
+            _pad3: 0,
         };
         let params_buf = device.create_buffer(&BufferDescriptor {
             label: Some("w4_params"),
@@ -4611,7 +4460,7 @@ mod tests_w4 {
             "w4_world_bg",
             &world_bgl,
             &BindGroupEntries::sequential((
-                &chunks_view,
+                chunks_buffer.as_entire_buffer_binding(),
                 params_buf.as_entire_buffer_binding(),
             )),
         );
@@ -4708,11 +4557,10 @@ mod tests_w4 {
             );
         }
 
-        // Verify the chunks texture: `.x` channel preserved, `.y` channel
-        // got the entity pointer (= update.data2).
-        let bytes_per_row = (size_in_chunks[0] * 8).max(256).next_multiple_of(256);
-        let staging_size =
-            (bytes_per_row * size_in_chunks[1] * size_in_chunks[2]) as u64;
+        // Verify the chunks buffer: `.x` channel preserved, `.y` channel
+        // got the entity pointer (= update.data2). Web-WebGPU migration:
+        // chunks is `array<vec2<u32>>`; flat buffer→buffer copy.
+        let staging_size = (chunk_count as u64) * 8;
         let chunks_staging = device.create_buffer(&BufferDescriptor {
             label: Some("w4_chunks_staging"),
             size: staging_size,
@@ -4722,32 +4570,13 @@ mod tests_w4 {
         let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("w4_chunks_readback"),
         });
-        enc.copy_texture_to_buffer(
-            TexelCopyTextureInfo {
-                texture: &chunks_texture,
-                mip_level: 0,
-                origin: Default::default(),
-                aspect: Default::default(),
-            },
-            bevy::render::render_resource::TexelCopyBufferInfo {
-                buffer: &chunks_staging,
-                layout: TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(size_in_chunks[1]),
-                },
-            },
-            Extent3d {
-                width: size_in_chunks[0],
-                height: size_in_chunks[1],
-                depth_or_array_layers: size_in_chunks[2],
-            },
-        );
+        enc.copy_buffer_to_buffer(&chunks_buffer, 0, &chunks_staging, 0, staging_size);
         queue.submit([enc.finish()]);
         let slice = chunks_staging.slice(..);
         slice.map_async(MapMode::Read, |r| r.unwrap());
         device.poll(PollType::wait_indefinitely()).unwrap();
         let raw = slice.get_mapped_range();
+        let pairs: &[[u32; 2]] = bytemuck::cast_slice(&raw);
         // For each update, decode chunk_pos + verify `.x` preserved + `.y`
         // updated.
         for upd in &cpu_uploads.chunk_updates {
@@ -4756,13 +4585,7 @@ mod tests_w4 {
             let cz = upd.data1 >> 21;
             let chunk_idx_in_world =
                 cx + cy * size_in_chunks[0] + cz * size_in_chunks[0] * size_in_chunks[1];
-            // The Rg32Uint layout has 8 B/texel; staging is row-aligned with
-            // bytes_per_row, but each row's first size[0]*8 bytes are real.
-            let row_idx = cz * size_in_chunks[1] + cy;
-            let row_offset = (row_idx as usize) * bytes_per_row as usize;
-            let texel_offset = row_offset + (cx as usize) * 8;
-            let xy: &[u32] =
-                bytemuck::cast_slice(&raw[texel_offset..texel_offset + 8]);
+            let xy = pairs[chunk_idx_in_world as usize];
             let preserved_x = 0xAA00_0000u32 + chunk_idx_in_world;
             assert_eq!(
                 xy[0], preserved_x,

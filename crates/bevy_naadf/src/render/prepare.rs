@@ -14,17 +14,24 @@
 //!   `TaaGpu` as the real `taa_sample_accum` — `prepare_frame_gpu` reads
 //!   `TaaGpu` and binds it (`06-design-a2.md` §5.5, §9.4).
 //!
-//! The chunk layer is a `Rg32Uint` 3D texture (`15-design-c.md` §1.3 / §1.7).
-//! Phase A landed it as `R32Uint`, CPU-built and upload-only — Phase C widened
-//! it to `Rg32Uint` (`.x` = block-state pointer + AADF, `.y` = entity pointer +
-//! counter) and gave it `STORAGE_BINDING | TEXTURE_BINDING | COPY_DST`, so the
-//! W1/W2/W3/W4 construction passes write it via
-//! `texture_storage_3d<…, read_write>`. The wgpu `STORAGE_READ_WRITE` × `read`
-//! constraint is resolved by `15-design-c.md` §1.3's **parallel-layout split**:
-//! the render passes bind it through `world_layout` (read-only `texture_3d`);
-//! the construction sub-graph binds it through `construction_world_layout` /
-//! `construction_bounds_world_layout` (`texture_storage_3d`, read-write).
-//! Both layouts reference the same underlying GPU texture.
+//! The chunk layer is an `array<vec2<u32>>` storage buffer (`.x` = block-state
+//! pointer + AADF, `.y` = entity pointer + counter; W4's chunk-pair widening,
+//! `15-design-c.md` §1.3 / §1.7). Phase A landed it as `R32Uint`, CPU-built
+//! and upload-only; Phase C widened it to `Rg32Uint` and gave it
+//! `STORAGE_BINDING | TEXTURE_BINDING | COPY_DST` so the W1/W2/W3/W4
+//! construction passes could write it via
+//! `texture_storage_3d<rg32uint, read_write>`. The web-WebGPU migration
+//! replaces the 3D texture with a flat storage buffer because the WebGPU spec
+//! only permits `read_write` storage textures on `r32{uint,sint,float}`.
+//!
+//! Both `world_layout` (read-only, render passes) and the three construction
+//! layouts (`construction_world_layout` /
+//! `construction_bounds_world_layout` / `entity_world_layout`, read-write,
+//! construction sub-graph) now bind the same underlying GPU storage buffer
+//! through `storage_buffer_read_only_sized` / `storage_buffer_sized`. Chunk
+//! position flattens to a linear index via `flatten_index(chunk_pos,
+//! size_in_chunks.x, size_in_chunks.x * size_in_chunks.y)` (the existing
+//! `common.wgsl:32` helper, x-fastest convention).
 
 use std::f32::consts::PI;
 
@@ -32,9 +39,7 @@ use bevy::math::Vec3;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntries, Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
-    Extent3d, PipelineCache, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor,
+    PipelineCache,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 
@@ -55,10 +60,16 @@ use crate::world::buffer::{GrowableBuffer, GROWABLE_BUFFER_USAGES};
 /// `WorldGpu` resource). Created once by [`prepare_world_gpu`].
 #[derive(Resource)]
 pub struct WorldGpu {
-    /// The chunk layer — a CPU-built, upload-only `R32Uint` 3D texture.
-    pub chunks: Texture,
-    /// View of [`chunks`](Self::chunks) for binding.
-    pub chunks_view: TextureView,
+    /// The chunk layer — an `array<vec2<u32>>` storage buffer indexed by
+    /// `flatten_index(chunk_pos, sx, sx*sy)` (x-fastest), where each pair
+    /// carries `(state, entity_y)`. Web-WebGPU migration replaced the
+    /// previous `Rg32Uint` 3D texture because WebGPU forbids `read_write`
+    /// storage textures on non-r32 formats.
+    pub chunks_buffer: Buffer,
+    /// World size in chunks — cached so consumers can derive the buffer's
+    /// 3D shape without reaching into a no-longer-existing texture. Matches
+    /// the `size_in_chunks` field on `GpuWorldMeta` / `GpuConstructionParams`.
+    pub chunks_size_in_chunks: UVec3,
     /// The block layer — a growable `u32` storage buffer.
     pub blocks: GrowableBuffer<u32>,
     /// The voxel layer — a growable `u32` storage buffer (packed voxels).
@@ -214,65 +225,38 @@ pub fn prepare_world_gpu(
     // Phase-C followup #1 — buffer sizing is GPU-producer-aware (the GPU
     // dispatch's outputs shift by +64 u32s for blocks / +32 u32s for voxels
     // because of the cursor seeds; we size with this headroom), but the
-    // **upload-skip** lever stays off in this revision. Empirically the
-    // pure-GPU producer path (skip CPU upload, run GPU dispatch from a
-    // render-graph node, read back via the renderer's read-only `texture_3d`
-    // bind) does NOT propagate the storage-texture writes through to the
-    // renderer's reads — likely a wgpu/Vulkan storage→sampled barrier
-    // hazard with the chunks-texture being aliased to both
-    // `texture_storage_3d<rg32uint, read_write>` (construction bind group)
-    // and `texture_3d<u32>` (renderer bind group). The GPU dispatch
-    // **still runs** as a render-graph node every startup, proving Algorithm
-    // 1 against the production buffers — the bit-exact GPU-vs-CPU oracle
-    // (`e2e_render --validate-gpu-construction`) gate verifies output
-    // equivalence on a deterministic 1×1×1 fixture. The CPU upload stays
-    // as the renderer's input until the barrier hazard is resolved
-    // (deferred Phase-D follow-up — `16-impl-c-followups.md`).
+    // **upload-skip** lever stays off in this revision. (Historical note:
+    // pre-migration this comment flagged a texture-aliasing hazard between
+    // the construction-side `texture_storage_3d<rg32uint, read_write>` and
+    // the renderer-side `texture_3d<u32>` bindings. Web-WebGPU migration
+    // unified both bindings on a single `array<vec2<u32>>` storage buffer;
+    // wgpu inserts STORAGE→STORAGE barriers automatically, so the hazard is
+    // moot. The upload-skip lever stays off only because the CPU upload is
+    // still the simplest correctness baseline.)
     let gpu_producer_skip_upload = false;
     let _ = gpu_producer_enabled;
 
-    // --- chunk layer: an Rg32Uint 3D texture, CPU-built today + GPU-writable
-    //     for Phase C ---------------------------------------------------------
-    // Phase A built the chunks texture as a CPU-built, upload-only `R32Uint`
-    // resource (TEXTURE_BINDING | COPY_DST). Phase C (`15-design-c.md` §1.4)
-    // makes construction the GPU-side producer: `chunkCalc.fx` /
-    // `worldChange.fx` (W1, W2) write the chunks texture via
-    // `texture_storage_3d<…, read_write>`, and `boundsCalc.fx` (W3) mutates the
-    // 5-bit AADFs the chunks texture stores. STORAGE_BINDING was added by W0;
-    // **W4 (this workstream) flips the format from `R32Uint` to `Rg32Uint`**
-    // (`15-design-c.md` §1.7) so the texture carries both:
+    // --- chunk layer: an `array<vec2<u32>>` storage buffer, CPU-built today
+    //     + GPU-writable for Phase C ------------------------------------------
+    // Phase A built the chunks resource as a CPU-built, upload-only `R32Uint`
+    // 3D texture. Phase C (`15-design-c.md` §1.4) makes construction the
+    // GPU-side producer: `chunkCalc.fx` / `worldChange.fx` (W1, W2) /
+    // `boundsCalc.fx` (W3) / `entityUpdate.fx` (W4) write the chunks resource
+    // via `read_write` storage. **W4 widened the chunks pair to
+    // `(state, entity_y)`** (`15-design-c.md` §1.7):
     //   .x = block-state pointer + AADF (W1/W2/W3, unchanged semantics)
     //   .y = entity pointer + counter (W4, `entityUpdate.wgsl` writes;
     //         `rayTracing.fxh:107` reads)
     // Every existing renderer-side reader takes `.x` explicitly so the widened
-    // format is a no-op for the no-entities path. The CPU upload now pairs
-    // each `R32Uint` u32 from `WorldData.chunks_cpu` with a zero `.y` channel
+    // pair is a no-op for the no-entities path. The CPU upload pairs each
+    // `R32Uint`-era u32 from `WorldData.chunks_cpu` with a zero `.y` channel
     // (entity pointer 0 = "no entities in this chunk").
-    let chunks = render_device.create_texture(&TextureDescriptor {
-        label: Some("naadf_chunks"),
-        size: Extent3d {
-            width: size.x,
-            height: size.y,
-            depth_or_array_layers: size.z,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D3,
-        format: TextureFormat::Rg32Uint,
-        usage: TextureUsages::TEXTURE_BINDING
-            | TextureUsages::COPY_DST
-            | TextureUsages::STORAGE_BINDING,
-        view_formats: &[],
-    });
-    // Phase-C followup #1 — pick the chunks texture's initial contents.
-    // - When the GPU producer is enabled: zero-init (the GPU dispatch in
-    //   `prepare_construction` will overwrite the chunks the dispatch
-    //   covers; un-touched chunks must read zero/empty, not uninitialised
-    //   garbage). wgpu textures created with `mapped_at_creation: false`
-    //   have implementation-defined contents on most backends; we MUST
-    //   zero-init explicitly.
-    // - When disabled (CPU producer): upload the CPU `construct()` output
-    //   from `extracted.chunks` (E4 fallback path).
+    //
+    // Web-WebGPU migration: the chunks resource is a storage **buffer**, not
+    // a 3D texture, because WebGPU only permits `read_write` storage textures
+    // on `r32{uint,sint,float}`. The flat layout is x-fastest:
+    // `idx = z*sx*sy + y*sx + x` (matches `common.wgsl::flatten_index` and
+    // `entity_handler.rs::chunk_index_to_pos`).
     let chunk_count = (size.x * size.y * size.z) as usize;
     let chunk_data_paired: Vec<[u32; 2]> = if gpu_producer_skip_upload {
         vec![[0u32, 0u32]; chunk_count]
@@ -285,27 +269,22 @@ pub fn prepare_world_gpu(
         }
         paired
     };
-    render_queue.write_texture(
-        TexelCopyTextureInfo {
-            texture: &chunks,
-            mip_level: 0,
-            origin: Default::default(),
-            aspect: Default::default(),
-        },
+    let chunks_buffer_size = (chunk_count as u64) * 8; // 8 B per [u32; 2]
+    let chunks_buffer = render_device.create_buffer(&BufferDescriptor {
+        label: Some("naadf_chunks"),
+        size: chunks_buffer_size,
+        // STORAGE for the rw/ro storage bindings; COPY_DST for the seed +
+        // future `write_buffer`-driven seeding (test fixtures + W2 staging);
+        // COPY_SRC for the GPU-vs-CPU oracle readback path in
+        // `construction/mod.rs::tests_w1` (build-once today; cheap to keep).
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    render_queue.write_buffer(
+        &chunks_buffer,
+        0,
         bytemuck::cast_slice(&chunk_data_paired),
-        TexelCopyBufferLayout {
-            offset: 0,
-            // Rg32Uint = 8 bytes per texel.
-            bytes_per_row: Some(size.x * 8),
-            rows_per_image: Some(size.y),
-        },
-        Extent3d {
-            width: size.x,
-            height: size.y,
-            depth_or_array_layers: size.z,
-        },
     );
-    let chunks_view = chunks.create_view(&TextureViewDescriptor::default());
 
     // --- block / voxel / voxel-type growable buffers ------------------------
     // wgpu storage buffers can't be zero-length — ensure at least one element.
@@ -449,7 +428,7 @@ pub fn prepare_world_gpu(
         "naadf_world_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.world_layout),
         &BindGroupEntries::sequential((
-            &chunks_view,
+            chunks_buffer.as_entire_buffer_binding(),
             blocks.buffer().as_entire_buffer_binding(),
             voxels.buffer().as_entire_buffer_binding(),
             voxel_types.buffer().as_entire_buffer_binding(),
@@ -461,8 +440,8 @@ pub fn prepare_world_gpu(
     );
 
     commands.insert_resource(WorldGpu {
-        chunks,
-        chunks_view,
+        chunks_buffer,
+        chunks_size_in_chunks: size,
         blocks,
         voxels,
         voxel_types,

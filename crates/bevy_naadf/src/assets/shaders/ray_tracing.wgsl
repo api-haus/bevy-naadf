@@ -283,7 +283,16 @@ fn shoot_ray(
         // --- chunk lookup ---------------------------------------------------
         let chunk_pos = vec3<u32>(cur_cell) / 16u;
         let voxel_pos_in_chunk = vec3<u32>(cur_cell) % 16u;
-        let chunk_texel = textureLoad(chunks, vec3<i32>(chunk_pos), 0);
+        // Web-WebGPU migration: chunks is now `array<vec2<u32>>` indexed by
+        // `flatten_index(chunk_pos, sx, sx*sy)` (x-fastest). Field selectors
+        // (`.x` / `.y`) carry forward byte-for-byte; no longer a `vec4<u32>`
+        // from `textureLoad`.
+        let chunk_idx = flatten_index(
+            chunk_pos,
+            world_meta.size_in_chunks.x,
+            world_meta.size_in_chunks.x * world_meta.size_in_chunks.y,
+        );
+        let chunk_texel = chunks[chunk_idx];
         var cur_node: u32 = chunk_texel.x;
 
         // W4 entity-track — collect this chunk's entity-pointer (`.y`) if

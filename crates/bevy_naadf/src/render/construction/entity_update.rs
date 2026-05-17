@@ -27,12 +27,11 @@ use std::num::NonZeroU64;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     binding_types::{
-        storage_buffer_read_only_sized, storage_buffer_sized, texture_storage_3d,
-        uniform_buffer_sized,
+        storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized,
     },
     BindGroup, BindGroupLayoutDescriptor, BindGroupLayoutEntries, CachedComputePipelineId,
     CommandEncoder, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
-    ShaderStages, StorageTextureAccess, TextureFormat,
+    ShaderStages,
 };
 use bevy::shader::Shader;
 use bytemuck::{Pod, Zeroable};
@@ -47,8 +46,12 @@ pub const ENTITY_UPDATE_SHADER_SRC: &str =
 /// `EntityUpdateParams` — the W4 uniform mirrored on the GPU
 /// (`entity_update.wgsl::EntityUpdateParams`).
 ///
-/// 32 B = 2 × 16-byte rows. Every field is a `u32`; no `vec3`-then-scalar
-/// hazard.
+/// 48 B = 3 × 16-byte rows. Row 0/1 are scalar `u32`s; row 2 is the world
+/// size in chunks (vec3 + pad).
+///
+/// Web-WebGPU migration: `size_in_chunks` was added so `update_chunks` can
+/// flatten the chunk position into the new `array<vec2<u32>>` chunks buffer
+/// (was a 3D storage texture, indexed by `vec3<i32>`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
 pub struct GpuEntityUpdateParams {
@@ -66,14 +69,21 @@ pub struct GpuEntityUpdateParams {
     pub _pad0: u32,
     pub _pad1: u32,
     pub _pad2: u32,
+    /// World size in chunks — needed by `update_chunks` to flatten the chunk
+    /// position into the `array<vec2<u32>>` chunks buffer. Matches
+    /// `WorldGpu.chunks_size_in_chunks`.
+    pub size_in_chunks: [u32; 3],
+    pub _pad3: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<GpuEntityUpdateParams>() == 32);
+const _: () = assert!(std::mem::size_of::<GpuEntityUpdateParams>() == 48);
 
 /// Build the `entity_world_layout` `@group(0)` for the three W4 entry points.
 ///
 /// 2 bindings:
-///   0: chunks_rw — `texture_storage_3d<rg32uint, read_write>`
+///   0: chunks_rw — `array<vec2<u32>>` storage buffer (was
+///                  `texture_storage_3d<rg32uint, read_write>` pre-web-WebGPU
+///                  migration)
 ///   1: params — uniform<EntityUpdateParams>
 pub fn entity_world_layout_descriptor() -> BindGroupLayoutDescriptor {
     let params_size =
@@ -83,10 +93,7 @@ pub fn entity_world_layout_descriptor() -> BindGroupLayoutDescriptor {
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                texture_storage_3d(
-                    TextureFormat::Rg32Uint,
-                    StorageTextureAccess::ReadWrite,
-                ),
+                storage_buffer_sized(false, None),
                 uniform_buffer_sized(false, Some(params_size)),
             ),
         ),
@@ -348,7 +355,7 @@ pub fn naadf_entity_update_node(
         "naadf_entity_update_world_bind_group",
         &entity_world_bgl,
         &bevy::render::render_resource::BindGroupEntries::sequential((
-            &world_gpu.chunks_view,
+            world_gpu.chunks_buffer.as_entire_buffer_binding(),
             params_buf.as_entire_buffer_binding(),
         )),
     );

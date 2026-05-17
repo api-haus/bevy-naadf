@@ -42,16 +42,22 @@ struct GpuWorldMeta {
 // --- @group(0) — world data (read-only in the render passes) ----------------
 
 // The chunk layer: encoded chunk pair per chunk, indexed by chunk position
-// (HLSL `Texture3D<CHUNKTYPE> chunks`; CHUNKTYPE = `uint2` under `ENTITIES`).
+// flattened linear via `flatten_index(chunk_pos, sx, sx*sy)` from
+// `common.wgsl` (x-fastest then y then z; matches the C# / CPU layout in
+// `entity_handler.rs::chunk_index_to_pos`).
 //
-// **W4 (`15-design-c.md` §1.7) — texture format widened to `Rg32Uint`** so the
-// chunks texture carries the per-chunk entity pointer in `.y`. The renderer's
-// view binding stays `texture_3d<u32>` (a `textureLoad` returns `vec4<u32>`
-// regardless of channel count); every render-side read takes `.x` explicitly
-// (the construction-side state pointer + AADF, unchanged from Phase A). The
-// entity-aware traversal path (`ray_tracing.wgsl`) additionally reads `.y` to
-// drive the entity sub-traversal branch.
-@group(0) @binding(0) var chunks: texture_3d<u32>;
+// **W4 (`15-design-c.md` §1.7) — chunk-pair widened to `vec2<u32>`** so each
+// chunk carries the per-chunk entity pointer in `.y`. `.x` = block-state
+// pointer + AADF (W1/W2/W3, unchanged semantics); `.y` = entity pointer +
+// counter (W4, `entity_update.wgsl` writes; `ray_tracing.wgsl` reads).
+//
+// **Web-WebGPU migration (`docs/orchestrate/web-chunks-storage-buffer/`)** —
+// representation changed from `texture_storage_3d<rg32uint, read_write>` /
+// `texture_3d<u32>` to `array<vec2<u32>>` because the WebGPU spec only
+// permits `StorageTextureAccess::ReadWrite` on the `r32{uint,sint,float}`
+// allow-list. Field-selector discipline (`.x` / `.y`) is preserved
+// byte-for-byte; only the binding type changed.
+@group(0) @binding(0) var<storage, read> chunks: array<vec2<u32>>;
 
 // The block layer: encoded block `u32`s, 64 consecutive per mixed chunk
 // (HLSL `StructuredBuffer<uint> blocks`).
