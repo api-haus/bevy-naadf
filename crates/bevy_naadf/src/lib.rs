@@ -207,6 +207,35 @@ impl Default for GiSettings {
     }
 }
 
+/// C# `WorldHandler.worldSizeToUseInWorldGenSegments` (`WorldHandler.cs:19`).
+///
+/// NAADF's fixed startup world size, expressed in **WorldGenSegment** units.
+/// One segment is `WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4 * 16` voxels per axis
+/// (4 chunks per group × 16 voxels per chunk = 64 voxels per group × 4 groups
+/// per segment = 256 voxels per segment). C# uses `(16, 2, 16)`, which gives
+/// the canonical `(4096, 512, 4096)`-voxel world the original engine boots
+/// into regardless of whether a model file is present.
+pub const WORLD_SIZE_IN_SEGMENTS: UVec3 = UVec3::new(16, 2, 16);
+
+/// C# `WorldHandler.worldGenSegmentSizeInGroups` (`WorldHandler.cs:18`). One
+/// group is `4^3` chunks (= `64^3` voxels); this many groups per segment per
+/// axis. Combined with [`WORLD_SIZE_IN_SEGMENTS`] this pins the fixed world
+/// dimensions.
+pub const WORLD_GEN_SEGMENT_SIZE_IN_GROUPS: u32 = 4;
+
+/// Derived: world size in chunks (`16 * 4 * 4 = 256`, `2 * 4 * 4 = 32`).
+///
+/// The same number `WorldData.cs:64-65` arrives at:
+/// `sizeInVoxels = sizeInWorldGenSegments * worldGenSegmentSizeInVoxels`, then
+/// `sizeInChunks = sizeInVoxels / 16`.
+///
+/// Hardcoded rather than computed because `glam`'s `UVec3` ops are not `const`;
+/// the relationship is enforced by [`tests::fixed_world_size_constants_agree`].
+pub const WORLD_SIZE_IN_CHUNKS: UVec3 = UVec3::new(256, 32, 256);
+
+/// Derived: world size in voxels (`256 * 16 = 4096`, `32 * 16 = 512`).
+pub const WORLD_SIZE_IN_VOXELS: UVec3 = UVec3::new(4096, 512, 4096);
+
 /// The default TAA sample-ring depth — **32**, NAADF's / the paper's depth
 /// (`WorldRenderBase.cs:17`, paper §4.1 / Fig 6).
 ///
@@ -324,6 +353,25 @@ pub struct AppArgs {
     /// regression that `--small-edit-visual` does not catch. See
     /// [`crate::e2e::small_edit_repro`].
     pub small_edit_repro_mode: bool,
+    /// `2026-05-17` — C#-faithful world initialisation. When `true`,
+    /// [`crate::voxel::grid::setup_test_grid`] always allocates the fixed
+    /// [`WORLD_SIZE_IN_CHUNKS`] world (`256×32×256` chunks = `4096×512×4096`
+    /// voxels) regardless of grid preset:
+    ///
+    /// - [`GridPreset::Default`] embeds the small primitive scene at the
+    ///   `(0, 0, 0)` corner of the full-size world — the rest is empty but
+    ///   editable (matches C#'s "world container is built, then `oasis.cvox`
+    ///   either loads or doesn't" behaviour at `WorldHandler.cs:29-35`).
+    /// - [`GridPreset::Vox`] auto-tiles the model in XZ using `voxelPos %
+    ///   modelSize` and leaves all `Y > 0` tiles empty — exactly what
+    ///   `generatorModel.fx:16-52` does on the GPU in C#. The `tiles` field
+    ///   of [`GridPreset::Vox`] is ignored in this mode.
+    ///
+    /// `false` (the default) preserves the legacy scene-sized behaviour the
+    /// e2e gates depend on (`crate::e2e::gates` derives its rectangles from
+    /// the small 64×32×64 voxel layout). `bevy-naadf::main` sets this `true`
+    /// always; e2e binaries leave it `false`.
+    pub fixed_world_size: bool,
 }
 
 impl Default for AppArgs {
@@ -340,6 +388,9 @@ impl Default for AppArgs {
             oasis_edit_visual_mode: false,
             small_edit_visual_mode: false,
             small_edit_repro_mode: false,
+            // Off by default — the e2e gates depend on the legacy small-world
+            // layout. `bevy-naadf::main` flips it on for the production binary.
+            fixed_world_size: false,
         }
     }
 }
@@ -843,5 +894,27 @@ mod tests {
             matches!(depth, 16 | 24 | 32),
             "taa_ring_depth = {depth} is not one of the supported 16/24/32 lever values"
         );
+    }
+
+    /// The derived [`WORLD_SIZE_IN_CHUNKS`] and [`WORLD_SIZE_IN_VOXELS`] must
+    /// match `WORLD_SIZE_IN_SEGMENTS * WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4`
+    /// (chunks) and `× 16` again (voxels). Pinned because the chunks/voxels
+    /// constants are hardcoded for `const`-eval and would silently drift if
+    /// the segment factors changed without updating them.
+    #[test]
+    fn fixed_world_size_constants_agree() {
+        let chunks = WORLD_SIZE_IN_SEGMENTS * WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4;
+        assert_eq!(
+            chunks, WORLD_SIZE_IN_CHUNKS,
+            "WORLD_SIZE_IN_CHUNKS drifted from segments × groups × 4",
+        );
+        assert_eq!(
+            chunks * 16,
+            WORLD_SIZE_IN_VOXELS,
+            "WORLD_SIZE_IN_VOXELS drifted from chunks × 16",
+        );
+        // The C# canonical values — same numbers `WorldHandler.cs:18-19` pins.
+        assert_eq!(WORLD_SIZE_IN_CHUNKS, UVec3::new(256, 32, 256));
+        assert_eq!(WORLD_SIZE_IN_VOXELS, UVec3::new(4096, 512, 4096));
     }
 }

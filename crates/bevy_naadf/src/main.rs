@@ -5,55 +5,45 @@
 //! (`src/bin/e2e_render.rs`) build the *same* app
 //! (`docs/orchestrate/naadf-bevy-port/e2e-render-test.md` §9, §11 step 1).
 //!
+//! ## C#-faithful world initialisation
+//!
+//! The production binary always boots into a fixed `(4096, 512, 4096)`-voxel
+//! world (= `(256, 32, 256)` chunks) and either embeds the small primitive
+//! test scene at the world origin (no `--vox`) or auto-tiles a loaded `.vox`
+//! file across the XZ plane (`--vox <path>`). Both paths mirror C#
+//! `WorldHandler.Initialize` (`World/WorldHandler.cs:29-35`) +
+//! `generatorModel.fx:16-52`'s `voxelPos % modelSize` tiling with `Y > 0` left
+//! empty. The world is editable everywhere — empty cells included — exactly
+//! the way C# behaves when `Content/oasis.cvox` is missing.
+//!
 //! ## CLI flags
 //!
-//! - `--vox <path>` — Track A
-//!   (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`):
-//!   load a MagicaVoxel `.vox` file at startup instead of the hard-coded test
-//!   grid. The path is read synchronously by
-//!   `voxel/vox_import::load_vox`; failure logs + falls back to
-//!   [`bevy_naadf::GridPreset::Default`] so the harness always boots into a
-//!   renderable world. Minimal `std::env::args` parsing — no `clap`.
-//! - `--vox-grid <N>` — tile the loaded `.vox` N×N times in the XZ plane.
-//!   Default `1` (single tile, identical to pre-existing `--vox`). At `N=4`
-//!   the world is 16 copies of the loaded `.vox`, matching C#'s startup
-//!   behaviour that loads 4×4 Oasis_Hard_Cover.vox at boot
-//!   (`docs/orchestrate/feature-completeness/03e-impl-dirty-fix-and-vox-grid.md`).
+//! - `--vox <path>` — load a MagicaVoxel `.vox` file at startup. The model is
+//!   sparse-walked + auto-tiled into the fixed `(256, 32, 256)`-chunk world
+//!   (matches C# `generatorModel.fx`); load failures log + fall back to the
+//!   embedded primitive scene. Minimal `std::env::args` parsing — no `clap`.
 
 use bevy::prelude::AppExit;
 use bevy_naadf::{build_app_with_args, AppArgs, AppConfig, GridPreset};
 
 fn main() -> AppExit {
     let mut args = AppArgs::default();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Production binary is always C#-faithful — fixed-size world container,
+    // model auto-tiling, identical to `WorldHandler.cs:29-35`. The e2e harness
+    // leaves this `false` because its luminance gates are tuned to the legacy
+    // small-world layout.
+    args.fixed_world_size = true;
 
-    // Parse --vox-grid <N> first (independent of --vox order; we apply tiles
-    // to whatever Vox preset gets set below).
-    let mut tiles: u32 = 1;
-    if let Some(idx) = argv.iter().position(|a| a == "--vox-grid") {
-        if let Some(n_str) = argv.get(idx + 1) {
-            match n_str.parse::<u32>() {
-                Ok(n) if n >= 1 => tiles = n,
-                Ok(_) => {
-                    eprintln!("error: --vox-grid N requires N >= 1");
-                    return AppExit::error();
-                }
-                Err(_) => {
-                    eprintln!("error: --vox-grid expects a positive integer");
-                    return AppExit::error();
-                }
-            }
-        } else {
-            eprintln!("error: --vox-grid flag requires an integer argument");
-            return AppExit::error();
-        }
-    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
 
     if let Some(idx) = argv.iter().position(|a| a == "--vox") {
         if let Some(path) = argv.get(idx + 1) {
             args.grid_preset = GridPreset::Vox {
                 path: std::path::PathBuf::from(path),
-                tiles,
+                // `tiles` is ignored when `fixed_world_size = true` — the
+                // loader fills the fixed-size world via `voxelPos %
+                // modelSize` instead. Set to 1 for the resource shape.
+                tiles: 1,
             };
         } else {
             eprintln!("error: --vox flag requires a path argument");

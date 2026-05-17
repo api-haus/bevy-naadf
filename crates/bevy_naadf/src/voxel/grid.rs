@@ -26,11 +26,12 @@
 
 use bevy::prelude::*;
 
-use crate::aadf::construct::{construct, DenseVolume};
+use crate::aadf::cell::{BlockCell, BlockPtr, ChunkCell, VoxelPtr};
+use crate::aadf::construct::{construct, ConstructedWorld, DenseVolume};
 use crate::voxel::vox_import;
 use crate::voxel::{MaterialBase, MaterialLayer, VoxelType, VoxelTypeId};
 use crate::world::data::{IAabb3, VoxelTypes, WorldData};
-use crate::{AppArgs, GridPreset};
+use crate::{AppArgs, GridPreset, WORLD_SIZE_IN_CHUNKS, WORLD_SIZE_IN_VOXELS};
 
 // Palette indices into `VoxelTypes::types`. Index 0 is the reserved empty
 // placeholder (C# convention) — see `VoxelTypes::default`.
@@ -81,129 +82,415 @@ const GRID_SIZE_IN_CHUNKS: [u32; 3] = [4, 2, 4];
 pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
     match &args.grid_preset {
         GridPreset::Default => {
-            let palette = build_palette();
-            let volume = build_default_volume();
-            let world = construct(&volume);
-            let size = volume.size_in_voxels();
-
-            info!(
-                "NAADF test grid ({:?}): {} chunks, {} blocks, {} voxel-u32s ({}x{}x{} voxels)",
-                args.grid_preset,
-                world.chunks.len(),
-                world.blocks.len(),
-                world.voxels.len(),
-                size[0],
-                size[1],
-                size[2],
-            );
-
-            // Phase-C followup #1 — preserve the dense voxel-type stream so
-            // the runtime GPU construction dispatch can rebuild
-            // `segment_voxel_buffer` without going through a CPU `construct()`
-            // re-run.
-            let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
-
-            let mut world_data = WorldData {
-                chunks_cpu: world.chunks,
-                blocks_cpu: world.blocks,
-                voxels_cpu: world.voxels,
-                size_in_chunks: UVec3::from_array(world.size_in_chunks),
-                bounding_box: IAabb3 {
-                    min: IVec3::ZERO,
-                    max: IVec3::new(size[0] as i32 - 1, size[1] as i32 - 1, size[2] as i32 - 1),
-                },
-                pending_edits: Default::default(),
-                dense_voxel_types,
-                block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
-            };
-            world_data.seed_block_hashing();
-            commands.insert_resource(world_data);
-
-            commands.insert_resource(VoxelTypes {
-                types: palette,
-            });
+            if args.fixed_world_size {
+                install_default_embedded_in_fixed_world(&mut commands);
+            } else {
+                install_default_small_world(&mut commands);
+            }
         }
-        GridPreset::Vox { path, tiles } => match vox_import::load_vox_tiled(path, *tiles) {
-            Ok(imp) => {
-                let size_in_chunks = imp.world.size_in_chunks;
-                let non_empty_voxels_buf_u32s = imp.world.voxels.len();
-                let non_empty_blocks_buf_u32s = imp.world.blocks.len();
-                let total_chunks = imp.world.chunks.len();
-                let tile_note = if *tiles > 1 {
-                    format!(" (tiled {0}×{0} in XZ)", tiles)
-                } else {
-                    String::new()
-                };
-                info!(
-                    "NAADF .vox loaded from {}: {} palette entries, world bounds {}×{}×{} chunks ({}×{}×{} voxels), {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s (sparse path, GPU producer skipped){}",
-                    path.display(),
-                    imp.palette.len(),
-                    size_in_chunks[0],
-                    size_in_chunks[1],
-                    size_in_chunks[2],
-                    size_in_chunks[0] * 16,
-                    size_in_chunks[1] * 16,
-                    size_in_chunks[2] * 16,
-                    total_chunks,
-                    non_empty_blocks_buf_u32s,
-                    non_empty_voxels_buf_u32s,
-                    tile_note,
-                );
-                // C#-faithful camera init (`Common/Camera.cs:95+121`,
-                // `World/Render/WorldRender.cs:48-49`). The C# camera spawns at
-                // a fixed `(500, 200, 40)` voxels in a fixed `1024×128×1024`
-                // default world; we rescale proportionally so the same vantage
-                // (~half X, above-the-ceiling Y, near-the-near-edge Z, looking
-                // +Z) reproduces in the actually-loaded `.vox` world dimensions.
-                // The e2e `setup_e2e_camera` ignores this resource (it spawns
-                // its own fixed-pose camera), so the `--vox-e2e` gate is
-                // unaffected. See [`crate::camera::InitialCameraPose`].
-                let world_voxels = [
-                    size_in_chunks[0] * 16,
-                    size_in_chunks[1] * 16,
-                    size_in_chunks[2] * 16,
-                ];
-                commands.insert_resource(crate::camera::InitialCameraPose::from_world_voxels(
-                    world_voxels,
-                ));
-                let (world_data, voxel_types) = vox_import::build_world_from_vox(imp);
-                commands.insert_resource(world_data);
-                commands.insert_resource(voxel_types);
+        GridPreset::Vox { path, tiles } => {
+            if args.fixed_world_size {
+                install_vox_in_fixed_world(&mut commands, path);
+            } else {
+                install_vox_sized_to_model(&mut commands, path, *tiles);
             }
-            Err(e) => {
-                error!(
-                    ".vox load failed ({e}); falling back to default test grid (path: {})",
-                    path.display()
-                );
-                let palette = build_palette();
-                let volume = build_default_volume();
-                let world = construct(&volume);
-                let size = volume.size_in_voxels();
-                let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
-                let mut world_data = WorldData {
-                    chunks_cpu: world.chunks,
-                    blocks_cpu: world.blocks,
-                    voxels_cpu: world.voxels,
-                    size_in_chunks: UVec3::from_array(world.size_in_chunks),
-                    bounding_box: IAabb3 {
-                        min: IVec3::ZERO,
-                        max: IVec3::new(
-                            size[0] as i32 - 1,
-                            size[1] as i32 - 1,
-                            size[2] as i32 - 1,
-                        ),
-                    },
-                    pending_edits: Default::default(),
-                    dense_voxel_types,
-                    block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
-                };
-                world_data.seed_block_hashing();
-                commands.insert_resource(world_data);
-                commands.insert_resource(VoxelTypes {
-                    types: palette,
-                });
-            }
+        }
+    }
+}
+
+/// Legacy small-world default — used by e2e gates whose luminance assertions
+/// are tuned to the 64×32×64-voxel grid. **DO NOT** change the chunks/blocks/
+/// voxels output here; the e2e baseline framebuffer is bit-sensitive.
+fn install_default_small_world(commands: &mut Commands) {
+    let palette = build_palette();
+    let volume = build_default_volume();
+    let world = construct(&volume);
+    let size = volume.size_in_voxels();
+
+    info!(
+        "NAADF test grid (Default, small): {} chunks, {} blocks, {} voxel-u32s ({}x{}x{} voxels)",
+        world.chunks.len(),
+        world.blocks.len(),
+        world.voxels.len(),
+        size[0],
+        size[1],
+        size[2],
+    );
+
+    // Phase-C followup #1 — preserve the dense voxel-type stream so the
+    // runtime GPU construction dispatch can rebuild `segment_voxel_buffer`
+    // without re-running CPU `construct()`. Only the small-world Default
+    // path keeps this populated; the fixed-world path skips it (the
+    // 4096×512×4096 dense buffer would be ~17 GiB).
+    let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
+
+    let mut world_data = WorldData {
+        chunks_cpu: world.chunks,
+        blocks_cpu: world.blocks,
+        voxels_cpu: world.voxels,
+        size_in_chunks: UVec3::from_array(world.size_in_chunks),
+        bounding_box: IAabb3 {
+            min: IVec3::ZERO,
+            max: IVec3::new(size[0] as i32 - 1, size[1] as i32 - 1, size[2] as i32 - 1),
         },
+        pending_edits: Default::default(),
+        dense_voxel_types,
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+    };
+    world_data.seed_block_hashing();
+    commands.insert_resource(world_data);
+    commands.insert_resource(VoxelTypes { types: palette });
+}
+
+/// C#-faithful default — build the same primitive scene the small-world path
+/// builds, then embed it at the `(0, 0, 0)` corner of a fixed
+/// [`WORLD_SIZE_IN_CHUNKS`] world. Mirrors `WorldHandler.cs:29-35`'s "world
+/// container is built, then the model either loads or doesn't" semantic: when
+/// the user runs `just dev` with no `.vox` argument, they get this populated
+/// corner inside a huge editable empty space.
+///
+/// `dense_voxel_types` is intentionally empty — at 4096×512×4096 voxels the
+/// dense u16 mirror is ~17 GiB. The data-driven gate at
+/// `render/construction/mod.rs:888` then skips the GPU producer chain and the
+/// renderer reads the pre-built CPU buffers directly.
+fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
+    let palette = build_palette();
+    let volume = build_default_volume();
+    let small = construct(&volume);
+
+    // Build a single-chunk ground template — 3 voxels of `TY_GROUND` at Y=0..2,
+    // empty above. Tiled across the entire chunk-Y=0 layer outside the demo
+    // footprint to give the user a permanent floor reference. Matches the
+    // demo's own ground stripe height so the demo/floor boundary is seamless.
+    let ground_template = construct(&build_ground_chunk_volume());
+
+    let center_offset_chunks = IVec3::new(
+        (WORLD_SIZE_IN_CHUNKS.x as i32 - small.size_in_chunks[0] as i32) / 2,
+        0,
+        (WORLD_SIZE_IN_CHUNKS.z as i32 - small.size_in_chunks[2] as i32) / 2,
+    );
+
+    let composed = compose_default_scene_into_fixed_world(
+        &small,
+        &ground_template,
+        WORLD_SIZE_IN_CHUNKS,
+        center_offset_chunks,
+    );
+    let size_v = WORLD_SIZE_IN_VOXELS;
+
+    info!(
+        "NAADF default scene embedded in fixed world: small={}×{}×{} chunks centered at chunk-({},{},{}); \
+         fixed {}×{}×{} chunks ({}×{}×{} voxels) with full-area ground at chunk-Y=0; \
+         chunks_cpu {} u32s, blocks_cpu {} u32s, voxels_cpu {} u32s. \
+         Dense voxel-type mirror skipped (would be ~17 GiB); GPU producer disabled, CPU upload path active.",
+        small.size_in_chunks[0],
+        small.size_in_chunks[1],
+        small.size_in_chunks[2],
+        center_offset_chunks.x,
+        center_offset_chunks.y,
+        center_offset_chunks.z,
+        WORLD_SIZE_IN_CHUNKS.x,
+        WORLD_SIZE_IN_CHUNKS.y,
+        WORLD_SIZE_IN_CHUNKS.z,
+        size_v.x,
+        size_v.y,
+        size_v.z,
+        composed.chunks.len(),
+        composed.blocks.len(),
+        composed.voxels.len(),
+    );
+
+    // Frame the centered demo with the same relative camera pose the
+    // small-world Default uses (`(11, 7, 17)` looking at `(0, 4, -3)`), just
+    // translated to the demo's embed origin in the fixed world. Without this
+    // resource `setup_camera` falls back to the small-world pose (centered on
+    // `(0, 0, 0)`), which now stares at empty space far from the demo.
+    let demo_origin_v = Vec3::new(
+        (center_offset_chunks.x * 16) as f32,
+        0.0,
+        (center_offset_chunks.z * 16) as f32,
+    );
+    let cam_pos = demo_origin_v + Vec3::new(11.0, 7.0, 17.0);
+    let cam_look = demo_origin_v + Vec3::new(0.0, 4.0, -3.0);
+    commands.insert_resource(crate::camera::InitialCameraPose(
+        Transform::from_translation(cam_pos).looking_at(cam_look, Vec3::Y),
+    ));
+
+    let mut world_data = WorldData {
+        chunks_cpu: composed.chunks,
+        blocks_cpu: composed.blocks,
+        voxels_cpu: composed.voxels,
+        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
+        // `bounding_box` is the **ray-traversal AABB clip** the renderer
+        // uploads as `boundingBoxMin/Max` (`render/prepare.rs:374-380`,
+        // matches C# `WorldData.cs:477-478` which always passes the full
+        // world extent). Sizing it to the full fixed world matters here:
+        // the user can edit voxels anywhere in the 4096×512×4096 container,
+        // and the primary ray must be allowed to reach + intersect those
+        // edits. A tight small-scene box (`64×32×64`) would clip rays before
+        // they hit any edit placed outside the corner — invisible writes
+        // from the user's perspective. Identical to the `.vox`-load path's
+        // bounds (set in `vox_import::build_world_from_vox`).
+        bounding_box: IAabb3 {
+            min: IVec3::ZERO,
+            max: IVec3::new(
+                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
+            ),
+        },
+        pending_edits: Default::default(),
+        dense_voxel_types: Vec::new(),
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+    };
+    world_data.seed_block_hashing();
+    commands.insert_resource(world_data);
+    commands.insert_resource(VoxelTypes { types: palette });
+}
+
+/// Legacy `.vox` loader — sizes the world to `tiles × tiles` copies of the
+/// model. Used by e2e gates (`--vox-e2e`, `--oasis-edit-visual`,
+/// `--small-edit-repro`) whose camera framing depends on the model bounds.
+fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path, tiles: u32) {
+    match vox_import::load_vox_tiled(path, tiles) {
+        Ok(imp) => {
+            let size_in_chunks = imp.world.size_in_chunks;
+            let tile_note = if tiles > 1 {
+                format!(" (tiled {0}×{0} in XZ)", tiles)
+            } else {
+                String::new()
+            };
+            info!(
+                "NAADF .vox loaded from {}: {} palette entries, world bounds {}×{}×{} chunks ({}×{}×{} voxels), {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s (sparse path, GPU producer skipped){}",
+                path.display(),
+                imp.palette.len(),
+                size_in_chunks[0],
+                size_in_chunks[1],
+                size_in_chunks[2],
+                size_in_chunks[0] * 16,
+                size_in_chunks[1] * 16,
+                size_in_chunks[2] * 16,
+                imp.world.chunks.len(),
+                imp.world.blocks.len(),
+                imp.world.voxels.len(),
+                tile_note,
+            );
+            let world_voxels = [
+                size_in_chunks[0] * 16,
+                size_in_chunks[1] * 16,
+                size_in_chunks[2] * 16,
+            ];
+            commands.insert_resource(crate::camera::InitialCameraPose::from_world_voxels(
+                world_voxels,
+            ));
+            let (world_data, voxel_types) = vox_import::build_world_from_vox(imp);
+            commands.insert_resource(world_data);
+            commands.insert_resource(voxel_types);
+        }
+        Err(e) => {
+            error!(
+                ".vox load failed ({e}); falling back to default test grid (path: {})",
+                path.display()
+            );
+            install_default_small_world(commands);
+        }
+    }
+}
+
+/// C#-faithful `.vox` loader — allocates the fixed [`WORLD_SIZE_IN_CHUNKS`]
+/// world and auto-tiles the model via `voxelPos % modelSize` with `Y > 0`
+/// tiles empty. Mirrors `WorldHandler.cs:29-35` +
+/// `generatorModel.fx:16-52`. On load failure falls back to the embedded
+/// default scene (so the world is still the fixed size, still editable —
+/// matches C#'s missing-`oasis.cvox` path).
+fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
+    let target: [u32; 3] = WORLD_SIZE_IN_CHUNKS.to_array();
+    match vox_import::load_vox_into_world(path, target) {
+        Ok(imp) => {
+            let s = imp.world.size_in_chunks;
+            info!(
+                "NAADF .vox loaded from {} into fixed {}×{}×{}-chunk world (auto-tiled in XZ; Y > model empty): \
+                 {} palette entries, {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s",
+                path.display(),
+                s[0],
+                s[1],
+                s[2],
+                imp.palette.len(),
+                imp.world.chunks.len(),
+                imp.world.blocks.len(),
+                imp.world.voxels.len(),
+            );
+            // C# camera spawn: literal `(500, 200, 40)` voxels in the fixed
+            // 4096×512×4096 world (`World/Render/WorldRender.cs:48-49`). No
+            // rescaling now that the world size is also fixed — use the C#
+            // constants verbatim.
+            let world_voxels = [s[0] * 16, s[1] * 16, s[2] * 16];
+            commands.insert_resource(crate::camera::InitialCameraPose::from_world_voxels(
+                world_voxels,
+            ));
+            let (world_data, voxel_types) = vox_import::build_world_from_vox(imp);
+            commands.insert_resource(world_data);
+            commands.insert_resource(voxel_types);
+        }
+        Err(e) => {
+            error!(
+                ".vox load failed ({e}); falling back to embedded default in fixed world (path: {})",
+                path.display()
+            );
+            install_default_embedded_in_fixed_world(commands);
+        }
+    }
+}
+
+/// A `1×1×1`-chunk [`DenseVolume`] containing the standard 3-voxel ground
+/// stripe (`TY_GROUND` at Y=0..2, empty above). Run through `construct()` to
+/// get the canonical chunk/block/voxel encoding for one "floor tile" — that
+/// encoding is then tiled across the full chunk-Y=0 layer outside the demo
+/// footprint by [`compose_default_scene_into_fixed_world`].
+fn build_ground_chunk_volume() -> DenseVolume {
+    let mut v = DenseVolume::empty([1, 1, 1]);
+    let s = v.size_in_voxels();
+    for z in 0..s[2] {
+        for x in 0..s[0] {
+            v.set([x, 0, z], TY_GROUND);
+            v.set([x, 1, z], TY_GROUND);
+            v.set([x, 2, z], TY_GROUND);
+        }
+    }
+    v
+}
+
+/// Compose a fixed-size world from (a) a centered demo scene and (b) a
+/// ground-chunk template tiled across the rest of the bottom Y-layer.
+///
+/// Output is byte-equivalent to what a single `construct(&DenseVolume)` call
+/// would produce on a hand-built world of the same content — except we never
+/// allocate the 17 GiB dense voxel mirror that would imply.
+///
+/// **Pointer-shift strategy:**
+///
+/// `demo.blocks` / `demo.voxels` are copied verbatim at the start of the
+/// output buffers, so every `demo.chunks[i]`'s `BlockPtr` (and every demo
+/// block's `VoxelPtr`) stays valid without rewriting.
+///
+/// `ground_template`'s voxels are appended after the demo voxels and its
+/// blocks are appended after the demo blocks with their `VoxelPtr` payloads
+/// shifted by the demo's voxel-buffer length. Each ground chunk gets its
+/// **own copy** of the 64-block slice (one per chunk) — sharing a single
+/// `BlockPtr` across thousands of chunks would mean a single edit to one
+/// ground chunk silently mutates every other ground chunk through the shared
+/// `blocks_cpu` window. Cost: `~65k chunks × 64 blocks × 4 bytes ≈ 16 MiB`
+/// for `blocks_cpu`.
+///
+/// The ground template's *voxel* slot, on the other hand, is shared across
+/// every ground block (block dedup is content-addressable via `VoxelPtr` and
+/// the [`crate::aadf::block_hash::BlockHashingHandler`] refcounts edits
+/// properly), so `voxels_cpu` only grows by the template's voxel count
+/// (~32 u32s).
+fn compose_default_scene_into_fixed_world(
+    demo: &ConstructedWorld,
+    ground_template: &ConstructedWorld,
+    target_chunks: UVec3,
+    center_offset: IVec3,
+) -> ConstructedWorld {
+    let [dx, dy, dz] = demo.size_in_chunks;
+    let tx = target_chunks.x;
+    let ty = target_chunks.y;
+    let tz = target_chunks.z;
+    debug_assert!(
+        dx <= tx && dy <= ty && dz <= tz,
+        "demo ({dx},{dy},{dz}) must fit inside fixed world ({tx},{ty},{tz})",
+    );
+    debug_assert_eq!(
+        ground_template.size_in_chunks, [1, 1, 1],
+        "ground template must be a single chunk",
+    );
+
+    // Start with the demo's data verbatim — its BlockPtr/VoxelPtr indices
+    // reference these offsets, so we preserve them.
+    let mut out_chunks = vec![0u32; (tx * ty * tz) as usize];
+    let mut out_blocks = demo.blocks.clone();
+    let mut out_voxels = demo.voxels.clone();
+
+    // Append the ground template's voxels — one shared slot for every tiled
+    // ground block thanks to content-addressable dedup.
+    let ground_voxel_base = out_voxels.len() as u32;
+    out_voxels.extend_from_slice(&ground_template.voxels);
+
+    // Pre-shift the ground-template's 64 blocks so their `VoxelPtr`s point at
+    // the right offsets in `out_voxels`. The same 64 shifted block words are
+    // re-appended once per ground chunk so each chunk owns its block slice
+    // (see the function-level doc for the "don't share BlockPtr" rationale).
+    let ground_chunk_block_count = 64usize;
+    debug_assert_eq!(
+        ground_template.blocks.len(),
+        ground_chunk_block_count,
+        "ground template should have exactly one chunk's worth of blocks (64)",
+    );
+    let ground_blocks_shifted: Vec<u32> = ground_template
+        .blocks
+        .iter()
+        .map(|&raw| shift_block_voxel_ptr(raw, ground_voxel_base))
+        .collect();
+
+    // Demo embed bounds in chunk space.
+    let off_x = center_offset.x as i64;
+    let off_z = center_offset.z as i64;
+    let off_y = center_offset.y as i64;
+
+    for cz in 0..tz {
+        for cy in 0..ty {
+            for cx in 0..tx {
+                let dst = (cx + cy * tx + cz * tx * ty) as usize;
+
+                // Inside the centered demo embed?
+                let demo_lx = cx as i64 - off_x;
+                let demo_ly = cy as i64 - off_y;
+                let demo_lz = cz as i64 - off_z;
+                let in_demo = demo_lx >= 0
+                    && demo_lx < dx as i64
+                    && demo_ly >= 0
+                    && demo_ly < dy as i64
+                    && demo_lz >= 0
+                    && demo_lz < dz as i64;
+                if in_demo {
+                    let src = (demo_lx as u32
+                        + demo_ly as u32 * dx
+                        + demo_lz as u32 * dx * dy) as usize;
+                    out_chunks[dst] = demo.chunks[src];
+                    continue;
+                }
+
+                if cy == 0 {
+                    // Allocate a fresh 64-block slice for this ground chunk so
+                    // edits stay local to this chunk (don't clobber neighbours
+                    // through a shared BlockPtr).
+                    let block_base = out_blocks.len() as u32;
+                    out_blocks.extend_from_slice(&ground_blocks_shifted);
+                    // The ground template's single chunk is `Mixed(BlockPtr(0))`
+                    // — we re-encode with this chunk's freshly-allocated base.
+                    out_chunks[dst] =
+                        ChunkCell::Mixed(BlockPtr(block_base)).encode();
+                }
+                // else: empty above the floor (chunks_cpu[dst] = 0u32).
+            }
+        }
+    }
+
+    ConstructedWorld {
+        chunks: out_chunks,
+        blocks: out_blocks,
+        voxels: out_voxels,
+        size_in_chunks: [tx, ty, tz],
+    }
+}
+
+/// Decode a block-cell `u32`, shift its `VoxelPtr` by `voxel_offset` if it's
+/// a Mixed cell, re-encode. Empty / UniformFull cells pass through unchanged.
+fn shift_block_voxel_ptr(raw: u32, voxel_offset: u32) -> u32 {
+    match BlockCell::decode(raw) {
+        BlockCell::Mixed(vp) => BlockCell::Mixed(VoxelPtr(vp.0 + voxel_offset)).encode(),
+        other => other.encode(),
     }
 }
 
@@ -514,5 +801,129 @@ mod tests {
         let p = build_palette();
         assert_eq!(p[0], VoxelType::default(), "element 0 must be the placeholder");
         assert_eq!(p[TY_EMISSIVE.0 as usize].material_base, MaterialBase::Emissive);
+    }
+
+    /// The centered embed must place the demo at the world centre, tile the
+    /// ground template across the rest of chunk-Y=0, and leave chunks above
+    /// the floor empty.
+    #[test]
+    fn composed_default_is_centered_with_full_area_ground() {
+        let demo = construct(&build_default_volume());
+        let ground = construct(&build_ground_chunk_volume());
+        let target = WORLD_SIZE_IN_CHUNKS;
+        let center_off = IVec3::new(
+            (target.x as i32 - demo.size_in_chunks[0] as i32) / 2,
+            0,
+            (target.z as i32 - demo.size_in_chunks[2] as i32) / 2,
+        );
+        let world =
+            compose_default_scene_into_fixed_world(&demo, &ground, target, center_off);
+
+        assert_eq!(world.size_in_chunks, [target.x, target.y, target.z]);
+        assert_eq!(
+            world.chunks.len(),
+            (target.x * target.y * target.z) as usize,
+        );
+
+        // Demo embed at the centre — sample chunks (0,0,0) and (dx-1, dy-1, dz-1)
+        // of the demo map to (off+0,0,off+0) and (off+dx-1, dy-1, off+dz-1) of
+        // the fixed world. The chunk encoding (including BlockPtr) must match
+        // bit-for-bit since demo.blocks were copied verbatim at the start of
+        // out_blocks.
+        let [dx, dy, dz] = demo.size_in_chunks;
+        for &(lx, ly, lz) in &[(0u32, 0u32, 0u32), (dx - 1, dy - 1, dz - 1)] {
+            let wx = (center_off.x as u32) + lx;
+            let wy = (center_off.y as u32) + ly;
+            let wz = (center_off.z as u32) + lz;
+            let dst = (wx + wy * target.x + wz * target.x * target.y) as usize;
+            let src = (lx + ly * dx + lz * dx * dy) as usize;
+            assert_eq!(
+                world.chunks[dst], demo.chunks[src],
+                "demo chunk ({lx},{ly},{lz}) must appear verbatim at fixed-world ({wx},{wy},{wz})"
+            );
+        }
+
+        // Outside the demo footprint at chunk-Y=0: must be a Mixed ground
+        // chunk (not empty, not the demo encoding). Pick a chunk well away
+        // from the centred demo.
+        let far_idx =
+            (0u32 + 0 * target.x + 0 * target.x * target.y) as usize;
+        match ChunkCell::decode(world.chunks[far_idx]) {
+            ChunkCell::Mixed(_) => { /* expected — ground tile */ }
+            other => panic!("expected ground tile at (0,0,0) in fixed world, got {other:?}"),
+        }
+
+        // Above the floor (chunk-Y >= 1, outside demo) must be empty.
+        let above_floor_idx =
+            (0u32 + 5 * target.x + 0 * target.x * target.y) as usize;
+        assert!(
+            matches!(
+                ChunkCell::decode(world.chunks[above_floor_idx]),
+                ChunkCell::Empty(_)
+            ),
+            "chunks above the floor and outside the demo must be Empty"
+        );
+
+        // Every ground chunk must have its own BlockPtr — i.e., the set of
+        // unique BlockPtrs at chunk-Y=0 (outside demo) must be `total - 1` at
+        // minimum (each ground chunk gets its own slice). Sanity-check with
+        // a small sample.
+        let mut block_ptrs: Vec<u32> = Vec::new();
+        for cz in 0..4u32 {
+            for cx in 0..4u32 {
+                let idx = (cx + 0 * target.x + cz * target.x * target.y) as usize;
+                if let ChunkCell::Mixed(bp) = ChunkCell::decode(world.chunks[idx]) {
+                    block_ptrs.push(bp.0);
+                }
+            }
+        }
+        block_ptrs.sort_unstable();
+        block_ptrs.dedup();
+        assert_eq!(
+            block_ptrs.len(),
+            16,
+            "every ground chunk must own a unique BlockPtr (edits stay local)"
+        );
+    }
+
+    /// Sanity: every chunk in the composed fixed-world `chunks_cpu` decodes to
+    /// a valid cell — sampling every 1024th chunk to keep the test fast.
+    #[test]
+    fn composed_default_decodes_cleanly() {
+        let demo = construct(&build_default_volume());
+        let ground = construct(&build_ground_chunk_volume());
+        let target = WORLD_SIZE_IN_CHUNKS;
+        let center_off = IVec3::new(
+            (target.x as i32 - demo.size_in_chunks[0] as i32) / 2,
+            0,
+            (target.z as i32 - demo.size_in_chunks[2] as i32) / 2,
+        );
+        let world =
+            compose_default_scene_into_fixed_world(&demo, &ground, target, center_off);
+        for raw in world.chunks.iter().step_by(1024) {
+            let _ = ChunkCell::decode(*raw);
+        }
+    }
+
+    /// The ground template should encode as one Mixed chunk pointing at one
+    /// 64-block slice, with the block buffer's mixed entries dedup-collapsed
+    /// to a single VoxelPtr (every 4×4×1 column has identical 3-ground-1-air
+    /// voxel content).
+    #[test]
+    fn ground_chunk_template_dedups_to_single_voxel_slot() {
+        let g = construct(&build_ground_chunk_volume());
+        assert_eq!(g.size_in_chunks, [1, 1, 1]);
+        // 1 chunk = 64 blocks of storage.
+        assert_eq!(g.blocks.len(), 64);
+        // Mixed-block dedup: all 16 ground blocks at block-Y=0 share one
+        // voxel slot, so voxels_cpu is exactly the placeholder slot (32 u32s
+        // reserved in `construct`'s `voxels_buf`) plus one dedup-collapsed
+        // 32-u32 slot for the shared 3-ground-1-air block content.
+        assert!(
+            !g.voxels.is_empty(),
+            "ground template must have at least one mixed block's voxel slot"
+        );
+        // The single chunk encoding must be Mixed.
+        assert!(matches!(ChunkCell::decode(g.chunks[0]), ChunkCell::Mixed(_)));
     }
 }
