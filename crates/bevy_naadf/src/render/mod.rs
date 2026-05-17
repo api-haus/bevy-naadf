@@ -42,7 +42,7 @@ use atmosphere::prepare_atmosphere;
 use extract::{
     extract_camera, extract_camera_history, extract_gi_config, extract_taa_config,
     stage_model_data_buildonce, stage_world_gpu_buildonce, ExtractedCameraData,
-    ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig, ModelDataRender, WorldDataMeta,
+    ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
 };
 use gi::prepare_gi;
 // Phase B Batch 6 (`09-design-b.md` §11 Batch 6 steps 17-18): the `base/` TAA
@@ -121,12 +121,21 @@ impl Plugin for NaadfRenderPlugin {
             // compile).
             .init_resource::<WorldDataMeta>()
             // vox-gpu-rewrite W5.1 — render-world mirror of main-world
-            // `ModelData`. Build-once populated by `stage_model_data_buildonce`
-            // on the first frame after `install_vox_in_fixed_world` inserts
-            // the main-world `ModelData`; long-lived (the W5.2/W5.3 GPU
-            // producer chain reads it every frame the bind group is being
-            // built).
-            .init_resource::<ModelDataRender>()
+            // `ModelData`. Build-once **inserted** by
+            // `stage_model_data_buildonce` on the first frame after
+            // `install_vox_in_fixed_world` inserts the main-world
+            // `ModelData`; long-lived (the W5.2/W5.3 GPU producer chain
+            // reads it every frame the bind group is being built).
+            //
+            // **NOT** `init_resource`d: that would seed a default empty
+            // `ModelDataRender { data_chunk = vec![], size_in_chunks = [0,0,0] }`
+            // and the extract system's `if existing.is_some() { return; }`
+            // gate would short-circuit forever — the real `ModelData` from
+            // `install_vox_in_fixed_world` would never replace it. Instead
+            // the resource is absent until the extract sees the main-world
+            // `ModelData` and `commands.insert_resource(...)`s it. Mirrors
+            // `WorldGpuStaging` (which is also extract-inserted, not
+            // `init_resource`d).
             .init_resource::<ExtractedCameraData>()
             .init_resource::<ExtractedCameraHistory>()
             .init_resource::<ExtractedTaaConfig>()

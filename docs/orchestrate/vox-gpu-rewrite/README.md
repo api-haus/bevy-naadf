@@ -51,11 +51,14 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Hard gate — W5.1 submitted, user confirmed
 - [x] Step 6 — Checkpoint commit + impl W5.2 landed (W5.2 committed `59adc31`)
 - [x] Hard gate — W5.2 submitted, user confirmed
-- [x] Step 6 — Checkpoint commit + impl W5.5 landed (W5.5 uncommitted pending next checkpoint; gate is RED pre-W5.3 as expected)
-- [ ] Hard gate — submit W5.5, wait for user  ← CURRENT
-- [ ] Hard gate — submit, wait
-- [ ] Step 6 — Checkpoint commit + impl W5.3 (segment-loop dispatch in naadf_gpu_producer_node)
-- [ ] Hard gate — submit, wait (W5.5 gate should go green here)
+- [x] Step 6 — Checkpoint commit + impl W5.5 landed (W5.5 committed `c5a5619`)
+- [x] Hard gate — W5.5 submitted, user confirmed
+- [x] Step 6 — Checkpoint commit + impl W5.3 landed (uncommitted; W5.3 fixed two latent W5.1 bugs)
+- [x] Hard gate — user live-tested W5.3, reported empty scene
+- [x] Diagnostic dispatch — `05-diagnostic.md` identified TWO bugs: (1) `prepare_world_gpu` buffer underallocation; (2) `InitialCameraPose::from_world_voxels` puts camera Y above world ceiling
+- [x] Hard gate — diagnostic submitted, user confirmed Fix #1 + workgroup-distribution; REJECTED Fix #2 (user: "would have surfaced millennia ago")
+- [ ] Step 6 — Checkpoint commit + W5.3 fix dispatch (Fix #1 prepare.rs buffer sizing + workgroup distribution for bounds chain, NO camera change)  ← CURRENT
+- [ ] Hard gate — user live-tests; expect geometry visible
 - [ ] Step 6 — Checkpoint commit + impl W5.4 (delete CPU stop-gap)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.6 (document default-scene divergence)

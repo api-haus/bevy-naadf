@@ -208,7 +208,18 @@ pub fn prepare_world_gpu(
     let Some(extracted) = staging else {
         return;
     };
-    if extracted.chunks.is_empty() {
+    // vox-gpu-rewrite W5.1 — the fixed-world `.vox` install path leaves
+    // `chunks_cpu`/`blocks_cpu`/`voxels_cpu` EMPTY because the W5 GPU producer
+    // chain populates the GPU-side `chunks_buffer`/blocks/voxels directly via
+    // per-segment `generator_model` + `chunk_calc` dispatches. The fixed world
+    // size is carried by `extracted.size_in_chunks` (non-zero); building the
+    // GPU resources from a non-zero size with empty CPU data is correct.
+    //
+    // The legacy "setup_test_grid has not run" check used `chunks.is_empty()`
+    // as a proxy for "size_in_chunks is meaningful". With W5.1 that proxy is
+    // wrong (size_in_chunks can be `WORLD_SIZE_IN_CHUNKS` with empty
+    // chunks_cpu); use the actual condition instead.
+    if extracted.size_in_chunks == UVec3::ZERO {
         // `setup_test_grid` has not run / extracted yet.
         return;
     }

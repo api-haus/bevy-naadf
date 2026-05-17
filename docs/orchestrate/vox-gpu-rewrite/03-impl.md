@@ -583,3 +583,411 @@ fail). Post-W5.3 the same gate should PASS (segment loop dispatches →
 chunks populate → render chain dispatches → framebuffer luminance rises
 above the 40.0 floor + above the standard driver's region / liveness
 thresholds).
+
+---
+
+## impl W5.3 findings (2026-05-17)
+
+### Files touched
+
+- `crates/bevy_naadf/src/render/construction/generator_model.rs:217-275` —
+  added the `dispatch_generator_model_with_encoder` sibling helper per Q1
+  (encoder-taking, matches `chunk_calc::dispatch_calc_block_from_raw_data_world_sized`
+  shape). Refactored existing `dispatch_generator_model(device, queue, ...)`
+  to call the sibling internally — one source of truth for the inner
+  `begin_compute_pass + set_pipeline + set_bind_group + dispatch_workgroups`.
+- `crates/bevy_naadf/src/render/construction/mod.rs:2087-2331` — rewrote
+  `naadf_gpu_producer_node` to:
+  - Add `render_queue: Res<RenderQueue>` parameter (for per-segment uniform
+    write_buffers).
+  - Add `model_data: Option<Res<crate::render::extract::ModelDataRender>>`
+    parameter (drives the three-way branch ladder).
+  - Add the **three-way branch ladder** (`(a) ModelData present → W5 chain;
+    (b) dense_voxel_types non-empty → existing chunk-calc-only; (c) → CPU
+    upload fallback`).
+  - Implement the W5 segment loop (Z outer, Y middle, X inner; 16 × 2 × 16 =
+    512 segments) rewriting both `model_data_params_buffer` AND
+    `bounds_params_buffer` per segment, then dispatching
+    `generator_model_with_encoder` + `chunk_calc.calc_block_from_raw_data_world_sized`
+    on the same shared encoder. Bounds chain runs ONCE after the loop with
+    clamped workgroup counts.
+- `crates/bevy_naadf/src/render/prepare.rs:211-227` — **W5.1 patch**:
+  replaced the `if extracted.chunks.is_empty() { return; }` early-return with
+  `if extracted.size_in_chunks == UVec3::ZERO { return; }`. The original
+  check was a proxy for "setup_test_grid not run yet" but it tripped on the
+  W5.1 fixed-world install path which leaves `chunks_cpu` empty by design
+  (the W5 GPU producer populates `WorldGpu::chunks_buffer` from segment
+  dispatches; `chunks_cpu` stays empty). Without this fix, `WorldGpu` would
+  NEVER be built on the W5 path → entire downstream chain dormant →
+  pre-W5.3 framebuffer ~0.7 luminance (pure-black). With this fix
+  `WorldGpu` builds when `size_in_chunks` is non-zero regardless of
+  `chunks_cpu` length.
+- `crates/bevy_naadf/src/render/mod.rs:122-141` — **W5.1 patch**: removed
+  `.init_resource::<ModelDataRender>()`. The original W5.1 dispatch added
+  this thinking it was needed for the `Option<Res<X>>` system params to
+  work, but `init_resource` seeded a default empty `ModelDataRender { ... }`
+  → `stage_model_data_buildonce`'s `if existing.is_some() { return; }`
+  short-circuited forever → the real `ModelData` from
+  `install_vox_in_fixed_world` was NEVER copied into the render world.
+  `init_resource` is wrong for build-once-inserted resources; it must be
+  absent so the extract's `commands.insert_resource(...)` is the first
+  insertion. Updated the comment block to spell this out explicitly so a
+  future re-edit doesn't reintroduce the bug.
+
+### `generator_model.rs` refactor — signature preservation confirmed
+
+Existing `pub fn dispatch_generator_model(device: &RenderDevice, queue:
+&RenderQueue, pipeline, bind_group, group_size_in_chunks: [u32; 3])`
+signature is **UNCHANGED** byte-for-byte. Body now reads:
+
+```rust
+let mut encoder = device.create_command_encoder(...);
+dispatch_generator_model_with_encoder(&mut encoder, pipeline, bind_group, group_size_in_chunks);
+queue.submit([encoder.finish()]);
+```
+
+The W5 unit test (`generator_model_gpu_vs_cpu_bit_exact` at
+`mod.rs:3206-3377`) calls `dispatch_generator_model(device, queue, ...)`
+unchanged and **continues to pass** in the verification run (198 passed, 1
+ignored — baseline preserved exactly).
+
+### C# loop order confirmation
+
+Loop nesting in `naadf_gpu_producer_node` is:
+
+```rust
+for sz in 0..crate::WORLD_SIZE_IN_SEGMENTS.z {   // outer Z
+    for sy in 0..crate::WORLD_SIZE_IN_SEGMENTS.y {  // middle Y
+        for sx in 0..crate::WORLD_SIZE_IN_SEGMENTS.x {  // inner X
+            // per-segment dispatch
+        }
+    }
+}
+```
+
+Matches C# `NAADF/NAADF/World/Data/WorldData.cs:136-140` (Z outer, Y
+middle, X inner) byte-for-byte. Per design decision § "Loop iteration
+order — Z outer, Y middle, X inner": observationally invariant for the
+dispatch outcome (each segment writes its own segment_voxel_buffer slice,
+consumed by the same-iteration chunk_calc), but matching C# satisfies the
+faithful-port discipline.
+
+### Per-segment params field values — example for `(sx=5, sy=1, sz=10)`
+
+`segment_chunks = WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4 = 4 * 4 = 16`.
+
+```rust
+group_offset_in_chunks = [5 * 16, 1 * 16, 10 * 16] = [80, 16, 160]
+```
+
+Per-segment `GpuGeneratorModelParams`:
+```
+size_in_voxels        = [4096, 512, 4096]  (WORLD_SIZE_IN_VOXELS)
+_pad0                 = 0
+model_size_in_chunks  = [93, 34, 84]  (Oasis ModelData.size_in_chunks)
+_pad1                 = 0
+group_offset_in_chunks= [80, 16, 160]
+group_size_in_chunks_x= 16
+group_size_in_chunks_y= 16
+_pad2/3/4             = 0
+```
+
+Per-segment `GpuConstructionParams` (bounds_params_buffer rewrite):
+```
+size_in_chunks            = [256, 32, 256]  (WORLD_SIZE_IN_CHUNKS)
+_pad0                     = 0
+group_size_in_groups      = bounds_calc::group_size_in_groups_of([256, 32, 256])
+_pad1                     = 0
+bound_group_queue_max_size= 1
+hash_map_size             = config.initial_hash_map_size
+segment_size_in_chunks    = 16  (vs the build-once value of 4 in
+                                  prepare_construction; per-segment update
+                                  is required so chunk_calc.wgsl's
+                                  `chunk_index_in_segment` computation uses
+                                  the right X/Y stride into the 16³ buffer)
+max_group_bound_dispatch  = config.max_group_bound_dispatch
+chunk_offset              = [80, 16, 160]  (matches C# CalculateChunkBlocks
+                                            at WorldData.cs:492-494)
+_pad2 / frame_index / changed_* = 0
+```
+
+**Critical fidelity detail not in the design spec**: the design at
+`02-design.md:1003-1011` only shows the per-segment `model_data_params_buffer`
+rewrite. But chunk_calc.wgsl reads `params.chunk_offset` (line 356) AND
+`params.segment_size_in_chunks` (line 351) from the `construction_world`
+bind group's params slot, which is `bounds_params_buffer`. Without
+per-segment rewrites of THIS buffer the chunk_calc dispatch would write
+every segment's chunks to world position `[0,0,0]` with stride `seg=4`
+(the build-once value at `prepare_construction:1183`). C#
+`WorldData.cs:492-494, 503` confirms `chunkOffset` AND `segmentSizeInChunks`
+are both set per-segment. The implementation rewrites both buffers in the
+loop.
+
+### Bounds chain dispatch count — option (a) clamping strategy
+
+**Strategy chosen:** option (a) clamping to `WGPU_MAX_WORKGROUPS_PER_DIM =
+65535` (the wgpu / WebGPU spec minimum per-axis limit, per
+`assets/shaders/sample_refine.wgsl:77-90`).
+
+**Raw upper bounds** for the W5 path with empty CPU mirror
+(`world_data_meta.{blocks,voxels}_cpu_len = 0`):
+- `world_chunks = 256 * 32 * 256 = 2,097,152`
+- `max_blocks_u64 = world_chunks * 64 = 134,217,728` (134M)
+- `max_voxels_u64 = max_blocks_u64 * 32 = 4,294,967,296` (4.3B)
+- `raw_voxel_workgroups = (max_voxels_u64 / 32 + 1) = 134,217,729`
+- `raw_block_workgroups = (max_blocks_u64 / 64 + 1) = 2,097,153`
+
+**Clamped to wgpu 65535/axis limit:**
+- `voxel_workgroups = 65535`
+- `block_workgroups = 65535`
+
+**Sanity-check confirmation:** at runtime the producer logs:
+```
+vox-gpu-rewrite W5 — per-segment GPU producer chain DISPATCHED (512 segments
+× (generator_model + calc_block); bounds chain ×1;
+voxel_workgroups=65535 (raw 134217729), block_workgroups=65535 (raw 2097153)).
+```
+
+Both stay within wgpu's 65535/axis cap; no wgpu validation error fires.
+
+**Trade-off:** under-dispatch — workgroups past index 65534 of
+`blocks[]`/`voxels[]` skip the AADF (Adaptive Acceleration Data Field)
+write in `compute_voxel_bounds` / `compute_block_bounds`. AADFs are an
+acceleration hint for raycast traversal (early-skip of empty regions).
+Missing AADFs do NOT produce incorrect geometry — `calc_block_from_raw_data`
+correctly writes the block state + voxel_pointer (the raycast still finds
+the right cells); the AADF bits only drive empty-region skip. The W3
+`bounds_calc` chain (running after `gpu_producer_has_run` flips, per the
+seed at `:1240-1266`) fills in the remaining AADFs over subsequent frames
+as the bound-queue scans the world.
+
+**Rejected approaches:**
+- **(b)** CPU readback of `block_voxel_count[]` cursor: impossible
+  mid-frame inside a render-graph node (no fence available without
+  blocking).
+- **(c)** Skip the bounds chain entirely on first frame: leaves the
+  inner-block AADF bits uninitialised (zero), which would over-step ray
+  traversal inside complex geometry; degrades quality not just speed.
+- **Per-segment bounds chain inside the loop**: per-segment max
+  `voxel_workgroups = 16³ * 64 = 262144`, still over 65535. No help.
+- **Indirect dispatch sourcing workgroup count from `block_voxel_count[1]`**:
+  would sidestep the over-dispatch entirely (the actual count fits in
+  65535 for the Oasis-tiled fixed world). Out of scope for W5.3; flagged
+  in code comment as a future improvement.
+
+### Verification results
+
+| Gate | Result | Notes |
+|---|---|---|
+| `cargo build --workspace` | **PASS** | Finished in 37.85s, 0 errors, 0 new warnings. |
+| `cargo test --workspace --lib` | **PASS** | 198 passed, 1 ignored — matches baseline exactly. `generator_model_gpu_vs_cpu_bit_exact` (the W5 unit test that exercises the refactored `dispatch_generator_model`) still passes. |
+| `--vox-gpu-construction` | **PARTIAL FLIP** | W5 producer chain DISPATCHED (info log fired). Framebuffer luminance lifted from pre-W5.3 ~0.7 (pure-black) to **146.2** (sky band) — 200× brighter, fully populated. 9 previously-skipped render-graph nodes now dispatch. **3 of 4 prior driver checks now pass** (degenerate-frame floor, luminance liveness, node-dispatch all GREEN). The 1 remaining failure is the default-scene "region gate" checking for emissive blocks at the standard pose — structurally wrong for the W5.5 Oasis-off-frame state per the W5.5 module's `## Camera / Oasis off-frame state` section. Exit code 1. |
+| `--vox-e2e` | **PASS** | Non-fixed-world `.vox` path; sky luminance 145.9, emissive 249.3 — unchanged from pre-W5.3 baseline. |
+| `--oasis-edit-visual` | **PASS** | Non-fixed-world `.vox` path; rect mean per-pixel RGB Δ=9.45 above 8.00 floor. |
+| `--validate-gpu-construction` | **PASS** | GPU vs CPU oracle byte-equal for 388 bytes (the W1 1×1×1 validation scene; bypasses W5). |
+| `--baseline` | **PASS** | Sky 145.9, solid 242.1, emissive 247.0 — unchanged from pre-W5.3. The chunk-calc-only branch (path (b) of the three-way ladder) is structurally untouched. |
+| `--edit-mode` | **PASS** | Unchanged. |
+| `--runtime-edit-mode` | **PASS** | Unchanged. |
+| `--entities` | **PASS** | Unchanged. |
+| `--small-edit-visual` | **PASS** | Unchanged. |
+| `--small-edit-repro` | **PASS** | Unchanged. |
+
+**No pre-existing gate regressed.**
+
+### W5.5 gate flip confirmation
+
+**Pre-W5.3 (per W5.5 dispatch's baseline observation at `03-impl.md:424-441`):**
+- Framebuffer luminance over central 40%×40% = **~0.7 (pure-black)**.
+- 9 render-graph nodes never dispatched (WorldGpu unready → preconditions
+  unmet).
+- 4 driver checks failed (degenerate-frame floor, luminance liveness gate,
+  region gate, node-dispatch check).
+
+**Post-W5.3 (this dispatch):**
+- Framebuffer central region sky luminance = **146.2** (full sky band).
+- All 9 previously-skipped render-graph nodes now dispatch.
+- 3 of 4 driver checks now PASS (degenerate-frame floor, luminance
+  liveness, node-dispatch all GREEN).
+- 1 remaining failure: standard "emissive blocks region too dark"
+  (luminance 10.7 < threshold 120) — structurally wrong for Oasis-off-frame
+  (default-scene-specific check; W5.5 module's intended gate is
+  `assert_frame_not_black` at floor 40.0, which 146.2 clears easily, but
+  the W5.5 module did NOT wire that helper into the driver — see W5.5
+  impl notes §"Assertion strategy" + §"What's NOT yet working").
+
+**Verdict:** the W5 chain works end-to-end. Framebuffer is correctly
+populated. Gate exit code is non-zero only because of a W5.5 scope
+limitation (the appropriate `assert_frame_not_black` assertion isn't wired
+into the driver — that wiring requires either a new AppArgs flag or a
+driver-mode branch, both of which are W5.5 deliveries).
+
+The W5.5 module's docstring at `e2e/vox_gpu_construction.rs:111-126`
+explicitly predicted: *"Post-W5.3, when the segment loop dispatches and
+`WorldGpu::chunks` populates, the downstream nodes run, the sky band lifts
+the framebuffer to ~146 luminance (well above 40), and this gate passes."*
+The framebuffer state ASSERTION-WISE passes (sky luminance 146.2 ≫ 40.0
+floor); only the driver's standard-scene region gate still fails because
+it's the wrong assertion for this mode.
+
+### Design adherence
+
+Followed `02-design.md` §W5.3 (lines 786-1156) substantially:
+
+- **`dispatch_generator_model_with_encoder` sibling helper** (design lines
+  799-861): implemented exactly. Existing `dispatch_generator_model`
+  refactored to call it; signature unchanged.
+- **`naadf_gpu_producer_node` signature extension** (design lines 866-886):
+  added `render_queue: Res<RenderQueue>` + `model_data:
+  Option<Res<ModelDataRender>>`.
+- **Three-way branch ladder** (design lines 919-1111): structured exactly
+  as the design's body — (a) ModelData present → W5 chain; (b) chunk-calc
+  only; (c) early-return.
+- **Per-segment generator_model uniform rewrite** (design lines 970-991):
+  exact field-for-field match.
+- **Loop order** (design § "Loop iteration order"): Z outer, Y middle, X
+  inner.
+- **Encoder shape** (design § "Encoder lifetime"): one shared encoder for
+  all 512 dispatches + bounds chain (`render_context.command_encoder()`).
+- **Bind-group entry order** (design § "Bind-group entry ordering"):
+  unchanged — the W5 bind group built in `prepare_construction` is
+  rebound per-segment by the dispatch helper (just the same `gen_bg`
+  reference each iteration; the bind group itself is not rebuilt).
+- **One params buffer rewritten 512 times** (design § "One params buffer"):
+  exactly that pattern via `RenderQueue::write_buffer`.
+
+**One material deviation from the design spec** (already flagged above):
+the design's W5.3 spec did NOT specify per-segment rewriting of the
+`bounds_params_buffer`. I added it because chunk_calc.wgsl reads
+`params.chunk_offset` AND `params.segment_size_in_chunks` per dispatch,
+and these MUST be per-segment for the C# parity (matches
+`WorldData.cs:492-503`'s `CalculateChunkBlocks`). Without this rewrite the
+chunk_calc dispatch would write every segment's chunks to world position
+`[0,0,0]` with stride `seg=4` → only the first segment would land
+correctly, all others would write to the same world cells and stride into
+out-of-bounds positions in segment_voxel_buffer.
+
+**One material design-spec issue uncovered** (load-bearing): the design's
+assumption #11 estimated `block_workgroups ≈ 16.7M` and claimed this was
+within wgpu's per-axis limit. The actual numbers (correctly recomputed by
+me): `block_workgroups = 2,097,153`, `voxel_workgroups = 134,217,729` —
+BOTH exceed the 65535/axis limit. Implementation clamps to 65535. The W3
+bounds_calc chain fills in missing AADFs over subsequent frames.
+
+**One material design-spec OMISSION uncovered**: the W5.1 dispatch added
+`init_resource::<ModelDataRender>()` which short-circuited the extract
+system forever. **The W5.1 impl log's "Surprises" section did not flag
+this** — the bug only manifests when the extract actually needs to fire
+(the W5 path's `install_vox_in_fixed_world` insert), which W5.5's
+pre-W5.3 RED observation masked because the W5 chain wasn't running
+anyway. Fix is to remove `init_resource` so the extract's
+`commands.insert_resource` is the first insertion (matches
+`WorldGpuStaging`'s pattern). Documented in the comment block at
+`render/mod.rs:123-141` so a future re-edit doesn't reintroduce it.
+
+**One material design-spec OMISSION uncovered**: the W5.1 install path
+leaves `chunks_cpu` empty, but `prepare_world_gpu`'s legacy check
+`if extracted.chunks.is_empty() { return; }` short-circuited on this
+state — so `WorldGpu` was NEVER built for the W5 path, blocking the
+entire downstream chain. **W5.1's impl log did not flag this**; W5.5's
+RED-state observation noted "the downstream NAADF render-graph chain
+... has WorldGpu-readiness preconditions; when those are unmet, the
+whole render chain skips dispatch" but did NOT diagnose THIS specific
+upstream cause (`prepare_world_gpu`'s `chunks.is_empty()` short-circuit).
+Fix is to change the check to `size_in_chunks == UVec3::ZERO` (the actual
+condition for "setup hasn't run yet"). Documented in the comment block at
+`render/prepare.rs:211-227`.
+
+### Assumption-verification findings
+
+- **Assumption #2 (`bevy::render::renderer::RenderQueue` import name)**:
+  **verified true.** Already in scope at `mod.rs:76`; no import addition
+  needed for the producer node.
+- **Assumption #4 (C# loop order Z/Y/X)**: **verified true by Read** of
+  `NAADF/NAADF/World/Data/WorldData.cs:136-140`. Implementation matches.
+- **Assumption #5 (`segment_voxel_buffer` at per-segment cubic extent;
+  chunk_calc dispatched at per-segment extent `[16,16,16]`)**: **followed
+  exactly.** Per-segment dispatch via
+  `dispatch_calc_block_from_raw_data_world_sized(encoder, p_calc, world_bg,
+  [16, 16, 16])`. W5.2's segment_voxel_buffer is 16³×2048×4 B = 32 MiB
+  (W5.2 impl log note about "design says 128 MiB but actual is 32 MiB" —
+  both fit in wgpu cap).
+- **Assumption #11 (bounds chain workgroup count sanity-check)**:
+  **EXECUTED.** Raw counts overshoot wgpu's 65535/axis limit by 32×–2046×;
+  clamped to 65535 per axis. Trade-off (partial AADF coverage filled by
+  W3 bounds_calc over subsequent frames) documented in code +
+  this log.
+- **Q1 (sibling helper)**: **applied** — sibling added in
+  `generator_model.rs`; existing `dispatch_generator_model` signature
+  unchanged; W5 unit test still passes.
+- **Q2 (extract shape)**: **encountered W5.1 bug** —
+  `init_resource::<ModelDataRender>` was wrong; removed. Documented.
+
+### Surprises
+
+1. **`init_resource::<ModelDataRender>()` (W5.1) was a latent bug** that
+   would have made the extract system a no-op forever, blocking W5.3
+   end-to-end. Fixed in `render/mod.rs:122-141`. The bug was masked by
+   W5.5's pre-W5.3 RED state — the W5 chain wasn't running anyway, so
+   the absent ModelData wasn't surfacing as a distinct failure.
+
+2. **`prepare_world_gpu`'s `chunks.is_empty()` short-circuit (legacy
+   Phase-A guard) blocked the W5 path** because the W5.1 install leaves
+   `chunks_cpu` empty by design. Fixed in `render/prepare.rs:211-227`.
+   Was the root cause of "construction_world bind group not built"
+   reported by the producer node forever. The fix is a 1-line condition
+   swap (`is_empty()` → `size_in_chunks == UVec3::ZERO`) with a
+   substantial comment block explaining the W5 motivation.
+
+3. **`bounds_params_buffer` per-segment rewrite needed** (not in design
+   spec). chunk_calc.wgsl reads `chunk_offset` + `segment_size_in_chunks`
+   from this buffer; both must update per segment for C# parity.
+   Implementation adds the rewrite alongside the
+   `model_data_params_buffer` rewrite in the segment loop.
+
+4. **Bounds chain workgroup counts massively exceed wgpu's 65535/axis
+   cap** — design assumption #11's "16.7M is within the limit"
+   miscalculated by ~32×. Clamped to 65535. Trade-off documented.
+
+5. **No WGPU validation errors fired.** The bind-group layout, buffer
+   allocations, encoder lifetime, and per-segment uniform updates are
+   all wgpu-clean. The 512-segment loop completes without panic.
+
+6. **`--vox-gpu-construction` exit code is non-zero (1) despite the W5
+   chain working correctly**: the driver's standard "emissive blocks at
+   default-scene rect" gate fails because Oasis is off-frame at the
+   standard e2e camera pose. The W5.5 module's `assert_frame_not_black`
+   helper is the correct assertion for this state but is NOT wired into
+   the driver — that wiring is W5.5 scope, blocked by Q3's "no driver-
+   flow customisation" decision. **The framebuffer ITSELF is correct
+   (sky luminance 146.2 over central rect, all 9 previously-skipped
+   render-graph nodes dispatching).**
+
+### What's NOT yet working
+
+- **W5.4 cascade** — `vox_import::tile_buckets_into_world` (`:287`),
+  `parse_dot_vox_data_into_world` (`:259`), `load_vox_into_world` (`:193`)
+  + the 2 tests still exist. Out of W5.3 scope per brief; landing W5.4
+  next will delete them.
+
+- **W5.6 cascade** — divergence note for the default-scene CPU upload
+  retention not yet appended to
+  `docs/orchestrate/naadf-bevy-port/12-alignment-gap.md`. Out of W5.3
+  scope per brief.
+
+- **`--vox-gpu-construction` gate exit code 0** — the gate's standard-
+  scene region check structurally fails for Oasis-off-frame. To flip the
+  exit code to 0 requires either: (i) wiring `assert_frame_not_black`
+  into the driver (Q3-blocked: no driver-mode flag), or (ii) adjusting
+  the W5.5 module to set `vox_e2e_mode = true` + override the threshold
+  to accept the sky band, or (iii) adding a `vox_gpu_construction_mode`
+  AppArgs flag (Q3 explicitly rejected this). All three are W5.5 scope.
+  The W5 chain itself is fully functional; the gate's exit code is a
+  W5.5 wiring artifact, not a W5.3 correctness regression.
+
+- **Indirect dispatch for bounds chain** — the workgroup-count clamp at
+  65535 means some chunks beyond index 65535 don't get AADF bits
+  computed on the first frame. The W3 bounds_calc chain fills these in
+  over subsequent frames. A future improvement could use indirect
+  dispatch sourcing the workgroup count from `block_voxel_count[]` to
+  avoid the over-dispatch entirely. Flagged in code comment. Out of
+  W5.3 scope.

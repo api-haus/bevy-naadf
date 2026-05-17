@@ -214,6 +214,38 @@ pub fn create_params_uniform(
     buffer
 }
 
+/// W5 — encoder-taking dispatch helper. Same shape as
+/// [`crate::render::construction::chunk_calc::dispatch_calc_block_from_raw_data_world_sized`]
+/// at `chunk_calc.rs:198-215`: caller owns the `CommandEncoder`, so the
+/// production `naadf_gpu_producer_node` can chain this against subsequent
+/// `chunk_calc` dispatches on the SAME encoder (so wgpu auto-inserts the
+/// STORAGE→STORAGE barrier between the generator's writes and chunk_calc's
+/// reads of `segment_voxel_buffer`).
+///
+/// Per vox-gpu-rewrite Q1 decision in
+/// `docs/orchestrate/vox-gpu-rewrite/01-context.md`: the "treat
+/// `generator_model.rs` as a FIXED dependency" rule is **explicitly loosened**
+/// for this one sibling helper.
+pub fn dispatch_generator_model_with_encoder(
+    encoder: &mut bevy::render::render_resource::CommandEncoder,
+    pipeline: &bevy::render::render_resource::ComputePipeline,
+    bind_group: &bevy::render::render_resource::BindGroup,
+    group_size_in_chunks: [u32; 3],
+) {
+    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+        label: Some("naadf_generator_model_pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    // Dispatch shape: one workgroup per chunk in the segment.
+    pass.dispatch_workgroups(
+        group_size_in_chunks[0],
+        group_size_in_chunks[1],
+        group_size_in_chunks[2],
+    );
+}
+
 /// Dispatch `generator_model.wgsl` against a caller-built bind group.
 ///
 /// One workgroup per chunk in the segment (`generator_model.wgsl` dispatch
@@ -226,6 +258,9 @@ pub fn create_params_uniform(
 /// `run_gpu_construction_startup` body calls this for each segment of the
 /// world, then immediately calls W1's `chunk_calc_calc_block_from_raw_data`
 /// dispatch over the same `segment_voxel_buffer`.
+///
+/// Per vox-gpu-rewrite Q1 decision, this delegates the dispatch body to
+/// [`dispatch_generator_model_with_encoder`] — one source of truth.
 pub fn dispatch_generator_model(
     device: &RenderDevice,
     queue: &RenderQueue,
@@ -236,20 +271,12 @@ pub fn dispatch_generator_model(
     let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("naadf_generator_model_encoder"),
     });
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("naadf_generator_model_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        // Dispatch shape: one workgroup per chunk in the segment.
-        pass.dispatch_workgroups(
-            group_size_in_chunks[0],
-            group_size_in_chunks[1],
-            group_size_in_chunks[2],
-        );
-    }
+    dispatch_generator_model_with_encoder(
+        &mut encoder,
+        pipeline,
+        bind_group,
+        group_size_in_chunks,
+    );
     queue.submit([encoder.finish()]);
 }
 
