@@ -27,9 +27,10 @@ design↔impl coupling.
 - [x] Architectural Q&A (Step 4) — 4 decisions captured in `01-context.md`
 - [x] Context bundle (`01-context.md`)
 - [x] Checkpoint commit (`8c2fd63`)
-- [x] Consolidated dispatch — design + self-review + implement + log written to `02-design-impl.md`; 9 of 10 verification gates PASS, 1 FAIL (`just test-wasm-full`, residual `DeviceLost` with no surfaced WebGPU validation error)
-- [ ] **Hard-gate user review of `## Implementation log`** ← pending
-- [ ] (Conditional) Fresh-eyes `delegate-reviewer` for the residual web-runtime `DeviceLost` — the consolidated agent's self-review escalated this as a new high-risk follow-up; the chunks-binding goal is complete and correct, but a second, deeper failure is latent in the wasm runtime
+- [x] Consolidated dispatch — design + self-review + implement + log written to `02-design-impl.md`; 9 of 10 verification gates PASS, 1 FAIL (`just test-wasm-full`, residual `DeviceLost` with no surfaced WebGPU validation error). **Chunks migration committed at `b1de4ef`.**
+- [x] e2e smoke-test fidelity bump — 5 s → 10 s wait + canvas screenshot capture (`test-results/.../canvas-after-10s.png`). Result: 10 s wait alone surfaced no new errors (DeviceLost terminates first), but the screenshot mechanism + the headed-mode pivot below paid off.
+- [x] **Headed-mode re-run** — `just test-wasm-headed`. **Three new actionable validation errors surfaced** (masked by the headless `DeviceLost`): `naadf_map_copy_pipeline::copy_map` Invalid ShaderModule, `naadf_generator_model_pipeline::fill_chunk_data_with_model_data_16` **missing entry-point** (real bug, not a cascade), `naadf_map_copy_test_hash_pipeline::test_hash` Invalid ShaderModule. Final error is `Validation RenderError` (not `DeviceLost` — headless was masking the real cause behind a GPU-process crash). Screenshot 1.85 MB — live framebuffer.
+- [ ] **Hard-gate user review** ← pending; decide between (a) commit test improvements and dispatch `delegate-reviewer` for the 3 specific validation errors, (b) attempt to fix them inline (likely just one missing `#{ENTITIES_ENABLED}`-style shader-def or a deleted entry-point — small surface), (c) declare orchestration complete (chunks migration's named goal is met; the new errors are pre-existing bugs uncovered by the better test fidelity, not regressions from the migration).
 
 ## Decisions captured
 

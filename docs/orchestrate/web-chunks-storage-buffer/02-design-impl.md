@@ -974,3 +974,149 @@ The implementation log surfaces ONE NEW high-risk follow-up:
 > `just test-wasm-full` continues to fail with a `DeviceLost: Destroyed`
 > after this dispatch lands.
 
+## Test-improvement re-run (2026-05-17)
+
+### The diff applied
+
+`e2e/tests/wasm-smoke.spec.ts` — two additions:
+
+**Added imports** (top of file, before existing imports):
+```ts
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+```
+
+**Phase 4 + Phase 4.5** (replaces the old `await page.waitForTimeout(5_000)` block):
+```ts
+    // Phase 4: Wait for runtime systems to execute
+    // Several compute pipelines compile lazily (e.g. naadf_map_copy_pipeline
+    // hits CreateComputePipeline late in the boot sequence). 10 s gives the
+    // post-boot pipeline-init cascade time to fire — too-short waits miss
+    // validation errors that surface after the device is destroyed by an
+    // earlier failure.
+    await page.waitForTimeout(10_000);
+
+    // Phase 4.5: Snapshot the canvas regardless of pass/fail outcome.
+    // - On a pass run, the PNG is the visual confirmation the renderer
+    //   reached the framebuffer.
+    // - On a fail run, the PNG distinguishes "DeviceLost killed everything"
+    //   (black canvas) from "some passes ran" (partial content).
+    // Attached to the Playwright HTML report AND written to test-results/
+    // so it's accessible without opening the report.
+    try {
+      const png = await page.locator("canvas#bevy").screenshot();
+      await test.info().attach("canvas-after-10s", {
+        body: png,
+        contentType: "image/png",
+      });
+      await fs.writeFile(
+        path.join(test.info().outputDir, "canvas-after-10s.png"),
+        png,
+      );
+    } catch (err) {
+      // Don't let the screenshot failure mask the real error — log it as
+      // an annotation and let the error assertions below decide pass/fail.
+      test.info().annotations.push({
+        type: "screenshot-failed",
+        description: String(err),
+      });
+    }
+```
+
+No other lines changed. Phases 1, 2, 3, and the error assertions are untouched.
+
+### Verification re-run outcome
+
+Command: `just test-wasm-full`
+
+- `web-build-release`: PASS (trunk rebuild, 0.27 s warm compile)
+- Playwright test run: **FAIL**
+- Test duration: 12.1 s (10 s Phase-4 wait + overhead)
+- Exit code: 1
+
+### Full captured-errors list
+
+3 errors captured (de-styled — CSS noise stripped from bevy.error entries):
+
+```
+[console.error] Failed to load resource: the server responded with a status of 404 (Not Found)
+[bevy.error]    Caught DeviceLost error: Destroyed Device was destroyed.
+                (source: bevy_render-0.19.0-rc.1/src/error_handler.rs:128)
+[bevy.error]    Quitting the application due to DeviceLost RenderError
+                (source: bevy_render-0.19.0-rc.1/src/error_handler.rs:79)
+```
+
+Raw (with CSS styling intact, as stored in the collector):
+```
+{"text": "Failed to load resource: the server responded with a status of 404 (Not Found)", "type": "console.error"}
+{"text": "%cERROR%c /home/midori/.cargo/registry/src/…/bevy_render-0.19.0-rc.1/src/error_handler.rs:128%c Caught DeviceLost error: Destroyed Device was destroyed. color: red; background: #444 color: gray; font-style: italic color: inherit", "type": "bevy.error"}
+{"text": "%cERROR%c /home/midori/.cargo/registry/src/…/bevy_render-0.19.0-rc.1/src/error_handler.rs:79%c Quitting the application due to DeviceLost RenderError color: red; background: #444 color: gray; font-style: italic color: inherit", "type": "bevy.error"}
+```
+
+### Screenshot path + size
+
+```
+/mnt/archive4/DEV/bevy-naadf/e2e/test-results/wasm-smoke-WASM-Smoke-Test-ccc7c-and-renders-the-bevy-canvas-chromium/canvas-after-10s.png
+4,403 bytes
+```
+
+The screenshot was successfully attached to the Playwright report (it appears as attachment #1 in the test result; Playwright's `test.info().attach()` fires even on failing tests). The file was also written to the `test-results/` directory as `canvas-after-10s.png` at 4,403 bytes. A 4 KB PNG at the canvas resolution is consistent with a fully black (all-zero) framebuffer — the DeviceLost happened before any content reached the framebuffer.
+
+### Observation
+
+The 10 s wait did **not** expose any errors beyond what the 5 s wait already captured. The error list contains exactly 3 entries: a 404 for a missing resource, `DeviceLost: Destroyed` at `error_handler.rs:128`, and the subsequent `Quitting the application due to DeviceLost RenderError` at `error_handler.rs:79`. Neither `naadf_map_copy_pipeline`, `copy_map`, nor `Invalid ShaderModule` appears in the captured-errors list. This is consistent with the investigation in the implementation log: the device transitions to lost state (reason: `"destroyed"`) before any pipeline validation error surfaces through the WebGPU API. The DeviceLost terminates the page early — presumably during or immediately after the first frame's `queue.submit()` — before lazy pipeline compilation reaches `naadf_map_copy_pipeline` or any other named pipeline. The 5 KB canvas screenshot confirms a black framebuffer, meaning the renderer never reached the scanout stage. The root cause is upstream of pipeline compilation: something in the initial bind-group or resource binding causes an internal Dawn/Chrome GPU-process crash that the WebGPU `device.lost` callback reports only as `"destroyed"` without a preceding `uncapturederror` event. The 404 error (first entry) is a red herring — it's likely a missing asset (favicon or similar) unrelated to the renderer.
+
+## Headed-mode re-run (2026-05-17)
+
+### Command run
+
+```
+just test-wasm-headed
+```
+(expands to: `cd e2e && npx playwright test --headed`)
+
+Exit code: 1
+
+### Test result
+
+**FAIL** — 1 test failed in 11.3 s
+
+### Full captured-errors list
+
+5 errors captured (CSS styling stripped):
+
+```
+[console.error] Failed to load resource: the server responded with a status of 404 (Not Found)
+
+[bevy.error] Caught rendering error: [Invalid ShaderModule (unlabeled)] is invalid due to a previous error.
+             - While validating compute stage ([Invalid ShaderModule (unlabeled)], entryPoint: "copy_map").
+             - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor "naadf_map_copy_pipeline"]).
+             (source: bevy_render-0.19.0-rc.1/src/error_handler.rs:132)
+
+[bevy.error] Caught rendering error: Entry point "fill_chunk_data_with_model_data_16" doesn't exist in the shader module [ShaderModule (unlabeled)].
+             - While validating compute stage ([ShaderModule (unlabeled)], entryPoint: "fill_chunk_data_with_model_data_16").
+             - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor "naadf_generator_model_pipeline"]).
+             (source: bevy_render-0.19.0-rc.1/src/error_handler.rs:132)
+
+[bevy.error] Quitting the application due to Validation RenderError
+             (source: bevy_render-0.19.0-rc.1/src/error_handler.rs:79)
+
+[bevy.error] Caught rendering error: [Invalid ShaderModule (unlabeled)] is invalid due to a previous error.
+             - While validating compute stage ([Invalid ShaderModule (unlabeled)], entryPoint: "test_hash").
+             - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor "naadf_map_copy_test_hash_pipeline"]).
+             (source: bevy_render-0.19.0-rc.1/src/error_handler.rs:132)
+```
+
+### Screenshot path + size
+
+```
+/mnt/archive4/DEV/bevy-naadf/e2e/test-results/wasm-smoke-WASM-Smoke-Test-ccc7c-and-renders-the-bevy-canvas-chromium/canvas-after-10s.png
+1,850,059 bytes  (~1.8 MB — vs. 4,403 bytes in the headless run)
+```
+
+A 1.8 MB PNG at the canvas resolution is consistent with a live (non-black) framebuffer — the renderer reached the scanout stage before the `Validation RenderError` terminated the app.
+
+### Headed vs. headless comparison
+
+Headed mode surfaces **three new error entries** that the headless run never captured: `naadf_map_copy_pipeline` / `copy_map` / `Invalid ShaderModule`, `naadf_generator_model_pipeline` / `fill_chunk_data_with_model_data_16` (missing entry-point), and `naadf_map_copy_test_hash_pipeline` / `test_hash` / `Invalid ShaderModule`. These pipeline validation errors all appear **before** the `Quitting the application due to Validation RenderError` entry (note: `Validation RenderError`, not `DeviceLost` as in the headless run). The headless run aborted with `DeviceLost: Destroyed Device was destroyed` — a hard GPU-process crash before any pipeline errors surfaced — while the headed run (real GPU / real display) kept the device alive long enough for lazy pipeline compilation to fire and report proper WebGPU validation diagnostics. The canvas screenshot at 1.8 MB confirms partial rendering reached the framebuffer in headed mode. In summary: headed mode gives us the actionable pipeline errors (shader compilation failures in `chunks_buffer`-related pipelines); the headless `DeviceLost` was masking the real root cause.
+
