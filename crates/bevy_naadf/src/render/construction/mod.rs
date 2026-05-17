@@ -187,6 +187,27 @@ pub struct ConstructionGpu {
     /// is true AND every dependency (compiled pipelines, allocated bind
     /// groups) is ready.
     pub gpu_producer_has_run: bool,
+
+    // === W5 — generator_model storage uploads + per-segment uniform ===========
+    // vox-gpu-rewrite W5.2 — these four buffers feed the W5
+    // `construction_generator_model` bind group (built in
+    // `prepare_construction`). They are allocated once on the first frame
+    // `ModelDataRender` is present (the W5.1 extract has fired) and reused
+    // for every subsequent producer dispatch.
+    /// W5 — `modelDataChunk` storage buffer (read-only by the generator;
+    /// `data_chunk` from `aadf::generator::ModelData`). Allocated + uploaded
+    /// once by `prepare_construction` on the first frame `ModelDataRender` is
+    /// present.
+    pub model_data_chunk_buffer: Option<Buffer>,
+    /// W5 — `modelDataBlock` storage buffer (read-only by the generator).
+    pub model_data_block_buffer: Option<Buffer>,
+    /// W5 — `modelDataVoxel` storage buffer (read-only by the generator).
+    pub model_data_voxel_buffer: Option<Buffer>,
+    /// W5 — `GpuGeneratorModelParams` uniform (64 B, `generator_model.rs:74-93`).
+    /// **One buffer, rewritten in place 512 times per producer run** — once
+    /// per segment in the W5.3 segment loop via `RenderQueue::write_buffer`.
+    /// (See `02-design.md` Decision: "one params buffer vs 512 buffers".)
+    pub model_data_params_buffer: Option<Buffer>,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -223,6 +244,19 @@ pub struct ConstructionBindGroups {
     /// indirect dispatch per the wgpu `STORAGE_READ_WRITE` × `INDIRECT` split
     /// (`15-design-c.md` §1.3). W3.
     pub bound_dispatch: Option<BindGroup>,
+    /// W5 — `@group(0)` bind group for `generator_model.wgsl`'s
+    /// `fill_chunk_data_with_model_data` entry point. 5 bindings:
+    ///   binding 0 = `segment_voxel_buffer` (chunk_data_rw, the W1 buffer the
+    ///               chunk_calc chain reads from after we write into it);
+    ///   binding 1 = `model_data_chunk_buffer`;
+    ///   binding 2 = `model_data_block_buffer`;
+    ///   binding 3 = `model_data_voxel_buffer`;
+    ///   binding 4 = `model_data_params_buffer` (rewritten per segment in
+    ///               `naadf_gpu_producer_node`).
+    /// Built once in `prepare_construction`; **same bind group reused for all
+    /// 512 segments** (binding identities are stable; only the uniform
+    /// contents rotate). vox-gpu-rewrite W5.2.
+    pub construction_generator_model: Option<BindGroup>,
 }
 
 /// The sibling of `NaadfPipelines` (`render/pipelines.rs`) for Phase-C
@@ -844,6 +878,11 @@ pub fn prepare_construction(
     // moved from `ExtractedWorld` (deleted) to `WorldDataMeta` (minimal
     // metadata-only render-world mirror — see `02f` Decision 4).
     world_data_meta: Option<Res<crate::render::extract::WorldDataMeta>>,
+    // vox-gpu-rewrite W5.2 — render-world mirror of `ModelData`. Present only
+    // after the W5.1 `stage_model_data_buildonce` extract has run (which only
+    // fires when the main-world install path inserts a `ModelData`); absent
+    // on default-scene + entity-only / non-VOX runs.
+    model_data: Option<Res<crate::render::extract::ModelDataRender>>,
 ) {
     // W0 seam: ensure-exists for both resources, then W1..W5 fill in their
     // family's allocations + bind groups on subsequent frames (when the
@@ -1211,6 +1250,140 @@ pub fn prepare_construction(
                 &BindGroupEntries::sequential((indirect.as_entire_buffer_binding(),)),
             );
             bind_groups.bound_dispatch = Some(bg);
+        }
+    }
+
+    // === W5 — generator_model upload + bind group ============================
+    //
+    // vox-gpu-rewrite W5.2: when `ModelDataRender` is present (the W5.1
+    // extract fired), allocate the 3 model_data storage buffers + the
+    // per-segment params uniform, upload the three model buffers ONCE, and
+    // build the W5 `@group(0)` bind group. Build-once: every step gates on
+    // `is_none()`, so this fires on the first frame all of {model_data,
+    // generator_model_layout, segment_voxel_buffer} are ready and is a no-op
+    // every frame after.
+    //
+    // Gating: requires
+    //   - `model_data: Option<Res<ModelDataRender>>` → Some
+    //   - `construction_pipelines.generator_model_layout` (always present per
+    //     the `ConstructionPipelines::from_world` impl at `:337-344`)
+    //   - `gpu.segment_voxel_buffer` → Some (the existing W1 block at
+    //     `:888-1015` gates `want_gpu_producer` on `dense_voxel_types` being
+    //     non-empty. The W5 install path leaves `dense_voxel_types =
+    //     Vec::new()`, so `segment_voxel_buffer` will NOT get auto-allocated
+    //     by the W1 block. The W5 block ALSO needs to allocate it — at
+    //     per-segment cubic extent per the REVISED design decision.)
+    //
+    // See `docs/orchestrate/vox-gpu-rewrite/02-design.md` Decision:
+    // "`segment_voxel_buffer` allocation in the W5 path — extend the
+    //  existing block" (REVISED — per-segment cubic 128 MiB, NOT full-world
+    //  cubic 134 GiB).
+    if let Some(model_data) = model_data.as_deref() {
+        // 1) Allocate `segment_voxel_buffer` if it's not already there. Per
+        //    the REVISED design decision: size at per-segment cubic extent
+        //    (`segment_chunks^3 × 2048 u32 × 4 B`). `segment_chunks =
+        //    WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4 = 16` → 16³ × 2048 × 4 =
+        //    128 MiB (within wgpu Vulkan-baseline 256 MiB cap). The W5.3
+        //    segment loop dispatches `chunk_calc` with `group_size_in_chunks
+        //    = [16, 16, 16]` and reuses the buffer across all 512 segments,
+        //    matching the C# `WorldData.cs:506`
+        //    `DispatchCompute(worldGenSegmentSizeInChunks, ...)` shape.
+        //
+        //    Full-world cubic (`WORLD_SIZE_IN_CHUNKS^3 * 2048 * 4` ≈ 134 GiB)
+        //    is REJECTED — past every realistic wgpu cap.
+        if gpu.segment_voxel_buffer.is_none() {
+            const SEGMENT_CHUNKS: u64 =
+                (crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS as u64) * 4;
+            let size = SEGMENT_CHUNKS
+                * SEGMENT_CHUNKS
+                * SEGMENT_CHUNKS
+                * (generator_model::CHUNK_DATA_U32S as u64)
+                * 4;
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("naadf_segment_voxel_buffer_w5"),
+                size,
+                usage: BufferUsages::STORAGE
+                    | BufferUsages::COPY_DST
+                    | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            gpu.segment_voxel_buffer = Some(buf);
+            // Force rebuild of every bind group that binds this buffer.
+            bind_groups.construction_world = None;
+            bind_groups.construction_generator_model = None;
+        }
+
+        // 2) Allocate + upload the 3 model_data storage buffers (build-once).
+        if gpu.model_data_chunk_buffer.is_none() {
+            let buf = generator_model::create_storage_buffer_u32(
+                &render_device,
+                &render_queue,
+                "naadf_model_data_chunk",
+                &model_data.data_chunk,
+            );
+            gpu.model_data_chunk_buffer = Some(buf);
+            bind_groups.construction_generator_model = None;
+        }
+        if gpu.model_data_block_buffer.is_none() {
+            let buf = generator_model::create_storage_buffer_u32(
+                &render_device,
+                &render_queue,
+                "naadf_model_data_block",
+                &model_data.data_block,
+            );
+            gpu.model_data_block_buffer = Some(buf);
+            bind_groups.construction_generator_model = None;
+        }
+        if gpu.model_data_voxel_buffer.is_none() {
+            let buf = generator_model::create_storage_buffer_u32(
+                &render_device,
+                &render_queue,
+                "naadf_model_data_voxel",
+                &model_data.data_voxel,
+            );
+            gpu.model_data_voxel_buffer = Some(buf);
+            bind_groups.construction_generator_model = None;
+        }
+
+        // 3) Allocate the params uniform (zeroed initial; the W5.3 segment
+        //    loop overwrites it 512 times per producer run).
+        if gpu.model_data_params_buffer.is_none() {
+            let zeroed: generator_model::GpuGeneratorModelParams =
+                bytemuck::Zeroable::zeroed();
+            let buf = generator_model::create_params_uniform(
+                &render_device,
+                &render_queue,
+                &zeroed,
+            );
+            gpu.model_data_params_buffer = Some(buf);
+            bind_groups.construction_generator_model = None;
+        }
+
+        // 4) Build the bind group when missing AND all 5 bindings exist.
+        if bind_groups.construction_generator_model.is_none() {
+            if let (Some(segv), Some(mdc), Some(mdb), Some(mdv), Some(params)) = (
+                gpu.segment_voxel_buffer.as_ref(),
+                gpu.model_data_chunk_buffer.as_ref(),
+                gpu.model_data_block_buffer.as_ref(),
+                gpu.model_data_voxel_buffer.as_ref(),
+                gpu.model_data_params_buffer.as_ref(),
+            ) {
+                let bgl = pipeline_cache.get_bind_group_layout(
+                    &construction_pipelines.generator_model_layout,
+                );
+                let bg = render_device.create_bind_group(
+                    "naadf_construction_generator_model_bind_group",
+                    &bgl,
+                    &BindGroupEntries::sequential((
+                        segv.as_entire_buffer_binding(),
+                        mdc.as_entire_buffer_binding(),
+                        mdb.as_entire_buffer_binding(),
+                        mdv.as_entire_buffer_binding(),
+                        params.as_entire_buffer_binding(),
+                    )),
+                );
+                bind_groups.construction_generator_model = Some(bg);
+            }
         }
     }
 

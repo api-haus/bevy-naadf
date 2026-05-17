@@ -47,10 +47,10 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Step 6 — Checkpoint commit + design dispatch (commit `4063d55`)
 - [x] Step 6 — Design agent landed `02-design.md` (1757 lines)
 - [x] Hard gate — design submitted, user confirmed
-- [x] Step 6 — Checkpoint commit + impl W5.1 landed (commit `483d86b` pre-impl; W5.1 changes uncommitted pending next checkpoint)
-- [ ] Hard gate — submit W5.1, wait for user  ← CURRENT
-- [ ] Step 6 — Checkpoint commit + impl W5.2 (prepare_construction buffer + bind-group allocation)
-- [ ] Hard gate — submit, wait
+- [x] Step 6 — Checkpoint commit + impl W5.1 landed (commit `483d86b` checkpoint; W5.1 committed `894fcd1`)
+- [x] Hard gate — W5.1 submitted, user confirmed
+- [x] Step 6 — Checkpoint commit + impl W5.2 landed (W5.2 changes uncommitted pending next checkpoint)
+- [ ] Hard gate — submit W5.2, wait for user  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.5 (e2e gate, lands BEFORE W5.3 to catch regressions)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.3 (segment-loop dispatch in naadf_gpu_producer_node)
