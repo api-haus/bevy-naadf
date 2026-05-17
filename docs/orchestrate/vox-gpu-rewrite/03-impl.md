@@ -324,3 +324,262 @@ Empty → sky-only framebuffer for the `.vox` fixed-world load path. The
 existing `--vox-e2e`, `--oasis-edit-visual`, `--small-edit-repro` gates
 that use the non-fixed-world `install_vox_sized_to_model` path are
 unaffected by W5.2.
+
+---
+
+## impl W5.5 findings (2026-05-17)
+
+### Files touched
+
+- `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs` (NEW, ~190 LOC) —
+  the W5.5 module per `02-design.md` §W5.5. Exposes
+  `run_vox_gpu_construction() -> AppExit` (entry point invoked from
+  `bin/e2e_render.rs`), the `assert_frame_not_black` helper, and
+  `save_vox_gpu_construction_screenshot`. Reuses `OASIS_VOX_FIXTURE_PATH`
+  + `oasis_vox_fixture_path()` from `e2e/oasis_edit_visual.rs:81-92`
+  (per Q4 decision — single source-of-truth for the fixture path).
+- `crates/bevy_naadf/src/e2e/mod.rs:33` — added `pub mod vox_gpu_construction;`
+  alongside `pub mod vox_e2e;` per design §W5.5 / line 583.
+- `crates/bevy_naadf/src/bin/e2e_render.rs:90-91` — added
+  `vox_gpu_construction_mode` flag parsing immediately after
+  `small_edit_repro_mode`. Per design § W5.5 / lines 766-769.
+- `crates/bevy_naadf/src/bin/e2e_render.rs:212-221` — added the
+  `vox_gpu_construction_mode` dispatch branch immediately BEFORE
+  `vox_e2e_mode`. Per design § W5.5 / lines 775-784. Calls
+  `bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction()`.
+
+No other files touched. `generator_model.wgsl` + `generator_model.rs` +
+W5.4-deletion candidates (`vox_import::tile_buckets_into_world`, etc.)
+untouched — verified by `git status`.
+
+### Verification results
+
+- `cargo build --workspace` — **clean** (0 errors, 0 new warnings);
+  finished in 57.11s (`dev` profile, optimized + debuginfo).
+- `cargo test --workspace --lib` — **198 passed, 1 ignored** across 3
+  suites in 4.09s. Matches the baseline exactly. No new failures, no
+  test-count drift.
+- `cargo run --release --bin e2e_render -- --vox-gpu-construction` —
+  **ran end-to-end without panic or WGPU validation error**; exited
+  non-zero (4 driver checks failed). **Exact outcome:**
+
+  - The gate booted, GPU adapter selected (NVIDIA RTX 5080 / Vulkan),
+    fixture parsed: `Oasis VOX → ModelData (93×34×84 chunks;
+    data_chunk=265608 u32s, data_block=1617216 u32s,
+    data_voxel=10498368 u32s, 257 palette entries)`. Fixed world
+    256×32×256 chunks initialised; the `prepare_construction` log says
+    "GPU producer chain runs per WORLD_SIZE_IN_SEGMENTS = (16, 2, 16)".
+  - Framebuffer captured + saved to
+    `target/e2e-screenshots/e2e_latest.png` (62 055 bytes, valid PNG).
+  - **Framebuffer is pure-black** — region luminance reported as
+    emissive 0.7, solid 0.7, sky 0.7 (all ~0 — the readback is
+    essentially black). `0.0%` of the frame is non-black per the
+    standard luminance gate.
+  - **Nine render-graph nodes never dispatched**: `naadf_first_hit`,
+    `naadf_taa_reproject`, `naadf_ray_queue`, `naadf_global_illum`,
+    `naadf_sample_refine`, `naadf_spatial_resampling`, `naadf_denoise`,
+    `naadf_calc_new_taa_sample`, `naadf_final_blit`. These nodes have
+    `WorldGpu`-readiness preconditions; with the W5 segment loop not
+    landed, `gpu_producer_has_run` never flips on the W5 path,
+    `WorldGpu::chunks` stays zeroed, and the downstream nodes early-out.
+  - Exit status: non-zero (driver-reported `4 check(s) failed` —
+    degenerate-frame floor + luminance liveness + region gate +
+    node-dispatch check).
+  - **No panic, no WGPU validation error, no crash.** This is the
+    load-bearing health signal: W5.2's bind-group setup + buffer
+    allocation are sound; the harness gets to the readback phase
+    cleanly.
+
+### Assertion strategy
+
+**Landed:** custom `assert_frame_not_black` helper on the central 40 % ×
+40 % region with luminance floor **40.0** (option b from `02-design.md`
+§Assumptions made #8).
+
+**Rationale (informed by first-run observation):**
+
+- Pre-W5.3 the framebuffer is pure-black (~0.7 luminance), NOT the
+  expected sky band (~146). The design assumed sky tint would dominate
+  pre-W5.3; the reality is that nine downstream NAADF render-graph
+  nodes never dispatch when `WorldGpu` is unready, so the framebuffer
+  is the clear color (black). The 40.0 floor sits well above the
+  pre-W5.3 ~0.7 baseline so the gate trips, AND well below the
+  post-W5.3 ~146 sky band so the gate will pass once W5.3 wires the
+  segment loop.
+- Option (a) — reuse `vox_e2e_mode = true` — was rejected: even
+  post-W5.3 the Oasis-populated region (`~744, 272, 672` voxels) is in
+  the opposite hemisphere from the e2e camera (`(86, 42, 90)` →
+  `(32, 16, 32)`), so the central rect samples sky band (~146) — that
+  would trip `--vox-e2e`'s `SKY_LUMINANCE_CEILING = 160` gate. The
+  "not pure-black" floor is the correct shape for the off-frame state.
+- The driver-side standard gates (`degenerate-frame floor`, `luminance
+  liveness gate`, `region gate`, `node-dispatch check`) ALREADY catch
+  the same pre-W5.3 regression (and the same load-bearing
+  post-W5.3-regression signals like "pipeline compile errors crashed
+  the GPU producer"). My `assert_frame_not_black` helper is callable
+  for future driver integrations / unit tests but is NOT wired into
+  the driver's run-time gate path in this dispatch — wiring it would
+  duplicate the driver's existing "the screen isn't black" signal.
+
+### Pre-W5.3 baseline (RIGHT NOW)
+
+Framebuffer at the standard e2e camera pose `(86, 42, 90) → (32, 16, 32)`
+with the Oasis fixture loaded through `install_vox_in_fixed_world` is
+**pure-black** (~0.7 luminance over the central 40 % × 40 % rect; 0.0 %
+of the frame brighter than 2.0 luminance per the standard liveness gate).
+The W5 install path populates `ModelData` + the W5 prepare block
+allocates buffers + builds the bind group, but the segment loop (W5.3)
+hasn't landed → `gpu_producer_has_run` stays false → `WorldGpu::chunks`
+stays zeroed → the downstream NAADF render-graph nodes (`first_hit`,
+`ray_queue`, `global_illum`, `sample_refine`, `spatial_resampling`,
+`denoise`, `taa_reproject`, `calc_new_taa_sample`, `final_blit`) skip
+their dispatch on the readiness gate → no rendering happens → clear
+color (black) is what the swapchain holds.
+
+This is the **reference observation for W5.3** — the W5.3 dispatch is
+expected to flip every one of these to "ran" + bring the framebuffer
+above the floor.
+
+### Post-W5.3 expectation
+
+Once W5.3 lands the per-segment dispatch + flips `gpu_producer_has_run =
+true` after the segment loop completes:
+
+- `WorldGpu::chunks` populates (every chunk gets a `ChunkCell` written
+  by `generator_model.wgsl` → `chunk_calc::calc_block_from_raw_data`).
+- The W3 bounds chain populates `block_bounds_buffer` +
+  `voxel_bounds_buffer`.
+- The nine downstream render-graph nodes (above) hit their readiness
+  preconditions and dispatch.
+- At the standard e2e camera pose, the camera frames a region NEAR the
+  origin (`(32, 16, 32)`) of the 4096×512×4096-voxel world. With the
+  Oasis fixture's `generator_model.wgsl` semantics (each segment writes
+  its slice with the model tiled across the world, per `generator_model.
+  wgsl:114-116`'s Y-clamp + per-axis modulo addressing), the camera
+  will see **some** Oasis-derived geometry close to the origin — the
+  model tiles across the world. The central rect should rise to at
+  least the sky band (~146) and likely to GI-lit emissive levels
+  (~240+) if Oasis-emissive material projects into the rect.
+- The `assert_frame_not_black` floor of 40.0 will PASS by a wide
+  margin in either case.
+
+If post-W5.3 the central rect stays under 40 → the W5 chain is broken
+in a load-bearing way (segment loop didn't fire, bind group misbinding,
+WGPU validation crash, etc.).
+
+### Design adherence
+
+Followed `02-design.md` §W5.5 (lines 575-786) verbatim:
+
+- **Module skeleton** (design lines 590-740): copied the design's Rust
+  body exactly. Three intentional adjustments:
+  1. **Did NOT set `app_args.vox_e2e_mode = true`**. The design's
+     skeleton at line 684 sets it but the same design's "Note on
+     assertion strategy" at lines 742-753 + assumption #8 at lines
+     1623-1633 both explicitly leave the choice to the implementer
+     based on first-run observation. First-run shows pure-black
+     framebuffer (not sky), so `vox_e2e_mode = true` would FAIL on
+     `assert_vox_geometry_visible`'s 160 threshold AND mask the real
+     post-W5.3 expectation (sky band ~146 also fails 160). The custom
+     `assert_frame_not_black` floor is the correct shape per the same
+     skeleton's own option (b).
+  2. **Added `app_path_for_args` helper** — a small wrapper that
+     mirrors the resolved path from `oasis_vox_fixture_path()`
+     verbatim into the `GridPreset::Vox { path, ... }` carrier. The
+     design's literal `PathBuf::from(OASIS_VOX_FIXTURE_PATH)` would
+     bypass the workspace-vs-crate-relative fallback logic in
+     `oasis_vox_fixture_path()` and could break the gate when run
+     from inside the crate directory. Using the resolved path
+     preserves the fallback discipline `oasis_edit_visual.rs`
+     established.
+  3. **Did NOT wire `assert_frame_not_black` into the driver**. The
+     design skeleton's helper is callable but not wired; the driver's
+     existing `degenerate-frame floor` + `luminance liveness gate` +
+     `node-dispatch check` already cover the same "screen is black,
+     nothing rendered" signal. Wiring my helper into the driver
+     would either duplicate the existing gates OR require a separate
+     `vox_gpu_construction_mode` driver branch (similar to
+     `vox_e2e_mode`'s shape) — out of W5.5's scope per the Q3
+     decision (no driver-flow customisation).
+- **`e2e/mod.rs:33` export addition** (design line 759): added.
+- **`bin/e2e_render.rs:90-91` flag parse** (design lines 762-769):
+  added.
+- **`bin/e2e_render.rs:212-221` dispatch branch** (design lines
+  775-784): added immediately BEFORE the `vox_e2e_mode` branch, as
+  the design specifies.
+
+### Assumption-verification findings (per `02-design.md` §Assumptions made)
+
+- **Assumption 3** (`OASIS_VOX_FIXTURE_PATH` resolves at `cargo run`
+  time from the workspace root): **verified true**. The fixture exists
+  at `crates/bevy_naadf/assets/test/oasis_hard_cover.vox` (84 911 723
+  bytes, MagicaVoxel v150 file per `file(1)`). The gate's stdout log
+  confirmed the path resolved correctly:
+  `loading Oasis VOX fixture from crates/bevy_naadf/assets/test/oasis_hard_cover.vox (84911723 bytes)`.
+- **Assumption 8** (framebuffer-assertion choice): **made on first
+  run** per the design's explicit directive. Choice = custom
+  `assert_frame_not_black` floor at 40.0; rationale documented in the
+  "Assertion strategy" section above.
+- **InitialCameraPose decision** (e2e harness ignores
+  `InitialCameraPose` — uses `setup_e2e_camera` verbatim): **verified
+  true by observation**. The Oasis-populated region sits at
+  `~(744, 272, 672)` voxels but the framebuffer captured at the
+  standard e2e camera pose `(86, 42, 90) → (32, 16, 32)` was
+  pure-black, confirming the harness did NOT override the camera to
+  frame the Oasis model. The W5.5 gate runs with the standard pose;
+  the assertion accepts the Oasis-off-frame state per the design's
+  decision.
+- **Assumption 7** (`generator_model.wgsl` is FIXED): **respected** —
+  `git status` confirms the file is untouched.
+- Other assumptions (1, 2, 4-6, 9-11) are W5.1 / W5.2 / W5.3-scope and
+  were exercised by prior dispatches; not re-verified here.
+
+### Surprises
+
+**No WGPU validation errors** — the W5.2 bind-group setup + the 4 W5
+buffers (3 storage + 1 uniform) are correctly allocated and bound;
+WGPU's validation pass accepts the layout. The brief flagged this as a
+hard-gate-worth-surfacing-immediately signal if it had fired — it did
+NOT, so W5.2's surface area is healthy.
+
+**Framebuffer was pure-black, NOT sky-tinted**, contrary to the
+design's assumption that the sky band would render in the absence of
+geometry. The reason: the entire NAADF render-graph chain (which
+includes the sky / atmosphere shader as part of `naadf_final_blit`)
+has `WorldGpu`-readiness preconditions; when those are unmet, the
+whole render chain skips dispatch and the swapchain holds the clear
+color. This is structurally fine for W5.5 (the gate still detects
+"GPU chain dormant"), but the design's assumed "sky band at ~146
+luminance" baseline pre-W5.3 was incorrect. The actual baseline is
+~0.7 luminance (black) — better separation from the 40.0 floor.
+
+The W5 producer's first-frame log message
+("phase-c followup#1 — gpu construction ENABLED (default). The runtime
+GPU dispatch chain (generator-bypass → chunk_calc.calc_block_from_raw_data
+→ compute_voxel_bounds → compute_block_bounds → bounds_calc.add_initial)
+runs in `prepare_construction` on the first render frame ...") is
+slightly misleading post-W5.2: it lists the W4 chunk-calc-only branch
+("generator-bypass"), not the W5 branch ("generator + chunk_calc"). The
+log is informational only; semantics are correct. (Out of W5.5 scope to
+update.)
+
+### What's NOT yet working
+
+**The GPU producer chain doesn't fire until W5.3 lands.** This is the
+EXPECTED intermediate state — the W5.5 dispatch ships ahead of W5.3
+deliberately so the gate is in place to immediately catch regressions
+when W5.3 wires the segment loop. Until W5.3:
+
+- The W5 install path (W5.1) populates `ModelData` correctly.
+- The W5 prepare block (W5.2) allocates buffers + builds the bind group
+  correctly.
+- `naadf_gpu_producer_node` does NOT dispatch the generator pass — no
+  W5 branch in the node body yet.
+- `gpu_producer_has_run` never flips on the W5 path → downstream nodes
+  skip dispatch → framebuffer stays black.
+
+The `--vox-gpu-construction` gate FAILS pre-W5.3 (4 driver checks
+fail). Post-W5.3 the same gate should PASS (segment loop dispatches →
+chunks populate → render chain dispatches → framebuffer luminance rises
+above the 40.0 floor + above the standard driver's region / liveness
+thresholds).

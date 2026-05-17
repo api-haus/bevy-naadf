@@ -87,6 +87,8 @@ fn main() -> ExitCode {
     let oasis_edit_visual_mode = args.iter().any(|a| a == "--oasis-edit-visual");
     let small_edit_visual_mode = args.iter().any(|a| a == "--small-edit-visual");
     let small_edit_repro_mode = args.iter().any(|a| a == "--small-edit-repro");
+    let vox_gpu_construction_mode =
+        args.iter().any(|a| a == "--vox-gpu-construction");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -207,6 +209,16 @@ fn main() -> ExitCode {
         // standard `--small-edit-visual` gate misses. See
         // [`bevy_naadf::e2e::small_edit_repro`].
         bevy_naadf::e2e::small_edit_repro::run_small_edit_repro()
+    } else if vox_gpu_construction_mode {
+        // `--vox-gpu-construction` — load the Oasis fixture through the
+        // production W5 GPU producer chain (vox-gpu-rewrite W5.5). Loads
+        // `crates/bevy_naadf/assets/test/oasis_hard_cover.vox` as
+        // `ModelData`, runs `16 × 2 × 16 = 512` per-segment generator +
+        // chunk_calc dispatches against the production WorldGpu buffers,
+        // and asserts the framebuffer is not pure-black. See
+        // `bevy_naadf::e2e::vox_gpu_construction` (+ the orchestration
+        // bundle at `docs/orchestrate/vox-gpu-rewrite/`).
+        bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then

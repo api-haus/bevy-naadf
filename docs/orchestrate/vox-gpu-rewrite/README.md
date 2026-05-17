@@ -49,9 +49,10 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Hard gate — design submitted, user confirmed
 - [x] Step 6 — Checkpoint commit + impl W5.1 landed (commit `483d86b` checkpoint; W5.1 committed `894fcd1`)
 - [x] Hard gate — W5.1 submitted, user confirmed
-- [x] Step 6 — Checkpoint commit + impl W5.2 landed (W5.2 changes uncommitted pending next checkpoint)
-- [ ] Hard gate — submit W5.2, wait for user  ← CURRENT
-- [ ] Step 6 — Checkpoint commit + impl W5.5 (e2e gate, lands BEFORE W5.3 to catch regressions)
+- [x] Step 6 — Checkpoint commit + impl W5.2 landed (W5.2 committed `59adc31`)
+- [x] Hard gate — W5.2 submitted, user confirmed
+- [x] Step 6 — Checkpoint commit + impl W5.5 landed (W5.5 uncommitted pending next checkpoint; gate is RED pre-W5.3 as expected)
+- [ ] Hard gate — submit W5.5, wait for user  ← CURRENT
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.3 (segment-loop dispatch in naadf_gpu_producer_node)
 - [ ] Hard gate — submit, wait (W5.5 gate should go green here)

@@ -30,6 +30,7 @@ pub mod readback;
 pub mod small_edit_repro;
 pub mod small_edit_visual;
 pub mod vox_e2e;
+pub mod vox_gpu_construction;
 
 use bevy::camera::Hdr;
 use bevy::core_pipeline::tonemapping::Tonemapping;
