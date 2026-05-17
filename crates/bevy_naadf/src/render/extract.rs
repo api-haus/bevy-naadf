@@ -118,6 +118,30 @@ pub struct WorldDataMeta {
     pub dense_voxel_types: Vec<u16>,
 }
 
+/// Render-world mirror of the main-world [`crate::aadf::generator::ModelData`]
+/// (vox-gpu-rewrite W5.1). Populated **build-once** by
+/// [`stage_model_data_buildonce`] on the first frame the main-world
+/// `ModelData` exists (after `install_vox_in_fixed_world` inserts it). Drives
+/// the W5 GPU producer chain in `naadf_gpu_producer_node`: presence of this
+/// resource is the gate that switches the node from the chunk_calc-only
+/// branch to the per-segment generator + chunk_calc chain.
+///
+/// Mirrors the `WorldGpuStaging` discipline (`extract.rs:67-87`) but is
+/// **long-lived** — `prepare_construction` reads it every frame the W5 bind
+/// group is being built (the buffers stay; the bind group only rebuilds when
+/// `Option<BindGroup>` is `None`).
+#[derive(Resource, Default, Clone)]
+pub struct ModelDataRender {
+    /// `ModelData.data_chunk` — `size_in_chunks.x * y * z` u32 entries.
+    pub data_chunk: Vec<u32>,
+    /// `ModelData.data_block` — variable length.
+    pub data_block: Vec<u32>,
+    /// `ModelData.data_voxel` — variable length, two voxels per u32.
+    pub data_voxel: Vec<u32>,
+    /// Model size in chunks (`ModelData.size_in_chunks`).
+    pub size_in_chunks: [u32; 3],
+}
+
 /// Render-world mirror of the camera's render-relevant state (`03-design.md`
 /// §4.5, §5.2). Rebuilt every frame by [`extract_camera`].
 #[derive(Resource, Default, Clone, Copy)]
@@ -200,6 +224,38 @@ pub fn stage_world_gpu_buildonce(
     meta.voxels_cpu_len = world_data.voxels_cpu.len() as u32;
     meta.dense_voxel_types.clone_from(&world_data.dense_voxel_types);
     commands.insert_resource(staging);
+}
+
+/// `ExtractSchedule` system: **build-once** hand-off of the main-world
+/// [`crate::aadf::generator::ModelData`] into the render-world
+/// [`ModelDataRender`] resource (vox-gpu-rewrite W5.1).
+///
+/// Gated on `Option<Res<ModelDataRender>>::is_none()` — once
+/// [`prepare_construction`]-side bind-group construction has its source
+/// payload, this system short-circuits on every subsequent frame. **There is
+/// no per-frame clone.** Mirrors `stage_world_gpu_buildonce` 1:1
+/// (`extract.rs:167-203`).
+///
+/// Per Q2 decision (`vox-gpu-rewrite/01-context.md`): a SEPARATE resource
+/// rather than extending `WorldDataMeta` (which carries the "DELIBERATELY
+/// MINIMAL" docstring at `extract.rs:102-105`).
+pub fn stage_model_data_buildonce(
+    mut commands: Commands,
+    existing: Option<Res<ModelDataRender>>,
+    model_data: Extract<Option<Res<crate::aadf::generator::ModelData>>>,
+) {
+    if existing.is_some() {
+        return;
+    }
+    let Some(model_data) = &*model_data else {
+        return;
+    };
+    commands.insert_resource(ModelDataRender {
+        data_chunk: model_data.data_chunk.clone(),
+        data_block: model_data.data_block.clone(),
+        data_voxel: model_data.data_voxel.clone(),
+        size_in_chunks: model_data.size_in_chunks,
+    });
 }
 
 /// `ExtractSchedule` system: copy the camera's `PositionSplit` + inverse

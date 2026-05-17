@@ -297,49 +297,135 @@ fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path, t
     }
 }
 
-/// C#-faithful `.vox` loader — allocates the fixed [`WORLD_SIZE_IN_CHUNKS`]
-/// world and auto-tiles the model via `voxelPos % modelSize` with `Y > 0`
-/// tiles empty. Mirrors `WorldHandler.cs:29-35` +
-/// `generatorModel.fx:16-52`. On load failure falls back to the embedded
-/// default scene (so the world is still the fixed size, still editable —
-/// matches C#'s missing-`oasis.cvox` path).
+/// C#-faithful `.vox` loader (vox-gpu-rewrite W5.1) — parses the `.vox` as a
+/// single-tile `ImportedVox` and hands it to the W5 GPU producer chain via a
+/// main-world [`crate::aadf::generator::ModelData`] resource. The CPU
+/// `WorldData` inserted here is **empty at the fixed world size**: the W5
+/// per-segment `generator_model` + `chunk_calc` dispatches populate
+/// `WorldGpu::chunks/blocks/voxels` directly on the GPU (mirrors C#
+/// `WorldData.GenerateWorld` at `WorldData.cs:120-156`, dispatching
+/// `generatorModel.fx` then `calcBlock` per segment).
+///
+/// **W5.1 intermediate state:** after W5.1 lands, the GPU producer chain that
+/// consumes `ModelData` is NOT yet wired (that's W5.2 + W5.3). The
+/// `.vox` → fixed-world path therefore renders nothing meaningful until W5.3
+/// lands. This is by design — W5.1 is data-plumbing only.
+///
+/// On load failure: falls back to `install_default_embedded_in_fixed_world`
+/// (same as the pre-W5.1 behaviour, so the world is still fixed-size and
+/// editable — matches C#'s missing-`oasis.cvox` path).
 fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
-    let target: [u32; 3] = WORLD_SIZE_IN_CHUNKS.to_array();
-    match vox_import::load_vox_into_world(path, target) {
-        Ok(imp) => {
-            let s = imp.world.size_in_chunks;
-            info!(
-                "NAADF .vox loaded from {} into fixed {}×{}×{}-chunk world (auto-tiled in XZ; Y > model empty): \
-                 {} palette entries, {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s",
-                path.display(),
-                s[0],
-                s[1],
-                s[2],
-                imp.palette.len(),
-                imp.world.chunks.len(),
-                imp.world.blocks.len(),
-                imp.world.voxels.len(),
-            );
-            // C# camera spawn: literal `(500, 200, 40)` voxels in the fixed
-            // 4096×512×4096 world (`World/Render/WorldRender.cs:48-49`). No
-            // rescaling now that the world size is also fixed — use the C#
-            // constants verbatim.
-            let world_voxels = [s[0] * 16, s[1] * 16, s[2] * 16];
-            commands.insert_resource(crate::camera::InitialCameraPose::from_world_voxels(
-                world_voxels,
-            ));
-            let (world_data, voxel_types) = vox_import::build_world_from_vox(imp);
-            commands.insert_resource(world_data);
-            commands.insert_resource(voxel_types);
-        }
+    // W5.1 — parse as a single-tile sparse import (no CPU tiling).
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
         Err(e) => {
             error!(
-                ".vox load failed ({e}); falling back to embedded default in fixed world (path: {})",
+                ".vox load failed (read error: {e}); falling back to embedded \
+                 default in fixed world (path: {})",
                 path.display()
             );
             install_default_embedded_in_fixed_world(commands);
+            return;
         }
-    }
+    };
+    let data = match dot_vox::load_bytes(&bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            error!(
+                ".vox load failed (parse error: {e}); falling back to embedded \
+                 default in fixed world (path: {})",
+                path.display()
+            );
+            install_default_embedded_in_fixed_world(commands);
+            return;
+        }
+    };
+    let imp = match vox_import::parse_dot_vox_data(&data) {
+        Ok(i) => i,
+        Err(e) => {
+            error!(
+                ".vox load failed ({e}); falling back to embedded default in \
+                 fixed world (path: {})",
+                path.display()
+            );
+            install_default_embedded_in_fixed_world(commands);
+            return;
+        }
+    };
+
+    let model_size_in_chunks = imp.world.size_in_chunks;
+    info!(
+        "NAADF .vox loaded from {} → ModelData ({}×{}×{} chunks; \
+         data_chunk={} u32s, data_block={} u32s, data_voxel={} u32s, \
+         {} palette entries). Fixed world {}×{}×{} chunks; GPU producer \
+         chain runs per WORLD_SIZE_IN_SEGMENTS = ({}, {}, {}).",
+        path.display(),
+        model_size_in_chunks[0],
+        model_size_in_chunks[1],
+        model_size_in_chunks[2],
+        imp.world.chunks.len(),
+        imp.world.blocks.len(),
+        imp.world.voxels.len(),
+        imp.palette.len(),
+        WORLD_SIZE_IN_CHUNKS.x,
+        WORLD_SIZE_IN_CHUNKS.y,
+        WORLD_SIZE_IN_CHUNKS.z,
+        crate::WORLD_SIZE_IN_SEGMENTS.x,
+        crate::WORLD_SIZE_IN_SEGMENTS.y,
+        crate::WORLD_SIZE_IN_SEGMENTS.z,
+    );
+
+    // C# camera spawn: literal (500, 200, 40) voxels in the fixed
+    // 4096×512×4096 world (WorldRender.cs:48-49). `from_world_voxels` scales
+    // proportionally for the fixed world size — see camera/mod.rs:54-64.
+    let world_voxels = [
+        WORLD_SIZE_IN_VOXELS.x,
+        WORLD_SIZE_IN_VOXELS.y,
+        WORLD_SIZE_IN_VOXELS.z,
+    ];
+    commands.insert_resource(crate::camera::InitialCameraPose::from_world_voxels(
+        world_voxels,
+    ));
+
+    // W5.1 — convert ConstructedWorld → ModelData. The `chunks/blocks/voxels`
+    // u32 buffers `vox_import` produces are byte-identical to NAADF's
+    // `dataChunk/dataBlock/dataVoxel` encoding (`aadf/generator.rs:64-71`).
+    let model_data = crate::aadf::generator::ModelData {
+        data_chunk: imp.world.chunks,
+        data_block: imp.world.blocks,
+        data_voxel: imp.world.voxels,
+        size_in_chunks: model_size_in_chunks,
+    };
+    commands.insert_resource(model_data);
+
+    // W5.1 — install an EMPTY WorldData at the FIXED world size. The renderer
+    // still consumes this for bind groups (prepare_world_gpu builds the
+    // chunks/blocks/voxels storage buffers); the GPU producer dispatches
+    // populate them from the segment_voxel_buffer the per-segment chain
+    // writes. `dense_voxel_types = Vec::new()` preserves the existing
+    // `if meta.dense_voxel_types.is_empty() { return; }` gate at
+    // `render/construction/mod.rs:1936-1941` (the W5.3 three-way ladder adds
+    // a NEW gate ABOVE that one for ModelDataRender presence).
+    let mut world_data = WorldData {
+        chunks_cpu: Vec::new(),
+        blocks_cpu: Vec::new(),
+        voxels_cpu: Vec::new(),
+        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
+        bounding_box: IAabb3 {
+            min: IVec3::ZERO,
+            max: IVec3::new(
+                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
+            ),
+        },
+        pending_edits: Default::default(),
+        dense_voxel_types: Vec::new(),
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+    };
+    world_data.seed_block_hashing();
+    commands.insert_resource(world_data);
+    commands.insert_resource(VoxelTypes { types: imp.palette });
 }
 
 /// A `1×1×1`-chunk [`DenseVolume`] containing the standard 3-voxel ground

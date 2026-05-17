@@ -41,8 +41,8 @@ use bevy::render::{
 use atmosphere::prepare_atmosphere;
 use extract::{
     extract_camera, extract_camera_history, extract_gi_config, extract_taa_config,
-    stage_world_gpu_buildonce, ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig,
-    ExtractedTaaConfig, WorldDataMeta,
+    stage_model_data_buildonce, stage_world_gpu_buildonce, ExtractedCameraData,
+    ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig, ModelDataRender, WorldDataMeta,
 };
 use gi::prepare_gi;
 // Phase B Batch 6 (`09-design-b.md` §11 Batch 6 steps 17-18): the `base/` TAA
@@ -120,6 +120,13 @@ impl Plugin for NaadfRenderPlugin {
             // (long-lived, used by `naadf_gpu_producer_node` after pipelines
             // compile).
             .init_resource::<WorldDataMeta>()
+            // vox-gpu-rewrite W5.1 — render-world mirror of main-world
+            // `ModelData`. Build-once populated by `stage_model_data_buildonce`
+            // on the first frame after `install_vox_in_fixed_world` inserts
+            // the main-world `ModelData`; long-lived (the W5.2/W5.3 GPU
+            // producer chain reads it every frame the bind group is being
+            // built).
+            .init_resource::<ModelDataRender>()
             .init_resource::<ExtractedCameraData>()
             .init_resource::<ExtractedCameraHistory>()
             .init_resource::<ExtractedTaaConfig>()
@@ -133,6 +140,9 @@ impl Plugin for NaadfRenderPlugin {
                 ExtractSchedule,
                 (
                     stage_world_gpu_buildonce,
+                    // vox-gpu-rewrite W5.1 — build-once hand-off of
+                    // main-world `ModelData` → render-world `ModelDataRender`.
+                    stage_model_data_buildonce,
                     extract_camera,
                     extract_camera_history,
                     extract_taa_config,

@@ -46,9 +46,9 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Step 5 — Shared-context files written
 - [x] Step 6 — Checkpoint commit + design dispatch (commit `4063d55`)
 - [x] Step 6 — Design agent landed `02-design.md` (1757 lines)
-- [ ] Hard gate — submit design, wait for user  ← CURRENT
-- [ ] Step 6 — Checkpoint commit + impl W5.1 (ModelData resource + extract)
-- [ ] Hard gate — submit, wait
+- [x] Hard gate — design submitted, user confirmed
+- [x] Step 6 — Checkpoint commit + impl W5.1 landed (commit `483d86b` pre-impl; W5.1 changes uncommitted pending next checkpoint)
+- [ ] Hard gate — submit W5.1, wait for user  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.2 (prepare_construction buffer + bind-group allocation)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.5 (e2e gate, lands BEFORE W5.3 to catch regressions)

@@ -43,6 +43,8 @@
 //! ground-level copy of the model is materialised vertically; everything above
 //! is empty. The CPU oracle replicates this exactly.
 
+use bevy::prelude::Resource;
+
 use crate::voxel::CELL_DIM;
 
 /// Side length of a chunk in voxels (`CELL_DIM² = 16`).
@@ -69,7 +71,7 @@ pub const CHUNK_DATA_U32S: u32 = 2048;
 /// - `data_voxel[(b & 0x3FFF_FFFF) + v / 2]` — two voxels per `u32`, low half
 ///   = even-index, high half = odd-index (only valid when
 ///   `data_block[base + b] >> 30 == 2`).
-#[derive(Clone, Debug)]
+#[derive(Resource, Clone, Debug)]
 pub struct ModelData {
     /// Flat `dataChunk` array — `size_in_chunks.x * y * z` entries.
     pub data_chunk: Vec<u32>,
