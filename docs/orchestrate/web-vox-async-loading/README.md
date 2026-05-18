@@ -25,11 +25,19 @@ Async `.vox` loading on web + native, with closed-loop e2e gates (Playwright hea
 - [x] Step 4 — Architectural Q&A (answers folded into `01-context.md`)
 - [x] Step 5 — Write `01-context.md` + `05-review.md` + this `README.md`
 - [x] Step 6a — Checkpoint commit (sonnet) + architect dispatch (commit `1ac6f0b6`; design at `03-architecture.md`)
-- [ ] Step 7a — **HARD GATE**: synthesize architecture, submit to user, wait *(awaiting user confirmation)*
-- [ ] Step 6b — Checkpoint commit + implementer dispatch
-- [ ] Step 7b — **HARD GATE**: synthesize implementation + verification log, submit to user, wait
-- [ ] Step 6c — Reviewer dispatch (reads ONLY `05-review.md`)
-- [ ] Step 7c — Reconcile review vs full context, present to user
+- [x] Step 7a — HARD GATE: architecture synthesis presented; user confirmed
+- [x] Step 6b — Implementer dispatch (Steps 1-5+7 → checkpoint `4e54c7a7`; Steps 6+8+9 → checkpoint `7dc739a`; RTFM no-bundler fix → checkpoint `162c40b8`)
+- [x] Step 7b — HARD GATE: implementation synthesis presented; user confirmed close-out
+- [~] Step 6c — Reviewer dispatch **SKIPPED** (user closed orchestration before reviewer; `05-review.md` left intact for any future reviewer pass)
+- [~] Step 7c — Reconcile **SKIPPED** (no review to reconcile)
+
+## Closed — handoff to /diagnose-first session
+
+Closed 2026-05-18. The async-loading deliverable is complete (Q1–Q7 all implemented; 7/8 verification gates green; the 8th — `wasm-smoke.spec.ts` — fails for an unrelated, pre-existing R2 CORS-on-404 issue documented in `04-refactoring.md`). Live binary inspection then surfaced a separate, narrower bug: web `.vox` loads correctly (geometry + voxel types right) but materials render as near-black where native renders with full colors. That divergence is handed off to a fresh `/diagnose-first` session.
+
+- **Handoff document:** `/tmp/web-vox-color-divergence-handoff.md`
+- **Final commit:** `162c40b8` (`fix(web-vox): wasm-bindgen-rayon no-bundler + W2/W5 label-leak re-alloc gates`)
+- **Branch:** `feat/web-vox-streaming`
 
 ## Hard gates respected
 
