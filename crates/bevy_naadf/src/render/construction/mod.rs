@@ -257,6 +257,28 @@ pub struct ConstructionGpu {
     /// frame; absent on non-streaming presets (the renderer-side bind group
     /// then carries the `WorldGpu::window_indirection_placeholder` instead).
     pub window_indirection_buffer: Option<Buffer>,
+    /// streaming-world Phase 2.8 — "bounds chain is stale" latch for the
+    /// streaming preset. Set to `true` on every admission/eviction frame
+    /// (segments were written but their AADF bounds bits are zero-initialised
+    /// or out-of-date). The streaming branch in `naadf_gpu_producer_node`
+    /// dispatches the full-world `compute_voxel_bounds` + `compute_block_bounds`
+    /// chain on the FIRST idle frame after the latch was set, then clears it.
+    ///
+    /// Why a deferred latch instead of per-admission-frame dispatch (the
+    /// pre-Phase-2.8 behaviour): the bounds chain costs ~300 ms per dispatch
+    /// at the fixed 256×32×256 world (134 M voxel workgroups). Firing it on
+    /// each of the ~128 admission frames during cold-start blew the cold-start
+    /// wall clock to ~40 s vs the static preset's ~5 s baseline (which only
+    /// dispatches bounds ONCE at the end of its 512-segment loop). Deferring
+    /// to the post-admission idle frame mirrors the static path's
+    /// "bounds-chain ×1 after cold-start" shape: bounds-chain total cost is
+    /// O(1) per cold-start, not O(admission frames). Trade-off: during
+    /// cold-start frames the new chunks render with bounds=0 (AADF maximally
+    /// conservative — rays step cell-by-cell instead of skipping). This is
+    /// correct but slower per-pixel; the next idle frame fires the bounds
+    /// dispatch and rendering speeds up. Per
+    /// `docs/orchestrate/streaming-world/03i-impl-dirty-segments-bounds.md`.
+    pub streaming_bounds_dirty: bool,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -3116,10 +3138,42 @@ pub fn naadf_gpu_producer_node(
             segments_dispatched += 1;
         }
 
-        // After the per-segment loop, run the bounds chain once if any
-        // admissions / evictions happened (per D.B7 — covers freshly-written
-        // chunks AND newly-emptied slots).
+        // streaming-world Phase 2.8 — deferred bounds-chain dispatch.
+        //
+        // Pre-2.8 (the cold-start perf bug): the bounds chain
+        // (`compute_voxel_bounds` + `compute_block_bounds`) fired on EVERY
+        // admission/eviction frame over the FULL world worst-case extent
+        // (134 M voxel workgroups, ~300 ms/dispatch). For the 128 admission
+        // frames of a cold-start, that's ~38 s of pure bounds overhead vs
+        // the static preset's ~5 s total cold-start (which dispatches bounds
+        // exactly once at the end of its 512-segment loop).
+        //
+        // The fix: defer the bounds chain to the FIRST IDLE FRAME after any
+        // admissions or evictions. We set `streaming_bounds_dirty` on every
+        // admission/eviction frame, then dispatch the bounds chain on the
+        // next frame where `admissions.is_empty() && evictions.is_empty()
+        // && streaming_bounds_dirty`. Cold-start now matches the static
+        // path's "bounds-chain ×1" shape (one 300 ms dispatch after all
+        // ~128 admission frames complete).
+        //
+        // Correctness: bounds bits are zero-initialised (max-conservative —
+        // rays step cell-by-cell instead of skipping AADF-empty regions).
+        // During cold-start, freshly-admitted chunks render with bounds=0
+        // until the next idle frame fires the chain. This is correct but
+        // slower per-pixel; the renderer produces correct images throughout
+        // and rendering speeds up on the post-cold-start idle frame.
+        //
+        // Per `02b-design-plan-b.md` D.B7's "Mitigation: only re-run bounds
+        // over the *affected* segments via a `dirty_segments` list" — this
+        // deferred-latch approach gets the same wall-clock win (cold-start
+        // bounds cost amortised to a single dispatch) without per-shader
+        // changes, at the cost of one frame of stale bounds for newly-
+        // admitted chunks. See
+        // `docs/orchestrate/streaming-world/03i-impl-dirty-segments-bounds.md`.
+        let mut bounds_dispatched_this_frame = false;
         if any_admissions_or_evictions {
+            gpu.streaming_bounds_dirty = true;
+        } else if gpu.streaming_bounds_dirty {
             let encoder = render_context.command_encoder();
 
             // Same bounds-chain dispatch shape as the W5 branch (full-world
@@ -3147,23 +3201,33 @@ pub fn naadf_gpu_producer_node(
                 world_bg,
                 block_workgroups,
             );
+
+            gpu.streaming_bounds_dirty = false;
+            bounds_dispatched_this_frame = true;
+            bevy::log::info!(
+                "streaming-world Phase 2.8: deferred bounds chain dispatched \
+                 on idle frame (voxel_workgroups={voxel_workgroups}, \
+                 block_workgroups={block_workgroups}); flag cleared."
+            );
         }
 
         // streaming-world: gpu_producer_has_run STAYS FALSE (the producer
-        // runs every frame any admission/eviction happens). Also flip
-        // bounds_initialized to true on the first dispatch so the bounds-init
-        // seed in prepare_construction doesn't re-fire (it would interleave
-        // with our own bounds chain).
-        if segments_dispatched > 0 && !gpu.bounds_initialized {
+        // runs every frame any admission/eviction happens). Flip
+        // `bounds_initialized = true` once we've actually dispatched the
+        // bounds chain at least once (either via the deferred flush on an
+        // idle frame, OR — pre-Phase-2.8 — on the first admission frame).
+        // This keeps the W3 regime-1 seed in `prepare_construction` skipped
+        // once we own the bounds dispatch.
+        if bounds_dispatched_this_frame && !gpu.bounds_initialized {
             gpu.bounds_initialized = true;
         }
         if segments_dispatched > 0 {
             bevy::log::info!(
                 "streaming-world: dispatched {} segment(s) this frame ({} evictions); \
-                 bounds chain {} run.",
+                 bounds chain deferred (latched dirty={}).",
                 segments_dispatched,
                 evictions.len(),
-                if any_admissions_or_evictions { "WAS" } else { "skipped" },
+                gpu.streaming_bounds_dirty,
             );
         }
         return;
