@@ -225,6 +225,29 @@ pub enum E2ePhase {
     /// disk (`oracle_cpu.png` for the CPU phase, `oracle_gpu.png` for the GPU
     /// phase), then write `AppExit::Success`.
     VoxGpuOracleDrain,
+    // --- streaming-framebuffer-diff sub-process phases
+    // (streaming-world Phase 2.12 —
+    //  `docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § A,
+    //  MUST-3) -----------------------------------------------------------------
+    //
+    // Selected when `AppArgs.streaming_framebuffer_static_phase == true` OR
+    // `AppArgs.streaming_framebuffer_streaming_phase == true`. Same shape as
+    // the VoxGpuOracle sub-process phases: Warmup → Shoot → Drain → save →
+    // exit. The two phases use different warmup durations:
+    //   - static: `STREAMING_FBDIFF_STATIC_WARMUP_FRAMES = 120` (one-shot
+    //     dispatch landed; TAA + GI converge).
+    //   - streaming: `STREAMING_FBDIFF_STREAMING_WARMUP_FRAMES = 256` (full
+    //     cold-start drain at 4 admissions/frame for 512 segments = 128
+    //     frames; double that to let TAA + GI settle).
+    /// Warmup at the shared framebuffer-diff pose — TAA + GI + (for
+    /// streaming) cold-start admission drain.
+    StreamingFramebufferDiffWarmup,
+    /// Spawn `Screenshot::primary_window()`.
+    StreamingFramebufferDiffShoot,
+    /// Drain the async capture, decode to a [`Framebuffer`], save the
+    /// PNG to disk (`framebuffer_static.png` for static, `framebuffer_streaming.png`
+    /// for streaming), write `AppExit::Success`.
+    StreamingFramebufferDiffDrain,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -550,6 +573,22 @@ pub fn e2e_driver(
     });
     if vox_gpu_oracle_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::VoxGpuOracleWarmup;
+        state.phase_ticks = 0;
+    }
+
+    // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § A, MUST-3) —
+    // streaming-framebuffer-diff sub-process fast-path. Routes into
+    // StreamingFramebufferDiffWarmup on tick 0 when either sub-process flag
+    // is set. Camera pose owned by
+    // `super::streaming_framebuffer_diff::pin_streaming_framebuffer_camera`.
+    let streaming_framebuffer_diff_mode = app_args.as_deref().is_some_and(|a| {
+        a.streaming_framebuffer_static_phase || a.streaming_framebuffer_streaming_phase
+    });
+    if streaming_framebuffer_diff_mode
+        && state.phase == E2ePhase::Warmup
+        && state.phase_ticks == 0
+    {
+        state.phase = E2ePhase::StreamingFramebufferDiffWarmup;
         state.phase_ticks = 0;
     }
 
@@ -1638,6 +1677,94 @@ pub fn e2e_driver(
                 let err = format!(
                     "vox-gpu-oracle: capture never delivered within {} drain frames",
                     super::vox_gpu_oracle::ORACLE_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        // ---- streaming-framebuffer-diff sub-process phases
+        // (streaming-world Phase 2.12 — single-screenshot save) -----------------
+        //
+        // Camera pose is owned by
+        // `pin_streaming_framebuffer_camera` (Update system,
+        // `.after(driver::e2e_driver)`); skip touching `camera` here.
+        E2ePhase::StreamingFramebufferDiffWarmup => {
+            let _ = &mut camera;
+            state.phase_ticks += 1;
+            let is_streaming_phase = app_args.as_deref().is_some_and(|a| {
+                a.streaming_framebuffer_streaming_phase
+            });
+            let target_warmup = if is_streaming_phase {
+                super::streaming_framebuffer_diff::STREAMING_FBDIFF_STREAMING_WARMUP_FRAMES
+            } else {
+                super::streaming_framebuffer_diff::STREAMING_FBDIFF_STATIC_WARMUP_FRAMES
+            };
+            if state.phase_ticks >= target_warmup {
+                screenshot.0 = None;
+                state.phase = E2ePhase::StreamingFramebufferDiffShoot;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::StreamingFramebufferDiffShoot => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::StreamingFramebufferDiffDrain;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::StreamingFramebufferDiffDrain => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        let is_static_phase = app_args.as_deref().is_some_and(|a| {
+                            a.streaming_framebuffer_static_phase
+                        });
+                        let is_streaming_phase = app_args.as_deref().is_some_and(|a| {
+                            a.streaming_framebuffer_streaming_phase
+                        });
+                        let filename = if is_static_phase {
+                            super::streaming_framebuffer_diff::STREAMING_FBDIFF_STATIC_PNG
+                        } else if is_streaming_phase {
+                            super::streaming_framebuffer_diff::STREAMING_FBDIFF_STREAMING_PNG
+                        } else {
+                            // Unreachable in practice (routed in only when
+                            // one of the two flags is set).
+                            super::streaming_framebuffer_diff::STREAMING_FBDIFF_STATIC_PNG
+                        };
+                        println!(
+                            "e2e_render --streaming-framebuffer-diff: capture \
+                             {}x{}; saving to {}",
+                            fb.width(),
+                            fb.height(),
+                            filename
+                        );
+                        super::streaming_framebuffer_diff::save_framebuffer_diff_screenshot(
+                            &fb, filename,
+                        );
+                        super::streaming_framebuffer_diff::stash_captured_framebuffer(fb);
+                        outcome.gate_result = Some(Ok(()));
+                        exit.write(AppExit::Success);
+                        state.phase = E2ePhase::Done;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "streaming-framebuffer-diff: capture decode \
+                             failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::streaming_framebuffer_diff::STREAMING_FBDIFF_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "streaming-framebuffer-diff: capture never delivered \
+                     within {} drain frames",
+                    super::streaming_framebuffer_diff::STREAMING_FBDIFF_DRAIN_FRAMES,
                 );
                 eprintln!("e2e_render: FAIL — {err}");
                 outcome.gate_result = Some(Err(err));

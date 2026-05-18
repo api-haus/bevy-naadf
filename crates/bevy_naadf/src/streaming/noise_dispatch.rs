@@ -314,6 +314,17 @@ pub struct StreamingExtractRender {
     /// per round; user-visible during shift bursts, invisible at
     /// steady-state.
     pub w3_reseed_full_world: bool,
+    /// streaming-world Phase 2.12
+    /// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § B,
+    /// MUST-1) — mirror of `Residency::clear_on_bind_queue`: slot indices
+    /// whose binding changed this frame (newly bound in Pass 3). The
+    /// render-world `clear_streaming_bound_slots` system drains this list
+    /// at `Render::Queue` time, issuing one `clear_buffer` per slot on a
+    /// single command encoder. Each `clear_buffer` zeroes 32 KiB
+    /// (`CHUNKS_PER_SLOT * 8` = 4096 chunks × `vec2<u32>`). Cost:
+    /// ~50 us per slot × up to 32 slots per shift = ~1.6 ms on shift
+    /// frames; zero on steady-state non-shift frames.
+    pub clear_on_bind_slots: Vec<SlotIndex>,
 }
 
 impl Default for StreamingExtractRender {
@@ -335,6 +346,7 @@ impl Default for StreamingExtractRender {
             window_origin: bevy::math::IVec3::ZERO,
             cold_start_complete: false,
             w3_reseed_full_world: false,
+            clear_on_bind_slots: Vec::new(),
         }
     }
 }
@@ -348,21 +360,45 @@ impl Default for StreamingExtractRender {
 /// The streaming and static branches are mutually exclusive (the install
 /// paths insert exactly one of `Residency` / `ProceduralStaticActive` —
 /// never both).
+/// streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § B) — static
+/// cross-world accumulator for pending clear-on-bind slot ids. Extract
+/// APPENDS to it from the main world; the render-world
+/// `clear_streaming_bound_slots` system DRAINS it once `WorldGpu` is
+/// available and the per-slot `clear_buffer` GPU command has been
+/// recorded. This pattern survives the Frame-0 race where `WorldGpu`
+/// isn't yet allocated by `prepare_world_gpu` (a build-once
+/// `PrepareResources` system that may take 1-3 frames). A naive
+/// `Vec<SlotIndex>` mirror on `StreamingExtractRender` would silently
+/// drop the cold-start binds during that race window.
+pub static PENDING_CLEAR_ON_BIND_SLOTS: std::sync::Mutex<Vec<SlotIndex>> =
+    std::sync::Mutex::new(Vec::new());
+
 pub fn extract_streaming_state(
     mut commands: Commands,
-    residency: bevy::render::Extract<Option<Res<Residency>>>,
-    chunk_source: bevy::render::Extract<Option<Res<super::chunk_source::NoiseChunkSource>>>,
-    shader_handle: bevy::render::Extract<Option<Res<StreamingShaderHandle>>>,
-    static_marker: bevy::render::Extract<
-        Option<Res<super::chunk_source::ProceduralStaticActive>>,
-    >,
+    main_world: ResMut<bevy::render::MainWorld>,
 ) {
-    let shader = shader_handle.as_deref().map(|s| s.0.clone());
-    let static_active = static_marker.as_deref().is_some();
+    // streaming-world Phase 2.12 — `ResMut<MainWorld>` so the extract can
+    // DRAIN `Residency::clear_on_bind_queue` atomically into the cross-
+    // world `PENDING_CLEAR_ON_BIND_SLOTS` accumulator. The accumulator
+    // outlives any single frame, so a Frame-0 race where `WorldGpu`
+    // isn't yet allocated does NOT lose binds — they stay in
+    // `PENDING_CLEAR_ON_BIND_SLOTS` until the render system drains them.
+    // Mirrors the `extract_world_changes` ResMut<MainWorld> pattern at
+    // `render/construction/mod.rs:815-832`.
+    let main_world: &mut bevy::ecs::world::World = &mut **main_world.into_inner();
+
+    let shader = main_world
+        .get_resource::<StreamingShaderHandle>()
+        .map(|s| s.0.clone());
+    let static_active = main_world
+        .get_resource::<super::chunk_source::ProceduralStaticActive>()
+        .is_some();
     if static_active {
         // Static preset path: NoiseChunkSource is the only required companion;
         // there is no Residency.
-        let Some(chunk_source) = chunk_source.as_deref() else {
+        let Some(chunk_source) =
+            main_world.get_resource::<super::chunk_source::NoiseChunkSource>()
+        else {
             // NoiseChunkSource missing — should never happen if the install
             // path ran. Emit a default-ish state with the shader handle so
             // the pipeline-queue path can still progress.
@@ -391,14 +427,35 @@ pub fn extract_streaming_state(
             // (`!streaming_active` branch) doesn't consume this field.
             cold_start_complete: false,
             w3_reseed_full_world: false,
+            clear_on_bind_slots: Vec::new(),
         });
         return;
     }
-    let (Some(residency), Some(chunk_source)) =
-        (residency.as_deref(), chunk_source.as_deref())
-    else {
+    // Read main-world NoiseChunkSource (read-only, optional).
+    let chunk_source_data = main_world
+        .get_resource::<super::chunk_source::NoiseChunkSource>()
+        .map(|c| {
+            (
+                c.state,
+                c.sea_level,
+                c.terrain_amplitude,
+                c.solid_voxel_type_id,
+            )
+        });
+
+    // Now take the mutable Residency borrow (needed to DRAIN the
+    // clear-on-bind queue atomically with extract — see § B above).
+    let Some(mut residency) = main_world.get_resource_mut::<Residency>() else {
         // Even when streaming isn't active, propagate the shader handle so
         // the lazy queue path picks it up the moment streaming flips on.
+        let mut default_state = StreamingExtractRender::default();
+        default_state.noise_terrain_shader = shader;
+        commands.insert_resource(default_state);
+        return;
+    };
+    let Some((noise_state, sea_level, terrain_amplitude, solid_voxel_type_id)) =
+        chunk_source_data
+    else {
         let mut default_state = StreamingExtractRender::default();
         default_state.noise_terrain_shader = shader;
         commands.insert_resource(default_state);
@@ -419,15 +476,29 @@ pub fn extract_streaming_state(
     let w3_reseed_full_world = !residency.admissions_this_frame.is_empty()
         || !residency.evictions_this_frame.is_empty();
 
+    // Phase 2.12 (`02e-design-phase-2-12.md` § B) — DRAIN the main-world
+    // `clear_on_bind_queue` into the cross-world `PENDING_CLEAR_ON_BIND_SLOTS`
+    // accumulator. `std::mem::take` moves the Vec out of main-world residency
+    // (replacing it with an empty Vec); the freed slot-id list is appended to
+    // the accumulator which the render-world drains once `WorldGpu` is ready.
+    // This survives the Frame-0 race where `WorldGpu` isn't yet allocated by
+    // the build-once `prepare_world_gpu` system.
+    let drained_from_main = std::mem::take(&mut residency.clear_on_bind_queue);
+    if !drained_from_main.is_empty() {
+        if let Ok(mut acc) = PENDING_CLEAR_ON_BIND_SLOTS.lock() {
+            acc.extend(drained_from_main);
+        }
+    }
+
     commands.insert_resource(StreamingExtractRender {
         streaming_mode_active: true,
         static_mode_active: false,
         admissions_this_frame: residency.admissions_this_frame.clone(),
         evictions_this_frame: residency.evictions_this_frame.clone(),
-        noise_state: chunk_source.state,
-        sea_level: chunk_source.sea_level,
-        terrain_amplitude: chunk_source.terrain_amplitude,
-        solid_voxel_type_id: chunk_source.solid_voxel_type_id,
+        noise_state,
+        sea_level,
+        terrain_amplitude,
+        solid_voxel_type_id,
         noise_terrain_shader: shader,
         // Phase 2.6 — copy the live indirection table so
         // `upload_window_indirection` (Render::Queue) can write it to GPU.
@@ -436,6 +507,12 @@ pub fn extract_streaming_state(
         window_origin: residency.window.origin(),
         cold_start_complete: residency.is_cold_start_complete(),
         w3_reseed_full_world,
+        // Phase 2.12 — the `clear_on_bind_slots` field on
+        // `StreamingExtractRender` is retained for compatibility but is now
+        // populated EMPTY. The render-world clear system reads
+        // `PENDING_CLEAR_ON_BIND_SLOTS` directly (the cross-world
+        // accumulator survives the Frame-0 `WorldGpu`-not-ready race).
+        clear_on_bind_slots: Vec::new(),
     });
 }
 
@@ -474,6 +551,97 @@ pub fn upload_window_indirection(
         return;
     };
     render_queue.write_buffer(buf, 0, bytemuck::cast_slice(&s.window_indirection));
+}
+
+// -----------------------------------------------------------------------------
+// streaming-world Phase 2.12 — clear-on-bind chunks_buffer system
+// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § B, MUST-1).
+// -----------------------------------------------------------------------------
+
+/// Render-app `Render::Queue` system — zero a slot's `chunks_buffer` region
+/// the same frame `residency_driver`'s Pass 3 rebound that slot.
+///
+/// **Why this exists**: when origin shifts, up to 32 slots are evicted +
+/// rebound to new world segments. `residency_driver` writes the new
+/// indirection entries SYNCHRONOUSLY (`windowed_slot_map.rs::bind()`), but
+/// the per-admission producer node only processes `max_segments_per_frame = 4`
+/// admissions per frame. For the other ~28 rebound slots, the indirection
+/// table points the NEW window-local positions at slots whose `chunks_buffer`
+/// region STILL CONTAINS the previously-evicted segment's data. The renderer
+/// + W3 bounds chain read this stale data as if it were current — producing
+/// the "ghost of old terrain" visual corruption diagnosed in
+/// `03p-diagnosis-remaining-bugs.md` § Bug 1.
+///
+/// **The fix**: every slot in `StreamingExtractRender::clear_on_bind_slots`
+/// has its `chunks_buffer` region zeroed on a single command encoder before
+/// the producer node runs. Post-clear, the chunks decode as `state = 0 >>
+/// 30 = UNIFORM_EMPTY, AADFs = 0` — readers see UNIFORM_EMPTY (sky) for
+/// un-admitted-yet slots, NOT ghost data.
+///
+/// **Cost**: ~50 us per slot × up to 32 slots per shift = ~1.6 ms on shift
+/// frames; zero on steady-state non-shift frames (the list is empty).
+///
+/// **Ordering**: runs in `Render::Queue` (same set as
+/// [`upload_window_indirection`]). Both must run BEFORE the producer node
+/// (which lives in `Core3d::PostProcess`). Order between the two doesn't
+/// matter — both write to GPU storage buffers; the renderer's first
+/// chunks-buffer read happens at the start of the render-graph pass, well
+/// after `Render::Queue`.
+///
+/// The per-admission `clear_buffer` call at `mod.rs:3301-3305` (Phase 2.11
+/// item 3) is RETAINED as defensive code — for the 4-of-32 slots that
+/// ALSO admit this frame, both clears fire (idempotent on zero data;
+/// wgpu auto-merges the COPY-DST→COPY-DST barriers).
+pub fn clear_streaming_bound_slots(
+    world_gpu: Option<bevy::prelude::Res<crate::render::prepare::WorldGpu>>,
+    streaming_extract: Option<bevy::prelude::Res<StreamingExtractRender>>,
+    render_device: bevy::prelude::Res<bevy::render::renderer::RenderDevice>,
+    render_queue: bevy::prelude::Res<RenderQueue>,
+) {
+    let (Some(world_gpu), Some(s)) = (world_gpu, streaming_extract) else {
+        // Either `WorldGpu` not yet allocated by `prepare_world_gpu` (build-
+        // once system; takes 1-3 frames on cold-start) or the
+        // `StreamingExtractRender` resource isn't yet present (extract hasn't
+        // run for the first time). Bail; the slot ids stay in
+        // `PENDING_CLEAR_ON_BIND_SLOTS` for the next frame.
+        return;
+    };
+    if !s.streaming_mode_active {
+        return;
+    }
+    // Drain the cross-world accumulator. Survives Frame-0 races where
+    // `WorldGpu` was unavailable.
+    let pending: Vec<SlotIndex> = match PENDING_CLEAR_ON_BIND_SLOTS.lock() {
+        Ok(mut acc) => std::mem::take(&mut *acc),
+        Err(_) => return,
+    };
+    if pending.is_empty() {
+        return;
+    }
+    /// 4096 chunks per slot (16×16×16 chunks per segment).
+    const CHUNKS_PER_SLOT: u32 = 4096;
+    /// `vec2<u32>` = 8 bytes per chunk_pair.
+    const CHUNK_PAIR_BYTES: u64 = 8;
+    let slot_size_bytes = (CHUNKS_PER_SLOT as u64) * CHUNK_PAIR_BYTES;
+    let mut enc = render_device.create_command_encoder(
+        &bevy::render::render_resource::CommandEncoderDescriptor {
+            label: Some("naadf_streaming_clear_bound_slots_encoder"),
+        },
+    );
+    for slot in &pending {
+        let slot_offset_bytes = (slot.0 as u64) * slot_size_bytes;
+        enc.clear_buffer(
+            &world_gpu.chunks_buffer,
+            slot_offset_bytes,
+            Some(slot_size_bytes),
+        );
+    }
+    render_queue.submit([enc.finish()]);
+    bevy::log::debug!(
+        "streaming-world Phase 2.12: cleared {} chunks_buffer slot region(s) \
+         (clear-on-bind)",
+        pending.len(),
+    );
 }
 
 /// Build the [`NoiseTerrainParams`] for one segment admission.

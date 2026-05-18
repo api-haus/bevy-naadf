@@ -91,6 +91,32 @@ pub struct Residency {
     /// "Resident" (already dispatched); a bound slot NOT in this set is
     /// "Generating" (queued for dispatch).
     pub dispatched_once: HashSet<SlotIndex>,
+    /// streaming-world Phase 2.12
+    /// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § B,
+    /// MUST-1) — slots whose binding changed and whose `chunks_buffer`
+    /// region must be cleared by the render-world `clear_streaming_bound_slots`
+    /// system before any reader (renderer, W3 chain, per-admission producer)
+    /// consumes them.
+    ///
+    /// **Sticky semantics (Phase 2.12 fix iteration)**: this queue does NOT
+    /// auto-clear at the start of each frame. It is APPENDED to by
+    /// `WindowedSlotMap::bind()` calls in `residency_driver` Pass 3, and
+    /// only DRAINED when the render-world's clear system actually issues
+    /// the GPU clears. This avoids a race where Frame 0's residency pushes
+    /// 512 slots onto the queue but `WorldGpu` isn't yet allocated by
+    /// `prepare_world_gpu` (an asynchronous build-once system that may
+    /// take 1-3 frames to land); a per-frame auto-clear of the queue would
+    /// silently drop those 512 entries.
+    ///
+    /// The render world drains it via the `take_clear_on_bind_slots()`
+    /// helper exposed on `Residency` — the extract reads the queue + clears
+    /// it atomically in the main world. Outcome: when origin shifts and N
+    /// slots get rebound, the indirection points NEW window-local positions
+    /// at slots whose `chunks_buffer` data is freshly zero (= UNIFORM_EMPTY
+    /// = sky) instead of the previous segment's data (= ghost-of-old-
+    /// terrain). Per-admission encoders then fill them with real data over
+    /// the next ~8 frames at 4/frame.
+    pub clear_on_bind_queue: Vec<SlotIndex>,
 }
 
 impl Residency {
@@ -111,6 +137,7 @@ impl Residency {
             frame_counter: 0,
             last_camera_seg: None,
             dispatched_once: HashSet::new(),
+            clear_on_bind_queue: Vec::new(),
         }
     }
 
@@ -301,6 +328,14 @@ pub fn residency_driver(
     residency.frame_counter = residency.frame_counter.wrapping_add(1);
     residency.admissions_this_frame.clear();
     residency.evictions_this_frame.clear();
+    // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § B,
+    // MUST-1) — `clear_on_bind_queue` is STICKY across frames. Do NOT
+    // auto-clear it here: the render-world `clear_streaming_bound_slots`
+    // system drains it via the extract path when it actually issues GPU
+    // clears (gated on `WorldGpu` being available; `WorldGpu` is
+    // allocated by `prepare_world_gpu`, an asynchronous build-once system
+    // that may take 1-3 frames). A per-frame auto-clear here would race
+    // and silently drop the initial 512 cold-start binds.
 
     // Phase 2.9 fix — prefer the production-side absolute position tracker
     // when available (the streaming preset's main camera path). Falls back
@@ -401,6 +436,14 @@ pub fn residency_driver(
             break;
         };
         residency.window.bind(w, slot);
+        // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § B,
+        // MUST-1) — record this bind in the clear-on-bind queue so the
+        // render world zeroes the slot's `chunks_buffer` region BEFORE
+        // any renderer/producer consumes it. This forecloses the
+        // "indirection points at slot whose chunks_buffer still holds
+        // the previously-evicted segment's data" race (the ghost-of-
+        // old-terrain bug from `03p-diagnosis-remaining-bugs.md` § Bug 1).
+        residency.clear_on_bind_queue.push(slot);
         // Don't push to admissions_this_frame yet — the budget gate below
         // caps it. Bound slots that aren't in admissions_this_frame are
         // implicitly Generating (per D4).

@@ -443,6 +443,22 @@ pub struct AppArgs {
     /// 2.11 bug class (W3 chain baking long stale skips through yet-to-be-
     /// admitted zero-chunks).
     pub streaming_aadf_parity_mode: bool,
+    /// streaming-world Phase 2.12
+    /// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § A,
+    /// MUST-3) — `true` when the e2e harness is running the **static
+    /// subprocess** of the `--gate streaming-framebuffer-diff` compare. The
+    /// driver routes through a single-shot Warmup → Shoot → Drain flow, the
+    /// camera-pin system pins to the shared framebuffer-diff pose, and the
+    /// drain phase saves `framebuffer_static.png`. Mutually exclusive with
+    /// `streaming_framebuffer_streaming_phase`.
+    pub streaming_framebuffer_static_phase: bool,
+    /// streaming-world Phase 2.12 — `true` when the e2e harness is running
+    /// the **streaming subprocess** of `--gate streaming-framebuffer-diff`.
+    /// Same shape as `streaming_framebuffer_static_phase` but installs
+    /// `ProceduralStreaming` and runs an extended cold-start drain (~256
+    /// ticks at 4 admissions/frame so all 512 segments admit before the
+    /// screenshot). Saves `framebuffer_streaming.png`.
+    pub streaming_framebuffer_streaming_phase: bool,
     /// streaming-world Phase 2.4 — runs the `--noise-static-world` e2e gate.
     /// When `true`, the e2e harness boots a `GridPreset::ProceduralStatic`
     /// world (the full 512-segment fixed-world container, generated once at
@@ -502,6 +518,8 @@ impl Default for AppArgs {
             vox_gpu_oracle_gpu_phase: false,
             streaming_window_mode: false,
             streaming_aadf_parity_mode: false,
+            streaming_framebuffer_static_phase: false,
+            streaming_framebuffer_streaming_phase: false,
             noise_static_mode: false,
             vram_budget_mib: 1024,
             max_segments_per_frame: 4,

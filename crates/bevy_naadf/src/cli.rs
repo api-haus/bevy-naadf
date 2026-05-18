@@ -287,6 +287,21 @@ fn apply_gate_defaults(args: &mut AppArgs, gate: Gate) {
         Gate::StreamingAadfParity => {
             crate::e2e::streaming_aadf_parity::apply_streaming_aadf_parity_defaults(args);
         }
+        Gate::StreamingFramebufferDiff => {
+            // Top-level subprocess orchestrator; short-circuited in main
+            // BEFORE build_app (mirrors `Gate::VoxGpuOracle`). No defaults
+            // applied to args.
+        }
+        Gate::StreamingFramebufferStatic => {
+            crate::e2e::streaming_framebuffer_diff::apply_streaming_framebuffer_static_defaults(
+                args,
+            );
+        }
+        Gate::StreamingFramebufferStreaming => {
+            crate::e2e::streaming_framebuffer_diff::apply_streaming_framebuffer_streaming_defaults(
+                args,
+            );
+        }
         Gate::NoiseStaticWorld => {
             crate::e2e::noise_static_world::apply_noise_static_defaults(args);
         }
@@ -383,6 +398,20 @@ pub enum Gate {
     /// distances that cross real terrain). Catches the Phase 2.11
     /// regression class (`03n-diagnosis-aadf-building.md` § Root cause).
     StreamingAadfParity,
+    /// streaming-world Phase 2.12
+    /// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § A,
+    /// MUST-3) — observable-output gate. Spawns two subprocesses (static
+    /// + streaming) at the shared spawn pose with the same seed, captures
+    /// PNGs, then SSIM-compares + mean-Δ-asserts. Catches the bug class
+    /// the tautological `StreamingAadfParity` gate missed.
+    StreamingFramebufferDiff,
+    /// Subprocess phase of [`Gate::StreamingFramebufferDiff`] — installs
+    /// the static preset, captures `framebuffer_static.png`.
+    StreamingFramebufferStatic,
+    /// Subprocess phase of [`Gate::StreamingFramebufferDiff`] — installs
+    /// the streaming preset, captures `framebuffer_streaming.png` after a
+    /// 256-tick cold-start drain.
+    StreamingFramebufferStreaming,
     /// streaming-world Phase 2.4 — boots ProceduralStatic, asserts strict
     /// luminance / non-sky-ratio floors on the post-warmup frame.
     NoiseStaticWorld,
@@ -439,6 +468,9 @@ impl Gate {
             Gate::Baseline => "baseline",
             Gate::StreamingWindow => "streaming-window",
             Gate::StreamingAadfParity => "streaming-aadf-parity",
+            Gate::StreamingFramebufferDiff => "streaming-framebuffer-diff",
+            Gate::StreamingFramebufferStatic => "streaming-framebuffer-static",
+            Gate::StreamingFramebufferStreaming => "streaming-framebuffer-streaming",
             Gate::NoiseStaticWorld => "noise-static-world",
             Gate::WgslNoiseOracle => "wgsl-noise-oracle",
             Gate::ValidateGpuConstruction => "validate-gpu-construction",

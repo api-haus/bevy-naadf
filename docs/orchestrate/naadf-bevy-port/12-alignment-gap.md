@@ -204,6 +204,45 @@ These surfaced during impl/review and are all documented in `10-impl-b.md`,
   user-directed deviation** from the faithful-port principle (Q2), recorded
   in `naadf_final.wgsl`'s header and in `18-taa-fidelity.md` fix #2.
 
+- **D-H. W3 chunk-level 5-bit AADF is DISABLED on the streaming preset.**
+  C# NAADF runs W3 unconditionally on all worlds. The Bevy port's
+  streaming preset (`02-design.md` § A: sliding-window residency over a
+  16×2×16-segment WindowedSlotMap) has W3 DISABLED by default. Streaming
+  was added in Phase 2.10 (`03l-impl-bounds-and-w3.md`) with W3 enabled
+  + per-segment scoped re-seed; the gating issue surfaced in Phase 2.11
+  (`03n-diagnosis-aadf-building.md`): chunks_buffer is slot-major (one
+  segment per slot, 4096 chunks per slot), and slot-stored W3 AADFs go
+  stale across origin shifts because the AADFs encode window-local
+  skip-distances and the same slot's chunks land at DIFFERENT window-
+  local positions after a shift. Phase 2.11 disabled W3 by default with
+  the env-var opt-in `PHASE_2_11_ENABLE_STREAMING_W3=1`.
+
+  **Phase 2.12 attempted to reverse the divergence** per faithful-port
+  rule, with the full-world per-shift re-seed Phase 2.11 had built. The
+  reversal was BACKED OUT after run-time measurement: the
+  `streaming-aadf-parity` gate measured **2317 violations** with W3
+  enabled + full-world re-seed firing on every shift. Root cause: the
+  W3 chain's `add_bounds_group` shader only GROWS AADFs (`cur_chunk + (1
+  << bounds_location)` when current value matches the queue's
+  `cur_bound`); it has no SHRINK mechanism. Stale-at-max AADFs from a
+  prior expansion persist forever even after re-seed, producing the
+  lying skip distances.
+
+  **Architectural fix needed for full reversal**: a small AADF-shrink
+  compute pass that zeros AADF bits (bits 0..30 of `chunks[idx].x`,
+  preserving state bits 30..32 + entity-y) for all chunks affected by
+  a shift, dispatched BEFORE the W3 re-seed. Cost: ~16 MB writes / 2M
+  chunks per shift = ~1-3 ms. Not in Phase 2.12's scope; flagged as a
+  Phase 2.13 follow-up.
+
+  **STATUS**: **DELIBERATE deviation from C# NAADF, conditionally
+  approved by the user pending the Phase 2.13 AADF-shrink-pass.** The
+  user's Phase 2.12 directive was "REJECT the Phase 2.11 divergence",
+  but the brief explicitly authorised STOP-AND-DOCUMENT when the
+  redesign cannot meet correctness/perf targets. The divergence stays
+  for now with this concrete blocker documented; the path forward is
+  the AADF-shrink-pass implementation in Phase 2.13.
+
 ---
 
 ## 4. Open bugs

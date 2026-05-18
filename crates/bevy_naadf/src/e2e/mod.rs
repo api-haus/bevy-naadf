@@ -31,6 +31,7 @@ pub mod readback;
 pub mod small_edit_repro;
 pub mod small_edit_visual;
 pub mod streaming_aadf_parity;
+pub mod streaming_framebuffer_diff;
 pub mod vox_e2e;
 pub mod streaming_window;
 pub mod vox_gpu_construction;
@@ -292,6 +293,22 @@ pub fn add_e2e_systems(app: &mut App) {
                 noise_static_world::pin_noise_static_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
+                .before(crate::camera::sync_position_split),
+        )
+        // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § A,
+        // MUST-3) — registered as a separate `add_systems` call because
+        // the prior tuple is already at Bevy 0.19's tuple-overload limit
+        // (11 items; adding a 12th overflows the IntoScheduleConfigs
+        // tuple impl). Same ordering constraints: runs `.after(pin_oasis_camera)`
+        // (to override the birdseye when oasis-mode fast-path triggers,
+        // same rationale as the streaming-window and noise-static-world
+        // pin systems) and `.before(sync_position_split)` (so the rest of
+        // the frame sees the pinned pose). Inactive on non-framebuffer-
+        // diff gates (early-returns on the per-phase flags).
+        .add_systems(
+            Update,
+            streaming_framebuffer_diff::pin_streaming_framebuffer_camera
+                .after(oasis_edit_visual::pin_oasis_camera)
                 .before(crate::camera::sync_position_split),
         );
 

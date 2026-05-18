@@ -45,8 +45,9 @@ pub use noise_dispatch::{
     create_noise_terrain_params_buffer, extract_streaming_state,
     noise_terrain_layout_descriptor, queue_noise_terrain_pipeline,
     queue_noise_terrain_pipeline_with_handle, seed_noise_terrain_shader,
-    upload_window_indirection, NoiseTerrainParams, StreamingExtractRender,
-    StreamingShaderHandle, NOISE_TERRAIN_SHADER_PATH, NOISE_TERRAIN_SHADER_SRC,
+    clear_streaming_bound_slots, upload_window_indirection, NoiseTerrainParams,
+    StreamingExtractRender, StreamingShaderHandle, NOISE_TERRAIN_SHADER_PATH,
+    NOISE_TERRAIN_SHADER_SRC,
 };
 pub use residency::{
     assert_vram_budget_sufficient, compute_slab_total_mib, residency_driver,
@@ -123,6 +124,18 @@ impl Plugin for StreamingPlugin {
             .add_systems(
                 Render,
                 upload_window_indirection.in_set(RenderSystems::Queue),
+            )
+            // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § B,
+            // MUST-1) — zero `chunks_buffer` slot regions the same frame
+            // their indirection-table entry rebound. Runs in
+            // `Render::Queue` alongside `upload_window_indirection`; both
+            // must complete before the `naadf_gpu_producer_node` (in
+            // `Core3d::PostProcess`) consumes the world bind group.
+            // Forecloses the ghost-of-old-terrain bug at the indirection
+            // race level (`03p-diagnosis-remaining-bugs.md` § Bug 1).
+            .add_systems(
+                Render,
+                clear_streaming_bound_slots.in_set(RenderSystems::Queue),
             );
     }
 }

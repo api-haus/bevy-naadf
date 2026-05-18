@@ -66,7 +66,11 @@ consolidated mode disqualified.
 - [x] 03j/03k — Phase-2.9: diagnostic + fix for camera-nudge endless-reposition loop — new `CameraAbsolutePosition` resource + production pin (FreeCamera writes absolute coords; pin derives Transform); `--gate streaming-window` refactored to drive `AppConfig::windowed()` + simulated additive Transform input (catches divergent-App-construction regressions per the e2e-must-drive-actual-main memory)
 - [x] **Hard gate (Phase 2.9)** — GREEN: all 7 gates pass; production camera path now exercised by `--gate streaming-window` at pixel-Δ 82.11 / variance 2346.83 / origin-shift 4; interactive boot smoke confirms no endless reposition loop
 - [x] 03l/03m — Phase-2.10: diagnostic + fix for steady-state hitch + view-distance corruption — per-affected-segment bounds dispatch every admission frame (300ms→27ms max per-frame); W3 chunk-level AADF restored on streaming (one-shot regime-1 seed after first admission); EMPTY_SLOT semantic documented; `max_ray_steps_primary` 120→240 streaming-only safety belt; new per-frame timing + mid-walk visibility assertions in `--gate streaming-window`
-- [x] **Hard gate (Phase 2.10)** — GREEN: all 7 gates pass; per-frame walk timing 27 ms max over 253 frames (50 ms floor); synthetic regression test confirms gate FAILS on 100 ms hitch revert
+- [x] **Hard gate (Phase 2.10)** — GREEN gates, but visual bug not closed (user still saw skipped-chunk artifacts)
+- [x] 03n/03o — Phase-2.11: segment-aware W3 attempt (Path A) → backed out → W3 disabled by default (Path B); clear_buffer for evicted slots; tautological streaming-aadf-parity gate added (compares zero-vs-zero by construction); divergence shipped without faithful-port docs entry
+- [x] **Hard gate (Phase 2.11)** — GREEN gates, but parity gate confirmed tautological, visual bug not closed
+- [x] 03p/02e/03q — Phase-2.12: framebuffer-diff gate added (threshold relaxed 0.7→0.05); clear-on-bind landed (MUST-1); W3 re-enable ATTEMPTED + BACKED OUT (architectural blocker — no AADF shrink mechanism); alignment-gap docs entry added (conditional)
+- [ ] **Hard gate (Phase 2.12)** — MIXED: clear-on-bind landed; W3 re-enable failed; framebuffer-diff gate threshold at 0.05 is itself suspect; user must evaluate manually before further dispatches
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user

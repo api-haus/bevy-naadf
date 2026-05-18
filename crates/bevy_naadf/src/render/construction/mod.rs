@@ -1924,6 +1924,13 @@ pub fn prepare_construction(
     let want_w3_seed_non_streaming = !gpu.bounds_initialized
         && (!want_gpu_producer || gpu.gpu_producer_has_run)
         && !noise_dispatch_active;
+    // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § C, MUST-2
+    // ATTEMPT BACKED OUT) — the W3-on-static seed was added briefly to
+    // make the framebuffer-diff gate apples-to-apples with W3-enabled
+    // streaming, but the W3 re-enable was itself backed out (see the
+    // long explanation at `prepare_construction:1970+`). Reverted to
+    // Phase 2.4 design (no W3 on static).
+    let want_w3_seed_static: bool = false;
     // streaming-world Phase 2.11
     // (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md`
     // punch-list item 1) — defer the W3 regime-1 seed on the streaming
@@ -1961,21 +1968,48 @@ pub fn prepare_construction(
     // 240 × 16 = 3840 voxels of empty space, easily reaching any in-window
     // terrain).
     //
-    // For environments that need W3 (e.g. a future preset with much larger
-    // empty regions), the seed can be re-enabled via the env var
-    // `PHASE_2_11_ENABLE_STREAMING_W3=1`. The gate then fires once
-    // cold-start is complete (Item 1's original design), and a full-world
-    // re-seed fires on every shift (Item 2's full-world variant). Both
-    // come with the cost noted above.
+    // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § C, MUST-2
+    // ATTEMPT BACKED OUT) — W3 was re-enabled on streaming as the user-
+    // authorized faithful-port reversal of the Phase 2.11 divergence. The
+    // attempt FAILED because the W3 chain has no mechanism to shrink
+    // AADFs that were already maxed-out (5-bit = 31) on a prior expansion;
+    // when origin shifts and the same chunks are now at different
+    // window-local positions, the re-seed marks the chunks for re-
+    // processing but `compute_group_bounds` reads stale AADFs (`cur_chunk
+    // = streaming_chunk_load_bc(...)`) and grows them only when their
+    // current value matches the queue's `cur_bound` — which is 0 for a
+    // re-seed, so AADFs already at 31 never get re-evaluated and persist
+    // as "lying" skip distances. The `streaming-aadf-parity` gate
+    // measured 2317 violations under this configuration (same number
+    // Phase 2.11 03o's Surprise #1 measured for the scoped re-seed —
+    // turns out the "full-world re-seed → 0 violations" claim in
+    // Phase 2.11 03o was NOT actually verified at run time; my Phase
+    // 2.12 reproduction with the full-world re-seed produces the same
+    // 2317 violations).
+    //
+    // The architecturally correct fix would be an additional compute
+    // pass that zeros AADF bits (bits 0..30 of chunks[idx].x, preserving
+    // state bits 30..32 + entity_y) on every shift frame, before the W3
+    // re-seed. That's ~16 MB writes for 2M chunks via a custom compute
+    // shader (~1-3 ms per shift). It's a clean fix but requires a
+    // dedicated shader + bind group + scheduling work that exceeds the
+    // Phase 2.12 scope.
+    //
+    // For Phase 2.12: REVERT to W3 disabled on streaming. Re-introduce
+    // the env-var gate so a future "Phase 2.13 W3-shrink-pass"
+    // implementation can re-enable. The faithful-port divergence stays
+    // on the books — but the diagnostic measurement (2317 violations
+    // when re-enabled) is now CONCRETE EVIDENCE that the re-enable as
+    // proposed by `03p` § MUST-2 reject path is insufficient and needs
+    // an additional shrink-pass to be correct.
+    //
+    // High-risk fresh-eyes item: design a chunks-AADF-clear compute
+    // shader (~1 ms per dispatch) to make the W3 re-enable correct.
     let _enable_streaming_w3: bool =
         std::env::var("PHASE_2_11_ENABLE_STREAMING_W3")
             .ok()
             .map(|v| v == "1")
             .unwrap_or(false);
-    // streaming-world Phase 2.11 — synthetic regression knob: bypass Item 1's
-    // cold-start gate so the W3 seed fires on the FIRST admission frame
-    // (reproduces the diagnostic's root-cause scenario). The parity gate's
-    // self-consistency check should report violations under this knob.
     let _synthetic_disable_cold_start_gate: bool = std::env::var(
         "PHASE_2_11_SYNTHETIC_DISABLE_COLD_START_GATE",
     )
@@ -1995,7 +2029,7 @@ pub fn prepare_construction(
         && !gpu.streaming_w3_seed_dispatched;
     if construction_config.gpu_construction_enabled
         && bound_group_count > 0
-        && (want_w3_seed_non_streaming || want_w3_seed_streaming)
+        && (want_w3_seed_non_streaming || want_w3_seed_streaming || want_w3_seed_static)
     {
         let Some(initial_pipeline) = pipeline_cache
             .get_compute_pipeline(construction_pipelines.bounds_calc_pipeline_add_initial)
@@ -2025,6 +2059,12 @@ pub fn prepare_construction(
             bevy::log::info!(
                 "streaming-world Phase 2.10: W3 regime-1 seed dispatched \
                  (one-shot — chunk-level 5-bit AADF queue now active)."
+            );
+        } else if want_w3_seed_static {
+            gpu.streaming_w3_seed_dispatched = true;
+            bevy::log::info!(
+                "streaming-world Phase 2.12: W3 regime-1 seed dispatched for \
+                 static preset (faithful-port alignment with C# NAADF)."
             );
         } else {
             gpu.bounds_initialized = true;
@@ -3374,13 +3414,13 @@ pub fn naadf_gpu_producer_node(
         // regime-2 background queue (`naadf_bounds_compute_node` gates on
         // this flag) — see Phase 2.10 punch-list item 3 below for the
         // matching W3 regime-1 seed restoration.
-        // streaming-world Phase 2.11 — flip `bounds_initialized = true`
-        // ONLY when the W3 chain has been explicitly enabled on streaming
-        // (via `PHASE_2_11_ENABLE_STREAMING_W3=1`). With the chain disabled
-        // (default), keeping `bounds_initialized = false` ensures
-        // `naadf_bounds_compute_node` early-returns (`bounds_calc.rs:348-350`)
-        // — the chain never reads the degenerate zero-init
-        // `bound_group_queues` and never writes corrupted AADFs.
+        // streaming-world Phase 2.12 — Phase 2.11's env-var gate for
+        // bounds_initialized retained (W3 re-enable backed out — see the
+        // long explanation at `prepare_construction:1970+` about the
+        // shrink-pass missing). With the chain disabled (default),
+        // keeping `bounds_initialized = false` ensures
+        // `naadf_bounds_compute_node` early-returns and never writes
+        // corrupted AADFs.
         let _enable_streaming_w3_for_flag: bool =
             std::env::var("PHASE_2_11_ENABLE_STREAMING_W3")
                 .ok()
@@ -3434,9 +3474,11 @@ pub fn naadf_gpu_producer_node(
         .ok()
         .map(|v| v == "1")
         .unwrap_or(false);
-        // streaming-world Phase 2.11 — the per-shift full-world re-seed
-        // only fires when the W3 chain is enabled on streaming (default
-        // OFF; see `prepare_construction:1917+` comment block).
+        // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § C,
+        // MUST-2 ATTEMPT BACKED OUT) — Phase 2.11's env-var gate retained
+        // (W3 re-enable backed out because the per-shift re-seed alone
+        // doesn't reset stale AADFs that were already at max=31; see the
+        // long explanation at `prepare_construction:1970+`).
         let _enable_streaming_w3: bool =
             std::env::var("PHASE_2_11_ENABLE_STREAMING_W3")
                 .ok()

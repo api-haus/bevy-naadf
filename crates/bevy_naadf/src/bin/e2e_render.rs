@@ -91,6 +91,14 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Some(Gate::StreamingFramebufferDiff) => {
+            // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § A) —
+            // top-level subprocess orchestrator. Spawns the static + streaming
+            // subprocesses (same shape as `Gate::VoxGpuOracle`) and runs the
+            // SSIM + mean-Δ compare on the two saved PNGs.
+            let code = bevy_naadf::e2e::streaming_framebuffer_diff::run_streaming_framebuffer_diff_compare();
+            return ExitCode::from(code);
+        }
         _ => {}
     }
 
