@@ -46,8 +46,8 @@ design; render-world gating fix is moderate blast radius rather than low.
 - [x] Step 6a hard gate — user confirmed root cause from observation
 - [x] Step 6b — Architecture dispatch (`03-design.md`)
 - [x] Step 6b hard gate — user approved fix shape (Candidate 1 focused-refresh) + Playwright per-channel assertion added to impl scope
-- [ ] Step 6c — Implementation dispatch (`04-impl.md`) ← **next**
-- [ ] Step 6c hard gate — user confirms web build + native gates green
+- [x] Step 6c — Implementation dispatch (renderer fix in parallel-session `dbdc2bf`; Playwright canvas-readback correction this session; both logged in `04-impl.md`)
+- [ ] Step 6c hard gate — user confirms web build + native gates green ← **here**
 - [ ] Step 6d — Fresh-eyes review dispatch (`05-review.md`)
 - [ ] Step 6d hard gate — user confirms reviewer flags reconciled
 - [ ] Exit
