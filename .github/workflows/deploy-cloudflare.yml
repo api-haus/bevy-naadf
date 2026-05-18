@@ -91,6 +91,11 @@ jobs:
       BINARYEN_CORES: "1" # prevent wasm-opt SIGSEGV from a race condition
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Required: `.vox` assets uploaded to R2 below are LFS-tracked.
+          # Without this, the R2 upload ships the LFS pointer file and the
+          # runtime parser rejects it as "Not a valid MagicaVoxel .vox file".
+          lfs: true
 
       - name: Install system dependencies
         # clang + mold: the workspace `.cargo/config.toml` host linker, used
