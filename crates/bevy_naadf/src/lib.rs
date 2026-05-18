@@ -668,13 +668,11 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // succeeds (same ordering as `NaadfRenderPlugin`'s
             // `init_gpu_resource::<NaadfPipelines>()`).
             render::construction::ConstructionPlugin,
-            // InstaMAT baked-material loader — registers `MaterialRonLoader` so
+            // `material.ron` loader — registers `MaterialRonLoader` so
             // `materials/<name>/material.ron` resolves to a `StandardMaterial`.
             // Infrastructure only: nothing in the scene consumes a baked
             // material yet (wiring baked PBR into the custom voxel render path
-            // is a separate future effort). The `bevy-instamat` dependency is
-            // the `instamat` feature OFF — zero FFI / libloading / image-baker
-            // code enters this build.
+            // is a separate future effort).
             bevy_instamat::BakedMaterialPlugin,
             // Registers the `*.texarray.ron` asset loader. The plugin also wires
             // the native Basis `AssetProcessor`, but that only activates when an

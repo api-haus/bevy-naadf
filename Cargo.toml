@@ -2,9 +2,8 @@
 #
 #   crates/bevy_naadf   — the Bevy 0.19 NAADF voxel renderer (lib + `bevy-naadf`
 #                         production binary + `e2e_render` test harness).
-#   crates/bevy-instamat — the InstaMAT → Bevy integration: a feature-free baked-
-#                         material loader the game depends on, plus a dev-side
-#                         offline batch baker behind the `instamat` feature.
+#   crates/bevy-instamat — `material.ron` + sibling PNG asset loader yielding
+#                         `StandardMaterial`. Small loader crate.
 #   crates/voxel_noise  — the FastNoise2 wrapper: a native Rust API plus a
 #                         C-ABI surface built to `wasm32-unknown-emscripten`
 #                         for the in-browser JS bridge. Carried over from

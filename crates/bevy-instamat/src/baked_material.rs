@@ -1,22 +1,17 @@
-//! Game-side consumption of baked InstaMAT materials — **feature-free**.
+//! `material.ron` → `StandardMaterial` asset loader.
 //!
-//! This module compiles into the shippable game with **no `instamat` feature**.
-//! It contains zero InstaMAT / FFI / `libloading` symbols — only `bevy`,
-//! `serde`, `ron`, and `std`.
-//!
-//! The offline `instamat_bake` tool (`src/bin/instamat_bake.rs`, dev-side only)
-//! writes a material as per-channel PNG files plus a `material.ron` manifest
-//! under `assets/materials/<name>/`. This module is the *other* side of that
-//! contract: [`MaterialRonLoader`] is a stock Bevy [`AssetLoader`] that
-//! RON-parses the manifest, loads the sibling PNGs through Bevy's own
+//! A `material.ron` manifest names per-channel PNG filenames (base color,
+//! normal, packed metallic/roughness, occlusion, emissive, height) plus
+//! scalar fallbacks. [`MaterialRonLoader`] is a stock Bevy [`AssetLoader`]
+//! that RON-parses the manifest, loads the sibling PNGs through Bevy's own
 //! `ImageLoader`, and yields a `StandardMaterial`. The game does:
 //!
 //! ```ignore
-//! asset_server.load::<StandardMaterial>("materials/steampunk_metal/material.ron")
+//! asset_server.load::<StandardMaterial>("materials/<name>/material.ron")
 //! ```
 //!
-//! and gets a `Handle<StandardMaterial>` straight away — no InstaMAT on this
-//! path, no custom wrapper asset.
+//! and gets a `Handle<StandardMaterial>` straight away — no custom wrapper
+//! asset.
 
 use bevy::asset::io::Reader;
 use bevy::asset::{AssetLoader, LoadContext};
@@ -26,16 +21,13 @@ use serde::{Deserialize, Serialize};
 
 // ---- material.ron schema ------------------------------------------------
 
-/// The `material.ron` schema — the contract between the dev-side bake tool and
-/// the game. RON is field-name-keyed; this struct is **structurally identical**
-/// to `MaterialRonOut` in `src/instamat/bake_output.rs` (the bake side), so the
-/// two round-trip. **Keep the field names in sync with that struct.**
+/// The `material.ron` schema. RON is field-name-keyed.
 ///
-/// A `None` filename means the channel was not baked; the loader falls back to
-/// the scalar fields for those channels.
+/// A `None` filename means the channel was not authored; the loader falls back
+/// to the scalar fields for those channels.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MaterialRon {
-    /// Material name (from the `.imp` file stem; informational).
+    /// Material name (informational).
     pub name: String,
     /// Base-color / albedo PNG, relative to `material.ron`'s own directory.
     pub base_color: Option<String>,
@@ -48,11 +40,9 @@ pub struct MaterialRon {
     /// Emissive PNG.
     pub emissive: Option<String>,
     /// Height / displacement PNG — a `Luma16` single-channel grayscale, linear
-    /// (white = high, the InstaMAT convention). Feeds
-    /// `StandardMaterial::depth_map` for parallax mapping; `#[serde(default)]`
-    /// so manifests written before the height field was added still load (the
-    /// `None` default = "no height baked", same as a freshly-baked material
-    /// whose `.imp` produced no height output).
+    /// (white = high). Feeds `StandardMaterial::depth_map` for parallax
+    /// mapping; `#[serde(default)]` so manifests written before the height
+    /// field was added still load (`None` default = "no height channel").
     #[serde(default)]
     pub height: Option<String>,
     /// Scalar roughness fallback for channels that were not baked (mirrors
@@ -178,7 +168,7 @@ impl AssetLoader for MaterialRonLoader {
         };
         // Height is linear; Bevy's PNG loader decodes `Luma16` into a 16-bit
         // single-channel `Image`, which `depth_map` samples as R. The R channel
-        // therefore carries the full 65 536-step precision the baker preserved.
+        // therefore carries the full 65 536-step Luma16 precision.
         let depth_map = match manifest.height.as_deref() {
             Some(f) => Some(load_png(f, false)?),
             None => None,

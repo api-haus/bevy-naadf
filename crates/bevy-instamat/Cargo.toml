@@ -2,42 +2,14 @@
 name = "bevy-instamat"
 version = "0.1.0"
 edition = "2021"
-description = "InstaMAT → Bevy integration: a feature-free baked-material loader, plus a dev-side offline batch baker behind the `instamat` feature."
+description = "Bevy asset loader for `material.ron` manifests + sibling PBR PNGs → `StandardMaterial`."
 license = "MIT"
 
 [dependencies]
-# Feature-free deps — the game crate compiles exactly these. The `material.ron`
-# loader needs only bevy_asset / bevy_image / bevy_pbr, all in `bevy`'s default
-# feature set, so no extra bevy features are enabled here. (`bevy-instamat` is
-# Solari-agnostic — reusable material-loading infrastructure, not tied to any
-# renderer.) The bevy version is pinned to match `crates/bevy_naadf` exactly so
-# the workspace resolves a single copy.
+# `material.ron` loader deps. The loader needs only bevy_asset / bevy_image /
+# bevy_pbr, all in `bevy`'s default feature set, so no extra bevy features
+# are enabled here. The bevy version is pinned to match `crates/bevy_naadf`
+# exactly so the workspace resolves a single copy.
 bevy = { version = "=0.19.0-rc.1" }
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
-
-# `instamat`-feature-only deps — the dev-side baker. The game never enables the
-# feature, so these never enter the game build.
-# libloading: runtime dlopen of libInstaMATNativeInterface.so (no build.rs).
-# image: PNG encoding in `bake_output.rs`. Pinned to the exact version
-# `crates/bevy_naadf` already uses (its e2e harness encodes PNGs) so the
-# workspace resolves a single `image` copy.
-libloading = { version = "0.8", optional = true }
-image = { version = "=0.25.10", default-features = false, features = ["png"], optional = true }
-
-[features]
-# OFF by default. Gates the FFI + bake modules (`src/instamat/`) and the
-# `instamat_bake` batch-baker binary. The game crate depends on this crate with
-# the feature OFF, so `cargo build -p bevy-naadf` compiles ZERO InstaMAT code.
-# Needs InstaMAT Studio + the extracted native-interface wrapper .so (see
-# `.envrc.example`). NOTE: no `bevy/asset_processor`, no `bevy/file_watcher` —
-# v1's AssetProcessor path is rejected; the baker is a plain CLI.
-instamat = ["dep:libloading", "dep:image"]
-
-# The batch baker. `required-features` keeps it out of a feature-off build
-# entirely — `cargo build -p bevy-instamat` (no feature) does not even try to
-# compile this target, so no whole-file `#[cfg]` stub is needed.
-[[bin]]
-name = "instamat_bake"
-path = "src/bin/instamat_bake.rs"
-required-features = ["instamat"]

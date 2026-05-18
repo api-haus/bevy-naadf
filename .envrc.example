@@ -13,12 +13,3 @@ export DLSS_SDK="/path/to/DLSS"
 # Vulkan headers + loader prefix. The system prefix is fine on most Linux
 # distros; point at the LunarG SDK's versioned directory if you use that.
 export VULKAN_SDK="/usr"
-
-# --- InstaMAT (optional; only needed to run the `instamat_bake` dev tool) ---
-# Absolute path to libInstaMATNativeInterface.so, extracted from the
-# "InstaMAT for Blender" plugin zip (instamat/DLLs/Linux64/). This wrapper is
-# proprietary and is NOT vendored in this repo.
-export INSTAMAT_NATIVE_INTERFACE="/path/to/libInstaMATNativeInterface.so"
-# InstaMAT Studio install root (contains lib/libInstaMAT.so). Defaults to
-# /opt/InstaMATStudio if unset.
-export INSTAMAT_STUDIO="/opt/InstaMATStudio"
