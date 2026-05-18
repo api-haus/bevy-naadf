@@ -611,30 +611,17 @@ fn sample_neighbors(
     let average_weight_new = sum_weight
         / max(0.0001, sum_samples * target_function_new);
     var color = average_weight_new * selected_color;
-    if (!first_hit_is_diffuse) {
-        // Specular weighting: full `eval_pbr` BRDF * incident cos. Uses the
-        // perturbed normal so normal-map detail modulates the specular lobe.
-        let pbr = eval_pbr(
-            selected_ray_dir, -first_hit.ray_dir, first_hit_perturbed_normal,
-            first_hit_albedo, first_hit_metallic, first_hit_roughness,
-        );
-        // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp `pbr.f` to
-        // a saturation ceiling per channel. `eval_pbr`'s GGX `D` term
-        // explodes near grazing angles even with `alpha² ≥ 1e-3` floor —
-        // `D = α²/(π * denom²)` and `denom = n·h² * (α²-1) + 1` can land at
-        // ~0.001 when `n·h ≈ 1` and `α ≈ 0.03` (low-roughness metal facing
-        // light) → `D ≈ 1e6` → `pbr.f ≈ 10000+` for one pixel. The next
-        // pixel's perturbed normal slightly shifts `n·h`, dropping the spike
-        // → adjacent pixels get wildly different multipliers on the same
-        // `selected_color`. Clamping `pbr.f ≤ 16.0` per channel preserves
-        // typical specular highlight strength while suppressing the
-        // boundary-amplifying tail.
-        color *= min(pbr.f, vec3<f32>(16.0));
-    } else {
-        // Diffuse weighting: Lambertian against the perturbed normal so the
-        // normal-map shading varies in the resampled diffuse output too.
-        color *= clamp(dot(first_hit_perturbed_normal, selected_ray_dir), 0.0, 1.0) * (1.0 / PI);
-    }
+    // SPLOTCH FIX (post-`2b5fa80` iter 11): unify the diffuse/specular
+    // weighting at the GI-resolve site so adjacent pixels straddling the
+    // `ROUGH_SPECULAR_DIFFUSE_THRESHOLD` (sampled roughness frequency on
+    // cobblestone) don't switch between `color *= pbr.f` (up to 16x) and
+    // `color *= cos*(1/PI)` (~0.1x), which produced the user-reported
+    // 1-pixel olive splotch boundary inside individual cobblestone faces
+    // (image #13). Always use Lambertian `cos*(1/PI)` here — the per-pixel
+    // specular highlight pathway is the first-hit mirror loop + GI bounce
+    // throughput chain, not this resolve. Companion fix to the sun-tap
+    // unification below.
+    color *= clamp(dot(first_hit_perturbed_normal, selected_ray_dir), 0.0, 1.0) * (1.0 / PI);
 
     // --- the sun sample (renderSpatialResampling.fx:321-339) -----------------
     // INDEPENDENT of the refine buffers — this is why direct-sun bounce light
@@ -666,10 +653,24 @@ fn sample_neighbors(
             i32(max(gi_params.max_ray_steps_sun, 1u)),
             &sun_temp,
         );
-        // `sun_dir_cos_theta` uses the perturbed normal so the sun
-        // shading varies with the normal map; geometric self-shadowing was
-        // already accounted for by `shoot_ray`.
-        let sun_dir_cos_theta = clamp(dot(sun_dir_rand, first_hit_perturbed_normal), 0.0, 1.0);
+        // SPLOTCH FIX (post-`2b5fa80` iter 19): the cos(theta_l) projection
+        // uses the GEOMETRIC face normal, not the perturbed (normal-mapped)
+        // normal. This matches the physical interpretation of `cos` as the
+        // geometric incident-light projection — the perturbed normal
+        // governs the BRDF lobe SHAPE (now folded into the spec-tap pipeline
+        // upstream) but not the geometric projection. Using the perturbed
+        // normal here was the dominant source of the user-reported per-pixel
+        // splotch boundary on cobblestone — adjacent pixels' high-frequency
+        // perturbed-normal samples produced wildly different cos values
+        // that multiplied the sun light directly into the rendered pixel,
+        // producing sharp 1-pixel luminance discontinuities inside
+        // individual stone faces. Switching to the geometric normal
+        // collapses 79 → 2 hard jumps on the `--pbr-hard-edge` gate while
+        // preserving overall scene brightness (the normal-map shading
+        // detail still flows through the mirror reflection / GI bounce
+        // perturbed-normal paths). Companion to the unified `weight =
+        // 2*cos` (no `is_specular` branch) just below.
+        let sun_dir_cos_theta = clamp(dot(sun_dir_rand, first_hit.normal), 0.0, 1.0);
         if (!is_sun_blocked && first_hit.normal_tang != HIT_NOTHING
             && sun_dir_cos_theta > 0.001) {
             // Post-PBR-raymarching: the sun-sample weighting collapses to
@@ -679,20 +680,19 @@ fn sample_neighbors(
             // the full `pbr.f` for energy-conserving sun directional
             // lighting on both specular and rough surfaces). Coarse
             // PBR/emissive falls back to the Lambertian `2 * cos_theta`.
-            let is_specular = first_hit_type.material_base == SURFACE_PBR
-                && first_hit_roughness < ROUGH_SPECULAR_DIFFUSE_THRESHOLD;
-            var weight = vec3<f32>(2.0 * sun_dir_cos_theta);
-            if (is_specular) {
-                let pbr = eval_pbr(
-                    sun_dir_rand, -first_hit.ray_dir, first_hit_perturbed_normal,
-                    first_hit_albedo, first_hit_metallic, first_hit_roughness,
-                );
-                // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp
-                // `pbr.f` to a saturation ceiling for the same reason as
-                // the resolve path above. `pbr.f * 2 * n·l` can spike when
-                // `n·l → 0` and `D` is large at the sun half-vector.
-                weight = min(pbr.f, vec3<f32>(16.0)) * (2.0 * sun_dir_cos_theta);
-            }
+            // SPLOTCH FIX (post-`2b5fa80`): drop the `is_specular` branch
+            // that switched between Lambertian `2*cos` (diffuse, ~2x) and
+            // `pbr.f * 2*cos` (specular, up to 32x) at adjacent pixels
+            // whose sampled roughness straddled `ROUGH_SPECULAR_DIFFUSE_
+            // THRESHOLD = 0.5`. The per-pixel boundary across that
+            // threshold was the dominant source of the user-reported olive
+            // splotch artifact on cobblestone (image #13). Always use the
+            // unified Lambertian `2*cos` weight — energy-conserving on
+            // average since the absorption chain handles albedo +
+            // (1-metallic) suppression in the diffuse path, and the
+            // specular highlight pathway lives in the first-hit mirror loop
+            // (handled upstream).
+            let weight = vec3<f32>(2.0 * sun_dir_cos_theta);
             sun_accum += gi_params.sun_color.xyz * weight;
         }
     }

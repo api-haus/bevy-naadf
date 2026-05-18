@@ -571,3 +571,30 @@ SUCCESS — gate FAILS as required (80 hard jumps > 5 ceiling) with the
 splotch artifact clearly visible in both the full framebuffer and the
 analysis-rect crop. REPRO ONLY dispatch — no splotch fix attempted.
 
+
+## Splotch fix (2026-05-19)
+
+See `05-diagnostic.md` § "Splotch fix using `--pbr-hard-edge` as ground
+truth (2026-05-19, post-`2b5fa80`)" for the 19-iteration log + final
+root-cause analysis + final fix diff + regression sweep.
+
+### Files changed
+
+- `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl`:
+  - Line ~611-624 (GI-resolve color weighting): drop the
+    `if (!first_hit_is_diffuse)` branch — always use Lambertian
+    `cos*(1/PI)` weight.
+  - Line ~672 (sun-direct cos-theta): switch from
+    `first_hit_perturbed_normal` to `first_hit.normal` (geometric).
+  - Line ~682-694 (sun-direct weight): drop the `is_specular` branch —
+    always use `weight = vec3<f32>(2.0 * sun_dir_cos_theta)`.
+- `crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl`:
+  - Line ~502-513 (GI bounce sun-direct weight): drop the
+    `pbr.f * 2*cos` weight, use `vec3<f32>(2*cos)` against the
+    GEOMETRIC bounce-surface normal (`ray_result.normal` instead of
+    `bounce_perturbed_normal`).
+
+### Verdict
+
+SUCCESS — `--pbr-hard-edge` gate from 79–80 hard jumps to **2 (ceiling 5)**;
+all 10 other gates + `just bake-texarrays` green.

@@ -499,18 +499,21 @@ fn calc_global_ilum(
             // Surface normal here is the PERTURBED normal so the sun-shading
             // varies with the normal map; the cos(θ_l) weight uses the same
             // perturbed normal for consistency.
-            let pbr = eval_pbr(
-                sun_dir_rand, -cur_dir, bounce_perturbed_normal,
-                sampled_albedo, sampled_metallic, sampled_roughness,
-            );
-            // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp `pbr.f`
-            // for the same reason as the spatial-resampling resolve. The
-            // GI pass writes `radiance` into the temporal ring; extreme
-            // per-pixel spikes from `D` term blow-ups corrupt the ring's
-            // contents for 64+ frames, surfacing as splotch outlines under
-            // motion + debug-mode switching (user-report image #16).
-            let fac = min(pbr.f, vec3<f32>(16.0))
-                * (2.0 * clamp(dot(bounce_perturbed_normal, sun_dir_rand), 0.0, 1.0));
+            // SPLOTCH FIX (post-`2b5fa80`): companion to spatial_resampling's
+            // sun-tap unification. Drop the `pbr.f * 2*cos` weight (which
+            // switched between ~0.1x diffuse and up-to-16x specular via the
+            // `is_specular` boundary at `sampled_roughness < 0.5`) and use a
+            // unified Lambertian `2*cos` against the GEOMETRIC face normal.
+            // The geometric normal removes the high-frequency per-pixel
+            // perturbed-normal modulation of the cos projection that the
+            // bounce surface contributes to the temporal ring, which then
+            // resurfaces in the per-pixel splotch at the first-hit pass.
+            // The metallic/specular highlight on bounce surfaces lives in
+            // the throughput chain (`cur_absorption *= (1-metallic)*albedo`
+            // for diffuse + `min(gi*f, 4)` for specular bounce). `eval_pbr`
+            // does not advance the RNG state, so dropping the call is safe
+            // for sample-stream parity.
+            let fac = vec3<f32>(2.0 * clamp(dot(ray_result.normal, sun_dir_rand), 0.0, 1.0));
 
             // The single sun-shadow ray (`gi_params.max_ray_steps_sun_secondary`
             // runtime knob — `21-design-quality-panel.md`).
