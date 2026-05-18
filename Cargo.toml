@@ -2,8 +2,6 @@
 #
 #   crates/bevy_naadf   — the Bevy 0.19 NAADF voxel renderer (lib + `bevy-naadf`
 #                         production binary + `e2e_render` test harness).
-#   crates/bevy-instamat — `material.ron` + sibling PNG asset loader yielding
-#                         `StandardMaterial`. Small loader crate.
 #   crates/voxel_noise  — the FastNoise2 wrapper: a native Rust API plus a
 #                         C-ABI surface built to `wasm32-unknown-emscripten`
 #                         for the in-browser JS bridge. Carried over from
@@ -14,7 +12,7 @@
 # (`crates/bevy_naadf/Trunk.toml`), the Emscripten Makefile for voxel_noise
 # (`crates/voxel_noise/Makefile`).
 [workspace]
-members = ["crates/bevy_naadf", "crates/bevy-instamat", "crates/voxel_noise"]
+members = ["crates/bevy_naadf", "crates/voxel_noise"]
 resolver = "2"
 
 # Bevy's standard fast-iteration tweak: optimise dependencies even in dev

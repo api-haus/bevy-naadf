@@ -12,6 +12,7 @@
 
 pub mod aadf;
 pub mod app_mode;
+pub mod baked_material;
 pub mod camera;
 pub mod e2e;
 pub mod editor;
@@ -675,7 +676,7 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // Infrastructure only: nothing in the scene consumes a baked
             // material yet (wiring baked PBR into the custom voxel render path
             // is a separate future effort).
-            bevy_instamat::BakedMaterialPlugin,
+            baked_material::BakedMaterialPlugin,
             // Registers the `*.texarray.ron` asset loader. The plugin also wires
             // the native Basis `AssetProcessor`, but that only activates when an
             // `AssetProcessor` resource exists — i.e. in the `bake` binary's

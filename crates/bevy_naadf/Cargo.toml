@@ -70,9 +70,6 @@ image = { version = "=0.25.10", default-features = false, features = [
 # (sky-bleed, voxel-type corruption, palette OOB) that would drop SSIM far
 # below 1.0. Pure-Rust dep, no native compile.
 image-compare = "0.5"
-# bevy-instamat = the `material.ron` + sibling PNG loader (yields
-# `StandardMaterial`). Small loader crate, local path dep.
-bevy-instamat = { path = "../bevy-instamat" }
 # ron = the `*.texarray.ron` texture-array definition format
 # (`src/texture_array/def.rs`). Bevy already pulls `ron` transitively at this
 # minor version.

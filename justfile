@@ -2,7 +2,6 @@
 #
 # Workspace layout:
 #   crates/bevy_naadf   — the Bevy 0.19 NAADF voxel renderer
-#   crates/bevy-instamat — `material.ron` + PNG → StandardMaterial loader
 #   crates/voxel_noise  — the FastNoise2 wrapper (native API + Emscripten module)
 
 # Trunk dev-server bind address — keep in sync with crates/bevy_naadf/Trunk.toml.

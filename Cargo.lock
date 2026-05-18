@@ -385,21 +385,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "bevy-instamat"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "ron",
- "serde",
-]
-
-[[package]]
 name = "bevy-naadf"
 version = "0.1.0"
 dependencies = [
  "basis-universal",
  "bevy",
- "bevy-instamat",
  "bytemuck",
  "dot_vox",
  "getrandom 0.3.4",

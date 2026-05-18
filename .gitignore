@@ -32,7 +32,7 @@ nohup.out
 # `*.texarray.ron` at assets/materials/. The hand-written `*.png.meta` sidecars
 # next to the source maps stay tracked (they pin the `Load` opt-out).
 /assets/materials/*.texarray.ron.meta
-# bevy-instamat's MaterialRonLoader is registered but has no default processor,
+# `baked_material::MaterialRonLoader` is registered but has no default processor,
 # so `material.ron` gets an auto-generated default `Load` meta on bake. Inert
 # source-side noise — same treatment as the shaders.
 /assets/materials/*/*.ron.meta
