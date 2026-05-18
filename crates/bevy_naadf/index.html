@@ -138,21 +138,54 @@
     </div>
     <canvas id="bevy"></canvas>
     <script>
-      // Progress-bar API — driven by the production `init.js` while it streams
-      // the wasm binary from R2. In dev (`trunk serve`) the bar just stays
-      // indeterminate until `TrunkApplicationStarted`.
-      window.updateLoadingProgress = (loaded, total) => {
-        const fill = document.getElementById("progress-fill");
-        fill.classList.remove("indeterminate");
-        const pct = Math.round((loaded / total) * 100);
-        fill.style.width = pct + "%";
-        document.getElementById("progress-text").textContent = pct + "%";
-      };
-      window.hideLoading = () =>
-        document.getElementById("loading").classList.add("hidden");
-      // Trunk's loader (dev) and the patched `init.js` (production) both
-      // dispatch this once the wasm app has started.
-      window.addEventListener("TrunkApplicationStarted", window.hideLoading);
+      (() => {
+        const showWebGPUError = (reason) => {
+          const bar = document.getElementById("progress-bar");
+          if (bar) bar.style.display = "none";
+          const text = document.getElementById("progress-text");
+          if (!text) return;
+          text.style.color = "#f87171";
+          text.style.textAlign = "center";
+          text.style.maxWidth = "400px";
+          text.style.lineHeight = "1.5";
+          text.innerHTML =
+            '<strong style="font-size:16px">WebGPU not supported</strong>' +
+            '<div style="margin-top:8px">This app requires a browser with WebGPU support.</div>' +
+            '<div style="margin-top:8px">Please use Chrome 113+, Edge 113+, or another WebGPU-compatible browser.</div>' +
+            (reason
+              ? '<div style="margin-top:12px;color:#64748b;font-size:12px">(' +
+                reason +
+                ")</div>"
+              : "");
+        };
+
+        if (!navigator.gpu) {
+          showWebGPUError("navigator.gpu missing");
+          return;
+        }
+        navigator.gpu
+          .requestAdapter()
+          .then((adapter) => {
+            if (!adapter) showWebGPUError("no GPU adapter found");
+          })
+          .catch((err) => showWebGPUError("adapter request failed: " + err));
+
+        // Progress-bar API — driven by the production `init.js` while it streams
+        // the wasm binary from R2. In dev (`trunk serve`) the bar just stays
+        // indeterminate until `TrunkApplicationStarted`.
+        window.updateLoadingProgress = (loaded, total) => {
+          const fill = document.getElementById("progress-fill");
+          fill.classList.remove("indeterminate");
+          const pct = Math.round((loaded / total) * 100);
+          fill.style.width = pct + "%";
+          document.getElementById("progress-text").textContent = pct + "%";
+        };
+        window.hideLoading = () =>
+          document.getElementById("loading").classList.add("hidden");
+        // Trunk's loader (dev) and the patched `init.js` (production) both
+        // dispatch this once the wasm app has started.
+        window.addEventListener("TrunkApplicationStarted", window.hideLoading);
+      })();
     </script>
   </body>
 </html>
