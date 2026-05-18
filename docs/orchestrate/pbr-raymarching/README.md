@@ -67,6 +67,8 @@ VNDF-GGX BRDF and multi-bounce `shoot_ray` scaffolding already in the shaders.
 - [x] Compound POM rewrite dispatched — SUCCESS; see `05-diagnostic.md` § "POM rewrite — modern implementation + wire-up audit"
 - [ ] Checkpoint commit (POM rewrite)
 - [ ] User live visual check #3
+- [x] Splotch repro gate built (`--pbr-hard-edge` rebuilt — `2b5fa80`)
+- [x] Splotch fix landed (gate 79→2 hard jumps — `a2c3aff`)
 - [ ] Final synthesis + user sign-off
 
 ## Worktree
