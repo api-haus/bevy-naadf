@@ -815,3 +815,144 @@ resolution and re-run the full Playwright suite.**
 The Playwright loaded-phase failure is a Step 5 blocker, not a Step 6/8/9
 deliverable. Documenting per the brief's "If you cannot fix it, write the
 diagnostic state to 04-refactoring.md and return" rule.
+
+---
+
+# Follow-up dispatch — wasm-bindgen-rayon `no-bundler` shim + verification
+2026-05-18
+
+## Summary
+
+The prior dispatch had identified the worker-resolution bug and made the
+`Cargo.toml` change (`features = ["no-bundler"]`) but did not rebuild +
+verify. This dispatch completed the verification cycle and discovered the
+existing `init-wasm-rayon.mjs` shim already matched the `no-bundler` API
+contract (`initThreadPool(numThreads)` is identical across both modes —
+the only difference is internal: `workerHelpers.no-bundler.js` spawns
+each worker from a Blob URL and reads `data.mainJS` via `import.meta.url`,
+removing the broken `import('../../..')` resolution).
+
+A second blocker surfaced on the first re-run: the debug-only Q4
+regression assertion at
+`crates/bevy_naadf/src/render/construction/mod.rs:1072-1100` fired on
+the .vox install path
+(`block_voxel_count_label = Some("naadf_block_voxel_count_w2_placeholder")`).
+Root cause: the web async-parse path runs the embedded default scene
+FIRST (which leaves `dense_voxel_types = Vec::new()`, so the W2
+placeholder block stamps the placeholder label), then swaps to .vox
+N frames later. The pre-allocation block at `:1577-1664` uses pure
+size-checks to detect "buffer needs re-allocating"; for
+`block_voxel_count` the W2 placeholder and the production buffer are
+byte-equivalent (both 8 B, both seeded `[64, 64]`) so the size check
+short-circuits and leaves the placeholder label in place. Same issue
+for `segment_voxel_buffer` (W5 block at `:1957` used `is_none()`
+which sees Some(placeholder) and skips the production 128 MiB
+allocation). Native gates don't hit this because they route through
+`GridPreset::Vox { path }` at Startup with no intermediate default
+install.
+
+Fix: extended the buffer-presence checks at both sites to also detect
+the W2 placeholder label (`block_voxel_count`) or size (`segment_voxel_buffer`,
+4 B placeholder vs the production 128 MiB) and re-allocate when found.
+
+## README excerpt — `no-bundler` recipe
+
+From `/tmp/wasm-bindgen-rayon-1.3.0/README.md:178-186` (and confirmed
+against the no-bundler `workerHelpers.no-bundler.js:30-34` source):
+
+> If you want to build this library for usage without bundlers, enable
+> the `no-bundler` feature for `wasm-bindgen-rayon` in your `Cargo.toml`:
+> `wasm-bindgen-rayon = { version = "1.2", features = ["no-bundler"] }`
+
+The README's documented JS bootstrap (§"Setting up") is identical
+across bundler/no-bundler modes:
+
+```js
+import init, { initThreadPool } from './pkg/index.js';
+await init();
+await initThreadPool(navigator.hardwareConcurrency);
+```
+
+The `no-bundler` worker glue
+(`workerHelpers.no-bundler.js`) spawns each Web Worker via a Blob URL of
+the worker script itself (`fetch(import.meta.url).then(r => r.blob())`)
+and re-imports the wasm-bindings JS via `data.mainJS`, populated from
+`wbg_rayon_PoolBuilder::main_js` which reads
+`import.meta.url` of the bindings JS (`lib.rs:66-76`). No JS-side API
+change required.
+
+## Changes applied
+
+- `crates/bevy_naadf/Cargo.toml` line 156 — feature flag (already
+  applied by prior dispatch; this dispatch left it untouched):
+  `wasm-bindgen-rayon = { version = "1.3", features = ["no-bundler"] }`.
+- `crates/bevy_naadf/init-wasm-rayon.mjs` — **unchanged.** The
+  `no-bundler` JS API surface is identical to the bundler API
+  (`initThreadPool(numThreads)`). Existing shim works as-is.
+- `crates/bevy_naadf/src/render/construction/mod.rs:1653-1700` — extended
+  the `block_voxel_count` pre-allocation gate to also re-allocate when
+  the existing buffer is labelled `w2_placeholder`. The W2 placeholder
+  and production buffers are byte-equivalent (size 8 B, init `[64, 64]`),
+  so this is a label fix-up only — no GPU buffer churn beyond a
+  one-time re-create on the first frame `ModelData` lands.
+- `crates/bevy_naadf/src/render/construction/mod.rs:1957-2005` —
+  changed the W5 `segment_voxel_buffer` allocation guard from
+  `is_none()` to a size-check (`< 128 MiB`). The W2 placeholder is 4 B;
+  the production W5 buffer is 128 MiB. Native gates author the buffer
+  directly (no pre-install of the W2 placeholder) so the size-check
+  doesn't change their behavior.
+
+## Verification
+
+| Gate | Command | Result |
+|---|---|---|
+| Wasm build | `cd crates/bevy_naadf && trunk build` | **PASS** (537 s clean build incl. build-std; warnings only) |
+| Headed Playwright (skybox baseline) | `timeout 300s just test-wasm` | **PASS** (6.4 s) |
+| Headed Playwright (loaded + SSIM) | (same command) | **PASS** (43.9 s; SSIM=0.271876, well below `--ssim-max=0.85`) |
+| Native regression: vox-e2e | `timeout 120s cargo run --bin e2e_render -- --vox-e2e` | **PASS** (vox_geometry centre luminance=250.5; per-batch region green) |
+| Native regression: vox-gpu-oracle | `timeout 120s cargo run --bin e2e_render -- --vox-gpu-oracle` | **PASS** (SSIM=0.8820; threshold 0.850) |
+
+The `wasm-smoke.spec.ts` test in the same suite fails for an
+**unrelated, pre-existing reason** in this branch:
+`startup_fetch_default_vox` (new in this branch — see
+`web_vox.rs:300-339`) fetches
+`https://bevy-naadf-assets.yura415.workers.dev/models/oasis_hard_cover.vox`
+unconditionally on the no-`?vox=` smoke path. The R2 key returns
+404 (verified: `curl -sI` → `HTTP/2 404`); the proxy worker at
+`workers/r2-proxy/src/index.js:19` does not stamp
+`Access-Control-Allow-Origin: *` on the 404 branch, so Chromium
+surfaces the failure as a CORS error → `bevy.error`-tagged console
+log → failed `collector.errors.toHaveLength(0)` assertion. This is
+orthogonal to the rayon worker fix (the rayon pool spawned cleanly
+on this run too — only the .vox fetch failed) and predates this
+dispatch — the prior dispatch's "Implementation blocker" section
+documents `just test-wasm` was never run end-to-end before this
+follow-up, so the pre-existing CORS-on-404 issue was masked.
+Resolutions are: upload `oasis_hard_cover.vox` to the R2 bucket
+(deploy-side), stamp CORS headers on the 404 path
+(`workers/r2-proxy/src/index.js`), or skip `startup_fetch_default_vox`
+in test mode. Not in this dispatch's scope per the brief.
+
+## Captured PNGs (this dispatch)
+
+- `/tmp/bevy-naadf-vox-parity-1722562/canvas-skybox-baseline.png`
+  (414 KB — pure-sky baseline through `?skybox=1`)
+- `/tmp/bevy-naadf-vox-parity-1722562/canvas-after-vox-install.png`
+  (693 KB — Oasis fixture rendered through async parse + W5 GPU
+  producer chain + Q3 readback after 10 s settle)
+- SSIM = **0.271876** (vs `SSIM_DISSIMILARITY_MAX = 0.85` — both halves
+  of the brief's success criterion satisfied: real pixels changed
+  AND no errors / no panics on the loaded-phase test)
+
+## Final goal status
+
+- Web .vox async loading lifecycle reaches install-complete: **YES**
+  (no `Failed to fetch dynamically imported module` worker errors,
+  no `vox-gpu-rewrite Q4 regression` panic, install-complete log
+  observed, SSIM compare PASS).
+- Both halves of the handoff's stated goal — "no errors / no panic"
+  AND "pixels actually changed via SSIM" — achieved on web AND
+  native for the .vox-loading flow.
+- Caveat: the pre-existing `wasm-smoke.spec.ts` CORS failure on the
+  no-`?vox=` smoke path is unrelated to this dispatch; documented
+  above for the next dispatch's pickup.

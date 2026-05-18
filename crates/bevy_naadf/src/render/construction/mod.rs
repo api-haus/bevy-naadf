@@ -1650,7 +1650,34 @@ pub fn prepare_construction(
         // calculable in its byte-equal compare. The production runtime is
         // not byte-compared at this point — it only needs to be functionally
         // correct, which `[64, 64]` already is.
-        if gpu.block_voxel_count.as_ref().map(|b| b.size()).unwrap_or(0) < 8 {
+        // web-vox-async-loading follow-up (2026-05-18) — re-allocate when
+        // the existing buffer is a W2 placeholder. The placeholder and the
+        // real gpu_producer buffer are byte-equivalent (both size=8, both
+        // seeded `[64, 64]`, both STORAGE|COPY_DST|COPY_SRC), so a pure
+        // size-check (`size() < 8`) treats the placeholder as already-good
+        // and leaves the `w2_placeholder` label in place. On the web async
+        // .vox path the embedded default-scene install precedes the .vox
+        // bytes by N frames — the W2 placeholder block in this `prepare`
+        // body therefore runs FIRST (during those N pre-`ModelData` frames)
+        // and stamps the placeholder label. When `ModelData` finally lands
+        // and `want_gpu_producer` flips true, the size-check skips
+        // reallocation and `populate_cpu_mirror_from_gpu_producer`'s Q4
+        // assertion fires on the lingering placeholder label. Re-checking
+        // the label catches this case and re-labels (no buffer churn —
+        // both buffers are identical, only `block_voxel_count_label`
+        // changes). The native `--vox-e2e` path doesn't see this because
+        // it routes through `GridPreset::Vox { path }` at Startup (no
+        // pre-`.vox` default-embedded install).
+        let needs_realloc = gpu
+            .block_voxel_count
+            .as_ref()
+            .map(|b| b.size())
+            .unwrap_or(0)
+            < 8
+            || gpu
+                .block_voxel_count_label
+                .is_some_and(|l| l.contains("w2_placeholder"));
+        if needs_realloc {
             let buf = render_device.create_buffer(&BufferDescriptor {
                 label: Some("naadf_block_voxel_count_gpu_producer"),
                 size: 8,
@@ -1954,17 +1981,33 @@ pub fn prepare_construction(
         //
         //    Full-world cubic (`WORLD_SIZE_IN_CHUNKS^3 * 2048 * 4` ≈ 134 GiB)
         //    is REJECTED — past every realistic wgpu cap.
-        if gpu.segment_voxel_buffer.is_none() {
-            const SEGMENT_CHUNKS: u64 =
-                (crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS as u64) * 4;
-            let size = SEGMENT_CHUNKS
-                * SEGMENT_CHUNKS
-                * SEGMENT_CHUNKS
-                * (generator_model::CHUNK_DATA_U32S as u64)
-                * 4;
+        // web-vox-async-loading follow-up (2026-05-18) — also re-allocate
+        // when the existing buffer is the W2 placeholder (size = 4 B, used
+        // only as a layout-required binding for `world_change.wgsl`). The
+        // web async .vox path runs the embedded-default install first
+        // (which leaves `dense_voxel_types = Vec::new()`, so the W2
+        // placeholder block fires and installs a 4 B placeholder buffer);
+        // when `ModelData` lands and this W5 block runs, an `is_none()`
+        // guard would see Some(placeholder) and skip the production
+        // 128 MiB allocation. The W5 dispatch then OOB-writes against the
+        // 4 B buffer and the chunk_calc shader produces garbage.
+        const SEGMENT_CHUNKS: u64 =
+            (crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS as u64) * 4;
+        let segment_voxel_buffer_full_size = SEGMENT_CHUNKS
+            * SEGMENT_CHUNKS
+            * SEGMENT_CHUNKS
+            * (generator_model::CHUNK_DATA_U32S as u64)
+            * 4;
+        let segment_needs_realloc = gpu
+            .segment_voxel_buffer
+            .as_ref()
+            .map(|b| b.size())
+            .unwrap_or(0)
+            < segment_voxel_buffer_full_size;
+        if segment_needs_realloc {
             let buf = render_device.create_buffer(&BufferDescriptor {
                 label: Some("naadf_segment_voxel_buffer_w5"),
-                size,
+                size: segment_voxel_buffer_full_size,
                 usage: BufferUsages::STORAGE
                     | BufferUsages::COPY_DST
                     | BufferUsages::COPY_SRC,
