@@ -80,9 +80,18 @@ struct ConstructionParams {
     hash_map_size: u32,
     segment_size_in_chunks: u32,
     max_group_bound_dispatch: u32,
-    // Row 3 (offset 48): chunk_offset (vec3) + pad to 16.
+    // Row 3 (offset 48): chunk_offset (vec3) + bounds_chunk_index_offset (u32).
     chunk_offset: vec3<u32>,
-    _pad2: u32,
+    // streaming-world Phase 2.10 — per-segment scoping offset for the
+    // `compute_voxel_bounds` + `compute_block_bounds` passes (was `_pad2`
+    // before Phase 2.10; bit-equivalent when 0). Semantics: chunk-base index
+    // for the segment being bounded (= `slot.0 * 4096` on streaming;
+    // 0 otherwise). The bounds entry points add this to their computed
+    // chunk/block index so a single per-segment dispatch (4096 chunks /
+    // 262144 blocks) targets exactly that slot's region of the flat
+    // chunks/blocks/voxels buffers. See
+    // `docs/orchestrate/streaming-world/03m-impl-bounds-and-w3.md`.
+    bounds_chunk_index_offset: u32,
     // Row 4 (offset 64): 4 × u32.
     frame_index: u32,
     changed_chunk_count: u32,
@@ -491,7 +500,17 @@ fn compute_voxel_bounds(
     @builtin(num_workgroups) num_workgroups_in: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
 ) {
-    let block_index = group_id.x
+    // streaming-world Phase 2.10 — `params.bounds_chunk_index_offset` is the
+    // chunk-base index for the segment being bounded. On streaming admission
+    // dispatches this is `slot.0 * 4096`; multiplied by 64 = block_base for
+    // the slot's contiguous block range. On non-streaming dispatches it is 0
+    // (no offset; the dispatch covers the full flat buffer). Adding the
+    // offset BEFORE the workgroup-id-derived `block_index` lets a per-segment
+    // dispatch of 262144 workgroups target exactly that slot's blocks rather
+    // than walking the full-world worst-case 134 M workgroup count.
+    let block_base: u32 = params.bounds_chunk_index_offset * 64u;
+    let block_index = block_base
+        + group_id.x
         + group_id.y * num_workgroups_in.x
         + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
     let voxel_index = block_index * 64u + local_index;
@@ -543,7 +562,12 @@ fn compute_block_bounds(
     @builtin(num_workgroups) num_workgroups_in: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
 ) {
-    let chunk_index = group_id.x
+    // streaming-world Phase 2.10 — per-segment scoping; see the matching
+    // comment on `compute_voxel_bounds` above. Adds the slot's chunk-base
+    // directly to the workgroup-id-derived `chunk_index` so a per-segment
+    // dispatch of 4096 workgroups targets exactly that slot's chunks.
+    let chunk_index = params.bounds_chunk_index_offset
+        + group_id.x
         + group_id.y * num_workgroups_in.x
         + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
     let block_index = chunk_index * 64u + local_index;

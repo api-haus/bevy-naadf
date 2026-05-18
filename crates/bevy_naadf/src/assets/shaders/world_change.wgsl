@@ -76,7 +76,12 @@ struct ConstructionParams {
     segment_size_in_chunks: u32,
     max_group_bound_dispatch: u32,
     chunk_offset: vec3<u32>,
-    _pad2: u32,
+    // streaming-world Phase 2.10 — per-segment scoping offset for the
+    // `chunk_calc.wgsl` bounds passes; carried here only for byte-identical
+    // mirroring of the shared `GpuConstructionParams` layout (world_change
+    // does NOT read this field). See
+    // `docs/orchestrate/streaming-world/03m-impl-bounds-and-w3.md`.
+    bounds_chunk_index_offset: u32,
     frame_index: u32,
     changed_chunk_count: u32,
     changed_block_count: u32,

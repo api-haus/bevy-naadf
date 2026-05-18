@@ -269,6 +269,13 @@ pub fn add_e2e_systems(app: &mut App) {
                 // streaming gate routes via oasis_edit_visual_mode = true).
                 streaming_window::pin_streaming_window_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
+                // streaming-world Phase 2.10
+                // (`03l-diagnosis-hitch-and-view-distance.md` punch-list
+                // items 4 + 5) — per-frame walk timing telemetry + mid-walk
+                // framebuffer capture. Runs `.after(pin_streaming_window_camera)`
+                // so it sees the same tick state the pin system reads.
+                streaming_window::record_walk_metrics_and_capture_mid_walk
+                    .after(streaming_window::pin_streaming_window_camera),
                 // streaming-world Phase 2.4 — pin the camera at the static
                 // preset's centre pose. Runs `.after(pin_oasis_camera)` for
                 // the same reason (overrides the birdseye pose; the

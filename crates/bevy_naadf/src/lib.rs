@@ -658,6 +658,28 @@ pub fn build_app(cfg: AppConfig) -> App {
 /// to override args use [`build_app`] (which forwards to this with the default).
 pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
 
+    // streaming-world Phase 2.10
+    // (`docs/orchestrate/streaming-world/03l-diagnosis-hitch-and-view-distance.md`
+    // punch-list item 2 + item 6): the canonical NAADF primary ray-step cap is
+    // 120 (tuned for full AADF acceleration). On the streaming preset there is
+    // a narrow window during admission settling where freshly-admitted segments
+    // may carry partially-stale AADF; the per-segment bounds dispatch (item 1)
+    // covers voxel + block AADF current-frame, but the W3 regime-2 background
+    // queue refines chunk-level 5-bit AADFs incrementally over many frames.
+    // Bump the cap to 240 on streaming only, as a safety belt during the
+    // multi-frame W3 settling. Other presets stay at 120 — the diagnostic
+    // explicitly warned against masking the real fix by raising the global
+    // cap.
+    let args = {
+        let mut a = args;
+        if matches!(a.grid_preset, GridPreset::ProceduralStreaming { .. })
+            && a.gi.max_ray_steps_primary < 240
+        {
+            a.gi.max_ray_steps_primary = 240;
+        }
+        a
+    };
+
     let mut app = App::new();
 
     // `DlssProjectId` must be inserted before `DefaultPlugins` so the render

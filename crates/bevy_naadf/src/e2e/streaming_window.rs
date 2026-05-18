@@ -32,10 +32,12 @@
 //! (`--max-segments-per-frame`, default 4).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bevy::prelude::*;
+use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 
 use crate::camera::position_split::PositionSplit;
 use crate::e2e::framebuffer::Framebuffer;
@@ -112,6 +114,230 @@ pub const STREAMING_WALK_DISTANCE_VOXELS: f32 = 1024.0;
 /// the walk. With a 1024-voxel = 4-segment walk and the camera centred in the
 /// window, the origin should follow by 4 segments.
 pub const STREAMING_MIN_ORIGIN_SHIFT_SEGMENTS: i32 = 4;
+
+/// streaming-world Phase 2.10 (`03l-diagnosis-hitch-and-view-distance.md`
+/// punch-list item 4) — maximum per-frame wall-clock during the walk phase,
+/// in milliseconds. The diagnostic measured ~300 ms hitch frames on every
+/// segment-boundary crossing pre-Phase-2.10 (the deferred-idle full-world
+/// bounds flush); the 50 ms threshold = ~20 fps, well above the ~3 fps the
+/// user observed and below ANY reasonable single-frame budget on the test
+/// hardware. Phase 2.10's per-segment bounds dispatch brings per-frame cost
+/// to ~10 ms (4 segments × ~2.5 ms); the gate FAILS if any frame exceeds
+/// this threshold during the camera walk — catches a regression that
+/// re-introduces a deferred-flush-style hitch.
+///
+/// First-frame budget exception: the FIRST 3 frames of the walk are
+/// excluded from the threshold check, as Bevy's renderer / wgpu's pipeline
+/// cache + DLSS/TAA history priming may legitimately spike on the very
+/// first walk frame. The diagnostic notes this exception explicitly.
+pub const STREAMING_MAX_PER_FRAME_MS: f32 = 50.0;
+
+/// Number of leading walk frames to exclude from the per-frame timing
+/// assertion (cold pipeline / cache warm-up).
+pub const STREAMING_TIMING_WARMUP_FRAMES: i32 = 3;
+
+/// streaming-world Phase 2.10 (`03l` punch-list item 5) — minimum
+/// non-skybox-pixel ratio at screen centre during mid-walk. The walk is
+/// 256 ticks; mid-walk = tick 128 = the height of admission churn. With
+/// per-segment bounds dispatch (item 1) + W3 seed restoration (item 3),
+/// distant terrain stays visible THROUGHOUT the walk — non-skybox ratio
+/// at screen centre stays well above this threshold. Pre-Phase-2.10 the
+/// mid-walk frame would collapse to mostly sky as rays terminated early
+/// through stale-AADF freshly-admitted segments (the user-observed "blocks
+/// far-away appear briefly for one frame and disappear" pattern).
+///
+/// Threshold is 30%: a real walk frame has ~50-70% terrain at screen
+/// centre (the camera looks slightly down toward the heightmap); the
+/// 30% floor sits well below that legitimate range but well above the
+/// ~5% the Bug-2 regression produces (sky-only-with-occasional-block).
+pub const STREAMING_MIN_MID_WALK_TERRAIN_RATIO: f32 = 0.30;
+
+/// Centre-region half-extent (pixels) for the mid-walk terrain-ratio
+/// assertion. A 128×128 box centred at the framebuffer centre — large
+/// enough to capture multiple terrain features at the e2e 256×256
+/// framebuffer resolution; small enough to exclude horizon + corner
+/// artefacts.
+pub const STREAMING_MID_WALK_CENTRE_HALF_EXTENT: u32 = 64;
+
+// ---------------------------------------------------------------------------
+// Per-frame timing telemetry (item 4)
+// ---------------------------------------------------------------------------
+
+/// Max per-frame `delta_secs * 1000` (milliseconds, stored as `u32`)
+/// observed during the walk phase. Seeded to 0 at gate start; read by
+/// `assert_streaming_window_landed` once the walk completes.
+static MAX_FRAME_TIME_DURING_WALK_MS: AtomicU32 = AtomicU32::new(0);
+/// Count of walk frames observed (excluding warmup). Diagnostic — printed
+/// alongside the max in the assertion report.
+static WALK_FRAMES_OBSERVED: AtomicU32 = AtomicU32::new(0);
+/// Count of warmup frames consumed (first N ticks excluded from the cap
+/// check). Diagnostic.
+static WALK_WARMUP_FRAMES_OBSERVED: AtomicU32 = AtomicU32::new(0);
+
+/// Reset the per-frame timing latches — called by
+/// [`apply_streaming_window_defaults`] so a second invocation in the same
+/// process gets a fresh budget.
+pub fn reset_walk_timing_latches() {
+    MAX_FRAME_TIME_DURING_WALK_MS.store(0, Ordering::SeqCst);
+    WALK_FRAMES_OBSERVED.store(0, Ordering::SeqCst);
+    WALK_WARMUP_FRAMES_OBSERVED.store(0, Ordering::SeqCst);
+}
+
+/// Read the recorded max-frame-time value (milliseconds) and count.
+pub fn walk_timing_telemetry() -> (f32, u32, u32) {
+    let ms = MAX_FRAME_TIME_DURING_WALK_MS.load(Ordering::SeqCst);
+    let frames = WALK_FRAMES_OBSERVED.load(Ordering::SeqCst);
+    let warmup = WALK_WARMUP_FRAMES_OBSERVED.load(Ordering::SeqCst);
+    (ms as f32, frames, warmup)
+}
+
+// ---------------------------------------------------------------------------
+// Mid-walk framebuffer capture (item 5)
+// ---------------------------------------------------------------------------
+
+/// One-shot trigger: when `walk_ticks_remaining` first equals this midpoint
+/// value, the pin system spawns a `Screenshot::primary_window()` entity
+/// with the [`stash_mid_walk_screenshot`] observer attached. The midpoint
+/// is half of `STREAMING_WALK_TICKS` (`= 128`), centred in the walk so
+/// admissions are at peak churn.
+fn mid_walk_trigger_tick() -> i32 {
+    STREAMING_WALK_TICKS / 2
+}
+
+/// `true` once the mid-walk screenshot has been requested (the
+/// pin system fires this once per gate run).
+static MID_WALK_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The captured mid-walk image. `None` until the observer fires; the
+/// `assert_streaming_window_landed` reads + clears this.
+static MID_WALK_IMAGE: Mutex<Option<Image>> = Mutex::new(None);
+
+/// Reset mid-walk capture state for a fresh run.
+pub fn reset_mid_walk_capture_latches() {
+    MID_WALK_REQUESTED.store(false, Ordering::SeqCst);
+    if let Ok(mut g) = MID_WALK_IMAGE.lock() {
+        *g = None;
+    }
+}
+
+/// Observer — stash a mid-walk `ScreenshotCaptured` image into
+/// [`MID_WALK_IMAGE`]. Distinct from the e2e driver's `stash_screenshot`
+/// observer so mid-walk + before/after captures cannot race for the same
+/// resource slot.
+fn stash_mid_walk_screenshot(captured: On<ScreenshotCaptured>) {
+    if let Ok(mut g) = MID_WALK_IMAGE.lock() {
+        if g.is_none() {
+            *g = Some(captured.image.clone());
+        }
+    }
+}
+
+/// Pull the stashed mid-walk image out of the static (consumes it).
+pub fn take_mid_walk_image() -> Option<Image> {
+    MID_WALK_IMAGE.lock().ok().and_then(|mut g| g.take())
+}
+
+/// `Update` system: record per-frame timing during the walk + spawn the
+/// mid-walk screenshot at the midpoint tick. Runs `.after(e2e_driver,
+/// pin_streaming_window_camera)` so it sees the updated walk-tick state
+/// the pin system writes.
+///
+/// streaming-world Phase 2.10 (`03l-diagnosis-hitch-and-view-distance.md`
+/// punch-list items 4 + 5) — implemented in the same system to keep the
+/// `Update` registration count minimal (one new system, not two).
+pub fn record_walk_metrics_and_capture_mid_walk(
+    mut commands: Commands,
+    time: Res<Time>,
+    args: Option<Res<crate::AppArgs>>,
+) {
+    let Some(args) = args else { return; };
+    if !args.streaming_window_mode {
+        return;
+    }
+    if !camera_has_walked() {
+        return;
+    }
+    let ticks_remaining = WALK_TICKS_REMAINING.load(Ordering::SeqCst);
+    if ticks_remaining <= 0 {
+        return;
+    }
+    let ticks_elapsed = STREAMING_WALK_TICKS - ticks_remaining;
+
+    // Per-frame timing (item 4) — skip the first `STREAMING_TIMING_WARMUP_FRAMES`
+    // walk frames; record max otherwise.
+    if ticks_elapsed >= STREAMING_TIMING_WARMUP_FRAMES {
+        let dt_ms = (time.delta_secs() * 1000.0).max(0.0).min(10_000.0);
+        let prev = MAX_FRAME_TIME_DURING_WALK_MS.load(Ordering::SeqCst);
+        let new = dt_ms as u32;
+        if new > prev {
+            MAX_FRAME_TIME_DURING_WALK_MS.store(new, Ordering::SeqCst);
+        }
+        WALK_FRAMES_OBSERVED.fetch_add(1, Ordering::SeqCst);
+    } else {
+        WALK_WARMUP_FRAMES_OBSERVED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // Mid-walk capture (item 5) — fire ONCE at the midpoint tick.
+    if !MID_WALK_REQUESTED.swap(true, Ordering::SeqCst)
+        && ticks_remaining <= mid_walk_trigger_tick()
+    {
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(stash_mid_walk_screenshot);
+    } else if ticks_remaining > mid_walk_trigger_tick() {
+        // Not yet at the midpoint — undo the swap if we set it prematurely.
+        // (This can only happen on the very first tick if the midpoint is
+        // STREAMING_WALK_TICKS itself; defensive.)
+        MID_WALK_REQUESTED.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Compute the ratio of "non-sky" pixels in the centre of the framebuffer.
+/// A pixel is classified as sky if its mean Rec.709 luminance falls in
+/// `[60, 255]` AND its blue channel exceeds red + green's average by more
+/// than 15 — i.e. the bluish-grey sky gradient the renderer emits when
+/// rays miss into atmosphere. Anything else is counted as terrain.
+///
+/// Returns the ratio in `[0, 1]`. A walk frame mid-stream over populated
+/// terrain at the camera's `(cx, cy_base+32, cz)` Pose-A-derived pose
+/// produces ~0.5-0.7; a sky-only frame is < 0.1.
+pub fn centre_non_sky_ratio(fb: &Framebuffer) -> f32 {
+    let w = fb.width();
+    let h = fb.height();
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let cx = w / 2;
+    let cy = h / 2;
+    let half = STREAMING_MID_WALK_CENTRE_HALF_EXTENT;
+    let x0 = cx.saturating_sub(half);
+    let y0 = cy.saturating_sub(half);
+    let x1 = (cx + half).min(w);
+    let y1 = (cy + half).min(h);
+    let mut total = 0u32;
+    let mut non_sky = 0u32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = fb.pixel(x, y);
+            let r = p[0] as f32;
+            let g = p[1] as f32;
+            let b = p[2] as f32;
+            // Sky heuristic: bluish OR uniformly bright.
+            let is_blue_sky = b > (r + g) * 0.5 + 15.0;
+            let is_white_haze = r > 200.0 && g > 200.0 && b > 200.0;
+            let is_sky = is_blue_sky || is_white_haze;
+            total += 1;
+            if !is_sky {
+                non_sky += 1;
+            }
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        non_sky as f32 / total as f32
+    }
+}
 
 /// One-shot latch — `true` once [`promote_camera_to_walk`] has been called.
 /// Mirrors the `vox_gpu_construction::CAMERA_PROMOTED` pattern.
@@ -451,6 +677,8 @@ pub fn apply_streaming_window_defaults(args: &mut crate::AppArgs) {
     // schedule.
     reset_camera_walked_latch();
     reset_gate_start_latch();
+    reset_walk_timing_latches();
+    reset_mid_walk_capture_latches();
     RESIDENCY_ORIGIN_X_AT_POSE_A.store(i32::MIN, Ordering::SeqCst);
 
     // Observer attachment — always set.
@@ -560,16 +788,48 @@ pub fn assert_streaming_window_landed(
     let after_lum_var = luminance_variance(after);
     let origin_shift_ok = origin_shift_x_seg.abs() >= STREAMING_MIN_ORIGIN_SHIFT_SEGMENTS;
 
+    // streaming-world Phase 2.10 — per-frame walk timing telemetry
+    // (`03l` punch-list item 4).
+    let (max_frame_ms, frames_observed, warmup_consumed) = walk_timing_telemetry();
+
+    // streaming-world Phase 2.10 — mid-walk visibility (`03l` punch-list
+    // item 5). Decode the stashed mid-walk image into a Framebuffer; if
+    // the capture never fired (driver-side regression — the pin system
+    // didn't reach the midpoint tick), report a sentinel ratio of -1.0
+    // so the assertion catches the missing capture distinctly.
+    let mid_walk_ratio: f32 = if let Some(image) = take_mid_walk_image() {
+        match Framebuffer::from_image(&image) {
+            Ok(fb) => {
+                let path =
+                    Path::new(crate::e2e::E2E_SCREENSHOT_DIR).join("streaming_window_mid_walk.png");
+                let _ = fb.save_png(&path);
+                centre_non_sky_ratio(&fb)
+            }
+            Err(_) => -1.0,
+        }
+    } else {
+        -1.0
+    };
+
     let report = format!(
         "streaming-window: mean pixel Δ = {:.2} (floor = {:.2}); \
          after-frame luminance variance = {:.2} (floor = {:.2}); \
-         residency origin shift in X = {} segments (floor = {})",
+         residency origin shift in X = {} segments (floor = {}); \
+         max per-frame walk time = {:.1} ms over {} frames \
+         (warmup excluded = {}; cap = {:.1} ms); \
+         mid-walk non-sky centre ratio = {:.3} (floor = {:.3})",
         pixel_delta,
         STREAMING_MIN_PIXEL_DELTA,
         after_lum_var,
         STREAMING_MIN_AFTER_LUM_VARIANCE,
         origin_shift_x_seg,
         STREAMING_MIN_ORIGIN_SHIFT_SEGMENTS,
+        max_frame_ms,
+        frames_observed,
+        warmup_consumed,
+        STREAMING_MAX_PER_FRAME_MS,
+        mid_walk_ratio,
+        STREAMING_MIN_MID_WALK_TERRAIN_RATIO,
     );
     println!("e2e_render --streaming-window: {report}");
 
@@ -592,6 +852,38 @@ pub fn assert_streaming_window_landed(
             "(d) residency origin shifted by only {} segments in X; expected \
              ≥ {}",
             origin_shift_x_seg, STREAMING_MIN_ORIGIN_SHIFT_SEGMENTS,
+        ));
+    }
+    // streaming-world Phase 2.10 — per-frame timing (item 4).
+    if frames_observed == 0 {
+        failures.push(format!(
+            "(e/Phase-2.10) walk produced 0 timed frames — the per-frame \
+             timing system never observed a non-warmup walk tick (driver \
+             regression?)",
+        ));
+    } else if max_frame_ms > STREAMING_MAX_PER_FRAME_MS {
+        failures.push(format!(
+            "(e/Phase-2.10) max per-frame walk time {:.1} ms exceeds cap \
+             {:.1} ms — likely a deferred bounds-flush regression re-introduced \
+             the {:.0} ms hitch the Phase-2.8 latch caused on every segment \
+             boundary crossing",
+            max_frame_ms, STREAMING_MAX_PER_FRAME_MS, max_frame_ms,
+        ));
+    }
+    // streaming-world Phase 2.10 — mid-walk visibility (item 5).
+    if mid_walk_ratio < 0.0 {
+        failures.push(format!(
+            "(f/Phase-2.10) mid-walk framebuffer capture never delivered \
+             — the screenshot observer didn't fire (driver / wgpu \
+             regression?)",
+        ));
+    } else if mid_walk_ratio < STREAMING_MIN_MID_WALK_TERRAIN_RATIO {
+        failures.push(format!(
+            "(f/Phase-2.10) mid-walk non-sky centre ratio {:.3} below floor \
+             {:.3} — rays terminated too early mid-walk, likely stale AADF \
+             on freshly-admitted segments (the diagnosed Bug 2 — \
+             `03l-diagnosis-hitch-and-view-distance.md` § Bug 2)",
+            mid_walk_ratio, STREAMING_MIN_MID_WALK_TERRAIN_RATIO,
         ));
     }
 

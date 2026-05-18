@@ -65,6 +65,8 @@ consolidated mode disqualified.
 - [x] **Hard gate (Phase 2.8)** — GREEN: all 8 gates pass; cold-start now FASTER than static baseline; streaming preset visibly populates within ~1 s
 - [x] 03j/03k — Phase-2.9: diagnostic + fix for camera-nudge endless-reposition loop — new `CameraAbsolutePosition` resource + production pin (FreeCamera writes absolute coords; pin derives Transform); `--gate streaming-window` refactored to drive `AppConfig::windowed()` + simulated additive Transform input (catches divergent-App-construction regressions per the e2e-must-drive-actual-main memory)
 - [x] **Hard gate (Phase 2.9)** — GREEN: all 7 gates pass; production camera path now exercised by `--gate streaming-window` at pixel-Δ 82.11 / variance 2346.83 / origin-shift 4; interactive boot smoke confirms no endless reposition loop
+- [x] 03l/03m — Phase-2.10: diagnostic + fix for steady-state hitch + view-distance corruption — per-affected-segment bounds dispatch every admission frame (300ms→27ms max per-frame); W3 chunk-level AADF restored on streaming (one-shot regime-1 seed after first admission); EMPTY_SLOT semantic documented; `max_ray_steps_primary` 120→240 streaming-only safety belt; new per-frame timing + mid-walk visibility assertions in `--gate streaming-window`
+- [x] **Hard gate (Phase 2.10)** — GREEN: all 7 gates pass; per-frame walk timing 27 ms max over 253 frames (50 ms floor); synthetic regression test confirms gate FAILS on 100 ms hitch revert
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user

@@ -615,12 +615,32 @@ pub struct GpuConstructionParams {
     /// `maxGroupBoundDispatch` — the regime-2 throttle. NAADF default `512 * 64`
     /// (`WorldBoundHandler.cs:25`). Mirrored from `ConstructionConfig`.
     pub max_group_bound_dispatch: u32,
-    // Row 3 (offset 48): chunkOffset (vec3) + pad to 16.
+    // Row 3 (offset 48): chunkOffset (vec3) + bounds_chunk_index_offset (u32).
     /// `chunkOffsetX/Y/Z` — per-segment chunk offset for the regime-1 dispatch
     /// loop. C# `WorldData.cs:138-151`.
     pub chunk_offset: [u32; 3],
-    /// std140 padding to the next 16-byte row.
-    pub _pad2: u32,
+    /// streaming-world Phase 2.10 (`03l-diagnosis-hitch-and-view-distance.md`
+    /// punch-list item 1) — per-segment scoping offset for the
+    /// `compute_voxel_bounds` + `compute_block_bounds` passes. Repurposes the
+    /// previous std140 padding slot (was `_pad2: u32`) without changing
+    /// struct size or any 16-byte row boundary. Semantics:
+    ///
+    /// - When 0 (the default for non-streaming dispatches), bounds passes
+    ///   operate on the full buffer starting at flat index 0 — byte-equivalent
+    ///   to pre-Phase-2.10 behaviour (every existing call site initialises
+    ///   this to 0).
+    /// - When set (streaming admission frames), the value is the **chunk-base
+    ///   index** for the segment being bounded (= `slot.0 * 4096`, where
+    ///   4096 is the chunk count per segment in the slot-indexed
+    ///   `chunks_buffer` layout — Phase 2.6's `02c-design-windowed-slot-map`
+    ///   § F). `compute_block_bounds` adds this directly to the computed
+    ///   `chunk_index`; `compute_voxel_bounds` multiplies by 64 to derive the
+    ///   block-base offset before adding.
+    ///
+    /// Phase 2.10 dispatches the bounds chain per affected segment on EVERY
+    /// admission frame (~10 ms / frame total), replacing the Phase-2.8
+    /// deferred-idle full-world flush (~300 ms / hitch frame).
+    pub bounds_chunk_index_offset: u32,
     // Row 4 (offset 64): 4 × u32.
     /// Monotonic frame counter — shared with `GpuRenderParams.frame_count` /
     /// `GpuTaaParams.frame_count`; populated identically.
@@ -893,6 +913,8 @@ const _: () =
 const _: () =
     assert!(std::mem::offset_of!(GpuConstructionParams, bound_group_queue_max_size) == 32);
 const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, chunk_offset) == 48);
+const _: () =
+    assert!(std::mem::offset_of!(GpuConstructionParams, bounds_chunk_index_offset) == 60);
 const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, frame_index) == 64);
 const _: () = assert!(std::mem::offset_of!(GpuConstructionParams, size_in_chunks) % 16 == 0);
 const _: () =
@@ -977,6 +999,10 @@ mod tests {
             44
         );
         assert_eq!(std::mem::offset_of!(GpuConstructionParams, chunk_offset), 48);
+        assert_eq!(
+            std::mem::offset_of!(GpuConstructionParams, bounds_chunk_index_offset),
+            60
+        );
         assert_eq!(std::mem::offset_of!(GpuConstructionParams, frame_index), 64);
         assert_eq!(
             std::mem::offset_of!(GpuConstructionParams, changed_chunk_count),

@@ -202,6 +202,31 @@ fn streaming_chunk_index(chunk_pos: vec3<u32>) -> u32 {
 // Convenience wrapper — load the chunks vec2<u32> at the streaming-translated
 // position, returning `vec2(0u, 0u)` (the "uniform empty" chunk state) on
 // EMPTY_SLOT.
+//
+// streaming-world Phase 2.10
+// (`docs/orchestrate/streaming-world/03l-diagnosis-hitch-and-view-distance.md`
+// § 2 — "EMPTY_SLOT returning sky vs treating as empty chunk"): the design
+// note `02c-design-windowed-slot-map.md` § E proposed
+// `if slot == EMPTY_SLOT { return SKY; }` as an early-out. What is actually
+// shipped is "treat as uniform-empty chunk with zero AADF":
+//   - cur_node = (0u, 0u) → `(cur_node >> 31u) == 0u` → ray DDA falls into
+//     the "not mixed" branch and skips to the far face of the empty chunk.
+//   - 5-bit chunk-level AADFs at bits [0..30) are zero → the skip is only
+//     `offset + 16 * 0 = offset` voxels (≤ 16), so the ray steps once per
+//     chunk through the empty region.
+//   - The ray either hits a resident chunk past the empty slot OR exits the
+//     world bbox at `bounding_box_max` and misses to atmosphere.
+//
+// We KEEP the "uniform empty" semantic in Phase 2.10 — it's well-defined and
+// rays exit the window cleanly. Picking up a SKY early-out instead would
+// short-circuit a tiny number of cycles on the per-chunk descent but
+// complicate the ray loop's atmosphere-shading path (which currently runs
+// only at `cur_cell >= bbox_max` exit). Phase 2.10's per-segment bounds
+// dispatch (`03l` punch-list item 1) + W3 regime-1 seed restoration (item 3)
+// make the AADF-stale-on-fresh-admission scenario disappear, so the
+// per-chunk-step penalty through EMPTY_SLOT regions is no longer a
+// user-visible artefact — there are no large EMPTY_SLOT regions inside the
+// resident window at steady state.
 fn streaming_chunk_load(chunk_pos: vec3<u32>) -> vec2<u32> {
     let idx = streaming_chunk_index(chunk_pos);
     if (idx == 0xFFFFFFFFu) {

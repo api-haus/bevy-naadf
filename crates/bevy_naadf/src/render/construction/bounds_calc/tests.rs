@@ -489,7 +489,7 @@ fn build_w3_fixture(
         segment_size_in_chunks: 4,
         max_group_bound_dispatch: 512 * 64,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        bounds_chunk_index_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,

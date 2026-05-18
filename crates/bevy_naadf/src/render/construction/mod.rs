@@ -279,6 +279,24 @@ pub struct ConstructionGpu {
     /// dispatch and rendering speeds up. Per
     /// `docs/orchestrate/streaming-world/03i-impl-dirty-segments-bounds.md`.
     pub streaming_bounds_dirty: bool,
+
+    /// streaming-world Phase 2.10
+    /// (`docs/orchestrate/streaming-world/03l-diagnosis-hitch-and-view-distance.md`
+    /// punch-list item 3) — one-shot latch for the W3 regime-1 seed
+    /// (`add_initial_groups_to_bound_queue`) when the streaming preset is
+    /// active. Pre-Phase-2.10 the `!noise_dispatch_active` guard at
+    /// `prepare_construction:1885` skipped the seed unconditionally on
+    /// streaming, leaving chunk-level 5-bit AADFs at zero forever; rays going
+    /// up-and-forward through sky-above-terrain would chunk-step through
+    /// 16-voxel granularity instead of the up-to-31-chunk skips (496 voxels)
+    /// the seeded AADF queue can deliver.
+    ///
+    /// The flag fires the seed ONCE after the first streaming admission has
+    /// landed bounds-current chunks in the buffer (option (a) from the
+    /// diagnostic § Punch-list item 3 — match the static preset's
+    /// "seed-after-cold-start" timing). On non-streaming presets the flag is
+    /// unused (the W3 seed runs via the existing `!bounds_initialized` gate).
+    pub streaming_w3_seed_dispatched: bool,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -1502,7 +1520,7 @@ pub fn prepare_construction(
             segment_size_in_chunks: 4,
             max_group_bound_dispatch: construction_config.max_group_bound_dispatch,
             chunk_offset: [0, 0, 0],
-            _pad2: 0,
+            bounds_chunk_index_offset: 0,
             frame_index: 0,
             changed_chunk_count: 0,
             changed_block_count: 0,
@@ -1873,16 +1891,38 @@ pub fn prepare_construction(
     // is still empty (producer hasn't run yet). The producer flips the flag
     // when it runs in the render-graph; that flip is visible to
     // `prepare_construction` on the next frame.
+    //
+    // streaming-world Phase 2.10 (`03l-diagnosis-hitch-and-view-distance.md`
+    // punch-list item 3): the original `&& !noise_dispatch_active` gate
+    // suppressed the seed on the streaming preset entirely — leaving
+    // chunk-level 5-bit AADFs at zero forever (the diagnostic
+    // `03l § 5. W3 background bounds-compute - VERIFIED NOT RUNNING ON
+    // STREAMING` measured the resulting per-chunk-step penalty: 16-voxel
+    // skips in uniform-empty regions vs the up-to-31-chunk skips a populated
+    // W3 queue delivers). Phase 2.10 separates the two cases:
+    //
+    //   - Non-streaming (static / W5 / Vox / dense): the seed gate is
+    //     identical to the pre-Phase-2.10 path — fires once the producer
+    //     dispatch's bounds chain has flipped `bounds_initialized = true`
+    //     and `noise_dispatch_active = false` (default / Vox / W5 presets
+    //     where the seed has always run).
+    //
+    //   - Streaming: gated on `streaming_w3_seed_dispatched` (a new
+    //     one-shot flag) AND on `bounds_initialized = true` (so the
+    //     producer's per-segment bounds dispatches have actually written
+    //     state to the chunks buffer before the W3 seed reads it). The seed
+    //     fires ONCE per world setup; the W3 regime-2 background loop then
+    //     iteratively expands the 5-bit AADF over many frames the standard
+    //     way.
+    let want_w3_seed_non_streaming = !gpu.bounds_initialized
+        && (!want_gpu_producer || gpu.gpu_producer_has_run)
+        && !noise_dispatch_active;
+    let want_w3_seed_streaming = streaming_active
+        && gpu.bounds_initialized
+        && !gpu.streaming_w3_seed_dispatched;
     if construction_config.gpu_construction_enabled
         && bound_group_count > 0
-        && !gpu.bounds_initialized
-        && (!want_gpu_producer || gpu.gpu_producer_has_run)
-        // streaming-world Phase 2: skip the bounds-init seed when streaming
-        // is active — the streaming branch in naadf_gpu_producer_node runs
-        // the full bounds chain per frame, which subsumes the once-at-startup
-        // seed. Phase 2.4: same skip for the static preset (the (a0b) branch
-        // runs the bounds chain once at the end of its 512-segment dispatch).
-        && !noise_dispatch_active
+        && (want_w3_seed_non_streaming || want_w3_seed_streaming)
     {
         let Some(initial_pipeline) = pipeline_cache
             .get_compute_pipeline(construction_pipelines.bounds_calc_pipeline_add_initial)
@@ -1907,7 +1947,15 @@ pub fn prepare_construction(
             bound_group_count,
         );
         render_queue.submit([encoder.finish()]);
-        gpu.bounds_initialized = true;
+        if want_w3_seed_streaming {
+            gpu.streaming_w3_seed_dispatched = true;
+            bevy::log::info!(
+                "streaming-world Phase 2.10: W3 regime-1 seed dispatched \
+                 (one-shot — chunk-level 5-bit AADF queue now active)."
+            );
+        } else {
+            gpu.bounds_initialized = true;
+        }
     }
 
     // === W2 — change-staging family + bind group =============================
@@ -2070,7 +2118,7 @@ pub fn prepare_construction(
                 segment_size_in_chunks: 4,
                 max_group_bound_dispatch: construction_config.max_group_bound_dispatch,
                 chunk_offset: [0, 0, 0],
-                _pad2: 0,
+                bounds_chunk_index_offset: 0,
                 frame_index: 0,
                 changed_chunk_count: events.changed_chunk_count,
                 changed_block_count: events.changed_block_count,
@@ -2854,7 +2902,7 @@ pub fn naadf_gpu_producer_node(
                         segment_size_in_chunks: segment_chunks,
                         max_group_bound_dispatch: config.max_group_bound_dispatch,
                         chunk_offset: group_offset_in_chunks,
-                        _pad2: 0,
+                        bounds_chunk_index_offset: 0,
                         frame_index: 0,
                         changed_chunk_count: 0,
                         changed_block_count: 0,
@@ -2982,8 +3030,12 @@ pub fn naadf_gpu_producer_node(
 
         let admissions = &streaming_extract.admissions_this_frame;
         let evictions = &streaming_extract.evictions_this_frame;
-        let any_admissions_or_evictions =
-            !admissions.is_empty() || !evictions.is_empty();
+        // streaming-world Phase 2.10 — pre-Phase-2.10 the streaming branch
+        // used an `any_admissions_or_evictions` flag to drive the deferred-
+        // idle bounds latch; the latch is removed (bounds now dispatched
+        // per-segment inline below) and the flag is no longer load-bearing.
+        // The `evictions` list is still consumed by the steady-state log
+        // statement below.
 
         // Per-segment chunk extent — same shape as the W5 producer
         // (`SEGMENT_CHUNKS = 16`).
@@ -3052,7 +3104,6 @@ pub fn naadf_gpu_producer_node(
                 local_y.max(0) as u32 * segment_chunks,
                 local_z.max(0) as u32 * segment_chunks,
             ];
-            let _ = slot;
 
             // Build the noise_terrain params.
             let noise_params = crate::streaming::build_noise_terrain_params(
@@ -3072,6 +3123,25 @@ pub fn naadf_gpu_producer_node(
                 crate::WORLD_SIZE_IN_CHUNKS.y,
                 crate::WORLD_SIZE_IN_CHUNKS.z,
             ]);
+            // streaming-world Phase 2.10
+            // (`docs/orchestrate/streaming-world/03l-diagnosis-hitch-and-
+            // view-distance.md` punch-list item 1) — per-segment bounds
+            // dispatch. The freshly-admitted slot owns a contiguous
+            // 4096-chunk / 262 144-block / 16 777 216-voxel range of the
+            // slot-indexed `chunks_buffer` / `blocks` / `voxels` buffers
+            // (Phase 2.6 layout `02c-design-windowed-slot-map.md` § F).
+            // Setting `bounds_chunk_index_offset = slot.0 * 4096` and
+            // dispatching `compute_voxel_bounds` over 4096 × 64 = 262 144
+            // workgroups + `compute_block_bounds` over 4096 workgroups
+            // covers EXACTLY that segment. The shaders add the offset to
+            // their workgroup-derived chunk/block index (Phase 2.10 shader
+            // edits in `chunk_calc.wgsl`); on non-streaming dispatches the
+            // offset is 0 and the dispatch covers the full buffer.
+            //
+            // Per-frame cost: 4 segments × ~2.5 ms ≈ 10 ms; replaces the
+            // Phase-2.8 deferred-idle full-world flush (~300 ms / hitch
+            // frame).
+            let bounds_chunk_offset: u32 = slot.0 * 4096u32;
             let construction_params = crate::render::gpu_types::GpuConstructionParams {
                 size_in_chunks: [
                     crate::WORLD_SIZE_IN_CHUNKS.x,
@@ -3090,7 +3160,7 @@ pub fn naadf_gpu_producer_node(
                 segment_size_in_chunks: segment_chunks,
                 max_group_bound_dispatch: config.max_group_bound_dispatch,
                 chunk_offset: group_offset_in_chunks,
-                _pad2: 0,
+                bounds_chunk_index_offset: bounds_chunk_offset,
                 frame_index: 0,
                 changed_chunk_count: 0,
                 changed_block_count: 0,
@@ -3103,7 +3173,12 @@ pub fn naadf_gpu_producer_node(
             );
 
             // Per-segment encoder + submit (inherits the W5 per-segment submit
-            // ordering fix at `:2427-2453`).
+            // ordering fix at `:2427-2453`). Phase 2.10 appends the
+            // per-segment-scoped bounds passes to the same encoder so all
+            // four passes for the segment (noise → chunk_calc → voxel_bounds
+            // → block_bounds) share the single per-segment uniform write +
+            // submit (wgpu auto-inserts STORAGE→STORAGE barriers between
+            // consecutive passes in the same encoder).
             let mut seg_encoder = render_device.create_command_encoder(
                 &CommandEncoderDescriptor {
                     label: Some("naadf_streaming_segment_encoder"),
@@ -3134,100 +3209,62 @@ pub fn naadf_gpu_producer_node(
                 world_bg,
                 group_size_in_chunks,
             );
+            // (c) Phase 2.10 — per-segment voxel_bounds dispatch. 4096 chunks
+            //     × 64 blocks/chunk = 262 144 workgroups, scoped to this
+            //     slot via `bounds_chunk_index_offset` (written into the
+            //     uniform above).
+            const CHUNKS_PER_SEGMENT: u32 = 4096; // 16 × 16 × 16.
+            chunk_calc::dispatch_compute_voxel_bounds(
+                &mut seg_encoder,
+                p_voxel,
+                world_bg,
+                CHUNKS_PER_SEGMENT * 64,
+            );
+            // (d) Phase 2.10 — per-segment block_bounds dispatch. 4096
+            //     chunks = 4096 workgroups.
+            chunk_calc::dispatch_compute_block_bounds(
+                &mut seg_encoder,
+                p_block,
+                world_bg,
+                CHUNKS_PER_SEGMENT,
+            );
             render_queue.submit([seg_encoder.finish()]);
             segments_dispatched += 1;
         }
 
-        // streaming-world Phase 2.8 — deferred bounds-chain dispatch.
+        // streaming-world Phase 2.10 — the per-segment bounds dispatch
+        // landed alongside each admission's noise + chunk_calc above. There
+        // is no deferred-idle flush anymore; AADF is current within the
+        // same frame any admission lands. The Phase-2.8 deferred-idle
+        // mechanism (`streaming_bounds_dirty` latch) is preserved as a
+        // resource field for backwards-compat but is no longer driven by
+        // the streaming branch — it stays `false` throughout.
         //
-        // Pre-2.8 (the cold-start perf bug): the bounds chain
-        // (`compute_voxel_bounds` + `compute_block_bounds`) fired on EVERY
-        // admission/eviction frame over the FULL world worst-case extent
-        // (134 M voxel workgroups, ~300 ms/dispatch). For the 128 admission
-        // frames of a cold-start, that's ~38 s of pure bounds overhead vs
-        // the static preset's ~5 s total cold-start (which dispatches bounds
-        // exactly once at the end of its 512-segment loop).
+        // Per `03l-diagnosis-hitch-and-view-distance.md`, the deferred-idle
+        // flush was the root cause of two user-visible bugs:
+        //   (Bug 1) ~300 ms / hitch frame on every segment-boundary crossing
+        //           (full-world bounds dispatch at 134 M voxel workgroups).
+        //   (Bug 2) Distant terrain flicker for 8 frames per crossing while
+        //           AADF stayed zero on freshly-admitted segments.
+        // The per-segment path fixes both: bounds is current every frame an
+        // admission lands, at ~10 ms / frame for 4 admissions (4 segments ×
+        // ~2.5 ms ≈ 10 ms total, vs ~300 ms before).
         //
-        // The fix: defer the bounds chain to the FIRST IDLE FRAME after any
-        // admissions or evictions. We set `streaming_bounds_dirty` on every
-        // admission/eviction frame, then dispatch the bounds chain on the
-        // next frame where `admissions.is_empty() && evictions.is_empty()
-        // && streaming_bounds_dirty`. Cold-start now matches the static
-        // path's "bounds-chain ×1" shape (one 300 ms dispatch after all
-        // ~128 admission frames complete).
-        //
-        // Correctness: bounds bits are zero-initialised (max-conservative —
-        // rays step cell-by-cell instead of skipping AADF-empty regions).
-        // During cold-start, freshly-admitted chunks render with bounds=0
-        // until the next idle frame fires the chain. This is correct but
-        // slower per-pixel; the renderer produces correct images throughout
-        // and rendering speeds up on the post-cold-start idle frame.
-        //
-        // Per `02b-design-plan-b.md` D.B7's "Mitigation: only re-run bounds
-        // over the *affected* segments via a `dirty_segments` list" — this
-        // deferred-latch approach gets the same wall-clock win (cold-start
-        // bounds cost amortised to a single dispatch) without per-shader
-        // changes, at the cost of one frame of stale bounds for newly-
-        // admitted chunks. See
-        // `docs/orchestrate/streaming-world/03i-impl-dirty-segments-bounds.md`.
-        let mut bounds_dispatched_this_frame = false;
-        if any_admissions_or_evictions {
-            gpu.streaming_bounds_dirty = true;
-        } else if gpu.streaming_bounds_dirty {
-            let encoder = render_context.command_encoder();
-
-            // Same bounds-chain dispatch shape as the W5 branch (full-world
-            // worst-case workgroup counts; extra workgroups are spec-safe
-            // no-ops per `chunk_calc::split_3d_dispatch` invariants).
-            let world_chunks = crate::WORLD_SIZE_IN_CHUNKS.x
-                * crate::WORLD_SIZE_IN_CHUNKS.y
-                * crate::WORLD_SIZE_IN_CHUNKS.z;
-            let max_blocks_u64 = (world_chunks as u64) * 64;
-            let max_voxels_u64 = max_blocks_u64 * 32;
-            let voxel_workgroups =
-                ((max_voxels_u64 / 32 + 1).max(1)).min(u32::MAX as u64) as u32;
-            let block_workgroups =
-                ((max_blocks_u64 / 64 + 1).max(1)).min(u32::MAX as u64) as u32;
-
-            chunk_calc::dispatch_compute_voxel_bounds(
-                encoder,
-                p_voxel,
-                world_bg,
-                voxel_workgroups,
-            );
-            chunk_calc::dispatch_compute_block_bounds(
-                encoder,
-                p_block,
-                world_bg,
-                block_workgroups,
-            );
-
-            gpu.streaming_bounds_dirty = false;
-            bounds_dispatched_this_frame = true;
-            bevy::log::info!(
-                "streaming-world Phase 2.8: deferred bounds chain dispatched \
-                 on idle frame (voxel_workgroups={voxel_workgroups}, \
-                 block_workgroups={block_workgroups}); flag cleared."
-            );
-        }
-
-        // streaming-world: gpu_producer_has_run STAYS FALSE (the producer
-        // runs every frame any admission/eviction happens). Flip
-        // `bounds_initialized = true` once we've actually dispatched the
-        // bounds chain at least once (either via the deferred flush on an
-        // idle frame, OR — pre-Phase-2.8 — on the first admission frame).
-        // This keeps the W3 regime-1 seed in `prepare_construction` skipped
-        // once we own the bounds dispatch.
-        if bounds_dispatched_this_frame && !gpu.bounds_initialized {
+        // First-admission flip: `bounds_initialized = true` once any
+        // admission has dispatched the bounds passes. This unblocks the W3
+        // regime-2 background queue (`naadf_bounds_compute_node` gates on
+        // this flag) — see Phase 2.10 punch-list item 3 below for the
+        // matching W3 regime-1 seed restoration.
+        if segments_dispatched > 0 && !gpu.bounds_initialized {
             gpu.bounds_initialized = true;
         }
         if segments_dispatched > 0 {
-            bevy::log::info!(
-                "streaming-world: dispatched {} segment(s) this frame ({} evictions); \
-                 bounds chain deferred (latched dirty={}).",
+            bevy::log::debug!(
+                "streaming-world Phase 2.10: dispatched {} segment(s) this \
+                 frame ({} evictions); per-segment bounds chain dispatched \
+                 inline (each segment scoped via bounds_chunk_index_offset).",
                 segments_dispatched,
                 evictions.len(),
-                gpu.streaming_bounds_dirty,
             );
         }
         return;
@@ -3378,7 +3415,7 @@ pub fn naadf_gpu_producer_node(
                         segment_size_in_chunks: segment_chunks,
                         max_group_bound_dispatch: config.max_group_bound_dispatch,
                         chunk_offset: group_offset_in_chunks,
-                        _pad2: 0,
+                        bounds_chunk_index_offset: 0,
                         frame_index: 0,
                         changed_chunk_count: 0,
                         changed_block_count: 0,
@@ -4032,7 +4069,7 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
         segment_size_in_chunks,
         max_group_bound_dispatch: 0,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        bounds_chunk_index_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,
@@ -4992,7 +5029,7 @@ pub fn validate_gpu_construction_production_scale() -> Result<String, String> {
         segment_size_in_chunks: segment_chunks,
         max_group_bound_dispatch: 0,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        bounds_chunk_index_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,
@@ -5126,7 +5163,7 @@ pub fn validate_gpu_construction_production_scale() -> Result<String, String> {
                     segment_size_in_chunks: segment_chunks,
                     max_group_bound_dispatch: 0,
                     chunk_offset,
-                    _pad2: 0,
+                    bounds_chunk_index_offset: 0,
                     frame_index: 0,
                     changed_chunk_count: 0,
                     changed_block_count: 0,
@@ -5780,7 +5817,7 @@ fn run_one_fixture_byte_diff(
         segment_size_in_chunks,
         max_group_bound_dispatch: 0,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        bounds_chunk_index_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,
@@ -6390,7 +6427,7 @@ fn run_one_fixture_multiseg_byte_diff(
                     segment_size_in_chunks,
                     max_group_bound_dispatch: 0,
                     chunk_offset,
-                    _pad2: 0,
+                    bounds_chunk_index_offset: 0,
                     frame_index: 0,
                     changed_chunk_count: 0,
                     changed_block_count: 0,
@@ -7144,7 +7181,7 @@ fn run_one_tiled_byte_diff(
                     segment_size_in_chunks: seg,
                     max_group_bound_dispatch: 0,
                     chunk_offset: off,
-                    _pad2: 0,
+                    bounds_chunk_index_offset: 0,
                     frame_index: 0,
                     changed_chunk_count: 0,
                     changed_block_count: 0,
@@ -7609,7 +7646,7 @@ fn run_oasis_segment_byte_diff(
             .max(group_size_in_chunks[2]),
         max_group_bound_dispatch: 0,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        bounds_chunk_index_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,
@@ -9181,7 +9218,7 @@ mod tests_w1 {
             segment_size_in_chunks,
             max_group_bound_dispatch: 0,
             chunk_offset: [0, 0, 0],
-            _pad2: 0,
+            bounds_chunk_index_offset: 0,
             frame_index: 0,
             changed_chunk_count: 0,
             changed_block_count: 0,
