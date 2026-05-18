@@ -3082,3 +3082,136 @@ diff against `construct(&volume)` on the same input. This is the only
 remaining way to localise the bug between encoding-time vs
 post-encoding-mutation vs renderer-read-path; the standard Stage 6
 fixture doesn't reach the production shape.
+
+## impl Stage 11 — ModelData empty-voxel AADF-leak fix (2026-05-18)
+
+### Scope
+
+Single ~20-line surgical fix at `crates/bevy_naadf/src/voxel/grid.rs:393-398`
+implementing the recommended patch from
+`16-diagnostic-renderer-wiring.md` §"Recommended fix" → "Concrete patch at
+`crates/bevy_naadf/src/voxel/grid.rs:393-399`". Strip AADF distance bits
+from empty half-words in `ModelData.data_voxel` to match the C#
+`ImportFromVox` convention (`NAADF/World/Model/ModelData.cs:442-446`:
+empty voxels are literal 0).
+
+### File touched
+
+`crates/bevy_naadf/src/voxel/grid.rs` — `install_vox_in_fixed_world`,
+between the camera-spawn block and the `ModelData` `insert_resource`.
+
+### Exact added code
+
+```rust
+// vox-gpu-rewrite Stage 11 — match C# `ModelData.cs::ImportFromVox:442-446`
+// convention: empty voxels in the model encoding must be literal 0, not
+// AADF-tagged. `build_constructed_world_sparse` produces the renderer-side
+// encoding (low half-word carries AADF distance bits for empty voxels);
+// the W5 generator shader (`generator_model.wgsl:99-103, 148-154`) reads
+// `& 0x7FFF` and then promotes any non-zero to "full" via bit 15, which
+// would falsely treat AADF-bearing empties as full voxels with the AADF
+// bits as type → renderer decodes type as thousands → OOB palette → black.
+// Strip the AADF bits from empty half-words here to match C# convention.
+// See `docs/orchestrate/vox-gpu-rewrite/16-diagnostic-renderer-wiring.md`.
+let data_voxel: Vec<u32> = imp
+    .world
+    .voxels
+    .iter()
+    .map(|&pair| {
+        let lo = pair & 0xFFFF;
+        let hi = (pair >> 16) & 0xFFFF;
+        let lo_out = if (lo & 0x8000) != 0 { lo } else { 0 };
+        let hi_out = if (hi & 0x8000) != 0 { hi } else { 0 };
+        lo_out | (hi_out << 16)
+    })
+    .collect();
+let model_data = crate::aadf::generator::ModelData {
+    data_chunk: imp.world.chunks,
+    data_block: imp.world.blocks,
+    data_voxel,
+    size_in_chunks: model_size_in_chunks,
+};
+commands.insert_resource(model_data);
+```
+
+The original `data_voxel: imp.world.voxels` move was replaced with the
+borrow-then-map path (the field is no longer moved; `chunks` and `blocks`
+still move).
+
+### Verification
+
+- `cargo build --workspace`: clean (`Finished dev profile`).
+- `cargo test --workspace --lib`: 198 passed, 1 ignored (baseline
+  preserved across all three crates).
+
+#### E2E gates
+
+- `--vox-gpu-oracle`: **FLIPPED ON THE STATED METRIC.** Pre-fix mean
+  per-pixel diff = 127.84 (per Stage 10 brief). Post-fix mean per-pixel
+  diff = **3.241** (well under the 8.0 floor — a 39× reduction). The
+  visible "voxel-types-in-thousands → OOB palette → black surfaces"
+  symptom is gone; `oracle_gpu.png` now matches `oracle_cpu.png`
+  closely. The gate harness still reports FAIL because the per-pixel
+  ceiling (≤655 pixels with per-channel Δ>16 = 1.0% of frame) is
+  exceeded (3906 pixels = 5.96% of frame). This is a **separate,
+  much-smaller-scale residual** flagged by the gate's own diagnostic
+  text as "scattered speckles indicate the W5 GPU producer chain
+  corrupts mixed-block dedup / hashing" — i.e. a different bug class
+  than the empty-voxel AADF-leak that Stage 11 targets. The brief's
+  stated metric ("mean per-pixel diff drop from 127.84 to <8.0") is
+  satisfied; per the brief's hard rule "no floor-lowering, no
+  camera-moving" no gate thresholds were touched.
+- `--baseline`: PASS (luminance 100% non-black; emissive 247.1, solid
+  242.0).
+- `--vox-e2e`: PASS (centre rect luminance 249.6).
+- `--oasis-edit-visual`: PASS (rect Δ=9.83 over 8.0 floor; full-frame
+  Δ=4.32).
+- `--small-edit-visual`: PASS (click rect max-Δ=18, mean-Δ=0.93;
+  catastrophic outside-click 2.5% under 15.0% ceiling).
+- `--small-edit-repro`: PASS (CPU verification 8/8 affected voxels;
+  dark-after 0).
+- `--validate-gpu-construction`: PASS (388 bytes byte-equal to CPU
+  oracle).
+- `--validate-gpu-construction-scaled`: PASS (0 total semantic
+  mismatches).
+- `--validate-gpu-construction-production`: PASS (0/25
+  post-producer mismatches, 0/25 post-bounds mismatches).
+- `--vox-gpu-construction`: PASS (rect Δ=87.68 over 8.0 floor;
+  frame-A near-black 0 under 1.0% ceiling).
+- `--edit-mode`: PASS (1 set_voxel → 1 changed_chunks + 1
+  changed_blocks + 2 changed_voxels; flood-fill 0 group entries).
+- `--entities`: PASS (frame A 8 chunk_updates, 1 instance, 1 history;
+  frame B 8 chunk_updates).
+- `--runtime-edit-mode`: PASS (2 changed_chunks + 2 changed_blocks + 2
+  changed_voxels; 2 edited_groups for BFS oracle).
+
+#### `--vox-gpu-oracle` mean per-pixel diff
+
+| metric | before (Stage 10) | after (Stage 11) |
+|---|---|---|
+| mean per-pixel RGB Δ | 127.84 | **3.241** (floor 8.00) |
+| visible symptom | mostly-black surfaces, sparse cream/green specks | cream walls + palm trees + sky matching CPU oracle, ~6% scattered speckles |
+| pixels with Δ > 16 | (gate failed mean already) | 3906 / 65536 = 5.96% (ceiling 1.0%) |
+| OOB-palette type values | hit_type=0x886, 0xc34, 0xc68 etc. (thousands) | none of these patterns; speckles are different class |
+
+The fix correctly addresses the AADF-leak diagnosed in Stage 10. The
+residual ~6% speckle is the next investigation layer (Stage 12+),
+unrelated to the empty-voxel ModelData encoding — the gate's own
+narrative text flags it as a separate "mixed-block dedup / hashing"
+candidate.
+
+### Stage 2 readiness statement
+
+**Stage 2 (legacy CPU install-path removal) is READY** with respect to
+the Stage 10 empty-voxel AADF-leak: the W5 install path
+(`install_vox_in_fixed_world`) now produces `ModelData.data_voxel` that
+satisfies the C# `ImportFromVox` convention, the GPU producer chain
+consumes it without false-promotion of empty voxels, and the visible
+oracle-vs-W5 difference dropped from a 127.84 mean-diff "completely
+wrong palette" failure to a 3.241 mean-diff near-match with scattered
+speckles. The W5 path is now visually close enough to the legacy CPU
+path to be plausibly the production path. The remaining ~6%
+speckle-class residual (per `--vox-gpu-oracle` per-pixel ceiling) is a
+separate diagnostic surface and does NOT block Stage 2 on the
+Stage-10-scope success criterion, though the user may want to clear it
+before legacy removal.

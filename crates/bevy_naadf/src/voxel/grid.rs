@@ -390,10 +390,33 @@ fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
     // W5.1 — convert ConstructedWorld → ModelData. The `chunks/blocks/voxels`
     // u32 buffers `vox_import` produces are byte-identical to NAADF's
     // `dataChunk/dataBlock/dataVoxel` encoding (`aadf/generator.rs:64-71`).
+    //
+    // vox-gpu-rewrite Stage 11 — match C# `ModelData.cs::ImportFromVox:442-446`
+    // convention: empty voxels in the model encoding must be literal 0, not
+    // AADF-tagged. `build_constructed_world_sparse` produces the renderer-side
+    // encoding (low half-word carries AADF distance bits for empty voxels);
+    // the W5 generator shader (`generator_model.wgsl:99-103, 148-154`) reads
+    // `& 0x7FFF` and then promotes any non-zero to "full" via bit 15, which
+    // would falsely treat AADF-bearing empties as full voxels with the AADF
+    // bits as type → renderer decodes type as thousands → OOB palette → black.
+    // Strip the AADF bits from empty half-words here to match C# convention.
+    // See `docs/orchestrate/vox-gpu-rewrite/16-diagnostic-renderer-wiring.md`.
+    let data_voxel: Vec<u32> = imp
+        .world
+        .voxels
+        .iter()
+        .map(|&pair| {
+            let lo = pair & 0xFFFF;
+            let hi = (pair >> 16) & 0xFFFF;
+            let lo_out = if (lo & 0x8000) != 0 { lo } else { 0 };
+            let hi_out = if (hi & 0x8000) != 0 { hi } else { 0 };
+            lo_out | (hi_out << 16)
+        })
+        .collect();
     let model_data = crate::aadf::generator::ModelData {
         data_chunk: imp.world.chunks,
         data_block: imp.world.blocks,
-        data_voxel: imp.world.voxels,
+        data_voxel,
         size_in_chunks: model_size_in_chunks,
     };
     commands.insert_resource(model_data);
