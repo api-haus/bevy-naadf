@@ -275,6 +275,45 @@ pub struct StreamingExtractRender {
     /// Used by the streaming dispatch loop to compute window-local positions
     /// (`local = world_seg - origin`) without needing to know slot indices.
     pub window_origin: bevy::math::IVec3,
+    /// streaming-world Phase 2.11
+    /// (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md`
+    /// punch-list item 1) — mirrors `Residency::is_cold_start_complete()`.
+    /// `true` once every slot in the window has been admitted at least once.
+    /// Gates the W3 regime-1 seed in `prepare_construction` so the seed
+    /// fires AFTER all chunks_buffer slots carry real chunk_calc-produced
+    /// state — prevents the W3 chain from baking stale long-skip AADFs
+    /// through yet-to-be-admitted zero-chunks (the bug in `03n` § Root
+    /// cause). Steady-state boundary crossings drop this to false until
+    /// the new admissions complete; the W3 seed only re-runs in scoped form
+    /// via the per-admission re-seed (Phase 2.11 punch-list item 2) once
+    /// cold-start is again complete.
+    pub cold_start_complete: bool,
+    /// streaming-world Phase 2.11
+    /// (`03n-diagnosis-aadf-building.md` punch-list item 2) — `true` when
+    /// this frame triggered any origin shift (evictions > 0 or
+    /// admissions > 0). Drives the render-world W3 full-world re-seed
+    /// dispatch.
+    ///
+    /// Why full-world re-seed (not scoped): the chunks_buffer is slot-
+    /// indexed; AADFs are stored per slot. When origin shifts, the
+    /// indirection table rebinds (slot S now at a different window-local
+    /// position), but slot S's chunks_buffer data does NOT move. The
+    /// AADFs in slot S's chunks describe neighbour relationships at
+    /// PRE-SHIFT window-local coords. The renderer + bounds-chain
+    /// interpret them via POST-SHIFT indirection → neighbour-via-indirection
+    /// now resolves to a different slot, so the AADF skip distance may now
+    /// "lie" (skip past terrain that is now adjacent in window-local space).
+    ///
+    /// Scope-aware re-seed (Phase 2.11 punch-list item 2's original
+    /// proposal) covers ONLY the just-admitted segments + a 1-group
+    /// border. That's too narrow: AADFs up to 31 chunks long can lie
+    /// about chunks far from any admission boundary. The full-world
+    /// re-seed (mark every group's mask bit, re-enqueue all 32768 groups
+    /// at size 0) is the simple correct fix. Cost: the W3 regime-2
+    /// background chain re-converges over ~30 frames at one bound size
+    /// per round; user-visible during shift bursts, invisible at
+    /// steady-state.
+    pub w3_reseed_full_world: bool,
 }
 
 impl Default for StreamingExtractRender {
@@ -294,6 +333,8 @@ impl Default for StreamingExtractRender {
             noise_terrain_shader: None,
             window_indirection: Vec::new(),
             window_origin: bevy::math::IVec3::ZERO,
+            cold_start_complete: false,
+            w3_reseed_full_world: false,
         }
     }
 }
@@ -344,6 +385,12 @@ pub fn extract_streaming_state(
             // absolute world chunk coords via the flat-coord layout.
             window_indirection: Vec::new(),
             window_origin: bevy::math::IVec3::ZERO,
+            // Static preset: not streaming, so the W3 cold-start gate is
+            // irrelevant; the static branch flips `bounds_initialized = true`
+            // directly. Set to false; the streaming-only W3 seed gate
+            // (`!streaming_active` branch) doesn't consume this field.
+            cold_start_complete: false,
+            w3_reseed_full_world: false,
         });
         return;
     }
@@ -357,6 +404,21 @@ pub fn extract_streaming_state(
         commands.insert_resource(default_state);
         return;
     };
+    // streaming-world Phase 2.11 — flag a full-world W3 re-seed when this
+    // frame had any origin shift (admissions or evictions). The chunks_buffer
+    // is slot-indexed; AADFs are interpreted via the indirection table.
+    // Origin shifts rebind indirection without moving the chunks_buffer data,
+    // so all slot-stored AADFs become stale (they describe neighbours at
+    // PRE-SHIFT window-local positions; the renderer now resolves neighbours
+    // via POST-SHIFT indirection → potentially different slots with
+    // potentially-solid content). Simple correct fix: full-world re-seed
+    // (re-enqueues all 32768 groups at bound_size 0; the chain reconverges
+    // over ~30 frames at 1 round per axis-size combo). Gated on
+    // `cold_start_complete` so cold-start admissions don't repeatedly fire
+    // the seed.
+    let w3_reseed_full_world = !residency.admissions_this_frame.is_empty()
+        || !residency.evictions_this_frame.is_empty();
+
     commands.insert_resource(StreamingExtractRender {
         streaming_mode_active: true,
         static_mode_active: false,
@@ -372,8 +434,11 @@ pub fn extract_streaming_state(
         // 2 KB clone per frame — cheap.
         window_indirection: residency.window.indirection_buffer().to_vec(),
         window_origin: residency.window.origin(),
+        cold_start_complete: residency.is_cold_start_complete(),
+        w3_reseed_full_world,
     });
 }
+
 
 // -----------------------------------------------------------------------------
 // Phase 2.6 — per-frame GPU upload of the window indirection table.

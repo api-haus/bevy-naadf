@@ -164,6 +164,20 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Gate::StreamingAadfParity) => {
+            // streaming-world Phase 2.11 — post-App self-consistency check on
+            // the chunks_buffer snapshot captured by the render-world
+            // readback system. The check runs AFTER the App run completes
+            // (the snapshot was captured at end of walk; the static holds
+            // the data across the App's shutdown).
+            match bevy_naadf::e2e::streaming_aadf_parity::assert_streaming_aadf_parity() {
+                Ok(report) => eprintln!("streaming-aadf-parity gate PASS: {report}"),
+                Err(msg) => {
+                    eprintln!("streaming-aadf-parity gate FAILED: {msg}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
         _ => {}
     }
 

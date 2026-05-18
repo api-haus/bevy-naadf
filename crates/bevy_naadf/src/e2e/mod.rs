@@ -30,6 +30,7 @@ pub mod oasis_edit_visual;
 pub mod readback;
 pub mod small_edit_repro;
 pub mod small_edit_visual;
+pub mod streaming_aadf_parity;
 pub mod vox_e2e;
 pub mod streaming_window;
 pub mod vox_gpu_construction;
@@ -276,6 +277,14 @@ pub fn add_e2e_systems(app: &mut App) {
                 // so it sees the same tick state the pin system reads.
                 streaming_window::record_walk_metrics_and_capture_mid_walk
                     .after(streaming_window::pin_streaming_window_camera),
+                // streaming-world Phase 2.11
+                // (`03n-diagnosis-aadf-building.md` punch-list item 4) —
+                // post-walk request_snapshot Update system for the
+                // chunks_buffer readback used by the parity gate.
+                // Inactive on non-parity gates (early-returns on
+                // `args.streaming_aadf_parity_mode = false`).
+                streaming_aadf_parity::request_snapshot_after_walk
+                    .after(streaming_window::pin_streaming_window_camera),
                 // streaming-world Phase 2.4 — pin the camera at the static
                 // preset's centre pose. Runs `.after(pin_oasis_camera)` for
                 // the same reason (overrides the birdseye pose; the
@@ -297,6 +306,16 @@ pub fn add_e2e_systems(app: &mut App) {
             .add_systems(
                 Render,
                 scan_pipeline_errors_render_system.after(RenderSystems::Render),
+            )
+            // streaming-world Phase 2.11 — chunks_buffer readback for the
+            // parity gate. Runs in the `Render` schedule (after RenderSystems::Render
+            // so the frame's GPU work has been submitted) and gates internally
+            // on `SNAPSHOT_REQUESTED`. Inactive on non-parity gates
+            // (early-returns when the latch is unset).
+            .add_systems(
+                Render,
+                streaming_aadf_parity::render_world_chunks_readback
+                    .after(RenderSystems::Render),
             );
     }
 }

@@ -432,6 +432,17 @@ pub struct AppArgs {
     /// `docs/orchestrate/streaming-world/02b-design-plan-b.md` § J +
     /// `crate::e2e::streaming_window`.
     pub streaming_window_mode: bool,
+    /// streaming-world Phase 2.11
+    /// (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md`
+    /// punch-list item 4) — runs the `--gate streaming-aadf-parity` e2e gate.
+    /// Wraps the standard streaming-window flow + adds a post-walk
+    /// `chunks_buffer` GPU-readback that asserts the W3 chunk-level 5-bit
+    /// AADFs are self-consistent: for every empty chunk c, the AADF skip
+    /// distance in each of 6 directions must not exceed the actual distance
+    /// to the nearest non-empty chunk in that direction. Catches the Phase
+    /// 2.11 bug class (W3 chain baking long stale skips through yet-to-be-
+    /// admitted zero-chunks).
+    pub streaming_aadf_parity_mode: bool,
     /// streaming-world Phase 2.4 — runs the `--noise-static-world` e2e gate.
     /// When `true`, the e2e harness boots a `GridPreset::ProceduralStatic`
     /// world (the full 512-segment fixed-world container, generated once at
@@ -490,6 +501,7 @@ impl Default for AppArgs {
             vox_gpu_oracle_cpu_phase: false,
             vox_gpu_oracle_gpu_phase: false,
             streaming_window_mode: false,
+            streaming_aadf_parity_mode: false,
             noise_static_mode: false,
             vram_budget_mib: 1024,
             max_segments_per_frame: 4,

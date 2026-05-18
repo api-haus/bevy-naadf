@@ -1831,7 +1831,14 @@ pub fn prepare_construction(
             let buf = render_device.create_buffer(&BufferDescriptor {
                 label: Some("naadf_streaming_window_indirection"),
                 size: WINDOW_INDIRECTION_CAPACITY * 4, // 2048 B.
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                // streaming-world Phase 2.11 — add COPY_SRC so the
+                // `--gate streaming-aadf-parity` readback can copy this
+                // table into a staging buffer for the post-walk
+                // self-consistency check (cross-slot AADF walk requires
+                // CPU access to the indirection table).
+                usage: BufferUsages::STORAGE
+                    | BufferUsages::COPY_DST
+                    | BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
             // Initialise to EMPTY_SLOT (0xFFFFFFFFu) — the first extract
@@ -1917,8 +1924,74 @@ pub fn prepare_construction(
     let want_w3_seed_non_streaming = !gpu.bounds_initialized
         && (!want_gpu_producer || gpu.gpu_producer_has_run)
         && !noise_dispatch_active;
+    // streaming-world Phase 2.11
+    // (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md`
+    // punch-list item 1) — defer the W3 regime-1 seed on the streaming
+    // preset until cold-start has fully drained. Pre-Phase-2.11 the gate
+    // was `bounds_initialized && !streaming_w3_seed_dispatched`, which
+    // fired the seed on the first admission frame — at which point only
+    // 4 of 512 segments had real chunk_calc-current data and the W3 chain
+    // baked stale long-skip AADFs through the 508 yet-to-be-admitted
+    // zero-chunks. The new gate ALSO requires
+    // `streaming_extract.cold_start_complete == true` — i.e., every slot
+    // in the window has been admitted at least once (mirrors
+    // `Residency::is_cold_start_complete()`, plumbed via the render-world
+    // extract). The cold-start seed then fires AFTER all chunks_buffer
+    // slots carry real data, so the W3 chain's first expansion pass reads
+    // only correct neighbour state.
+    // streaming-world Phase 2.11
+    // (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md`
+    // punch-list item 1 + item 6) — the W3 regime-1 seed is DISABLED on
+    // the streaming preset by default. The chunks_buffer is slot-indexed;
+    // AADFs reference cross-slot neighbours via the indirection table. When
+    // origin shifts, indirection rebinds (the same slot is now at a
+    // different window-local position), but slot-stored AADFs do not move
+    // — they describe relationships at PRE-SHIFT window-local coords, but
+    // the renderer interprets them via POST-SHIFT indirection → AADFs
+    // become inconsistent.
+    //
+    // Scoped re-seed (covering admitted segments + 1-group border) doesn't
+    // fix the 480 slots that stayed bound across the shift. Full-world
+    // re-seed on every shift produces 90-frame chain re-converge cycles
+    // and ~128 ms hitches (the original Bug 1 from `03l`). The simple
+    // correct fix is: don't fire W3 on streaming at all. The static preset
+    // proves this works (its `chunks_buffer` AADFs stay 0; rays step at
+    // chunk granularity = 16-voxel skips through empty space; with the
+    // streaming-preset `max_ray_steps_primary = 240` cap, rays can traverse
+    // 240 × 16 = 3840 voxels of empty space, easily reaching any in-window
+    // terrain).
+    //
+    // For environments that need W3 (e.g. a future preset with much larger
+    // empty regions), the seed can be re-enabled via the env var
+    // `PHASE_2_11_ENABLE_STREAMING_W3=1`. The gate then fires once
+    // cold-start is complete (Item 1's original design), and a full-world
+    // re-seed fires on every shift (Item 2's full-world variant). Both
+    // come with the cost noted above.
+    let _enable_streaming_w3: bool =
+        std::env::var("PHASE_2_11_ENABLE_STREAMING_W3")
+            .ok()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+    // streaming-world Phase 2.11 — synthetic regression knob: bypass Item 1's
+    // cold-start gate so the W3 seed fires on the FIRST admission frame
+    // (reproduces the diagnostic's root-cause scenario). The parity gate's
+    // self-consistency check should report violations under this knob.
+    let _synthetic_disable_cold_start_gate: bool = std::env::var(
+        "PHASE_2_11_SYNTHETIC_DISABLE_COLD_START_GATE",
+    )
+    .ok()
+    .map(|v| v == "1")
+    .unwrap_or(false);
+    let cold_start_complete = streaming_extract
+        .as_deref()
+        .map(|s| s.cold_start_complete)
+        .unwrap_or(false);
+    let cold_start_complete_effective =
+        cold_start_complete || _synthetic_disable_cold_start_gate;
     let want_w3_seed_streaming = streaming_active
+        && _enable_streaming_w3
         && gpu.bounds_initialized
+        && cold_start_complete_effective
         && !gpu.streaming_w3_seed_dispatched;
     if construction_config.gpu_construction_enabled
         && bound_group_count > 0
@@ -2753,6 +2826,10 @@ pub fn naadf_gpu_producer_node(
     // dispatch loop. The non-streaming W5 + dense ladder below stays
     // byte-identical for `GridPreset::Default` + `GridPreset::Vox`.
     streaming_extract: Option<Res<crate::streaming::StreamingExtractRender>>,
+    // streaming-world Phase 2.11 — needed by Item 3 (clear the slot's
+    // chunks_buffer region before chunk_calc rewrites it on admission) +
+    // Item 2 (scoped W3 re-seed dispatch).
+    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
 ) {
     let Some(config) = construction_config else { return; };
     if !config.gpu_construction_enabled {
@@ -2991,6 +3068,12 @@ pub fn naadf_gpu_producer_node(
 
     if streaming_mode_active {
         // === (a0) streaming-world Phase 2 branch ============================
+        // streaming-world Phase 2.11 — `world_gpu` is required by Items 2+3
+        // (clear slot region + scoped W3 re-seed dispatch). Bail when it
+        // isn't present yet (first-frame prepare-resources race).
+        let Some(world_gpu) = world_gpu.as_deref() else {
+            return;
+        };
         //
         // Per-frame admission loop:
         //   1. For each admission in `streaming_extract.admissions_this_frame`
@@ -3184,6 +3267,42 @@ pub fn naadf_gpu_producer_node(
                     label: Some("naadf_streaming_segment_encoder"),
                 },
             );
+            // streaming-world Phase 2.11
+            // (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md`
+            // punch-list item 3) — zero the slot's `chunks_buffer` region
+            // BEFORE chunk_calc writes new content. Reasons:
+            //
+            //   (a) An evicted slot's previous `chunks_buffer` bytes (state
+            //       + 5-bit AADFs) persist until chunk_calc overwrites them.
+            //       Between eviction and re-admission of THIS slot to a NEW
+            //       world segment, the indirection table points the new
+            //       local position at this slot — readers see stale data
+            //       until chunk_calc fires.
+            //   (b) Steady-state boundary crossings evict 32 slots and admit
+            //       32 new ones over ~8 frames at 4/frame. During those 8
+            //       frames the indirection points the new locals at slots
+            //       still carrying old segment data. W3 chain neighbour
+            //       reads through those slots would see stale AADFs.
+            //
+            // chunk_calc DOES overwrite every chunk in the slot
+            // (`chunk_calc.wgsl:447-470` — 4096 workgroups, one per chunk;
+            // writes `chunks[idx] = vec2<u32>(state, 0u)`), so post-
+            // chunk_calc the slot is clean. But the explicit pre-clear here
+            // forecloses any "stale data visible mid-encoder" subtle bug
+            // (e.g. if a future change adds a read between encoder start and
+            // chunk_calc dispatch). Cost: one ClearBuffer = ~50 us / segment
+            // for 4 admissions = 200 us / frame; negligible.
+            const CHUNKS_PER_SLOT: u32 = 4096;
+            const CHUNK_PAIR_BYTES: u64 = 8; // vec2<u32>
+            let slot_chunk_offset_bytes =
+                (slot.0 as u64) * (CHUNKS_PER_SLOT as u64) * CHUNK_PAIR_BYTES;
+            let slot_chunk_size_bytes =
+                (CHUNKS_PER_SLOT as u64) * CHUNK_PAIR_BYTES;
+            seg_encoder.clear_buffer(
+                &world_gpu.chunks_buffer,
+                slot_chunk_offset_bytes,
+                Some(slot_chunk_size_bytes),
+            );
             // (a) Dispatch noise_terrain: writes `segment_voxel_buffer`.
             {
                 let mut pass = seg_encoder.begin_compute_pass(
@@ -3255,7 +3374,22 @@ pub fn naadf_gpu_producer_node(
         // regime-2 background queue (`naadf_bounds_compute_node` gates on
         // this flag) — see Phase 2.10 punch-list item 3 below for the
         // matching W3 regime-1 seed restoration.
-        if segments_dispatched > 0 && !gpu.bounds_initialized {
+        // streaming-world Phase 2.11 — flip `bounds_initialized = true`
+        // ONLY when the W3 chain has been explicitly enabled on streaming
+        // (via `PHASE_2_11_ENABLE_STREAMING_W3=1`). With the chain disabled
+        // (default), keeping `bounds_initialized = false` ensures
+        // `naadf_bounds_compute_node` early-returns (`bounds_calc.rs:348-350`)
+        // — the chain never reads the degenerate zero-init
+        // `bound_group_queues` and never writes corrupted AADFs.
+        let _enable_streaming_w3_for_flag: bool =
+            std::env::var("PHASE_2_11_ENABLE_STREAMING_W3")
+                .ok()
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        if segments_dispatched > 0
+            && !gpu.bounds_initialized
+            && _enable_streaming_w3_for_flag
+        {
             gpu.bounds_initialized = true;
         }
         if segments_dispatched > 0 {
@@ -3265,6 +3399,200 @@ pub fn naadf_gpu_producer_node(
                  inline (each segment scoped via bounds_chunk_index_offset).",
                 segments_dispatched,
                 evictions.len(),
+            );
+        }
+
+        // streaming-world Phase 2.11
+        // (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md`
+        // punch-list item 2) — per-admission scoped W3 re-seed.
+        //
+        // The W3 chunk-level 5-bit AADF chain produces correct results only
+        // when its neighbour-chunk reads return real, admitted state. During
+        // cold-start the seed is deferred (Item 1 gate above); after cold-
+        // start, every steady-state boundary crossing evicts 32 segments and
+        // admits 32 new ones over ~8 frames. During those 8 frames the
+        // affected segments' neighbour groups carry stale AADFs from the
+        // PRE-eviction state. Without intervention those stale AADFs would
+        // persist forever (the W3 chain's mask bits are set; the chain
+        // short-circuits at the re-enqueue gate at `bounds_calc.wgsl:480-481`).
+        //
+        // Fix: re-seed the chunk-group AABB of (admissions ∪ evictions)
+        // expanded by 1 group on each axis. The seed shader's scoped path
+        // (bit-31 of `bounds_chunk_index_offset` set) overwrites mask bits
+        // to size-0-only (clearing higher-bound bits via `atomicStore(1u)`)
+        // and atomic-appends the affected groups to the size-0 queues. The
+        // W3 regime-2 background loop then re-expands AADFs across the
+        // scope from scratch.
+        //
+        // Gated on (a) cold-start complete (matches the Item 1 cold-start
+        // seed gate — only re-seed after the world is fully populated), and
+        // (b) a non-None re-seed range (some admissions/evictions happened
+        // this frame).
+        let _synthetic_disable_reseed: bool = std::env::var(
+            "PHASE_2_11_SYNTHETIC_DISABLE_RESEED",
+        )
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+        // streaming-world Phase 2.11 — the per-shift full-world re-seed
+        // only fires when the W3 chain is enabled on streaming (default
+        // OFF; see `prepare_construction:1917+` comment block).
+        let _enable_streaming_w3: bool =
+            std::env::var("PHASE_2_11_ENABLE_STREAMING_W3")
+                .ok()
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        // streaming-world Phase 2.11 — full-world W3 re-seed on every
+        // shift frame (admissions ∪ evictions > 0). Gated on
+        // `cold_start_complete` so cold-start admissions don't repeatedly
+        // re-fire the seed (the cold-start case is handled by the first
+        // seed gate in `prepare_construction`).
+        //
+        // Why full-world (not scoped to admissions): chunks_buffer is
+        // slot-indexed; AADFs persist across origin shifts. When origin
+        // shifts, slot identity → world-segment binding is unchanged for
+        // remaining slots, but indirection[pack(local)] → slot changes
+        // (the same slot is now at a different window-local position).
+        // Stored AADFs reference window-local neighbours via indirection-
+        // at-write-time; post-shift the indirection-at-read-time resolves
+        // to potentially-different slots → AADFs become inconsistent.
+        // Scoping the re-seed to admitted segments doesn't cover the
+        // remaining 480 slots' AADFs which are also stale. Full-world
+        // re-seed is the simple correct fix.
+        //
+        // Cost: ~512 workgroups (32768 groups / 64 threads) per seed
+        // dispatch + ~90 frames of regime-2 background work to drain
+        // queues + saturate masks. Shifts happen ~every 50 frames during
+        // walk; the chain runs at "converging-but-not-done" steady state
+        // through the walk and converges 90 frames after the last shift.
+        let want_reseed = _enable_streaming_w3
+            && streaming_extract.cold_start_complete
+            && gpu.streaming_w3_seed_dispatched
+            && streaming_extract.w3_reseed_full_world
+            && !_synthetic_disable_reseed;
+        if want_reseed {
+            // Resolve seed pipeline + bind groups. Bail silently on first-
+            // frame races.
+            let (Some(seed_pipeline), Some(bounds_world_bg), Some(bounds_bg)) = (
+                pipeline_cache.get_compute_pipeline(
+                    construction_pipelines.bounds_calc_pipeline_add_initial,
+                ),
+                construction_bind_groups.construction_bounds_world.as_ref(),
+                construction_bind_groups.construction_bounds.as_ref(),
+            ) else {
+                return;
+            };
+            let bound_group_count = bounds_calc::bound_group_count_of([
+                crate::WORLD_SIZE_IN_CHUNKS.x,
+                crate::WORLD_SIZE_IN_CHUNKS.y,
+                crate::WORLD_SIZE_IN_CHUNKS.z,
+            ]);
+            // Use the unscoped legacy seed path — the shader's bit-31 of
+            // `bounds_chunk_index_offset` is 0 in the pre-allocated
+            // `bounds_params_buffer` (allocated at `prepare_construction`
+            // with `bounds_chunk_index_offset = 0`). The per-admission
+            // encoders may have written non-zero `bounds_chunk_index_offset`
+            // values (= slot.0 * 4096) during their per-segment bounds
+            // dispatches; restore the params here so the unscoped seed
+            // path sees `bounds_chunk_index_offset = 0`.
+            //
+            // bit-31 = 0 in this value ensures the shader's unscoped path
+            // fires (= legacy cold-start behavior).
+            let group_size_in_groups = bounds_calc::group_size_in_groups_of([
+                crate::WORLD_SIZE_IN_CHUNKS.x,
+                crate::WORLD_SIZE_IN_CHUNKS.y,
+                crate::WORLD_SIZE_IN_CHUNKS.z,
+            ]);
+            let seed_params = crate::render::gpu_types::GpuConstructionParams {
+                size_in_chunks: [
+                    crate::WORLD_SIZE_IN_CHUNKS.x,
+                    crate::WORLD_SIZE_IN_CHUNKS.y,
+                    crate::WORLD_SIZE_IN_CHUNKS.z,
+                ],
+                _pad0: 0,
+                group_size_in_groups,
+                _pad1: 0,
+                bound_group_queue_max_size: bound_group_count.max(1),
+                hash_map_size: config.initial_hash_map_size,
+                segment_size_in_chunks: 4,
+                max_group_bound_dispatch: config.max_group_bound_dispatch,
+                chunk_offset: [0, 0, 0],
+                bounds_chunk_index_offset: 0,
+                frame_index: 0,
+                changed_chunk_count: 0,
+                changed_block_count: 0,
+                changed_voxel_count: 0,
+            };
+            let Some(bounds_params_buf) = gpu.bounds_params_buffer.as_ref() else {
+                return;
+            };
+            render_queue.write_buffer(
+                bounds_params_buf,
+                0,
+                bytemuck::bytes_of(&seed_params),
+            );
+
+            // Note: the bound_queue_info buffer has been advanced by
+            // prior frames' regime-2 prepare_group_bounds passes (queue
+            // start cursors moved, size counters drained). Re-running the
+            // unscoped seed writes packed group positions at
+            // `bound_group_queues[max_size * 0 + group_index]` for every
+            // group_index. The size-0 queue's `start` cursor may not be
+            // 0 — we need to also reset the queue info so the chain
+            // re-reads from the start of the slot range. Reset all 32 × 3
+            // = 96 queue infos via render_queue.write_buffer.
+            //
+            // Without this reset, prepare_group_bounds would advance from
+            // the post-prior-drain start cursor and the seed entries would
+            // be invisible.
+            if let Some(info_buf) = gpu.bound_queue_info.as_ref() {
+                let mut info_seed: Vec<
+                    crate::render::gpu_types::GpuBoundQueueInfo,
+                > = Vec::with_capacity(32 * 3);
+                for i in 0..32u32 {
+                    for _xyz in 0..3u32 {
+                        info_seed.push(
+                            crate::render::gpu_types::GpuBoundQueueInfo {
+                                start: 0,
+                                size: if i == 0 { bound_group_count } else { 0 },
+                            },
+                        );
+                    }
+                }
+                render_queue.write_buffer(
+                    info_buf,
+                    0,
+                    bytemuck::cast_slice(&info_seed),
+                );
+            }
+
+            // Also clear bound_group_masks. The chain processes only
+            // groups whose mask bit is set at the queue's current bound
+            // size. After prior cold-start convergence, all mask bits
+            // are 0. The seed re-sets mask[group_index * 3 + axis] = 1u
+            // (bit 0 only), which is correct for size-0 re-enqueue.
+            //
+            // But mask bits at sizes 1..30 stay 0 from convergence —
+            // when the chain processes a re-seeded group at size 0, it
+            // sets next-bound-size bit 1 via `atomicOr` and re-enqueues.
+            // That works correctly.
+            let mut seed_encoder = render_device.create_command_encoder(
+                &CommandEncoderDescriptor {
+                    label: Some("naadf_streaming_w3_full_reseed_encoder"),
+                },
+            );
+            bounds_calc::dispatch_add_initial_groups(
+                &mut seed_encoder,
+                seed_pipeline,
+                bounds_world_bg,
+                bounds_bg,
+                bound_group_count,
+            );
+            render_queue.submit([seed_encoder.finish()]);
+            bevy::log::debug!(
+                "streaming-world Phase 2.11: W3 full-world re-seed dispatched \
+                 (shift frame; bound_group_count = {})",
+                bound_group_count,
             );
         }
         return;

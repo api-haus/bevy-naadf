@@ -284,6 +284,27 @@ fn add_bounds_group(
 }
 
 // ─── Entry point 1: add_initial_groups_to_bound_queue — fx:39-48 ──────────────
+//
+// streaming-world Phase 2.11
+// (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md` punch-list
+// item 2) — the host-side reset of `bound_queue_info[*].start` to 0 +
+// `[size_0_*].size` to `bound_group_count` allows re-firing this shader on
+// the streaming preset's shift frames as a full-world re-seed. The shader
+// itself is unchanged from the pre-Phase-2.11 legacy version (single-axis
+// flat dispatch over `bound_group_queue_max_size` workgroups, writing
+// packed group positions at the flat `group_index` slot of each of the
+// three size-0 queues). The host's combined queue-info-reset + seed
+// dispatch is what makes the re-seed correctly observable to the W3 regime-2
+// chain.
+//
+// (An earlier Phase 2.11 design used a "scoped seed" via bit-31 of
+// `bounds_chunk_index_offset` + 3D dispatch over a chunk-group AABB.
+// Discarded: chunks_buffer is slot-indexed, AADFs reference cross-slot
+// neighbours via indirection, and indirection bindings change on every
+// origin shift — so AADFs OUTSIDE the just-admitted segments are also
+// stale post-shift. The scoped re-seed didn't cover those, and our
+// `--gate streaming-aadf-parity` self-consistency check caught the residual
+// violations. Full-world re-seed is the simple correct fix.)
 
 @compute @workgroup_size(64, 1, 1)
 fn add_initial_groups_to_bound_queue(
@@ -300,13 +321,21 @@ fn add_initial_groups_to_bound_queue(
     let gpz = group_index / (gsx * gsy);
 
     // Seed the per-axis mask with bit-0 set (the size-0 queue holds every
-    // group). 3 atomic stores — one per axis.
+    // group). 3 atomic stores — one per axis. `atomicStore` of 1u
+    // **overwrites the mask**, clearing every higher bit — critical for
+    // the re-seed path so the W3 chain re-enqueues this group through every
+    // bound size (else mask bits 1..30 stay set from the prior expansion
+    // and the chain short-circuits at the next-bound `atomicOr` gate).
     atomicStore(&bound_group_masks[group_index * 3u + 0u], 1u);
     atomicStore(&bound_group_masks[group_index * 3u + 1u], 1u);
     atomicStore(&bound_group_masks[group_index * 3u + 2u], 1u);
 
     // Pack `(gpx | gpy<<11 | gpz<<21)` and write it into each of the three
-    // size-0 X / Y / Z queues at offset `group_index`.
+    // size-0 X / Y / Z queues at offset `group_index`. The host has reset
+    // `bound_queue_info[size_0_*].start = 0` + `size = bound_group_count`
+    // before this dispatch, so the queue's logical contents span
+    // `[0, bound_group_count)` and the flat-index write lands at the
+    // correct queue slot.
     let packed = gpx | (gpy << 11u) | (gpz << 21u);
     let max_size = params.bound_group_queue_max_size;
     bound_group_queues[max_size * 0u + group_index] = packed; // X

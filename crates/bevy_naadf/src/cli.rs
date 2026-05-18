@@ -284,6 +284,9 @@ fn apply_gate_defaults(args: &mut AppArgs, gate: Gate) {
         Gate::StreamingWindow => {
             crate::e2e::streaming_window::apply_streaming_window_defaults(args);
         }
+        Gate::StreamingAadfParity => {
+            crate::e2e::streaming_aadf_parity::apply_streaming_aadf_parity_defaults(args);
+        }
         Gate::NoiseStaticWorld => {
             crate::e2e::noise_static_world::apply_noise_static_defaults(args);
         }
@@ -374,6 +377,12 @@ pub enum Gate {
     /// boundaries; asserts the residency window followed + terrain
     /// re-populated.
     StreamingWindow,
+    /// streaming-world Phase 2.11 — runs the streaming-window flow + adds
+    /// a post-walk `chunks_buffer` GPU readback that asserts the W3
+    /// chunk-level 5-bit AADFs are self-consistent (no "lying" skip
+    /// distances that cross real terrain). Catches the Phase 2.11
+    /// regression class (`03n-diagnosis-aadf-building.md` § Root cause).
+    StreamingAadfParity,
     /// streaming-world Phase 2.4 — boots ProceduralStatic, asserts strict
     /// luminance / non-sky-ratio floors on the post-warmup frame.
     NoiseStaticWorld,
@@ -429,6 +438,7 @@ impl Gate {
         match self {
             Gate::Baseline => "baseline",
             Gate::StreamingWindow => "streaming-window",
+            Gate::StreamingAadfParity => "streaming-aadf-parity",
             Gate::NoiseStaticWorld => "noise-static-world",
             Gate::WgslNoiseOracle => "wgsl-noise-oracle",
             Gate::ValidateGpuConstruction => "validate-gpu-construction",

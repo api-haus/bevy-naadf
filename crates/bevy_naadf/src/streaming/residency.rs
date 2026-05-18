@@ -156,6 +156,31 @@ impl Residency {
     pub fn slot_of(&self, s: WorldSegmentPos) -> Option<SlotIndex> {
         self.window.lookup_slot(s)
     }
+
+    /// streaming-world Phase 2.11
+    /// (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md` punch-list
+    /// item 1) — `true` once the cold-start admission burst has fully drained
+    /// (every slot in the window has been admitted at least once).
+    ///
+    /// Used by the render-world to gate the W3 regime-1 seed dispatch.
+    /// Pre-Phase-2.11 the seed fired on the first admission frame —
+    /// at which point only 4 of 512 segments had real data and the W3 chain
+    /// baked stale long-skip AADFs through 508 yet-to-be-admitted zero-chunks.
+    /// Gating the seed on this method delays it until ALL 512 slots are
+    /// chunk_calc-current, so the W3 chain's first expansion pass reads
+    /// only real data.
+    ///
+    /// Implementation: returns `dispatched_once.len() == total_slots()`. The
+    /// `dispatched_once` set is populated by `process_pending_admissions`
+    /// (one slot per admission) and cleared per-slot on eviction
+    /// (`set_origin` → `dispatched_once.remove`). At steady-state after
+    /// cold-start, every bound slot is in `dispatched_once`, so this returns
+    /// `true`. During a steady-state boundary crossing, evicted slots are
+    /// removed from `dispatched_once`, this drops to `false` until the new
+    /// admissions all dispatch, then climbs back to `true`.
+    pub fn is_cold_start_complete(&self) -> bool {
+        (self.dispatched_once.len() as u32) == Self::total_slots()
+    }
 }
 
 /// Convert a world-voxel `IVec3` position to a `WorldSegmentPos` via
@@ -575,6 +600,42 @@ mod tests {
             "the legacy formula over-counts origin when pos_int is already absolute — \
              Phase 2.9 fix routes through camera_segment_pos_from_abs to bypass this"
         );
+    }
+
+    /// streaming-world Phase 2.11
+    /// (`03n-diagnosis-aadf-building.md` punch-list item 1) — the
+    /// `is_cold_start_complete` predicate gates the W3 regime-1 seed on the
+    /// streaming preset. Empty residency reports false; after every slot has
+    /// been admitted at least once it reports true; after an eviction that
+    /// drops a slot from `dispatched_once`, it reverts to false until the
+    /// new admission re-populates the set.
+    #[test]
+    fn is_cold_start_complete_tracks_full_admission() {
+        let mut residency = Residency::empty(4);
+        // Empty: 0 of 512 slots admitted.
+        assert!(!residency.is_cold_start_complete());
+
+        // Plant + dispatch every slot's worth of admissions.
+        for sx in 0..WORLD_SIZE_IN_SEGMENTS.x as i32 {
+            for sy in 0..WORLD_SIZE_IN_SEGMENTS.y as i32 {
+                for sz in 0..WORLD_SIZE_IN_SEGMENTS.z as i32 {
+                    let slot = residency.window.allocate().expect("slot");
+                    residency
+                        .window
+                        .bind(WorldSegmentPos(IVec3::new(sx, sy, sz)), slot);
+                    residency.dispatched_once.insert(slot);
+                }
+            }
+        }
+        // Full: 512 slots, all admitted.
+        assert!(residency.is_cold_start_complete());
+
+        // Simulate eviction — `set_origin` removes evicted slots from
+        // `dispatched_once`. After dropping ANY slot from the set, the
+        // cold-start-complete predicate flips back to false.
+        let any_slot = *residency.dispatched_once.iter().next().unwrap();
+        residency.dispatched_once.remove(&any_slot);
+        assert!(!residency.is_cold_start_complete());
     }
 
     /// Phase 2.6 — migrated regression catcher (Phase 2.5's
