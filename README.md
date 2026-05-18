@@ -121,8 +121,6 @@ later without another restructure.
 The NAADF port is essentially complete — the substrate, GI pipeline, and GPU-side
 construction + editing all landed. The remaining work is content / streaming on top.
 
-- [x] Toolchain proof-of-concept — Bevy 0.19 on Linux *(Solari was stripped; it is
-      reference-only, not the GI substrate)*
 - [x] NAADF substrate + albedo first-hit — three-layer chunk/block/voxel cell hierarchy,
       CPU-side AADF construction + cuboid expansion, DDA-with-AADF traversal, int+frac
       `PositionSplit` camera, two-pass albedo first-hit WGSL render path
