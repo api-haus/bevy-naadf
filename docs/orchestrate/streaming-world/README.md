@@ -57,8 +57,8 @@ consolidated mode disqualified.
 - [x] **Hard gate (Phase 2.5)** — strict gate correctly FAILS sky-only output (variance 222 vs floor 800); SECONDARY defect surfaced — slot-to-world geometric mapping
 - [x] 02c — Phase-2.6 design: `WindowedSlotMap` primitive (pool + mapping + indirection table) — design at `02c-design-windowed-slot-map.md`
 - [ ] **Hard gate (Phase 2.6 design)** — submit refined design to user before impl dispatch
-- [ ] 03f — Phase-2.6 impl: `WindowedSlotMap` data structure + GPU indirection buffer + shader helper threading (per `02c` § G migration plan)
-- [ ] **Hard gate (Phase 2.6 impl)** — confirm visible sliding-window streaming + strict gate passes
+- [x] 03f — Phase-2.6 impl: `WindowedSlotMap` data structure + GPU indirection buffer + shader helper threading (per `02c` § G migration plan)
+- [x] **Hard gate (Phase 2.6 impl)** — GREEN: `--streaming-window` PASS at pixel-Δ 83 (floor 3) / variance 2326 (floor 800); all 7 gates green; visible sliding-window streaming verified for the first time
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user
