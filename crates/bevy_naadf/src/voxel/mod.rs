@@ -77,61 +77,73 @@ impl VoxelTypeId {
     }
 }
 
-/// Base material class of a voxel type (C# `MaterialTypeBase`).
+/// Base material class of a voxel type — post-PBR-raymarching pivot.
 ///
-/// Phase A only needs to distinguish *emissive* from the rest for albedo; the
-/// metal/mirror BRDF and emissive contribution are Phase B (`02-research.md`
-/// §4.6).
+/// Collapses the C# 4-value `MaterialTypeBase` to a 1-bit `{ PBR, Emissive }`
+/// flag. Every PBR hit runs the unified BRDF in `eval_pbr()`
+/// (`pbr_sampling.wgsl`); every Emissive hit takes the fast-path (no BRDF,
+/// no PBR-array samples). Metallic / roughness / height are now texture-
+/// driven (sampled from the `MaterialSet` MRH array) — NOT per-voxel-type
+/// scalars. See `docs/orchestrate/pbr-raymarching/02-design.md` § A.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(u8)]
 pub enum MaterialBase {
+    /// All-PBR — the unified GGX-Smith-Schlick BRDF in
+    /// `pbr_sampling.wgsl::eval_pbr`, with `metallic` / `roughness` / `height`
+    /// read from the MRH texture array at `material_layer_index`.
     #[default]
-    Diffuse = 0,
+    Pbr = 0,
+    /// Emissive fast-path — skip the BRDF, sample the Emissive texture array,
+    /// multiply by `color_layered` HDR intensity.
     Emissive = 1,
-    MetallicRough = 2,
-    MetallicMirror = 3,
 }
 
-/// Optional second material layer of a voxel type (C# `MaterialTypeLayer`).
-/// Note `1` is intentionally absent — the C# enum skips it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[repr(u8)]
-pub enum MaterialLayer {
-    #[default]
-    None = 0,
-    MetallicRough = 2,
-    MetallicMirror = 3,
-}
-
-/// One entry of the voxel-type palette (C# `VoxelType`, `02-research.md` §4.6).
+/// One entry of the voxel-type palette — the per-voxel-type CPU material
+/// data, post-PBR-raymarching pivot.
 ///
-/// Follows the C# 128-bit `Uint4` entry, not the paper's 16-bit summary
-/// (`03-design.md` §2.4). Phase A uses only `color_base` (albedo) and
-/// `material_base` (emissive-vs-diffuse); the full layout is built so Phase B
-/// needs no data-format change.
+/// **All physical-material parameters (albedo RGB, metallic, roughness,
+/// height, AO, tangent-space normal) live in the `MaterialSet` texture
+/// arrays at `material_layer_index`; this struct only carries the
+/// per-VoxelType bits that *select and tint* the texture sample.**
+///
+/// The 4 C# `MaterialBase` branches collapse to a 1-bit flag here
+/// (`PBR` vs `Emissive`) — see [`MaterialBase`].
+///
+/// **User-approved divergence from C# NAADF**
+/// (`docs/orchestrate/pbr-raymarching/01-context.md` D1, D4): the C#
+/// `VoxelType` has no texture-array layer index and carries `color_base`
+/// as IOR. This port replaces that with a texture-array layer +
+/// `albedo_tint`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct VoxelType {
-    /// Base material class.
+    /// Base material class — `Pbr` or `Emissive`. Replaces the 4-value C#
+    /// `MaterialBase` enum (the `MetallicRough` / `MetallicMirror` values
+    /// are removed; metallic comes from the texture sample now).
     pub material_base: MaterialBase,
-    /// Optional second material layer.
-    pub material_layer: MaterialLayer,
-    /// Surface roughness (`f16` on the GPU).
-    pub roughness: f32,
-    /// Base RGB albedo.
-    pub color_base: Vec3,
-    /// Layered RGB — emissive intensity for `Emissive`, tint for layered metals.
+    /// 0-based index into the `MaterialSet` texture arrays (diffuse_ao,
+    /// normal, mrh, emissive — all share the layer-index space). 12-bit
+    /// on the GPU (4096 distinct materials max).
+    pub material_layer_index: u16,
+    /// sRGB byte tint applied multiplicatively to the sampled albedo, like
+    /// Bevy's `StandardMaterial.base_color × base_color_texture`. 8-bit
+    /// per channel (24 bits total) on the GPU. The neutral value is
+    /// `[255, 255, 255]` (no tint).
+    pub albedo_tint: [u8; 3],
+    /// Layered RGB — **emissive HDR colour multiplier** when
+    /// `material_base == Emissive`. The Emissive fast-path output is
+    /// `sampled_emissive_rgb × color_layered` (see design § H). Carried
+    /// as 3× f16 on the GPU. Unused (zeroed) when `material_base == Pbr`.
     pub color_layered: Vec3,
 }
 
 impl Default for VoxelType {
-    /// The reserved empty placeholder (material-buffer element 0): a black
-    /// diffuse surface.
+    /// The reserved empty placeholder (material-buffer element 0): a PBR
+    /// surface pointing at material-layer 0 (fabric), no tint, no emissive.
     fn default() -> Self {
         Self {
-            material_base: MaterialBase::Diffuse,
-            material_layer: MaterialLayer::None,
-            roughness: 1.0,
-            color_base: Vec3::ZERO,
+            material_base: MaterialBase::Pbr,
+            material_layer_index: 0,
+            albedo_tint: [255, 255, 255],
             color_layered: Vec3::ZERO,
         }
     }

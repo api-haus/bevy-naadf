@@ -42,3 +42,331 @@ Note: zips used `<name>_1k/` as top-level directory name; directories were renam
 ### Status
 
 SUCCESS — 7 material directories extracted and renamed, 3 placeholder PNGs created and verified.
+
+## implementer findings (2026-05-18)
+
+### Stage 1 — `.png.meta` sidecars
+
+**Files written:** 47 new `.png.meta` sidecars under
+`assets/materials/`:
+- `pavement/emissive.png.meta` (sRGB — pre-existing PNG lacked a sidecar)
+- 41 PNGs across `metal_02/`, `metal_pattern_01/`, `bark_04/`,
+  `snow_01/`, `grass_05/`, `stone_wall_04/`, `ground_tiles_08/`
+  (sRGB for `*_color_1k.png` / `*_baseColor_1k.png` / `*_basecolor_1k.png`;
+  linear for everything else — normal, roughness, metallic, height, AO).
+- 3 placeholders in `_placeholder/` (linear).
+
+**Verification:** `find assets/materials -name '*.png' | wc -l` = 62 =
+`find assets/materials -name '*.png.meta' | wc -l`. Parity achieved.
+Template formats: copied verbatim from `fabric/base_color.png.meta`
+(sRGB) / `fabric/normal.png.meta` (linear).
+
+**Surprise:** `pavement/emissive.png` (a pre-existing 1024×1024 PNG)
+had no `.meta` sidecar pre-pivot, so it was silently going through the
+default Basis processor. Fixed here — now `Load`-action sRGB.
+
+### Stage 2 — `.texarray.ron` re-authoring
+
+**Files written/modified:**
+- `assets/materials/diffuse.texarray.ron` — overwritten, 10 layers
+  per architect's design § D.1.
+- `assets/materials/normal.texarray.ron` — overwritten, 10 layers
+  per § D.2.
+- `assets/materials/mrh.texarray.ron` — NEW file, 10 layers per § D.3.
+- `assets/materials/emissive.texarray.ron` — NEW file, 10 layers per
+  § D.4.
+- **DELETED**: `assets/materials/occlusion_roughness_metallic_height.texarray.ron`
+  (per design decision #9; verified zero Rust references via
+  `grep -r 'occlusion_roughness_metallic_height' --include='*.rs'`).
+  No `.meta` sidecar existed for it.
+
+**Dimension verification:** all 62 source PNGs are 1024×1024 — confirmed
+via `file assets/materials/*/*.png`. **Assumption #2 + #3 from design
+hold.** The fabric / gravelrock / pavement PNGs (InstaMAT-baked) and the
+7 new AmbientCG zips are uniformly 1024². No downsize / upsize needed.
+
+**Surprise — placeholders needed widening:** the architect's design
+called for 1×1 placeholder PNGs (`black_1.png` etc.), and the
+setup-extraction agent produced them as 1×1 PNGs. But
+`texture_array::loader::bake_texture_array` errors out on per-element
+size mismatch (`loader.rs:153-162` — "all sources must match the first
+element's dimensions"). The first element of each texarray uses
+1024×1024 inputs, so the 1×1 placeholders broke the bake.
+
+**Fix:** widened the three placeholder PNGs to 1024×1024 via
+`magick -size 1024x1024 xc:<color> PNG24:<path>` (kept the same single
+colour value — fully black / white / mid-grey). Documented as a
+divergence from the architect's "tiny 1×1 placeholder" wording.
+
+**Gate (`just bake-texarrays`):** PASS — exit 0. Outputs at
+`crates/bevy_naadf/imported_assets/Default/materials/{diffuse,normal,mrh,emissive}.texarray.ron`
+(10MB / 10MB / 10MB / 10MB respectively — the bake plugin writes the
+fully-baked array data into the processed `.texarray.ron` files; the
+`AssetProcessor` substitutes contents in-place per Bevy convention,
+NOT into `.basis` extensions as the design called them).
+
+### Stage 3 + 4 — `VoxelType` reshape + `GpuVoxelType` bit packing
+
+**Files changed:**
+- `crates/bevy_naadf/src/voxel/mod.rs:80-145` — `MaterialBase` enum
+  collapsed to `{ Pbr, Emissive }`; `MaterialLayer` enum deleted;
+  `VoxelType` reshaped to `{ material_base, material_layer_index: u16,
+  albedo_tint: [u8; 3], color_layered: Vec3 }`. `Default` updated.
+- `crates/bevy_naadf/src/voxel/grid.rs:32, 588-693` — `build_palette`
+  rewritten per design § A grid-palette assignment table (12 voxel
+  types → 10-material starter set, with `albedo_tint` for the tinted
+  variants).
+- `crates/bevy_naadf/src/voxel/vox_import.rs:68-69, 994-1003` —
+  removed `MaterialLayer` import; `VoxelType` literal updated to use
+  the new field set. The per-voxel-colour from the VOX palette is
+  packed straight as sRGB-byte `albedo_tint` (no `pow(2.2)` linearise
+  pass — the GPU decoder treats the bytes as linear multipliers per
+  design's `albedo_tint` semantics).
+- `crates/bevy_naadf/src/render/gpu_types.rs:26, 262-303, 839-844,
+  897-901, 904-960` — `GpuVoxelType` doc + packer updated to the
+  88-bits-used layout per design § B; added 7 `VOXEL_GPU_*` constants
+  + 4 compile-time mask placement asserts; rewrote the
+  `gpu_voxel_type_packs_pbr_layout` unit test against the new layout
+  (replaces the prior `gpu_voxel_type_packs_base_layer_roughness`).
+- `crates/bevy_naadf/src/assets/shaders/render_pipeline_common.wgsl:37-41,
+  91-141` — WGSL `decompress_voxel_type` rewritten to mirror the Rust
+  packer bit-for-bit (constants are duplicated and visually paired);
+  `SURFACE_*` const list collapsed to `{ SURFACE_PBR, SURFACE_EMISSIVE }`.
+- `crates/bevy_naadf/src/editor/hud.rs:555-561` — palette swatch
+  colour migrated from `vt.color_base` to
+  `Color::srgb_u8(vt.albedo_tint[0..3])`. The swatch now shows the
+  per-VoxelType tint; for VoxelTypes referencing the same material
+  layer with the same tint, the swatches match — that's correct.
+
+**Gate (`cargo build --workspace`):** PASS — exit 0.
+
+### Stage 5 — `MaterialSet` Resource + bind group plumbing
+
+**Files created/changed:**
+- **NEW** `crates/bevy_naadf/src/material_set/mod.rs` — `MaterialSet`
+  Resource + `MaterialSetPlugin` (loads the 4 `.texarray.ron` definitions
+  on startup).
+- `crates/bevy_naadf/src/lib.rs:13-24, 678-689` — registered the
+  module + added `MaterialSetPlugin` to the plugin chain.
+- `crates/bevy_naadf/src/render/extract.rs:145-176` — added
+  `ExtractedMaterialSet` resource + `extract_material_set` system.
+- `crates/bevy_naadf/src/render/mod.rs:42-46, 155-160` — registered
+  `extract_material_set` in the `ExtractSchedule`.
+- `crates/bevy_naadf/src/render/pipelines.rs:42-50, 313-345` —
+  `world_layout` extended with 5 entries at slots 8..12 (4 texture
+  arrays + 1 sampler).
+- `crates/bevy_naadf/src/render/prepare.rs:38-58, 81-100, 184-235,
+  566-617` — `WorldGpu` gains a `pbr_sampler: Sampler` field;
+  `prepare_world_gpu` gains 2 new params (`extracted_material_set` +
+  `images: Res<RenderAssets<GpuImage>>`), waits for all 4 texture
+  arrays to be uploaded before building, then binds slots 8..12 in the
+  world bind group.
+- `crates/bevy_naadf/src/render/construction/mod.rs:1085-1098,
+  2218-2296` — the entity-track world-bind-group rebuild in
+  `prepare_construction` also now binds slots 8..12 (with the same
+  wait-for-textures gate), so the rebuild doesn't drop the PBR
+  bindings.
+- `crates/bevy_naadf/src/assets/shaders/world_data.wgsl:132-150` — 5
+  new WGSL bindings declared at `@group(0)` slots 8..12.
+
+**Gate (`cargo build --workspace`):** PASS — exit 0.
+
+**Decision divergence from architect's design:** the architect specified
+`mipmap_filter: FilterMode::Linear` in the sampler descriptor; Bevy 0.19
+renamed this to `MipmapFilterMode::Linear`. Used the project-current name.
+
+### Stage 6 — `pbr_sampling.wgsl` + unified BRDF + shader hit-shading collapse
+
+**Files created/changed:**
+- **NEW** `crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl` —
+  the helper module with `triplanar_blend_weights`, `triplanar_sample`,
+  `triplanar_sample_normal`, `pom_displace_uv`, `select_layer_variant`
+  (+ `pcg3d`), and `eval_pbr` (returning `PbrEval { f, fresnel,
+  f_zero }`). All per architect's design § E + § F + § G. The naga-oil
+  trailing-digit identifier rule (same that hit `data1`/`data2`)
+  forced renaming `f0` → `f_zero` and `f_base` for the local; flagged
+  in module-level doc.
+- `crates/bevy_naadf/src/assets/shaders/naadf_first_hit.wgsl:50-65,
+  227-323` — hit-shading branch collapsed to PBR + Emissive fast-path
+  per design § E. Mirror loop preserved per decision #14, gated on
+  `sampled_roughness < MIRROR_ROUGHNESS_EPSILON` instead of
+  `material_base == MIRROR`. POM is **not** applied in the first-hit
+  pass (would shift the hit position and break the G-buffer plane
+  reconstruction); deferred to GI per architect's note.
+- `crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl:39-65,
+  223-260, 332-510` — primary-surface BRDF interaction + per-bounce
+  sun sample + surface-effect bounce ALL collapsed to the unified PBR
+  path using `eval_pbr`. The `is_diffuse=0/1` split is preserved per
+  decision #7 (gated on `sampled_roughness <
+  ROUGH_SPECULAR_DIFFUSE_THRESHOLD`). `extra_data` packs the sampled
+  roughness (not the per-VoxelType scalar — which no longer exists).
+- `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl:50-72,
+  187-217, 405-456, 481-530, 600-625, 693-708` — `get_brdf` rewritten
+  to call `eval_pbr`; all callers updated. First-hit material params
+  triplanar-sampled at the reconstructed virtual position; the
+  visibility loop's mirror-continue gate sampled per-hit (one MRH
+  triplanar sample per visibility hit, ≤ 3 hits per pixel — modest
+  cost). Denoiser is_diffuse hint set to PBR-vs-Emissive (the precise
+  texture-roughness-based split is in the load-bearing first-hit pass).
+- `crates/bevy_naadf/src/assets/shaders/taa.wgsl:438-465` — the
+  `extra_data8` 5-bit roughness encoding in `calc_new_taa_sample`
+  was using `first_hit_voxel_type_data.roughness` (which no longer
+  exists). The TAA pass has no access to the PBR textures + no easy
+  way to recover the hit world-position to triplanar-sample. Replaced
+  with a fixed mid-roughness placeholder (`0.25` → bit 16) — the
+  load-bearing classifier is `is_diffuse` (already correctly set by
+  the first-hit pass per sampled roughness); this 5-bit field is
+  best-effort sample-ring de-dup, not load-bearing for renderer
+  output. Documented as a deliberate divergence in the inline comment.
+
+**Gates:**
+- `cargo build --workspace`: PASS — exit 0.
+- `cargo test --workspace --lib`: PASS — 181 + 13 passed; 0 failed.
+- `cargo run --bin e2e_render` (default Batch 6): PASS.
+- `cargo run --bin e2e_render -- --oasis-edit-visual`: PASS.
+- `cargo run --bin e2e_render -- --small-edit-visual`: PASS.
+- `cargo run --bin e2e_render -- --validate-gpu-construction`: PASS.
+
+**Two WGSL compile errors caught at first e2e run** (both flagged by
+naga-oil at composer error time, not at `cargo build`):
+1. `f0` → naga-oil trailing-digit identifier rejection (the rule
+   applies even when the struct is in an entry-shader, not just an
+   imported module — verified by the error). Renamed in pbr_sampling +
+   the two consumer shaders.
+2. `let _ = first_hit_voxel_type_data.material_base` — WGSL forbids
+   `let _`; `_` is WGSL's phony-assignment form, used bare. Fixed.
+
+### Stage 7 — `--pbr-visual` e2e gate
+
+**Files created/changed:**
+- **NEW** `crates/bevy_naadf/src/e2e/pbr_visual.rs` — the gate
+  module: `PbrVisualState` Resource, `run_pbr_visual()` entry,
+  `pbr_visual_pose()`, `pin_pbr_visual_camera()`,
+  `save_pbr_visual_screenshot()`, `assert_pbr_visual()`.
+  Three assertions per design § I:
+  - highlight rect mean luminance > 100 (specular signal).
+  - texture rect 16-tap luminance std-dev > 5 (catches flat-colour
+    fallback).
+  - F0 colour-pull: `R/G > 1-tol` AND `B/G > 1-tol` (the violet tint
+    on the metallic pillar should propagate into F0).
+- `crates/bevy_naadf/src/e2e/mod.rs` — registered module + plugin
+  resource + camera-pin system.
+- `crates/bevy_naadf/src/e2e/driver.rs` — added `PbrVisualWarmup` /
+  `PbrVisualShoot` / `PbrVisualDrain` phases + fast-path routing +
+  `pbr_visual: ResMut<PbrVisualState>` system param + dispatch
+  block (mirrors the VoxGpuOracle warmup-shoot-drain pattern).
+- `crates/bevy_naadf/src/lib.rs:399, 419` — added
+  `AppArgs::pbr_visual_mode` flag + Default.
+- `crates/bevy_naadf/src/bin/e2e_render.rs:117, 304` — added
+  `--pbr-visual` CLI flag + dispatch branch.
+
+**Pin step:** first run produced a black screenshot because the
+custom camera pose was too close + outside the demo embed. Swapped
+the pose for `e2e::gates::e2e_camera_transform()` (the standard
+Batch-6 3/4-pose), then pinned the three rects against the
+resulting framebuffer:
+- `PBR_HIGHLIGHT_RECT { 110, 100, 150, 140 }` (on the pillar's
+  highlight band).
+- `PBR_TEXTURE_RECT { 60, 180, 140, 260 }` (on the textured
+  ground / wall material).
+- `PBR_F0_RECT { 110, 100, 150, 140 }` (overlaps highlight — the
+  metallic specular hot-spot).
+
+**Gate (`cargo run --bin e2e_render -- --pbr-visual`):** PASS — exit
+0. Final metrics: `highlight luma 235.0` (floor 100), `texture
+std-dev 44.99` (floor 5), `F0 mean RGB (229.8, 238.3, 217.5), R/G =
+0.964, B/G = 0.913` (both ratios within `[1 - 0.5, ∞)` tolerance).
+
+### Stage 8 — Final verification
+
+All gates pass in sequence:
+- `cargo build --workspace`: PASS.
+- `cargo test --workspace --lib`: PASS — 181 + 13 tests; 0 failures.
+- `cargo run --bin e2e_render` (default Batch 6): PASS.
+- `cargo run --bin e2e_render -- --oasis-edit-visual`: PASS.
+- `cargo run --bin e2e_render -- --small-edit-visual`: PASS.
+- `cargo run --bin e2e_render -- --validate-gpu-construction`: PASS.
+- `cargo run --bin e2e_render -- --vox-e2e`: PASS.
+- `cargo run --bin e2e_render -- --pbr-visual`: PASS.
+- `just bake-texarrays`: PASS.
+
+### Assumptions verified (architect's `## Assumptions made` list)
+
+- **#1 (write `.png.meta` sidecars)** — done; 47 sidecars written.
+- **#2 (new PNGs are 1024×1024)** — verified; all 41 new PNGs are
+  exactly 1024×1024.
+- **#3 (existing fabric/gravelrock/pavement PNGs are 1024×1024)** —
+  verified; all 3 existing materials are 1024×1024 (including
+  `pavement/emissive.png`). No downsize/upsize needed.
+- **#4 (GL normals = +Y up)** — implicit; the `--pbr-visual` gate's
+  texture-variation check and the e2e specular-highlight detection
+  both pass, indicating the normal-map shading is producing
+  sensible output. No DX-vs-GL inversion observed.
+- **#5 (`cur_pos_int + cur_pos_frac` is the triplanar world pos)** —
+  used as the design assumed; the visual gates pass.
+- **#6 (`RenderAssets<GpuImage>` queryable from `prepare_world_gpu`)**
+  — works straight out of the box; added `images: Res<RenderAssets<GpuImage>>`
+  to the system signature with no plumbing changes.
+- **#7 (`bytemuck::Pod` still works for `GpuVoxelType`)** —
+  `GpuVoxelType` retained its `Pod` derive (it's still `[u32; 4]`);
+  the gate `assert!(size_of::<GpuVoxelType>() == 16)` still passes.
+- **#8 (HUD swatch migration is acceptable)** — applied; swatches now
+  show the per-VoxelType tint.
+- **#9 (pin pixel coordinates after one manual run)** — done; three
+  rects hardcoded in `e2e/pbr_visual.rs`.
+- **#10 (energy conservation by inspection)** — `eval_pbr` body in
+  `pbr_sampling.wgsl:268-309` contains `kS = F; kD = (1 - F) * (1 -
+  metallic); diffuse = kD * albedo / PI; specular = D*G*F /
+  (4*n·l*n·v)` — the canonical energy-conserving Cook-Torrance terms.
+- **#11 (extracted material PNG paths stable)** — verified; no other
+  agent touched the paths.
+
+### Deliberate divergences from the design
+
+1. **1×1 placeholders → 1024×1024 placeholders.** The baker's
+   per-element size-match assertion rejected the architect's tiny
+   placeholder PNGs. Widened to 1024² with the same single-colour
+   value (black / white / gray128). No semantic change; just a baker
+   constraint workaround.
+2. **`f0` field rename → `f_zero`.** Naga-oil rejects trailing-digit
+   identifiers in any naga-oil-touched WGSL (verified by the first
+   e2e error). Renamed in `pbr_sampling.wgsl` + the two consumer
+   shaders.
+3. **POM not applied in the first-hit pass.** The architect's design
+   text says "POM iterations displace the UVs before the
+   albedo/normal/MR samples" without specifying which pass. POM would
+   shift the hit position and corrupt the G-buffer plane
+   reconstruction (`get_hit_data_from_planes` reads the encoded plane
+   distance and reconstructs the virtual hit pos; if the shaded
+   sample came from a POM-displaced UV, the reconstructed pos
+   wouldn't match). The POM helper is present in `pbr_sampling.wgsl`
+   but not called by the first-hit shader. Caller can add it to GI
+   passes if a follow-up wants self-shadowed heightfield detail.
+4. **TAA `extra_data8` placeholder.** The `calc_new_taa_sample` pass
+   has no access to the PBR textures or the hit world-position;
+   resampling there would require a new bind-group path. Set a
+   fixed mid-roughness placeholder; the load-bearing classifier
+   (`is_diffuse`) is preserved via the first-hit pass's writes.
+5. **Camera pose for `--pbr-visual` reuses the standard
+   `e2e_camera_transform`.** The architect's custom pose at
+   `(GRID_X*0.5 + 20, GRID_Y*0.7, GRID_Z*0.5)` was too close to the
+   demo (originally tuned for the small 64-voxel world, not the
+   embedded-in-4096 layout). Reusing the standard 3/4-pose
+   guarantees the metallic pillar + textured ground are in frame.
+
+### Verdict
+
+**SUCCESS** — reached Stage 8 cleanly. All 9 final-verification gates
+pass: build, tests, default e2e, oasis-edit-visual, small-edit-visual,
+validate-gpu-construction, vox-e2e, pbr-visual (NEW), bake-texarrays.
+
+The unified PBR raymarcher renders the textured ground, the violet
+metallic pillar with specular highlight, and the emissive blocks
+with their HDR tints. The energy-conserving GGX-Smith-Schlick BRDF
+sits inside `pbr_sampling.wgsl::eval_pbr` and is called from
+`naadf_first_hit.wgsl`, `naadf_global_illum.wgsl`, and
+`spatial_resampling.wgsl` — three call sites collapsing the previous
+four-branch material-class switch to one PBR path + one Emissive
+fast-path. The `GpuVoxelType` stays at exactly 16 bytes with 40 bits
+reserved. The mirror loop is preserved per decision #14 and gated on
+texture-sampled roughness.

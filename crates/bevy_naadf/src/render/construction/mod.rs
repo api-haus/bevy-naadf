@@ -1088,6 +1088,11 @@ pub fn prepare_construction(
     // fires when the main-world install path inserts a `ModelData`); absent
     // on default-scene + entity-only / non-VOX runs.
     model_data: Option<Res<crate::render::extract::ModelDataRender>>,
+    // PBR-raymarching texture arrays — when this system rebuilds the
+    // renderer-side world bind group with real W4 entity buffers (slots 0..7),
+    // the PBR slots (8..12) must also be re-bound (`02-design.md` § C).
+    extracted_material_set: Option<Res<crate::render::extract::ExtractedMaterialSet>>,
+    images: Res<bevy::render::render_asset::RenderAssets<bevy::render::texture::GpuImage>>,
 ) {
     // W0 seam: ensure-exists for both resources, then W1..W5 fill in their
     // family's allocations + bind groups on subsequent frames (when the
@@ -2217,16 +2222,34 @@ pub fn prepare_construction(
         // entry-set; the pipeline cache returns the same layout id as
         // `NaadfPipelines::world_layout`.
         if !gpu.world_bind_group_has_entities {
-            if let (Some(eci_rw), Some(evd), Some(eih_rw)) = (
-                gpu.entity_chunk_instances.as_ref(),
-                gpu.entity_voxel_data.as_ref(),
-                gpu.entity_instances_history.as_ref(),
+            // PBR-raymarching: the world bind group has 13 entries (0..7
+            // buffers + 8..12 PBR texture-arrays + sampler). Wait until the
+            // four `GpuImage`s are uploaded before rebuilding so we don't drop
+            // the placeholder bind group with no replacement.
+            let pbr_views = extracted_material_set.as_deref().and_then(|set| {
+                let d = images.get(&set.diffuse_ao)?;
+                let n = images.get(&set.normal)?;
+                let m = images.get(&set.mrh)?;
+                let e = images.get(&set.emissive)?;
+                Some((d, n, m, e))
+            });
+            if let (Some((eci_rw, evd, eih_rw)), Some((d, n, m, e))) = (
+                gpu.entity_chunk_instances.as_ref().and_then(|a| {
+                    Some((
+                        a,
+                        gpu.entity_voxel_data.as_ref()?,
+                        gpu.entity_instances_history.as_ref()?,
+                    ))
+                }),
+                pbr_views,
             ) {
                 use bevy::render::render_resource::{
                     binding_types::{
-                        storage_buffer_read_only_sized, uniform_buffer_sized,
+                        sampler as bgl_sampler, storage_buffer_read_only_sized,
+                        texture_2d_array, uniform_buffer_sized,
                     },
-                    BindGroupLayoutEntries, ShaderStages,
+                    BindGroupLayoutEntries, BindingResource, SamplerBindingType,
+                    ShaderStages, TextureSampleType,
                 };
                 use std::num::NonZeroU64;
                 let world_meta_size = NonZeroU64::new(
@@ -2239,7 +2262,10 @@ pub fn prepare_construction(
                         ShaderStages::COMPUTE,
                         (
                             // Web-WebGPU migration: chunks is `array<vec2<u32>>`
-                            // (ro on render-side).
+                            // (ro on render-side). Slots 0..7 mirror the
+                            // descriptor in `NaadfPipelines::world_layout`
+                            // (`pipelines.rs:313`); slots 8..12 are the PBR
+                            // texture arrays + sampler.
                             storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
@@ -2248,6 +2274,11 @@ pub fn prepare_construction(
                             storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
+                            texture_2d_array(TextureSampleType::Float { filterable: true }),
+                            texture_2d_array(TextureSampleType::Float { filterable: true }),
+                            texture_2d_array(TextureSampleType::Float { filterable: true }),
+                            texture_2d_array(TextureSampleType::Float { filterable: true }),
+                            bgl_sampler(SamplerBindingType::Filtering),
                         ),
                     ),
                 );
@@ -2264,6 +2295,11 @@ pub fn prepare_construction(
                         eci_rw.as_entire_buffer_binding(),
                         evd.as_entire_buffer_binding(),
                         eih_rw.as_entire_buffer_binding(),
+                        BindingResource::TextureView(&d.texture_view),
+                        BindingResource::TextureView(&n.texture_view),
+                        BindingResource::TextureView(&m.texture_view),
+                        BindingResource::TextureView(&e.texture_view),
+                        BindingResource::Sampler(&world_gpu.pbr_sampler),
                     )),
                 );
                 world_gpu.bind_group = rebuilt;

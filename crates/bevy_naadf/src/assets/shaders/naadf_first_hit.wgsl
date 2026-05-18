@@ -49,18 +49,26 @@
 
 #import "shaders/render_pipeline_common.wgsl"::{
     GpuCamera, GpuRenderParams, VoxelType, decompress_voxel_type, get_ray_dir,
-    compress_first_hit_data, get_reflectance_fresnel,
+    compress_first_hit_data,
     HIT_NOTHING, HIT_UNDEFINED, ENTITY_FREE,
-    SURFACE_EMISSIVE, SURFACE_SPECULAR_ROUGH, SURFACE_SPECULAR_MIRROR,
+    SURFACE_PBR, SURFACE_EMISSIVE,
     FLAG_SHOW_RAY_STEP, FLAG_IS_ATMOSPHERE_INTERACTION,
 }
 #import "shaders/ray_tracing.wgsl"::{
     RayResult, ray_aabb, shoot_ray,
 }
-#import "shaders/world_data.wgsl"::{voxel_types, world_meta}
+#import "shaders/world_data.wgsl"::{
+    voxel_types, world_meta,
+    pbr_diffuse_ao, pbr_normal, pbr_mrh, pbr_emissive, pbr_sampler,
+}
 #import "shaders/atmosphere.wgsl"::{
     AtmosphereParams, AtmoLight, apply_atmosphere, atmosphere_oct_index,
     add_light_for_direction,
+}
+#import "shaders/pbr_sampling.wgsl"::{
+    triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
+    pom_displace_uv, select_layer_variant,
+    MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
 
 // --- @group(1) — frame data -------------------------------------------------
@@ -226,35 +234,93 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
             let voxel_type: VoxelType =
                 decompress_voxel_type(voxel_types[ray_result.hit_type]);
-            let ior = voxel_type.color_base;
 
-            // Non-mirror surface — terminate the primary-ray bounces (`:93-108`).
-            if (voxel_type.material_base != SURFACE_SPECULAR_MIRROR) {
-                // Apply albedo unless the surface is rough specular.
-                if (voxel_type.material_base != SURFACE_SPECULAR_ROUGH) {
-                    acc.absorption = acc.absorption * voxel_type.color_base;
-                }
-                // Emissive surfaces add `colorLayer.r` * absorption.
-                if (voxel_type.material_base == SURFACE_EMISSIVE) {
-                    acc.light = acc.light + acc.absorption * voxel_type.color_layer.r;
-                }
+            // PBR-raymarching pivot: every hit goes through the unified PBR
+            // path or the Emissive fast-path. `material_base` is the only
+            // surviving branch (`02-design.md` § E call-site map).
+            //
+            // World-space hit position for triplanar UV — `cur_pos_int +
+            // cur_pos_frac` is the camera-int-relative world position
+            // (`02-design.md` assumption #5). The triplanar functions only
+            // need a position whose mod-1 footprint tiles the texture; the
+            // camera-int offset is constant per frame so the tiling shifts
+            // uniformly — the visible texture is identical to the
+            // world-absolute case.
+            let hit_world_pos = vec3<f32>(cur_pos_int) + cur_pos_frac;
+            let face_normal = ray_result.normal;
+            let blend_weights = triplanar_blend_weights(face_normal);
+            let layer = select_layer_variant(
+                voxel_type.material_layer_index,
+                voxel_type.variant_span,
+                ray_result.voxel_pos,
+            );
+
+            // Emissive fast-path — skip the BRDF, sample the Emissive
+            // texture, multiply by per-VoxelType `color_layered` (HDR), add
+            // and terminate (`02-design.md` § H).
+            if (voxel_type.material_base == SURFACE_EMISSIVE) {
+                let emissive_sample = triplanar_sample(
+                    pbr_emissive, pbr_sampler,
+                    hit_world_pos, blend_weights, layer,
+                ).rgb;
+                acc.light = acc.light
+                    + acc.absorption * emissive_sample * voxel_type.color_layered;
                 distance_ray = dist + volume.dist_min_max.x;
                 voxel_type_raw = ray_result.hit_type;
-                is_diffuse = select(
-                    1u, 0u, voxel_type.material_base == SURFACE_SPECULAR_ROUGH,
-                );
-                // (`#ifdef ENTITIES` — `entity = rayResult.entity` — omitted.)
+                is_diffuse = 1u;
                 break;
             }
 
-            // Mirror surface — reflect and continue to the next plane (`:110-114`).
-            let cos_theta = clamp(dot(ray_result.normal, -ray_dir), 0.0, 1.0);
-            let r = get_reflectance_fresnel(ior, cos_theta);
-            acc.absorption = acc.absorption * r;
-            ray_dir = reflect(ray_dir, ray_result.normal);
-            old_pos = vec3<f32>(cur_pos_int) + cur_pos_frac;
+            // PBR hit — sample MRH, albedo, then decide mirror vs. defer.
+            // POM is not applied in the first-hit path (it would shift the
+            // hit position and break the G-buffer plane reconstruction);
+            // POM is the GI/spatial-resampling pass's job once that lands.
+            let mrh = triplanar_sample(
+                pbr_mrh, pbr_sampler, hit_world_pos, blend_weights, layer,
+            );
+            let sampled_metallic = mrh.r;
+            let sampled_roughness = mrh.g;
 
-            i = i + 1u;
+            let diffuse_ao = triplanar_sample(
+                pbr_diffuse_ao, pbr_sampler, hit_world_pos, blend_weights, layer,
+            );
+            // sRGB-decoded albedo × per-VoxelType tint, × per-voxel-face AO.
+            let sampled_albedo = diffuse_ao.rgb * voxel_type.albedo_tint * diffuse_ao.a;
+
+            // Polished metal / glass — re-enter the existing 4-iteration
+            // perfect-reflect mirror loop. Schlick Fresnel weights the
+            // absorption; the mirror reflection direction stays exactly the
+            // same as the prior C# mirror branch (`02-design.md` decision
+            // #14). Reuses the `mix(0.04, albedo, metallic)` F0 to make
+            // metallic mirrors retain their metallic tint.
+            if (sampled_roughness < MIRROR_ROUGHNESS_EPSILON) {
+                let cos_theta = clamp(dot(face_normal, -ray_dir), 0.0, 1.0);
+                let f_base = mix(vec3<f32>(0.04), sampled_albedo, sampled_metallic);
+                let one_minus_ct = 1.0 - cos_theta;
+                let r = f_base + (vec3<f32>(1.0) - f_base) * pow(one_minus_ct, 5.0);
+                acc.absorption = acc.absorption * r;
+                ray_dir = reflect(ray_dir, face_normal);
+                old_pos = vec3<f32>(cur_pos_int) + cur_pos_frac;
+                i = i + 1u;
+                continue;
+            }
+
+            // Rough PBR — terminate the primary-ray bounce, defer the
+            // shading to the GI pass. Apply `(1-metallic)*albedo`
+            // absorption (diffuse colour transport — the specular lobe
+            // contribution is added back by the GI pass per `eval_pbr`).
+            // `is_diffuse=0` for fine-roughness surfaces (VNDF sampling
+            // wins); `is_diffuse=1` above the threshold (uniform-hemisphere
+            // wins). `02-design.md` decision #7.
+            let albedo_attenuation = (vec3<f32>(1.0) - vec3<f32>(sampled_metallic))
+                * sampled_albedo;
+            acc.absorption = acc.absorption * albedo_attenuation;
+            distance_ray = dist + volume.dist_min_max.x;
+            voxel_type_raw = ray_result.hit_type;
+            is_diffuse = select(
+                1u, 0u, sampled_roughness < ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
+            );
+            break;
         }
 
         // All 4 iterations ran without a non-mirror hit (`:117-121`).

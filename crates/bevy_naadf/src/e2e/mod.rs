@@ -26,6 +26,7 @@ pub mod driver;
 pub mod framebuffer;
 pub mod gates;
 pub mod oasis_edit_visual;
+pub mod pbr_visual;
 pub mod readback;
 pub mod small_edit_repro;
 pub mod small_edit_visual;
@@ -226,6 +227,7 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<small_edit_visual::SmallEditVisualState>()
         .init_resource::<small_edit_repro::SmallEditReproState>()
         .init_resource::<vox_gpu_oracle::VoxGpuOracleState>()
+        .init_resource::<pbr_visual::PbrVisualState>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
         // camera `Transform` + `PositionSplit` during the `MOTION` / `SETTLE`
@@ -258,6 +260,10 @@ pub fn add_e2e_systems(app: &mut App) {
                 // the birdseye write the Oasis pin emits when oasis-mode
                 // fast-path triggers).
                 vox_gpu_oracle::pin_vox_gpu_oracle_camera
+                    .after(oasis_edit_visual::pin_oasis_camera),
+                // PBR-raymarching `--pbr-visual` camera pin. Same ordering
+                // as the other pins.
+                pbr_visual::pin_pbr_visual_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
                 .before(crate::camera::sync_position_split),

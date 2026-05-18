@@ -1,35 +1,78 @@
-// Normal-map 2D-array — one layer per material, pass-through of each
-// material's `normal.png` (RGB tangent-space normal, A unused). Linear pixel
-// format (not sRGB) so the GPU does not gamma-decode normal data.
-//
-// Layer index ↔ material order matches `diffuse.texarray.ron` /
-// `occlusion_roughness_metallic_height.texarray.ron`:
-//   0  fabric
-//   1  gravelrock
-//   2  pavement
+// Normal-map 2D-array — RGB = tangent-space (GL convention, Y-up). Linear.
+// Layer order matches diffuse / mrh / emissive (see diffuse.texarray.ron).
 (
     format: Rgba8Unorm,
     elements: [
-        // layer 0 — fabric.normal
+        // layer 0 — fabric (existing files keep their plain `normal.png` name —
+        // they were authored as GL convention).
         (
             r: (input: "materials/fabric/normal.png",     channel: R),
             g: (input: "materials/fabric/normal.png",     channel: G),
             b: (input: "materials/fabric/normal.png",     channel: B),
             a: (input: "materials/fabric/normal.png",     channel: A),
         ),
-        // layer 1 — gravelrock.normal
+        // layer 1 — gravelrock.
         (
             r: (input: "materials/gravelrock/normal.png", channel: R),
             g: (input: "materials/gravelrock/normal.png", channel: G),
             b: (input: "materials/gravelrock/normal.png", channel: B),
             a: (input: "materials/gravelrock/normal.png", channel: A),
         ),
-        // layer 2 — pavement.normal
+        // layer 2 — pavement.
         (
             r: (input: "materials/pavement/normal.png",   channel: R),
             g: (input: "materials/pavement/normal.png",   channel: G),
             b: (input: "materials/pavement/normal.png",   channel: B),
             a: (input: "materials/pavement/normal.png",   channel: A),
+        ),
+        // layer 3 — metal_02.
+        (
+            r: (input: "materials/metal_02/metal_02_normal_gl_1k.png",                   channel: R),
+            g: (input: "materials/metal_02/metal_02_normal_gl_1k.png",                   channel: G),
+            b: (input: "materials/metal_02/metal_02_normal_gl_1k.png",                   channel: B),
+            a: (input: "materials/metal_02/metal_02_normal_gl_1k.png",                   channel: A),
+        ),
+        // layer 4 — metal_pattern_01.
+        (
+            r: (input: "materials/metal_pattern_01/metal_pattern_01_normal_gl_1k.png",   channel: R),
+            g: (input: "materials/metal_pattern_01/metal_pattern_01_normal_gl_1k.png",   channel: G),
+            b: (input: "materials/metal_pattern_01/metal_pattern_01_normal_gl_1k.png",   channel: B),
+            a: (input: "materials/metal_pattern_01/metal_pattern_01_normal_gl_1k.png",   channel: A),
+        ),
+        // layer 5 — bark_04.
+        (
+            r: (input: "materials/bark_04/bark_04_normal_gl_1k.png",                     channel: R),
+            g: (input: "materials/bark_04/bark_04_normal_gl_1k.png",                     channel: G),
+            b: (input: "materials/bark_04/bark_04_normal_gl_1k.png",                     channel: B),
+            a: (input: "materials/bark_04/bark_04_normal_gl_1k.png",                     channel: A),
+        ),
+        // layer 6 — snow_01.
+        (
+            r: (input: "materials/snow_01/snow_01_normal_gl_1k.png",                     channel: R),
+            g: (input: "materials/snow_01/snow_01_normal_gl_1k.png",                     channel: G),
+            b: (input: "materials/snow_01/snow_01_normal_gl_1k.png",                     channel: B),
+            a: (input: "materials/snow_01/snow_01_normal_gl_1k.png",                     channel: A),
+        ),
+        // layer 7 — grass_05.
+        (
+            r: (input: "materials/grass_05/grass_05_normal_gl_1k.png",                   channel: R),
+            g: (input: "materials/grass_05/grass_05_normal_gl_1k.png",                   channel: G),
+            b: (input: "materials/grass_05/grass_05_normal_gl_1k.png",                   channel: B),
+            a: (input: "materials/grass_05/grass_05_normal_gl_1k.png",                   channel: A),
+        ),
+        // layer 8 — stone_wall_04.
+        (
+            r: (input: "materials/stone_wall_04/stone_wall_04_normal_gl_1k.png",         channel: R),
+            g: (input: "materials/stone_wall_04/stone_wall_04_normal_gl_1k.png",         channel: G),
+            b: (input: "materials/stone_wall_04/stone_wall_04_normal_gl_1k.png",         channel: B),
+            a: (input: "materials/stone_wall_04/stone_wall_04_normal_gl_1k.png",         channel: A),
+        ),
+        // layer 9 — ground_tiles_08.
+        (
+            r: (input: "materials/ground_tiles_08/ground_tiles_08_normal_gl_1k.png",     channel: R),
+            g: (input: "materials/ground_tiles_08/ground_tiles_08_normal_gl_1k.png",     channel: G),
+            b: (input: "materials/ground_tiles_08/ground_tiles_08_normal_gl_1k.png",     channel: B),
+            a: (input: "materials/ground_tiles_08/ground_tiles_08_normal_gl_1k.png",     channel: A),
         ),
     ],
 )

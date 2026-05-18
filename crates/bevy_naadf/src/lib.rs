@@ -17,6 +17,7 @@ pub mod camera;
 pub mod e2e;
 pub mod editor;
 pub mod hud;
+pub mod material_set;
 pub mod render;
 pub mod settings;
 pub mod texture_array;
@@ -395,6 +396,13 @@ pub struct AppArgs {
     /// capture a single screenshot to `oracle_gpu.png`, then exit. See
     /// [`crate::e2e::vox_gpu_oracle`].
     pub vox_gpu_oracle_gpu_phase: bool,
+    /// PBR-raymarching `--pbr-visual` mode — when `true`, the e2e driver
+    /// pins a fixed side-on pose looking at the metallic pillar in the
+    /// default test grid, captures a single screenshot, and asserts the
+    /// three PBR signal checks (specular highlight luminance, textured-
+    /// albedo variation, metallic F0 colour-pull). See
+    /// [`crate::e2e::pbr_visual`] and `02-design.md` § I.
+    pub pbr_visual_mode: bool,
 }
 
 impl Default for AppArgs {
@@ -414,6 +422,7 @@ impl Default for AppArgs {
             vox_gpu_construction_mode: false,
             vox_gpu_oracle_cpu_phase: false,
             vox_gpu_oracle_gpu_phase: false,
+            pbr_visual_mode: false,
         }
     }
 }
@@ -682,6 +691,12 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // `AssetProcessor` resource exists — i.e. in the `bake` binary's
             // `AssetMode::Processed` app, not here. See `crate::texture_array`.
             texture_array::TextureArrayPlugin,
+            // PBR-raymarching: load the four `.texarray.ron` material arrays
+            // into a `MaterialSet` resource at startup; `extract_material_set`
+            // ferries the four handles into the render world, and
+            // `prepare_world_gpu` binds them at world `@group(0)` slots 8..12
+            // once their `GpuImage`s are uploaded (`02-design.md` § C).
+            material_set::MaterialSetPlugin,
         ));
 
     // The fly camera + runtime DLSS toggle — production only. The e2e config

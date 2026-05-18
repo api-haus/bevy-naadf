@@ -1,0 +1,84 @@
+// Metallic / Roughness / Height 2D-array (target glTF MRH layout):
+//   R ← metallic
+//   G ← roughness (perceptual; perceptual^2 inside the BRDF as α — see § E)
+//   B ← height in [0,1] (POM source — 0=deepest, 1=surface)
+//   A ← unused (zeroed via black placeholder)
+//
+// Layer order matches diffuse / normal / emissive (see diffuse.texarray.ron).
+(
+    format: Rgba8Unorm,
+    elements: [
+        // layer 0 — fabric: legacy `metallic_roughness.png` is glTF-packed
+        // (R unused, G=roughness, B=metallic). R metallic ← MR.B; G roughness
+        // ← MR.G; B height ← height.R.
+        (
+            r: (input: "materials/fabric/metallic_roughness.png",     channel: B),
+            g: (input: "materials/fabric/metallic_roughness.png",     channel: G),
+            b: (input: "materials/fabric/height.png",                 channel: R),
+            a: (input: "materials/_placeholder/black_1.png",          channel: R),
+        ),
+        // layer 1 — gravelrock.
+        (
+            r: (input: "materials/gravelrock/metallic_roughness.png", channel: B),
+            g: (input: "materials/gravelrock/metallic_roughness.png", channel: G),
+            b: (input: "materials/gravelrock/height.png",             channel: R),
+            a: (input: "materials/_placeholder/black_1.png",          channel: R),
+        ),
+        // layer 2 — pavement.
+        (
+            r: (input: "materials/pavement/metallic_roughness.png",   channel: B),
+            g: (input: "materials/pavement/metallic_roughness.png",   channel: G),
+            b: (input: "materials/pavement/height.png",               channel: R),
+            a: (input: "materials/_placeholder/black_1.png",          channel: R),
+        ),
+        // layer 3 — metal_02 (separate metallic + roughness + height PNGs).
+        (
+            r: (input: "materials/metal_02/metal_02_metallic_1k.png",  channel: R),
+            g: (input: "materials/metal_02/metal_02_roughness_1k.png", channel: R),
+            b: (input: "materials/metal_02/metal_02_height_1k.png",    channel: R),
+            a: (input: "materials/_placeholder/black_1.png",           channel: R),
+        ),
+        // layer 4 — metal_pattern_01.
+        (
+            r: (input: "materials/metal_pattern_01/metal_pattern_01_metallic_1k.png",  channel: R),
+            g: (input: "materials/metal_pattern_01/metal_pattern_01_roughness_1k.png", channel: R),
+            b: (input: "materials/metal_pattern_01/metal_pattern_01_height_1k.png",    channel: R),
+            a: (input: "materials/_placeholder/black_1.png",                           channel: R),
+        ),
+        // layer 5 — bark_04.
+        (
+            r: (input: "materials/bark_04/bark_04_metallic_1k.png",  channel: R),
+            g: (input: "materials/bark_04/bark_04_roughness_1k.png", channel: R),
+            b: (input: "materials/bark_04/bark_04_height_1k.png",    channel: R),
+            a: (input: "materials/_placeholder/black_1.png",         channel: R),
+        ),
+        // layer 6 — snow_01 (no metallic PNG → black placeholder = 0).
+        (
+            r: (input: "materials/_placeholder/black_1.png",           channel: R),
+            g: (input: "materials/snow_01/snow_01_roughness_1k.png",   channel: R),
+            b: (input: "materials/snow_01/snow_01_height_1k.png",      channel: R),
+            a: (input: "materials/_placeholder/black_1.png",           channel: R),
+        ),
+        // layer 7 — grass_05 (no metallic, no height → black / gray128).
+        (
+            r: (input: "materials/_placeholder/black_1.png",           channel: R),
+            g: (input: "materials/grass_05/grass_05_roughness_1k.png", channel: R),
+            b: (input: "materials/_placeholder/gray128_1.png",         channel: R),
+            a: (input: "materials/_placeholder/black_1.png",           channel: R),
+        ),
+        // layer 8 — stone_wall_04 (no metallic).
+        (
+            r: (input: "materials/_placeholder/black_1.png",                     channel: R),
+            g: (input: "materials/stone_wall_04/stone_wall_04_roughness_1k.png", channel: R),
+            b: (input: "materials/stone_wall_04/stone_wall_04_height_1k.png",    channel: R),
+            a: (input: "materials/_placeholder/black_1.png",                     channel: R),
+        ),
+        // layer 9 — ground_tiles_08 (no metallic).
+        (
+            r: (input: "materials/_placeholder/black_1.png",                         channel: R),
+            g: (input: "materials/ground_tiles_08/ground_tiles_08_roughness_1k.png", channel: R),
+            b: (input: "materials/ground_tiles_08/ground_tiles_08_height_1k.png",    channel: R),
+            a: (input: "materials/_placeholder/black_1.png",                         channel: R),
+        ),
+    ],
+)

@@ -37,15 +37,19 @@ use std::f32::consts::PI;
 
 use bevy::math::Vec3;
 use bevy::prelude::*;
+use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
-    BindGroup, BindGroupEntries, Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
-    PipelineCache,
+    AddressMode, BindGroup, BindGroupEntries, BindingResource, Buffer, BufferDescriptor,
+    BufferUsages, CommandEncoderDescriptor, FilterMode, MipmapFilterMode, PipelineCache,
+    Sampler, SamplerDescriptor,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::render::texture::GpuImage;
 
 use crate::render::atmosphere::AtmosphereGpu;
 use crate::render::extract::{
-    ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig, WorldGpuStaging,
+    ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig, ExtractedMaterialSet,
+    WorldGpuStaging,
 };
 use crate::render::gi::{GiBindGroups, GiGpu};
 use crate::render::gpu_types::{
@@ -93,6 +97,10 @@ pub struct WorldGpu {
     pub entity_voxel_data_placeholder: Buffer,
     /// Phase-C wave-3 — placeholder for `entity_instances_history` (slot 7).
     pub entity_instances_history_placeholder: Buffer,
+    /// PBR-raymarching shared linear-repeat sampler bound at slot 12. Cached
+    /// on `WorldGpu` so it's not recreated per frame; reused by every bind-
+    /// group rebuild (entity-track switch, etc.).
+    pub pbr_sampler: Sampler,
 }
 
 /// The per-frame GPU resources (`03-design.md` §4.4 — render-world `FrameGpu`
@@ -197,6 +205,13 @@ pub fn prepare_world_gpu(
     // writes Algorithm 1 outputs into those buffers on the next system
     // (after `prepare_world_gpu`).
     construction_config: Option<Res<crate::render::construction::ConstructionConfig>>,
+    // PBR-raymarching texture arrays — `prepare_world_gpu` waits until all
+    // four `Handle<Image>`s have a `GpuImage` available in
+    // `RenderAssets<GpuImage>` before building `WorldGpu`, then binds the
+    // four texture views + a shared linear-repeat sampler at slots 8..12 of
+    // the world bind group (`02-design.md` § C).
+    extracted_material_set: Option<Res<ExtractedMaterialSet>>,
+    images: Res<RenderAssets<GpuImage>>,
 ) {
     // Build-once: WorldGpu already exists → this system is forever done.
     if existing.is_some() {
@@ -206,6 +221,21 @@ pub fn prepare_world_gpu(
     // `stage_world_gpu_buildonce` once both `WorldData` and `VoxelTypes`
     // are present in the main world.
     let Some(extracted) = staging else {
+        return;
+    };
+    // Wait for the four MaterialSet texture arrays to be uploaded. The
+    // bake's output is a Basis `.texarray.ron.basis` decoded by Bevy's
+    // image asset loader → `GpuImage`; until all four are ready the world
+    // bind group can't be built.
+    let Some(material_set) = extracted_material_set else {
+        return;
+    };
+    let (Some(diffuse_ao), Some(normal), Some(mrh), Some(emissive)) = (
+        images.get(&material_set.diffuse_ao),
+        images.get(&material_set.normal),
+        images.get(&material_set.mrh),
+        images.get(&material_set.emissive),
+    ) else {
         return;
     };
     // vox-gpu-rewrite W5.1 — the fixed-world `.vox` install path leaves
@@ -544,11 +574,31 @@ pub fn prepare_world_gpu(
         mapped_at_creation: false,
     });
 
+    // --- PBR-raymarching shared linear-repeat sampler ----------------------
+    // Same configuration that `texture_array::loader::bake_texture_array`
+    // applies to every baked array (`loader.rs:197` — `ImageAddressMode::Repeat`
+    // + linear). One sampler is enough; if a future change introduces e.g.
+    // point-sampled normals, split into per-array samplers then
+    // (`02-design.md` § C).
+    let pbr_sampler = render_device.create_sampler(&SamplerDescriptor {
+        label: Some("naadf_pbr_sampler"),
+        address_mode_u: AddressMode::Repeat,
+        address_mode_v: AddressMode::Repeat,
+        address_mode_w: AddressMode::Repeat,
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        mipmap_filter: MipmapFilterMode::Linear,
+        ..Default::default()
+    });
+
     // --- @group(0) bind group ----------------------------------------------
-    // Phase-C wave-3 — `world_layout` now has 8 bindings; slots 5/6/7 are the
-    // W4 entity-track read-only buffers. Bound to placeholders here; the
-    // construction-side `prepare_construction` may rebuild this bind group with
-    // the real W4 buffers when `ConstructionConfig.entities_enabled = true`.
+    // Phase-C wave-3 — `world_layout` has 8 buffer bindings (slots 0..7); the
+    // PBR-raymarching pivot adds 5 more (slots 8..12) for the four texture
+    // arrays + the shared sampler (`02-design.md` § C). Bound to placeholders
+    // for the entity track; `prepare_construction` may rebuild this bind group
+    // with the real W4 buffers when `ConstructionConfig.entities_enabled = true`
+    // — that rebuild path must also bind the same PBR slots (see
+    // `construction/mod.rs::prepare_construction`).
     let bind_group = render_device.create_bind_group(
         "naadf_world_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.world_layout),
@@ -561,6 +611,11 @@ pub fn prepare_world_gpu(
             placeholder_entity_chunk_instances.as_entire_buffer_binding(),
             placeholder_entity_voxel_data.as_entire_buffer_binding(),
             placeholder_entity_instances_history.as_entire_buffer_binding(),
+            BindingResource::TextureView(&diffuse_ao.texture_view),
+            BindingResource::TextureView(&normal.texture_view),
+            BindingResource::TextureView(&mrh.texture_view),
+            BindingResource::TextureView(&emissive.texture_view),
+            BindingResource::Sampler(&pbr_sampler),
         )),
     );
 
@@ -575,6 +630,7 @@ pub fn prepare_world_gpu(
         entity_chunk_instances_placeholder: placeholder_entity_chunk_instances,
         entity_voxel_data_placeholder: placeholder_entity_voxel_data,
         entity_instances_history_placeholder: placeholder_entity_instances_history,
+        pbr_sampler,
     });
     // Build-once consumed. Drop the staging resource so its ~48 MiB on
     // Oasis is reclaimed and no future code path can accidentally re-read

@@ -1,13 +1,11 @@
-// Diffuse / albedo 2D-array — one layer per InstaMAT-baked material under
-// `assets/materials/<name>/`, all sampled straight from each material's
-// `base_color.png` (RGBA). sRGB pixel format because albedo is colour data.
+// Diffuse + AO 2D-array — RGB albedo + A=AO per material. sRGB pixel format
+// (RGB is colour; A is "data" but `Rgba8UnormSrgb` decodes A as linear so
+// it round-trips correctly — Bevy convention).
 //
-// Layer index ↔ material is fixed across `diffuse`, `normal`, and
-// `occlusion_roughness_metallic_height` — a renderer reading layer N gets the
-// same material's albedo / normal / data triplet:
-//   0  fabric
-//   1  gravelrock
-//   2  pavement
+// Layer index ↔ material is fixed across diffuse / normal / mrh / emissive:
+//   0 fabric           1 gravelrock       2 pavement         3 metal_02
+//   4 metal_pattern_01 5 bark_04          6 snow_01          7 grass_05
+//   8 stone_wall_04    9 ground_tiles_08
 //
 // Path resolution: `assets/materials/` is symlinked into
 // `crates/bevy_naadf/src/assets/materials/` so paths are relative to Bevy's
@@ -15,26 +13,75 @@
 (
     format: Rgba8UnormSrgb,
     elements: [
-        // layer 0 — fabric.base_color
+        // layer 0 — fabric: A ← occlusion.R (was: pass-through alpha).
         (
             r: (input: "materials/fabric/base_color.png",     channel: R),
             g: (input: "materials/fabric/base_color.png",     channel: G),
             b: (input: "materials/fabric/base_color.png",     channel: B),
-            a: (input: "materials/fabric/base_color.png",     channel: A),
+            a: (input: "materials/fabric/occlusion.png",      channel: R),
         ),
-        // layer 1 — gravelrock.base_color
+        // layer 1 — gravelrock.
         (
             r: (input: "materials/gravelrock/base_color.png", channel: R),
             g: (input: "materials/gravelrock/base_color.png", channel: G),
             b: (input: "materials/gravelrock/base_color.png", channel: B),
-            a: (input: "materials/gravelrock/base_color.png", channel: A),
+            a: (input: "materials/gravelrock/occlusion.png",  channel: R),
         ),
-        // layer 2 — pavement.base_color
+        // layer 2 — pavement.
         (
             r: (input: "materials/pavement/base_color.png",   channel: R),
             g: (input: "materials/pavement/base_color.png",   channel: G),
             b: (input: "materials/pavement/base_color.png",   channel: B),
-            a: (input: "materials/pavement/base_color.png",   channel: A),
+            a: (input: "materials/pavement/occlusion.png",    channel: R),
+        ),
+        // layer 3 — metal_02.
+        (
+            r: (input: "materials/metal_02/metal_02_color_1k.png",                channel: R),
+            g: (input: "materials/metal_02/metal_02_color_1k.png",                channel: G),
+            b: (input: "materials/metal_02/metal_02_color_1k.png",                channel: B),
+            a: (input: "materials/metal_02/metal_02_ambient_occlusion_1k.png",    channel: R),
+        ),
+        // layer 4 — metal_pattern_01.
+        (
+            r: (input: "materials/metal_pattern_01/metal_pattern_01_color_1k.png",             channel: R),
+            g: (input: "materials/metal_pattern_01/metal_pattern_01_color_1k.png",             channel: G),
+            b: (input: "materials/metal_pattern_01/metal_pattern_01_color_1k.png",             channel: B),
+            a: (input: "materials/metal_pattern_01/metal_pattern_01_ambient_occlusion_1k.png", channel: R),
+        ),
+        // layer 5 — bark_04 (camelCase filenames).
+        (
+            r: (input: "materials/bark_04/bark_04_baseColor_1k.png",        channel: R),
+            g: (input: "materials/bark_04/bark_04_baseColor_1k.png",        channel: G),
+            b: (input: "materials/bark_04/bark_04_baseColor_1k.png",        channel: B),
+            a: (input: "materials/bark_04/bark_04_ambientOcclusion_1k.png", channel: R),
+        ),
+        // layer 6 — snow_01.
+        (
+            r: (input: "materials/snow_01/snow_01_color_1k.png",             channel: R),
+            g: (input: "materials/snow_01/snow_01_color_1k.png",             channel: G),
+            b: (input: "materials/snow_01/snow_01_color_1k.png",             channel: B),
+            a: (input: "materials/snow_01/snow_01_ambient_occlusion_1k.png", channel: R),
+        ),
+        // layer 7 — grass_05 (AO missing → white placeholder = 1.0).
+        (
+            r: (input: "materials/grass_05/grass_05_basecolor_1k.png", channel: R),
+            g: (input: "materials/grass_05/grass_05_basecolor_1k.png", channel: G),
+            b: (input: "materials/grass_05/grass_05_basecolor_1k.png", channel: B),
+            a: (input: "materials/_placeholder/white_1.png",           channel: R),
+        ),
+        // layer 8 — stone_wall_04.
+        (
+            r: (input: "materials/stone_wall_04/stone_wall_04_color_1k.png",             channel: R),
+            g: (input: "materials/stone_wall_04/stone_wall_04_color_1k.png",             channel: G),
+            b: (input: "materials/stone_wall_04/stone_wall_04_color_1k.png",             channel: B),
+            a: (input: "materials/stone_wall_04/stone_wall_04_ambient_occlusion_1k.png", channel: R),
+        ),
+        // layer 9 — ground_tiles_08.
+        (
+            r: (input: "materials/ground_tiles_08/ground_tiles_08_color_1k.png",             channel: R),
+            g: (input: "materials/ground_tiles_08/ground_tiles_08_color_1k.png",             channel: G),
+            b: (input: "materials/ground_tiles_08/ground_tiles_08_color_1k.png",             channel: B),
+            a: (input: "materials/ground_tiles_08/ground_tiles_08_ambient_occlusion_1k.png", channel: R),
         ),
     ],
 )

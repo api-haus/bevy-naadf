@@ -225,6 +225,14 @@ pub enum E2ePhase {
     /// disk (`oracle_cpu.png` for the CPU phase, `oracle_gpu.png` for the GPU
     /// phase), then write `AppExit::Success`.
     VoxGpuOracleDrain,
+    /// PBR-raymarching visual gate — warmup at the side-on metallic-pillar
+    /// pose; converge TAA/GI.
+    PbrVisualWarmup,
+    /// Spawn `Screenshot::primary_window()` for the PBR baseline frame.
+    PbrVisualShoot,
+    /// Drain the async PBR-visual capture, save the PNG to
+    /// `pbr_visual_baseline.png`, run the three PBR assertions, exit.
+    PbrVisualDrain,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -440,6 +448,7 @@ pub fn e2e_driver(
     mut small_edit: ResMut<super::small_edit_visual::SmallEditVisualState>,
     mut small_edit_repro: ResMut<super::small_edit_repro::SmallEditReproState>,
     mut vox_gpu_oracle: ResMut<super::vox_gpu_oracle::VoxGpuOracleState>,
+    mut pbr_visual: ResMut<super::pbr_visual::PbrVisualState>,
     world_data: Option<ResMut<crate::world::data::WorldData>>,
     diagnostics: Res<DiagnosticsStore>,
     pipeline_scan: Res<PipelineScanResult>,
@@ -531,6 +540,17 @@ pub fn e2e_driver(
     });
     if vox_gpu_oracle_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::VoxGpuOracleWarmup;
+        state.phase_ticks = 0;
+    }
+
+    // PBR-raymarching `--pbr-visual` fast-path. Routes into PbrVisualWarmup
+    // on tick 0 when the flag is set. Camera pose owned by
+    // `super::pbr_visual::pin_pbr_visual_camera`.
+    let pbr_visual_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.pbr_visual_mode);
+    if pbr_visual_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+        state.phase = E2ePhase::PbrVisualWarmup;
         state.phase_ticks = 0;
     }
 
@@ -1523,6 +1543,82 @@ pub fn e2e_driver(
                 let err = format!(
                     "vox-gpu-oracle: capture never delivered within {} drain frames",
                     super::vox_gpu_oracle::ORACLE_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        // ---- PBR-raymarching visual gate phases (`02-design.md` § I) -----
+        // Camera pose owned by `pin_pbr_visual_camera` (Update system,
+        // `.after(driver::e2e_driver)`).
+        E2ePhase::PbrVisualWarmup => {
+            let _ = &mut camera;
+            state.phase_ticks += 1;
+            if state.phase_ticks >= super::pbr_visual::PBR_VISUAL_WARMUP_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::PbrVisualShoot;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::PbrVisualShoot => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::PbrVisualDrain;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::PbrVisualDrain => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        println!(
+                            "e2e_render --pbr-visual: capture {}x{}; saving to {}",
+                            fb.width(),
+                            fb.height(),
+                            super::pbr_visual::PBR_VISUAL_PNG,
+                        );
+                        super::pbr_visual::save_pbr_visual_screenshot(
+                            &fb,
+                            super::pbr_visual::PBR_VISUAL_PNG,
+                        );
+                        let result = super::pbr_visual::assert_pbr_visual(&fb);
+                        pbr_visual.captured = Some(fb);
+                        pbr_visual.saved = true;
+                        match &result {
+                            Ok(msg) => {
+                                println!("e2e_render --pbr-visual: {msg}");
+                                println!(
+                                    "e2e_render: pbr-visual PASS — \
+                                     {} warmup frames; default test grid \
+                                     side-on metallic-pillar view.",
+                                    super::pbr_visual::PBR_VISUAL_WARMUP_FRAMES,
+                                );
+                                outcome.gate_result = Some(Ok(()));
+                                exit.write(AppExit::Success);
+                            }
+                            Err(msg) => {
+                                eprintln!("e2e_render: FAIL —\n{msg}");
+                                outcome.gate_result = Some(Err(msg.clone()));
+                                exit.write(AppExit::error());
+                            }
+                        }
+                        state.phase = E2ePhase::Done;
+                    }
+                    Err(msg) => {
+                        let err =
+                            format!("pbr-visual: capture decode failed: {msg}");
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks >= super::pbr_visual::PBR_VISUAL_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "pbr-visual: capture never delivered within {} drain frames",
+                    super::pbr_visual::PBR_VISUAL_DRAIN_FRAMES,
                 );
                 eprintln!("e2e_render: FAIL — {err}");
                 outcome.gate_result = Some(Err(err));

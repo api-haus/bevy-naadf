@@ -554,11 +554,11 @@ pub fn refresh_palette_swatches(
 
     for (idx, vt) in voxel_types.types.iter().enumerate().skip(1) {
         let id = VoxelTypeId(idx as u16);
-        let color = Color::linear_rgb(
-            vt.color_base.x.clamp(0.0, 1.0),
-            vt.color_base.y.clamp(0.0, 1.0),
-            vt.color_base.z.clamp(0.0, 1.0),
-        );
+        // Post-PBR-raymarching pivot: the per-VoxelType "user-picked colour"
+        // is `albedo_tint` (the sampled albedo multiplier). The swatch shows
+        // the tint — sRGB byte → linear `[0,1]` via Bevy's `Color::srgb_u8`,
+        // which converts to linear internally.
+        let color = Color::srgb_u8(vt.albedo_tint[0], vt.albedo_tint[1], vt.albedo_tint[2]);
         let swatch = commands
             .spawn((
                 PaletteSwatch(id),

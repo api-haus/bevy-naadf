@@ -40,9 +40,10 @@ use bevy::render::{
 
 use atmosphere::prepare_atmosphere;
 use extract::{
-    extract_camera, extract_camera_history, extract_gi_config, extract_taa_config,
-    stage_model_data_buildonce, stage_world_gpu_buildonce, ExtractedCameraData,
-    ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
+    extract_camera, extract_camera_history, extract_gi_config, extract_material_set,
+    extract_taa_config, stage_model_data_buildonce, stage_world_gpu_buildonce,
+    ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig,
+    WorldDataMeta,
 };
 use gi::prepare_gi;
 // Phase B Batch 6 (`09-design-b.md` §11 Batch 6 steps 17-18): the `base/` TAA
@@ -156,6 +157,7 @@ impl Plugin for NaadfRenderPlugin {
                     extract_camera_history,
                     extract_taa_config,
                     extract_gi_config,
+                    extract_material_set,
                 ),
             )
             // Prepare: create + upload GPU resources, build bind groups,

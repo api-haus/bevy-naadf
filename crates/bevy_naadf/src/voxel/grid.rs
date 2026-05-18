@@ -29,7 +29,7 @@ use bevy::prelude::*;
 use crate::aadf::cell::{BlockCell, BlockPtr, ChunkCell, VoxelPtr};
 use crate::aadf::construct::{construct, ConstructedWorld, DenseVolume};
 use crate::voxel::vox_import;
-use crate::voxel::{MaterialBase, MaterialLayer, VoxelType, VoxelTypeId};
+use crate::voxel::{MaterialBase, VoxelType, VoxelTypeId};
 use crate::world::data::{IAabb3, VoxelTypes, WorldData};
 use crate::{AppArgs, GridPreset, WORLD_SIZE_IN_CHUNKS, WORLD_SIZE_IN_VOXELS};
 
@@ -586,104 +586,101 @@ fn shift_block_voxel_ptr(raw: u32, voxel_offset: u32) -> u32 {
 /// Build the Phase-A voxel-type palette. Index 0 is the empty placeholder; the
 /// rest match the `TY_*` constants.
 fn build_palette() -> Vec<VoxelType> {
+    // Per PBR-raymarching design § A grid-palette assignment:
+    // 10-material starter set indices (0..9) — see
+    // `assets/materials/diffuse.texarray.ron` layer order:
+    //   0 fabric          1 gravelrock    2 pavement       3 metal_02
+    //   4 metal_pattern_01 5 bark_04      6 snow_01        7 grass_05
+    //   8 stone_wall_04   9 ground_tiles_08
+    //
+    // `albedo_tint` is the per-VoxelType sRGB byte tint applied to the
+    // sampled albedo (multiplicative — `[255,255,255]` is no tint).
+    // `color_layered` is the Emissive HDR multiplier (PBR voxels: ZERO).
     vec![
         // 0 — reserved empty placeholder.
         VoxelType::default(),
-        // 1 — ground: a flat grey diffuse slab.
+        // 1 — ground: stone_wall_04.
         VoxelType {
-            material_base: MaterialBase::Diffuse,
-            material_layer: MaterialLayer::None,
-            roughness: 0.9,
-            color_base: Vec3::new(0.55, 0.55, 0.58),
+            material_base: MaterialBase::Pbr,
+            material_layer_index: 8,
+            albedo_tint: [255, 255, 255],
             color_layered: Vec3::ZERO,
         },
-        // 2 — box A: warm diffuse.
+        // 2 — box A: ground_tiles_08 tinted warm.
         VoxelType {
-            material_base: MaterialBase::Diffuse,
-            material_layer: MaterialLayer::None,
-            roughness: 0.8,
-            color_base: Vec3::new(0.80, 0.30, 0.22),
+            material_base: MaterialBase::Pbr,
+            material_layer_index: 9,
+            albedo_tint: [204, 76, 56],
             color_layered: Vec3::ZERO,
         },
-        // 3 — box B: cool diffuse.
+        // 3 — box B: ground_tiles_08 tinted cool.
         VoxelType {
-            material_base: MaterialBase::Diffuse,
-            material_layer: MaterialLayer::None,
-            roughness: 0.8,
-            color_base: Vec3::new(0.25, 0.45, 0.80),
+            material_base: MaterialBase::Pbr,
+            material_layer_index: 9,
+            albedo_tint: [64, 115, 204],
             color_layered: Vec3::ZERO,
         },
-        // 4 — sphere: green diffuse.
+        // 4 — sphere: grass_05 tinted green.
         VoxelType {
-            material_base: MaterialBase::Diffuse,
-            material_layer: MaterialLayer::None,
-            roughness: 0.7,
-            color_base: Vec3::new(0.30, 0.70, 0.32),
+            material_base: MaterialBase::Pbr,
+            material_layer_index: 7,
+            albedo_tint: [76, 178, 81],
             color_layered: Vec3::ZERO,
         },
-        // 5 — warm-white emissive box. `color_layered` doubles as emissive
-        // intensity (`02-research.md` §4.6); the contribution itself is Phase B.
+        // 5 — warm-white emissive box: pavement (has emissive texture).
         VoxelType {
             material_base: MaterialBase::Emissive,
-            material_layer: MaterialLayer::None,
-            roughness: 1.0,
-            color_base: Vec3::new(1.0, 0.92, 0.78),
+            material_layer_index: 2,
+            albedo_tint: [255, 255, 255],
             color_layered: Vec3::new(8.0, 7.4, 6.2),
         },
-        // 6 — tower: a neutral light-grey diffuse (corner towers).
+        // 6 — tower: bark_04.
         VoxelType {
-            material_base: MaterialBase::Diffuse,
-            material_layer: MaterialLayer::None,
-            roughness: 0.85,
-            color_base: Vec3::new(0.62, 0.60, 0.58),
+            material_base: MaterialBase::Pbr,
+            material_layer_index: 5,
+            albedo_tint: [255, 255, 255],
             color_layered: Vec3::ZERO,
         },
-        // 7 — wall: a warm sand diffuse (the back wall + arch).
+        // 7 — wall: snow_01 tinted sand.
         VoxelType {
-            material_base: MaterialBase::Diffuse,
-            material_layer: MaterialLayer::None,
-            roughness: 0.85,
-            color_base: Vec3::new(0.72, 0.62, 0.42),
+            material_base: MaterialBase::Pbr,
+            material_layer_index: 6,
+            albedo_tint: [183, 158, 107],
             color_layered: Vec3::ZERO,
         },
-        // 8 — pillar: a violet diffuse (the pillar row).
+        // 8 — pillar: metal_02 tinted violet.
         VoxelType {
-            material_base: MaterialBase::Diffuse,
-            material_layer: MaterialLayer::None,
-            roughness: 0.8,
-            color_base: Vec3::new(0.45, 0.32, 0.62),
+            material_base: MaterialBase::Pbr,
+            material_layer_index: 3,
+            albedo_tint: [115, 82, 158],
             color_layered: Vec3::ZERO,
         },
         // 9 — cool-white emissive.
         VoxelType {
             material_base: MaterialBase::Emissive,
-            material_layer: MaterialLayer::None,
-            roughness: 1.0,
-            color_base: Vec3::new(0.82, 0.88, 1.0),
+            material_layer_index: 2,
+            albedo_tint: [255, 255, 255],
             color_layered: Vec3::new(6.4, 6.9, 8.0),
         },
         // 10 — warm amber emissive.
         VoxelType {
             material_base: MaterialBase::Emissive,
-            material_layer: MaterialLayer::None,
-            roughness: 1.0,
-            color_base: Vec3::new(1.0, 0.66, 0.28),
+            material_layer_index: 2,
+            albedo_tint: [255, 255, 255],
             color_layered: Vec3::new(8.0, 5.3, 2.2),
         },
         // 11 — green emissive.
         VoxelType {
             material_base: MaterialBase::Emissive,
-            material_layer: MaterialLayer::None,
-            roughness: 1.0,
-            color_base: Vec3::new(0.40, 1.0, 0.46),
+            material_layer_index: 2,
+            albedo_tint: [255, 255, 255],
             color_layered: Vec3::new(3.2, 8.0, 3.7),
         },
         // 12 — magenta emissive.
         VoxelType {
             material_base: MaterialBase::Emissive,
-            material_layer: MaterialLayer::None,
-            roughness: 1.0,
-            color_base: Vec3::new(1.0, 0.42, 0.86),
+            material_layer_index: 2,
+            albedo_tint: [255, 255, 255],
             color_layered: Vec3::new(8.0, 3.4, 6.9),
         },
     ]

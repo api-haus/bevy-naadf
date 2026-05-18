@@ -128,3 +128,20 @@ struct EntityChunkInstance {
 // branch does not consume the history) — the placeholder is bind-only,
 // never read, never written.
 @group(0) @binding(7) var<storage, read> entity_instances_history: array<vec4<u32>>;
+
+// === PBR-raymarching texture arrays (slots 8..12) ===========================
+//
+// The four linked texture arrays + the shared sampler the unified PBR
+// raymarcher samples per voxel-face. Each array has 10 layers (one per
+// material — see `assets/materials/diffuse.texarray.ron` for the canonical
+// layer ordering). See `docs/orchestrate/pbr-raymarching/02-design.md` § C
+// for the bind-group integration design.
+//
+// These bindings are present on **every** pipeline that uses `world_layout`
+// (first-hit, global-illum, spatial-resampling). The PBR sampling helpers
+// in `pbr_sampling.wgsl` consume them.
+@group(0) @binding(8)  var pbr_diffuse_ao: texture_2d_array<f32>;
+@group(0) @binding(9)  var pbr_normal:     texture_2d_array<f32>;
+@group(0) @binding(10) var pbr_mrh:        texture_2d_array<f32>;
+@group(0) @binding(11) var pbr_emissive:   texture_2d_array<f32>;
+@group(0) @binding(12) var pbr_sampler:    sampler;

@@ -114,6 +114,11 @@ fn main() -> ExitCode {
     let vox_gpu_oracle_mode = args.iter().any(|a| a == "--vox-gpu-oracle");
     let vox_gpu_oracle_cpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-cpu");
     let vox_gpu_oracle_gpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-gpu");
+    // PBR-raymarching visual gate (`02-design.md` § I) — side-on metallic-
+    // pillar view of the default test grid, single screenshot, three PBR
+    // signal assertions (specular highlight luma, textured-albedo variation,
+    // metallic F0 colour-pull).
+    let pbr_visual_mode = args.iter().any(|a| a == "--pbr-visual");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -298,6 +303,8 @@ fn main() -> ExitCode {
         // `bevy_naadf::e2e::vox_gpu_construction` (+ the orchestration
         // bundle at `docs/orchestrate/vox-gpu-rewrite/`).
         bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction()
+    } else if pbr_visual_mode {
+        bevy_naadf::e2e::pbr_visual::run_pbr_visual()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then

@@ -437,11 +437,31 @@ fn calc_new_taa_sample(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // `extra_data8` — the 5-bit roughness for a non-diffuse surface
     // (`base/...:189-192`). `isDiffuse` is `firstHit.y & 0x1`.
+    //
+    // Post-PBR-raymarching: the per-VoxelType `.roughness` scalar is gone
+    // (roughness now lives in the MRH texture array, sampled at the hit
+    // world position). The calc_new_taa_sample pass runs in a TAA-only bind
+    // group with no access to the PBR textures + the hit's world position
+    // is non-trivial to recover here; the TAA sample ring's
+    // `extra_data8` field is only consumed for sample-ring de-dup
+    // heuristics, so a stable mid-roughness proxy keeps the ring valid
+    // without resurrecting the per-VoxelType scalar. The non-diffuse flag
+    // (set by the first-hit pass per `sampled_roughness <
+    // ROUGH_SPECULAR_DIFFUSE_THRESHOLD`) is the load-bearing classifier;
+    // this 5-bit field is best-effort.
     let is_diffuse = first_hit.y & 0x1u;
     var extra_data8: u32 = 0u;
     if (is_diffuse == 0u) {
-        extra_data8 = 1u + u32(pow(first_hit_voxel_type_data.roughness, 0.5) * 30.5);
+        // Mid-roughness placeholder: `pow(0.25, 0.5) * 30.5 ≈ 15.25` → bit 16.
+        let placeholder_roughness: f32 = 0.25;
+        extra_data8 = 1u + u32(pow(placeholder_roughness, 0.5) * 30.5);
     }
+    // Keep `first_hit_voxel_type_data` referenced so naga retains the
+    // `voxel_types` binding in the layout — the calc_new_taa_sample pass
+    // no longer reads any field from it after the PBR pivot, but the
+    // binding stays for frame-layout stability. (WGSL forbids `let _ =`;
+    // `_` is WGSL's phony-assignment form.)
+    _ = first_hit_voxel_type_data.material_base;
 
     // Compress the new sample into the 16-deep ring. The HLSL passes the f16
     // *bits* (`voxelType == 0 ? f32tof16(65520) : (firstHit.w & 0x7FFF)`);
