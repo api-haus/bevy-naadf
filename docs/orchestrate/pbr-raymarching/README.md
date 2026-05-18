@@ -62,8 +62,11 @@ VNDF-GGX BRDF and multi-bounce `shoot_ray` scaffolding already in the shaders.
 - [x] User live visual check #1 — reported 3 bugs (normal map invisible, POM dormant, glitchy splotches)
 - [x] Checkpoint commit (impl) — `ae42a6d`
 - [x] Compound diagnose+fix dispatched (per user direction) — SUCCESS; see `05-diagnostic.md`
-- [ ] Checkpoint commit (diagnose+fix)
-- [ ] User live visual check #2
+- [x] Checkpoint commit (diagnose+fix) — `a0ca87a`
+- [x] User live visual check #2 — reported "only albedo POM-offsetted; want adaptive + self-shadow"
+- [x] Compound POM rewrite dispatched — SUCCESS; see `05-diagnostic.md` § "POM rewrite — modern implementation + wire-up audit"
+- [ ] Checkpoint commit (POM rewrite)
+- [ ] User live visual check #3
 - [ ] Final synthesis + user sign-off
 
 ## Worktree

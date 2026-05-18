@@ -73,6 +73,21 @@ pub const PBR_F0_RECT: Rect = Rect { x0: 110, y0: 100, x1: 150, y1: 140 };
 /// `03a` (normal map sampled but unused by every BRDF call site).
 pub const PBR_NORMAL_RECT: Rect = Rect { x0: 78, y0: 156, x1: 96, y1: 186 };
 
+/// 30×30 px rect on the **bark_04 tower face** at glancing-sun angle —
+/// pinned from the post-rewrite baseline at `(100,170)-(130,200)`. The
+/// tower (VoxelType 6 = bark_04, no tint) has a uniform tan/brown albedo
+/// and high-frequency heightmap variation. The sun's tangent-space
+/// component on this face is small enough (`sky_sun_dir` projected onto
+/// the face normal ≈ 0.35-0.5) that the modern POM self-shadow march
+/// produces a measurable per-pixel darkening in the heightfield valleys.
+///
+/// **Catches the "self-shadow turned off" regression class** — when
+/// shadow strength is forced to zero (or `pom_self_shadow` returns 1
+/// unconditionally), the rect's mean luminance rises by ~4 units. The
+/// `PBR_SHADOW_MEAN_LUMA_CEIL` floor pins the ceiling between the
+/// shadow-on (~152) and shadow-off (~157) means.
+pub const PBR_SHADOW_RECT: Rect = Rect { x0: 100, y0: 170, x1: 130, y1: 200 };
+
 /// Minimum mean-luminance the highlight rect must reach.
 ///
 /// **Tuned from baseline.** The standalone Batch-6 default-scene readback
@@ -107,6 +122,18 @@ pub const PBR_NORMAL_STD_DEV_FLOOR: f32 = 8.0;
 /// **Catches Bug B** NaN-cascade class regressions
 /// (`05-diagnostic.md` B-extra).
 pub const PBR_TEXTURE_SAT_FRAC_CEIL: f32 = 0.10;
+
+/// Maximum mean luminance of [`PBR_SHADOW_RECT`] (the bark_04 tower face
+/// at glancing-sun angle). Without POM self-shadow the rect's mean is
+/// ~156.5; with self-shadow active it drops to ~152.5 (heightfield
+/// valleys are dimmed by the secondary sun-march in `pom_self_shadow`).
+/// The ceiling is pinned between the two cases at 155.0 so disabling
+/// self-shadow (or accidentally setting `POM_SHADOW_STRENGTH = 0`)
+/// causes the gate to fail.
+///
+/// **Catches the modern POM self-shadow regression class**
+/// (`05-diagnostic.md` "POM rewrite — modern implementation").
+pub const PBR_SHADOW_MEAN_LUMA_CEIL: f32 = 155.0;
 
 // ---------------------------------------------------------------------------
 // State resource
@@ -264,6 +291,11 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
     // saturation count.
     let normal_std = region_luminance_std_dev_16(fb, PBR_NORMAL_RECT);
     let sat_frac = region_saturated_fraction(fb, PBR_TEXTURE_RECT);
+    // POM-rewrite — mean luminance on the bark_04 tower face at glancing
+    // sun angle. Self-shadowing dims the heightfield valleys, dropping the
+    // rect's mean below the no-shadow ceiling.
+    let (sr, sg, sb) = region_mean_rgb(fb, PBR_SHADOW_RECT);
+    let shadow_mean_luma = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb;
 
     // The metallic pillar carries a violet `albedo_tint = [115, 82, 158]`
     // (PBR-raymarching § A grid-palette assignment), so the F0 colour
@@ -280,6 +312,7 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
          texture std-dev {texture_std:.2} (floor {PBR_TEXTURE_STD_DEV_FLOOR}); \
          normal-rect std-dev {normal_std:.2} (floor {PBR_NORMAL_STD_DEV_FLOOR}); \
          texture sat-frac {sat_frac:.3} (ceil {PBR_TEXTURE_SAT_FRAC_CEIL}); \
+         shadow-rect mean luma {shadow_mean_luma:.2} (ceil {PBR_SHADOW_MEAN_LUMA_CEIL}); \
          F0 mean RGB ({fr:.1}, {fg:.1}, {fb_blue:.1}), \
          R/G = {r_over_g:.3}, B/G = {b_over_g:.3}",
     );
@@ -325,6 +358,21 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
              NaN-cascade through `eval_pbr` (typically roughness ≈ 0 with \
              perfect half-vector alignment) saturates pixel clusters. {report}. \
              Inspect target/e2e-screenshots/{PBR_VISUAL_PNG}.",
+        ));
+    }
+    // POM self-shadow regression catch: with `pom_self_shadow` returning
+    // anything close to 1.0 (or `POM_SHADOW_STRENGTH = 0`), the
+    // bark_04 tower face at glancing sun angle stays bright. With the
+    // shadow march active the rect mean luminance drops below the
+    // pinned ceiling — see `PBR_SHADOW_MEAN_LUMA_CEIL`.
+    if shadow_mean_luma > PBR_SHADOW_MEAN_LUMA_CEIL {
+        return Err(format!(
+            "pbr-visual gate FAIL — POM shadow rect mean luminance \
+             {shadow_mean_luma:.2} exceeds ceiling {PBR_SHADOW_MEAN_LUMA_CEIL}. \
+             The POM self-shadow march is likely returning 1.0 or \
+             `POM_SHADOW_STRENGTH` was reset to 0 — heightfield valleys \
+             on the bark_04 tower face are not darkening as expected. \
+             {report}. Inspect target/e2e-screenshots/{PBR_VISUAL_PNG}.",
         ));
     }
     // Colour-pull: with the violet tint we expect both ratios > 1 - tol.

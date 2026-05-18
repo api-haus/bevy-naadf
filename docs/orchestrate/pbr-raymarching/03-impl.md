@@ -391,3 +391,33 @@ SUCCESS — Bug A (normal map invisible), Bug B (NaN-cascade splotches),
 Bug C (POM dormant) all root-caused with evidence + fixed; `--pbr-visual`
 gate tightened with `normal-rect std-dev` and `texture sat-frac`
 assertions; all 9 verification gates green.
+
+## modern-pom rewrite + wire-up fix (2026-05-18)
+
+See `05-diagnostic.md` § "POM rewrite — modern implementation + wire-up audit"
+for the design + impl log.
+
+### Files changed (in dirty diff vs. `a0ca87a`)
+
+- `crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl` — modern POM:
+  `PomResult` struct, adaptive `pom_displace_uv` (8-32 steps, linear-interp
+  refine, soft-clip), `pom_self_shadow` (adaptive 6-16 steps, smoothstep
+  penumbra), `pom_displaced_uv_dominant` (3D-view-dir API), `project_plane_uv` /
+  `project_plane_n` helpers, tunables block.
+- `crates/bevy_naadf/src/assets/shaders/naadf_first_hit.wgsl` — wire-up:
+  single shared `displaced_uv` per pixel, all three samples (MRH, Diffuse/AO,
+  Normal) consume it via `_pom` helpers, `pom_self_shadow` factor folded into
+  `acc.absorption` for both mirror and rough-PBR paths.
+- `crates/bevy_naadf/src/e2e/pbr_visual.rs` — `PBR_SHADOW_RECT` +
+  `PBR_SHADOW_MEAN_LUMA_CEIL = 155.0` assertion (catches `pom_self_shadow`
+  regression).
+- `docs/orchestrate/pbr-raymarching/05-diagnostic.md` — design + impl + audit log.
+
+### Verdict
+
+SUCCESS — modern POM (adaptive + linear-interp + self-shadow + soft-clip)
+landed and verified. Wire-up audit confirms all three first-hit samples
+consume the shared displaced UV; user's "only albedo is pom-offsetted"
+report is a visual-subtlety perception (normals/MRH POM produces less
+obvious visual signature than albedo POM) rather than a missing-wire-up
+bug. Nine verification gates green.

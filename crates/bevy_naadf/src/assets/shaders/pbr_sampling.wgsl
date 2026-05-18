@@ -49,12 +49,39 @@ const TRIPLANAR_BLEND_SHARPNESS: f32 = 8.0;
 // the AmbientCG default).
 const WORLD_UV_SCALE: f32 = 1.0;
 
-// POM tunables (`02-design.md` § F.4). `HEIGHT_SCALE = 0.05` = 5% of a
-// voxel side; `LINEAR_STEPS = 8`, `BINARY_STEPS = 4` (industry-standard
-// linear-search + binary-refine).
+// POM tunables (`02-design.md` § F.4 + `05-diagnostic.md` "POM rewrite —
+// modern implementation").
+//
+// `POM_HEIGHT_SCALE = 0.05` = 5% of a voxel side. Unchanged from the prior
+// baseline.
+//
+// Adaptive linear-march step count: `mix(MAX, MIN, abs(cos_view))`. Face-on
+// → `MIN` steps; grazing → `MAX` steps. Replaces the prior fixed
+// `LINEAR_STEPS=8 + BINARY_STEPS=4`. Linear interpolation between the last
+// two samples (Dayuppy steep-parallax style) replaces the binary refine —
+// at adaptive 8-32 steps the local slope is dense enough that a single
+// linear interpolant matches binary-refine quality.
 const POM_HEIGHT_SCALE: f32 = 0.05;
-const POM_LINEAR_STEPS: i32 = 8;
-const POM_BINARY_STEPS: i32 = 4;
+const POM_MIN_LINEAR_STEPS: i32 = 8;
+const POM_MAX_LINEAR_STEPS: i32 = 32;
+
+// Self-shadow march step count: `mix(MAX, MIN, abs(cos_light))`. Sun
+// overhead → `MIN`; sun grazing → `MAX`. The shadow march fires from the
+// displaced UV toward the sun in the dominant plane's tangent space.
+const POM_SHADOW_MIN_STEPS: i32 = 6;
+const POM_SHADOW_MAX_STEPS: i32 = 16;
+
+// Maximum shadow attenuation (the shadow factor cannot dip below
+// `1 - SHADOW_STRENGTH`). Keeping valleys at 15% of unshadowed brightness
+// avoids fighting with the GI ambient fill that adds light back regardless.
+const POM_SHADOW_STRENGTH: f32 = 0.85;
+
+// Soft-clip for the parallax displacement magnitude. When the search has
+// marched more than this many UV units from the base UV, the displacement
+// fades back toward zero via a smoothstep over `[FADE_MAX, FADE_MAX*2]`.
+// Prevents extreme grazing on a high-relief textured face from wrapping
+// around the next tile.
+const POM_DISPLACEMENT_FADE_MAX: f32 = 0.5;
 
 // Below this perceptual-roughness the first-hit pass re-enters the existing
 // 4-iteration perfect-reflect mirror loop instead of deferring to the GI
@@ -143,14 +170,47 @@ fn triplanar_sample_pom(
     return s_x * weights.x + s_y * weights.y + s_z * weights.z;
 }
 
-// Compute the POM-displaced UV on the dominant plane. `view_dir` is the
-// world-space ray direction (the camera-to-hit ray; NOT reversed). The 2D
-// projection into the plane's UV space uses the same plane swizzling as
-// `triplanar_sample` so the displacement direction stays consistent with the
-// sampled texture coordinates.
+// `PomResult` — bundles the POM-displaced UV with the height at the
+// intersection. The shadow march re-uses the intersection height as the
+// starting depth, so the modern POM returns both.
+struct PomResult {
+    uv:     vec2<f32>,
+    height: f32,
+}
+
+// Tangent-space basis for the dominant triplanar plane.
 //
-// Returns the displaced UV (consumed by `triplanar_sample_pom` /
-// `triplanar_sample_normal_pom`).
+//   axis=0 (X-dominant, plane = YZ): u=world.y, v=world.z, n=world.x
+//   axis=1 (Y-dominant, plane = ZX): u=world.z, v=world.x, n=world.y
+//   axis=2 (Z-dominant, plane = XY): u=world.x, v=world.y, n=world.z
+//
+// `project_plane_uv(world_pos, axis)` returns `(u, v)`; `project_plane_n`
+// returns the component along the plane normal. The view / light vectors
+// are projected via the same routines so all marches share one tangent
+// space.
+fn project_plane_uv(p: vec3<f32>, dominant_axis: u32) -> vec2<f32> {
+    if (dominant_axis == 0u) { return p.yz; }
+    if (dominant_axis == 1u) { return p.zx; }
+    return p.xy;
+}
+
+fn project_plane_n(p: vec3<f32>, dominant_axis: u32) -> f32 {
+    if (dominant_axis == 0u) { return p.x; }
+    if (dominant_axis == 1u) { return p.y; }
+    return p.z;
+}
+
+// Compute the POM-displaced UV on the dominant plane.
+//
+// `view_dir` is the world-space ray direction (the camera-to-hit ray; NOT
+// reversed). The function projects it into the dominant plane's tangent
+// space and runs the modern adaptive-step parallax march, returning both
+// the displaced UV AND the sampled height at the intersection.
+//
+// The returned UV is consumed by `triplanar_sample_pom` /
+// `triplanar_sample_normal_pom`; the returned height is consumed by
+// `pom_self_shadow` (the shadow march starts at that height to avoid
+// self-occlusion on the first tap).
 fn pom_displaced_uv_dominant(
     mrh_tex:       texture_2d_array<f32>,
     smp:           sampler,
@@ -158,21 +218,12 @@ fn pom_displaced_uv_dominant(
     view_dir:      vec3<f32>,
     layer:         u32,
     dominant_axis: u32,
-) -> vec2<f32> {
+) -> PomResult {
     let p = world_pos * WORLD_UV_SCALE;
-    var base_uv: vec2<f32>;
-    var view_uv: vec2<f32>;
-    if (dominant_axis == 0u) {
-        base_uv = p.yz;
-        view_uv = view_dir.yz;
-    } else if (dominant_axis == 1u) {
-        base_uv = p.zx;
-        view_uv = view_dir.zx;
-    } else {
-        base_uv = p.xy;
-        view_uv = view_dir.xy;
-    }
-    return pom_displace_uv(mrh_tex, smp, base_uv, view_uv, layer);
+    let base_uv = project_plane_uv(p, dominant_axis);
+    let view_uv = project_plane_uv(view_dir, dominant_axis);
+    let view_n  = project_plane_n(view_dir, dominant_axis);
+    return pom_displace_uv(mrh_tex, smp, base_uv, view_uv, view_n, layer);
 }
 
 // --- triplanar normal-map sample (RNM blend) -------------------------------
@@ -266,55 +317,190 @@ fn triplanar_sample_normal_pom(
     return blended / sqrt(len2);
 }
 
-// --- POM displacement (dominant-plane only) --------------------------------
+// --- POM displacement (dominant-plane only, modern adaptive) --------------
 
-// Displace a 2D UV by sampling the MRH.B height channel along the view
-// direction projected into the plane's UV space. 8-tap linear search +
-// 4-tap binary refine. Returns the displaced UV (suitable for a final
-// albedo/normal/MRH re-sample on that plane). The caller passes one of
-// `world_pos.yz` / `.zx` / `.xy` and the matching `view_dir.yz/.zx/.xy`.
+// Modern steep-parallax displacement. After the linear search overshoots
+// the heightfield, the intersection is approximated by linear interpolation
+// between the last-before and first-after samples (Dayuppy steep-parallax
+// reference, `05-diagnostic.md` "POM rewrite" § Design).
+//
+// The step count adapts to the view angle: face-on uses
+// `POM_MIN_LINEAR_STEPS`, grazing uses `POM_MAX_LINEAR_STEPS`. The march
+// proceeds opposite the view direction in UV space, divided by
+// `abs(view_n)` so silhouette thickness stays constant in screen space.
+//
+// `base_uv` is the original plane UV (e.g. `world_pos.xy` for Z-dominant);
+// `view_uv` is the plane projection of the world-space view direction
+// (e.g. `view_dir.xy`); `view_n` is the view direction's component along
+// the dominant axis (e.g. `view_dir.z`).
+//
+// Returns the displaced UV and the sampled height at the intersection
+// point. The caller (typically `pom_self_shadow`) re-uses the height as
+// the shadow march's starting depth to avoid the first-tap self-occlusion
+// failure mode.
 fn pom_displace_uv(
-    mrh_tex:     texture_2d_array<f32>,
-    smp:         sampler,
-    base_uv:     vec2<f32>,
-    view_dir_2d: vec2<f32>,
-    layer:       u32,
-) -> vec2<f32> {
-    let dir = view_dir_2d * POM_HEIGHT_SCALE;
-    let step = dir / f32(POM_LINEAR_STEPS);
+    mrh_tex:    texture_2d_array<f32>,
+    smp:        sampler,
+    base_uv:    vec2<f32>,
+    view_uv:    vec2<f32>,
+    view_n:     f32,
+    layer:      u32,
+) -> PomResult {
+    // Adaptive step count: face-on → MIN, grazing → MAX. `abs(view_n)`
+    // approximates `cos(theta)` between view and surface normal.
+    let cos_view = clamp(abs(view_n), 0.01, 1.0);
+    let num_steps_f = mix(
+        f32(POM_MAX_LINEAR_STEPS),
+        f32(POM_MIN_LINEAR_STEPS),
+        cos_view,
+    );
+    let num_steps = i32(num_steps_f);
+    let inv_steps = 1.0 / num_steps_f;
+
+    // Per-step UV delta. The minus sign marches AGAINST view_dir (we step
+    // toward the camera in plane coords). `/cos_view` keeps silhouette
+    // thickness constant across view angles (Dayuppy ref convention).
+    let step = -view_uv * POM_HEIGHT_SCALE * inv_steps / cos_view;
+    let delta_h = inv_steps;
+
     var uv = base_uv;
     var prev_uv = uv;
-    var prev_layer_depth: f32 = 0.0;
     var depth: f32 = 0.0;
-    var sampled: f32 = 1.0;
+    var prev_depth: f32 = 0.0;
+    var sampled: f32 = 0.0;
+    var prev_sampled: f32 = 0.0;
 
-    for (var i: i32 = 0; i < POM_LINEAR_STEPS; i = i + 1) {
+    // Linear search. We march until the sampled height rises above the
+    // current ray-remaining depth (the surface "catches up" to the ray).
+    // `depth` here is "depth into the heightfield from the top", matching
+    // the prior convention `depth >= 1.0 - sampled`.
+    for (var i: i32 = 0; i < num_steps; i = i + 1) {
         prev_uv = uv;
-        prev_layer_depth = depth;
+        prev_depth = depth;
+        prev_sampled = sampled;
         uv = uv + step;
-        depth = depth + 1.0 / f32(POM_LINEAR_STEPS);
+        depth = depth + delta_h;
         sampled = textureSampleLevel(mrh_tex, smp, uv, i32(layer), 0.0).b;
         if (depth >= 1.0 - sampled) { break; }
     }
 
-    // Binary refine between (prev_uv, uv).
-    var lo = prev_uv;
-    var hi = uv;
-    var lo_depth = prev_layer_depth;
-    var hi_depth = depth;
-    for (var i: i32 = 0; i < POM_BINARY_STEPS; i = i + 1) {
-        let mid = 0.5 * (lo + hi);
-        let mid_depth = 0.5 * (lo_depth + hi_depth);
-        let mid_sample = textureSampleLevel(mrh_tex, smp, mid, i32(layer), 0.0).b;
-        if (mid_depth >= 1.0 - mid_sample) {
-            hi = mid;
-            hi_depth = mid_depth;
-        } else {
-            lo = mid;
-            lo_depth = mid_depth;
-        }
+    // Linear interpolation between the last-before and first-after taps.
+    // Replaces the prior binary-refine pass with a single weighted blend.
+    //
+    //   after_overshoot  = sampled      - (1 - depth)
+    //   before_overshoot = prev_sampled - (1 - prev_depth)  [≤ 0 normally]
+    //
+    // The intersection is at `t = before / (before + after)` along the
+    // step (the "lerp toward the larger overshoot" Dayuppy trick).
+    let after  = sampled      - (1.0 - depth);
+    let before = (1.0 - prev_depth) - prev_sampled;
+    let denom = before + after;
+    let t = select(0.5, clamp(before / denom, 0.0, 1.0), denom > 1e-5);
+    let raw_uv = mix(prev_uv, uv, t);
+    let intersection_height = mix(prev_sampled, sampled, t);
+
+    // Soft-clip the parallax displacement magnitude. When the search has
+    // marched far from `base_uv`, fade the displacement back toward zero
+    // to avoid wrap artefacts at the tile boundary. The fade kicks in
+    // beyond `FADE_MAX` and saturates at `FADE_MAX * 2`.
+    let raw_offset = raw_uv - base_uv;
+    let off_mag = length(raw_offset);
+    let fade = 1.0 - smoothstep(
+        POM_DISPLACEMENT_FADE_MAX,
+        POM_DISPLACEMENT_FADE_MAX * 2.0,
+        off_mag,
+    );
+    let final_uv = base_uv + raw_offset * fade;
+
+    var r: PomResult;
+    r.uv = final_uv;
+    r.height = intersection_height;
+    return r;
+}
+
+// `pom_self_shadow` — secondary march from the POM-displaced surface point
+// toward the light, in the dominant plane's tangent space.
+//
+// Starting at the intersection height (NOT the surface), march outward
+// along the light direction in UV space, sampling height at each step. If
+// any tap exceeds the current shadow-ray height, the surface is in
+// self-shadow (the light is occluded by a higher local microgeometry
+// feature).
+//
+// Returns a shadow factor in `[1 - POM_SHADOW_STRENGTH, 1]`. A smoothstep
+// over the maximum overshoot softens the binary hard-shadow into a
+// pseudo-penumbra without the cost of a PCF kernel.
+//
+// The march is skipped when:
+//   * `cos_light_n <= 0` — light below the plane horizon (back-face);
+//   * `intersection_height >= 1.0` — surface tap is already at the
+//     heightmap maximum (no occluder above).
+//
+// `light_dir` is the world-space direction TOWARDS the light (sky_sun_dir
+// convention). `base_height` is the `PomResult.height` from
+// `pom_displace_uv` — the height at the intersection point that anchors
+// the shadow ray's starting depth.
+fn pom_self_shadow(
+    mrh_tex:       texture_2d_array<f32>,
+    smp:           sampler,
+    displaced_uv:  vec2<f32>,
+    base_height:   f32,
+    light_dir:     vec3<f32>,
+    layer:         u32,
+    dominant_axis: u32,
+) -> f32 {
+    let light_uv = project_plane_uv(light_dir, dominant_axis);
+    let light_n  = project_plane_n(light_dir, dominant_axis);
+
+    // Light below the plane → fully shadowed (back-face); the caller is
+    // expected to gate the multiplication on `dot(n, l) > 0` already, but
+    // a defensive early-out keeps the function safe in isolation.
+    let cos_light = clamp(abs(light_n), 0.01, 1.0);
+    if (light_n <= 0.0) {
+        return 1.0 - POM_SHADOW_STRENGTH;
     }
-    return 0.5 * (lo + hi);
+    if (base_height >= 0.999) {
+        return 1.0;
+    }
+
+    // Adaptive shadow-march step count: overhead → MIN, grazing → MAX.
+    let num_steps_f = mix(
+        f32(POM_SHADOW_MAX_STEPS),
+        f32(POM_SHADOW_MIN_STEPS),
+        cos_light,
+    );
+    let num_steps = i32(num_steps_f);
+    let inv_steps = 1.0 / num_steps_f;
+
+    // Per-step UV delta along the light direction. The plus sign marches
+    // AWAY from the surface toward the light. `/cos_light` keeps silhouette
+    // thickness constant.
+    let step = light_uv * POM_HEIGHT_SCALE * inv_steps / cos_light;
+    // Per-step shadow-ray height delta. The ray starts at `base_height +
+    // small_bias` and climbs toward 1.0; an occluder at any UV whose
+    // height exceeds the ray height blocks the sun.
+    let delta_h = inv_steps;
+    let bias = delta_h * 0.1;
+
+    var uv = displaced_uv + step;
+    var ray_h = base_height + bias;
+    var max_overshoot: f32 = 0.0;
+
+    for (var i: i32 = 0; i < num_steps; i = i + 1) {
+        if (ray_h >= 1.0) { break; }
+        let h = textureSampleLevel(mrh_tex, smp, uv, i32(layer), 0.0).b;
+        let overshoot = h - ray_h;
+        if (overshoot > max_overshoot) {
+            max_overshoot = overshoot;
+        }
+        uv = uv + step;
+        ray_h = ray_h + delta_h;
+    }
+
+    // Smoothstep over the maximum overshoot → soft pseudo-penumbra.
+    // `0` overshoot → no shadow; `2 * delta_h` overshoot → full shadow.
+    let penumbra = smoothstep(0.0, delta_h * 2.0, max_overshoot);
+    return 1.0 - penumbra * POM_SHADOW_STRENGTH;
 }
 
 // --- variant select (PCG3D hash) -------------------------------------------

@@ -68,7 +68,7 @@
 #import "shaders/pbr_sampling.wgsl"::{
     triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
     triplanar_sample_pom, triplanar_sample_normal_pom,
-    dominant_axis_from_weights, pom_displaced_uv_dominant,
+    dominant_axis_from_weights, pom_displaced_uv_dominant, pom_self_shadow,
     select_layer_variant,
     MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
@@ -280,11 +280,18 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // geometric hit position written into the G-buffer
             // (`compress_first_hit_data` below uses `distance_ray` +
             // `norm_tangs`, both untouched by POM) is unaffected.
+            //
+            // Modern POM (`05-diagnostic.md` "POM rewrite — modern
+            // implementation"): adaptive step count (8-32 view-angle-
+            // dependent), linear-interpolation refine, soft-clip
+            // displacement, plus a secondary `pom_self_shadow` march toward
+            // the sun in the dominant plane's tangent space.
             let dominant_axis = dominant_axis_from_weights(blend_weights);
-            let displaced_uv = pom_displaced_uv_dominant(
+            let pom = pom_displaced_uv_dominant(
                 pbr_mrh, pbr_sampler,
                 hit_world_pos, ray_dir, layer, dominant_axis,
             );
+            let displaced_uv = pom.uv;
             let mrh = triplanar_sample_pom(
                 pbr_mrh, pbr_sampler,
                 hit_world_pos, blend_weights, layer, dominant_axis, displaced_uv,
@@ -309,6 +316,33 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 layer, dominant_axis, displaced_uv,
             );
 
+            // POM self-shadow — secondary march from the displaced surface
+            // point toward the sun. The shadow factor folds into
+            // `acc.absorption` so downstream GI / sun-direct shading on
+            // this pixel sees the attenuated direct light. The valleys of
+            // the heightfield receive `(1 - SHADOW_STRENGTH) × full` light;
+            // the peaks see full light. The G-buffer encode is unchanged
+            // (the shadow factor passes through `first_hit_absorption`,
+            // a buffer that already exists and is already written every
+            // pixel).
+            //
+            // The shadow attenuation multiplies ALL downstream radiance
+            // through the absorption chain (sun direct + sky bounce +
+            // GI). Strictly the shadow factor should attenuate sun direct
+            // only — doing so requires either a new G-buffer slot or a
+            // POM re-evaluation in GI / spatial_resampling, both excluded
+            // by the rewrite brief. The current approximation is
+            // visually defensible: shadowed POM valleys are also less
+            // sky-exposed (the local microgeometry partially occludes
+            // the sky), so attenuating the sky bounce alongside the sun
+            // is geometrically reasonable.
+            let pom_shadow = pom_self_shadow(
+                pbr_mrh, pbr_sampler,
+                displaced_uv, pom.height,
+                atmosphere_params.sky_sun_dir,
+                layer, dominant_axis,
+            );
+
             // Polished metal / glass — re-enter the existing 4-iteration
             // perfect-reflect mirror loop. Schlick Fresnel weights the
             // absorption; the mirror reflection direction stays exactly the
@@ -323,7 +357,10 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let f_base = mix(vec3<f32>(0.04), sampled_albedo, sampled_metallic);
                 let one_minus_ct = 1.0 - cos_theta;
                 let r = f_base + (vec3<f32>(1.0) - f_base) * pow(one_minus_ct, 5.0);
-                acc.absorption = acc.absorption * r;
+                // POM self-shadow attenuates the Fresnel weight: the
+                // reflected mirror ray carries the same shadow factor as
+                // the rough-PBR break path.
+                acc.absorption = acc.absorption * r * pom_shadow;
                 ray_dir = reflect(ray_dir, perturbed_normal);
                 old_pos = vec3<f32>(cur_pos_int) + cur_pos_frac;
                 i = i + 1u;
@@ -337,9 +374,12 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // `is_diffuse=0` for fine-roughness surfaces (VNDF sampling
             // wins); `is_diffuse=1` above the threshold (uniform-hemisphere
             // wins). `02-design.md` decision #7.
+            //
+            // POM self-shadow folds into the absorption: shadowed valleys
+            // attenuate downstream radiance by `(1 - SHADOW_STRENGTH)`.
             let albedo_attenuation = (vec3<f32>(1.0) - vec3<f32>(sampled_metallic))
                 * sampled_albedo;
-            acc.absorption = acc.absorption * albedo_attenuation;
+            acc.absorption = acc.absorption * albedo_attenuation * pom_shadow;
             distance_ray = dist + volume.dist_min_max.x;
             voxel_type_raw = ray_result.hit_type;
             is_diffuse = select(
