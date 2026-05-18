@@ -187,6 +187,23 @@ pub struct ConstructionGpu {
     /// is true AND every dependency (compiled pipelines, allocated bind
     /// groups) is ready.
     pub gpu_producer_has_run: bool,
+    /// vox-gpu-rewrite W5.3-fix Stage 5 (D1 fix) — `true` once the post-W5
+    /// GPU→CPU readback has copied `WorldGpu::{chunks,blocks,voxels}` back
+    /// into the main-world `WorldData::{chunks_cpu,blocks_cpu,voxels_cpu}`.
+    /// One-shot per startup; flipped in
+    /// `populate_cpu_mirror_from_gpu_producer` (extract-schedule system) on
+    /// the first frame after `gpu_producer_has_run` is true.
+    ///
+    /// Mirrors C# `WorldData.cs:158-198` where `dataChunkGpu.GetData(dataChunk)`
+    /// + `CopyFromStructuredBufferLarge` populate the CPU mirror buffers from
+    /// the GPU producer output. Without this readback the W5 install path's
+    /// `WorldData.chunks_cpu` is empty (constructed empty in
+    /// `install_vox_in_fixed_world`), so the CPU-side `ray_traversal` (used
+    /// by the editor's mouse-pick) immediately returns `None` for every
+    /// position — every brush misses. (Diagnostic:
+    /// `docs/orchestrate/vox-gpu-rewrite/10-diagnostic-encoding-comparison.md`
+    /// "Bug D1".)
+    pub cpu_mirror_populated: bool,
 
     // === W5 — generator_model storage uploads + per-segment uniform ===========
     // vox-gpu-rewrite W5.2 — these four buffers feed the W5
@@ -833,6 +850,194 @@ pub fn extract_world_changes(
     }
 
     commands.insert_resource(events);
+}
+
+/// vox-gpu-rewrite W5.3-fix Stage 5 (D1 fix) — GPU→CPU readback that
+/// populates the main-world `WorldData::{chunks_cpu, blocks_cpu, voxels_cpu}`
+/// from the W5 GPU producer's output (`WorldGpu::chunks_buffer`,
+/// `WorldGpu::blocks`, `WorldGpu::voxels`) the first frame after
+/// `gpu_producer_has_run` flips true.
+///
+/// **Why.** `install_vox_in_fixed_world` (`voxel/grid.rs:317-429`)
+/// constructs a `WorldData` with empty CPU mirror buffers — the W5 GPU
+/// producer chain populates the GPU buffers, but the CPU mirror stayed
+/// empty. The CPU-side `WorldData::ray_traversal` (used by the editor's
+/// mouse-pick) immediately returns `None` when `chunk_idx >=
+/// self.chunks_cpu.len()` (i.e., always, since `len() == 0`), so every
+/// edit-mode raycast misses. This system mirrors C# `WorldData.cs:158-198`
+/// (`dataChunkGpu.GetData(dataChunk)` +
+/// `CopyFromStructuredBufferLarge(dataBlockGpu/dataVoxelGpu)` after the
+/// segment loop) — without it the editor brush has no CPU mirror to
+/// raycast against.
+///
+/// **Shape B** per `docs/orchestrate/vox-gpu-rewrite/10-diagnostic-encoding-comparison.md:387-413`:
+/// after the GPU readback, the system also calls
+/// `WorldData::seed_block_hashing()` so the CPU-side edit-time hash table
+/// is in sync with the just-readback voxel buffer (matches C#'s
+/// post-`GetData()` editor state).
+///
+/// **One-shot.** Gated on `gpu_producer_has_run = true` AND
+/// `cpu_mirror_populated = false`. The readback uses `device.poll()` to
+/// drive the staging-buffer map, which is synchronous and stalls the
+/// extract-schedule thread for the duration of the readback. For Oasis
+/// at the 256×32×256-chunk fixed-world size this is ~16 MiB chunks (×2
+/// for the pair-channel) + N MiB blocks + M MiB voxels — N+M+~32 MiB
+/// total — ~10-20 ms one-shot at startup. Per-frame cost after that:
+/// one boolean check.
+///
+/// **Read sizing.** Chunks are sized to the full fixed-world extent
+/// (every chunk is read, including empty ones — the renderer reads the
+/// full extent too). Blocks/voxels are sized from the
+/// `block_voxel_count` cursor pair (mirrors C# where
+/// `dataBlock.Length` / `dataVoxel.Length` track the GPU producer's
+/// cursor). The cursors include the initial-prefix bump (cursor[0]=64,
+/// cursor[1]=64 at producer entry), so the readback sizes are
+/// `voxels_cpu.len() = block_voxel_count[0] / 2` and
+/// `blocks_cpu.len() = block_voxel_count[1]` directly.
+pub fn populate_cpu_mirror_from_gpu_producer(
+    main_world: ResMut<bevy::render::MainWorld>,
+    mut gpu: Option<ResMut<ConstructionGpu>>,
+    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    // Only run on the W5 install path — the path where the CPU mirror was
+    // installed EMPTY in `install_vox_in_fixed_world`. For the legacy default
+    // / sized-to-model paths the CPU mirror is built from CPU `construct()`
+    // and overwriting it with the GPU output would defeat the legacy paths'
+    // bit-exact CPU oracle (and would propagate any GPU producer bug into
+    // the CPU mirror, breaking the editor where it currently works).
+    model_data: Option<Res<crate::render::extract::ModelDataRender>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+) {
+    use bevy::render::render_resource::{MapMode, PollType};
+
+    let Some(gpu) = gpu.as_mut() else { return; };
+    if !gpu.gpu_producer_has_run || gpu.cpu_mirror_populated {
+        return;
+    }
+    if model_data.is_none() {
+        // Legacy paths: CPU mirror is already populated by CPU `construct()`
+        // (see `install_default_small_world` / `install_default_embedded_in_fixed_world`
+        // / `install_vox_sized_to_model`); the readback is a no-op +
+        // unnecessary risk. Mark populated so we don't keep checking.
+        gpu.cpu_mirror_populated = true;
+        return;
+    }
+    let Some(world_gpu) = world_gpu else { return; };
+    let Some(block_voxel_count_buf) = gpu.block_voxel_count.as_ref() else {
+        return;
+    };
+
+    // Helper — copy `count` u32s starting at offset 0 from `src` back to a
+    // mapped staging buffer, return the contents.
+    let readback_u32 = |src: &Buffer, u32_count: u64| -> Vec<u32> {
+        if u32_count == 0 {
+            return Vec::new();
+        }
+        let size = u32_count * 4;
+        let staging = render_device.create_buffer(&BufferDescriptor {
+            label: Some("vox_gpu_rewrite_cpu_mirror_readback_staging"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = render_device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("vox_gpu_rewrite_cpu_mirror_readback_enc"),
+        });
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+        render_queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        render_device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        out
+    };
+
+    // 1) Read the cursor pair to size the blocks/voxels readback.
+    let cursor = readback_u32(block_voxel_count_buf, 2);
+    if cursor.len() < 2 {
+        bevy::log::warn!(
+            "vox-gpu-rewrite D1 readback: block_voxel_count read returned {} u32s; \
+             cannot determine GPU-buffer fill levels — skipping CPU mirror population",
+            cursor.len(),
+        );
+        return;
+    }
+    let voxels_u32_count = (cursor[0] / 2) as u64;
+    let blocks_u32_count = cursor[1] as u64;
+
+    // 2) Read chunks (`array<vec2<u32>>` storage buffer; we want the `.x`
+    //    state channel — `.y` is the W4 entity-pointer + counter).
+    let chunks_extent = world_gpu.chunks_size_in_chunks;
+    let chunk_count = (chunks_extent.x * chunks_extent.y * chunks_extent.z) as u64;
+    let chunks_pair_count_u32 = chunk_count * 2; // 2 u32s per pair
+    let chunks_pairs = readback_u32(&world_gpu.chunks_buffer, chunks_pair_count_u32);
+    if chunks_pairs.len() as u64 != chunks_pair_count_u32 {
+        bevy::log::warn!(
+            "vox-gpu-rewrite D1 readback: chunks_buffer read size mismatch \
+             (got {} u32s, expected {})",
+            chunks_pairs.len(),
+            chunks_pair_count_u32,
+        );
+        return;
+    }
+    let mut chunks_cpu: Vec<u32> = Vec::with_capacity(chunk_count as usize);
+    for i in 0..chunk_count as usize {
+        // `.x` is at index 0 of each pair; `.y` at index 1.
+        chunks_cpu.push(chunks_pairs[i * 2]);
+    }
+
+    // 3) Read blocks + voxels.
+    let blocks_cpu = readback_u32(world_gpu.blocks.buffer(), blocks_u32_count);
+    let voxels_cpu = readback_u32(world_gpu.voxels.buffer(), voxels_u32_count);
+
+    let chunks_len = chunks_cpu.len();
+    let blocks_len = blocks_cpu.len();
+    let voxels_len = voxels_cpu.len();
+
+    // 4) Mutate the main-world `WorldData` via `MainWorld` — Bevy-sanctioned
+    //    pattern (see `extract_world_changes` :703-715 for precedent).
+    let main_world: &mut bevy::ecs::world::World = &mut **main_world.into_inner();
+    let Some(mut world_data) =
+        main_world.get_resource_mut::<crate::world::data::WorldData>()
+    else {
+        bevy::log::warn!(
+            "vox-gpu-rewrite D1 readback: main-world WorldData not present; \
+             skipping CPU mirror population this frame"
+        );
+        return;
+    };
+
+    world_data.chunks_cpu = chunks_cpu;
+    world_data.blocks_cpu = blocks_cpu;
+    world_data.voxels_cpu = voxels_cpu;
+    // Re-seed the block-hashing table against the freshly-populated voxel
+    // mirror so the editor's hash-keyed edit path (`set_voxel*`) sees the
+    // correct refcounted slot state. C# does this implicitly because the
+    // GPU producer and the CPU mirror share the same `BlockHashingHandler`
+    // instance (`WorldData.cs:131-132`).
+    world_data.block_hashing = crate::aadf::block_hash::BlockHashingHandler::new();
+    world_data.seed_block_hashing();
+    drop(world_data);
+
+    gpu.cpu_mirror_populated = true;
+    bevy::log::info!(
+        "vox-gpu-rewrite W5.3-fix Stage 5 (D1) — CPU mirror populated from \
+         GPU producer output: chunks_cpu.len() = {}, blocks_cpu.len() = {}, \
+         voxels_cpu.len() = {} (cursor[0]={} voxel-pairs → {} u32s, \
+         cursor[1]={} block-u32s, chunks_extent={}×{}×{})",
+        chunks_len,
+        blocks_len,
+        voxels_len,
+        cursor[0],
+        voxels_u32_count,
+        cursor[1],
+        chunks_extent.x,
+        chunks_extent.y,
+        chunks_extent.z,
+    );
 }
 
 /// `RenderSystems::PrepareResources` system — the empty Phase-C prepare seam.
@@ -2634,7 +2839,17 @@ impl Plugin for ConstructionPlugin {
             )
             // W2 — extract main-world `WorldData::pending_edits` to the
             // render-world `ConstructionEvents` resource.
-            .add_systems(ExtractSchedule, extract_world_changes);
+            //
+            // vox-gpu-rewrite W5.3-fix Stage 5 — D1 fix: after the W5 GPU
+            // producer chain runs, copy the GPU buffer outputs back to the
+            // main-world `WorldData::{chunks,blocks,voxels}_cpu` so the
+            // CPU-side editor raycaster has data to traverse. One-shot,
+            // gated by `gpu_producer_has_run && !cpu_mirror_populated`;
+            // no-op on every other frame.
+            .add_systems(
+                ExtractSchedule,
+                (extract_world_changes, populate_cpu_mirror_from_gpu_producer),
+            );
     }
 }
 

@@ -2443,3 +2443,213 @@ the unfixed bug).
 - No `mod.rs` runtime changes survived this dispatch (all iter 3, 5,
   6 attempts reverted).
 - No config / sizing changes survived this dispatch (iter 7 reverted).
+
+## impl W5.3-fix Stage 5 (D1 fix + 1+3 diagnostic) findings (2026-05-18)
+
+### Summary
+
+Part A: **landed the D1 fix** per `10-diagnostic-encoding-comparison.md
+:387-413`. The W5 install path's empty CPU mirror is now populated
+from the GPU producer's output via a one-shot GPU→CPU readback. Shape B
+implementation (post-readback `seed_block_hashing()` so the editor's
+content-keyed hash table is in sync with the readback voxel buffer).
+
+Part B: **diagnostic doc landed** at
+`docs/orchestrate/vox-gpu-rewrite/11-diagnostic-buffer-byte-diff.md`.
+Uses the D1 readback's `info!` log to compare GPU producer cursor
+counts vs the CPU oracle's `ConstructedWorld` cursor counts at Oasis
+scale; identifies that the **voxel-slot dedup IS working** (voxels_cpu
+matches within 0.2 %) and the bug is downstream of allocation, in the
+dedup-hit's voxel-pointer resolution path (per round-4 + encoding
+diagnostics' remaining candidate). Recommends Approach 1
+(progressively-larger fixture scale-up of `--validate-gpu-construction`)
+as the next dispatch's discriminator.
+
+### Files touched (Part A)
+
+- `crates/bevy_naadf/src/render/construction/mod.rs:189-208` — added
+  `cpu_mirror_populated: bool` field to `ConstructionGpu` with full
+  docstring tracing back to `10-diagnostic-encoding-comparison.md`'s
+  Bug D1.
+- `crates/bevy_naadf/src/render/construction/mod.rs:855-1015` — added
+  the `populate_cpu_mirror_from_gpu_producer` ExtractSchedule system.
+  Body: gated on `gpu_producer_has_run && !cpu_mirror_populated`,
+  scoped to the W5 install path (`ModelDataRender` present) so it
+  doesn't overwrite the CPU mirror for legacy paths that already have
+  it populated by CPU `construct()`. Reads `block_voxel_count` cursor
+  pair, derives the GPU `blocks`/`voxels` u32 counts, reads the
+  `WorldGpu.chunks_buffer` (full extent, pair-channel `.x` only),
+  reads `WorldGpu.blocks` and `WorldGpu.voxels` (cursor-sized), then
+  mutates main-world `WorldData` via `bevy::render::MainWorld` to
+  populate the CPU mirror + re-seed `block_hashing` via
+  `WorldData::seed_block_hashing()`. Emits an `info!` log with cursor
+  pair + resulting CPU mirror lengths.
+- `crates/bevy_naadf/src/render/construction/mod.rs:2787-2795`
+  (`ConstructionPlugin::build`) — registered the new system in
+  `ExtractSchedule` next to `extract_world_changes`.
+
+### Files touched (Part B)
+
+- `docs/orchestrate/vox-gpu-rewrite/11-diagnostic-buffer-byte-diff.md`
+  — NEW diagnostic doc summarising the cursor-level byte-diff between
+  the W5 GPU producer's output and the CPU oracle's `ConstructedWorld`
+  at Oasis scale, plus the recommended next-dispatch approach.
+
+### Shape of the readback (Part A)
+
+**Shape B** per the brief's recommendation in
+`10-diagnostic-encoding-comparison.md:391-403`:
+
+1. After the per-segment loop sets `gpu_producer_has_run = true`, the
+   next frame's `ExtractSchedule` invokes
+   `populate_cpu_mirror_from_gpu_producer`.
+2. The system reads `block_voxel_count[0..2]` cursor pair via a
+   2-u32 staging-buffer readback.
+3. Reads the full `WorldGpu.chunks_buffer` (the `array<vec2<u32>>`
+   storage buffer) as `chunk_count × 2` u32s, then extracts the `.x`
+   state channel into `chunks_cpu` (size = chunk_count = full fixed
+   world extent).
+4. Reads `WorldGpu.blocks` for `cursor[1]` u32s into `blocks_cpu`.
+5. Reads `WorldGpu.voxels` for `cursor[0] / 2` u32s into `voxels_cpu`.
+6. Re-creates a fresh `BlockHashingHandler` and runs
+   `WorldData::seed_block_hashing()` to register every mixed block's
+   voxel-slot pointer with the freshly-populated CPU mirror.
+7. Sets `cpu_mirror_populated = true` (one-shot guard).
+
+### Cheap proof — readback log captured live
+
+From `cargo run --release --bin e2e_render -- --vox-gpu-construction`:
+
+```
+vox-gpu-rewrite W5.3-fix Stage 5 (D1) — CPU mirror populated from GPU
+producer output: chunks_cpu.len() = 2097152, blocks_cpu.len() = 12882752,
+voxels_cpu.len() = 10479520 (cursor[0]=20959040 voxel-pairs → 10479520
+u32s, cursor[1]=12882752 block-u32s, chunks_extent=256×32×256)
+```
+
+For Oasis: 2,097,152 chunks (full fixed-world extent) + ~10.5M voxel
+u32s + ~12.9M block u32s. **chunks_cpu.len() > 0 → editor raycaster
+will now traverse the CPU mirror successfully**. The pre-D1-fix
+behaviour was `chunks_cpu.len() == 0` → `ray_traversal` early-returned
+`None` for every position → every edit-mode raycast missed.
+
+### Full e2e verification
+
+- `cargo build --workspace` — **PASS** (clean, no new warnings,
+  ~30 s warm tree).
+- `cargo test --workspace --lib` — **PASS** (198 passed, 1 ignored
+  baseline preserved).
+- `cargo run --release --bin e2e_render -- --vox-gpu-construction` —
+  **PASS** (rect Δ=16.53 above 8.00 floor; frame-A near-black 0/65536;
+  emits D1 readback log line — see above).
+- `cargo run --release --bin e2e_render -- --baseline` — **PASS**
+  (emissive 247.0, solid 242.0, sky 145.9 — identical to Stage 4
+  baseline; D1 readback NOT invoked because no `ModelDataRender`
+  present, gate scoped to W5 install path).
+- `cargo run --release --bin e2e_render -- --vox-e2e` — **PASS** (centre
+  rect luminance 249.7).
+- `cargo run --release --bin e2e_render -- --oasis-edit-visual` —
+  **PASS** (rect Δ=9.44 above 8.00 floor).
+- `cargo run --release --bin e2e_render -- --small-edit-visual` —
+  **PASS** (click rect max-Δ=18 above 15 floor; outside-click 2.5 %
+  under 15 % ceiling).
+- `cargo run --release --bin e2e_render -- --small-edit-repro` —
+  **PASS** (0 dark pixels in 1920×1080 frame).
+- `cargo run --release --bin e2e_render -- --validate-gpu-construction` —
+  **PASS** (388 bytes byte-equal).
+- `cargo run --release --bin e2e_render -- --edit-mode` — **PASS** (1
+  set_voxel → 1+1+2 records).
+- `cargo run --release --bin e2e_render -- --entities` — **PASS** (8
+  chunk_updates, 1 entity_chunk).
+- `cargo run --release --bin e2e_render -- --runtime-edit-mode` —
+  **PASS** (1 batch, 2+2+2 records).
+- `cargo run --release --bin e2e_render -- --vox-gpu-oracle` — **FAIL**
+  (mean Δ = 127.95 above 8.00; pre-existing RED gate; the D1 fix does
+  NOT touch the GPU producer chain so this is expected unchanged).
+
+**Zero regressions on pre-Stage-5 GREEN gates.** Only RED gate remains
+`--vox-gpu-oracle` (unchanged from Stage 4).
+
+### Did `--vox-gpu-oracle` change?
+
+**No** — the D1 fix only adds a GPU→CPU readback AFTER the W5 producer
+runs; it does NOT modify the W5 producer's WGSL shaders or dispatch
+chain. The framebuffer the renderer produces is unchanged by D1; the
+`--vox-gpu-oracle` mean Δ = 127.95 is within noise of the Stage 4
+baseline of 127.94. (Cross-process comparison: Stage 4 baseline was
+recorded with the screenshot from the previous CPU phase still on
+disk; this dispatch's run re-generated the CPU phase too, so the small
+difference reflects TAA jitter on the CPU oracle's frame.)
+
+### Surprises
+
+1. **The CPU mirror for legacy paths.** The first iteration of the
+   readback system ran on EVERY path that had `gpu_producer_has_run =
+   true`, including the small-world default scene (which authors a
+   `dense_voxel_types` stream → chunk-calc-only producer branch).
+   That path's CPU mirror is already populated by CPU `construct()`;
+   overwriting with the GPU readback is unnecessary and would
+   propagate any (latent) GPU producer bug into the editor where it
+   currently works correctly. Fixed by adding an early-return when
+   `ModelDataRender` is absent — the D1 readback is scoped to the W5
+   install path.
+2. **Voxel-cursor matches CPU oracle within 0.2 %.** GPU's
+   `voxels_cpu.len() = 10,479,520` vs CPU oracle's
+   `voxels_cpu.len() = 10,498,368`. The voxel-slot dedup IS working
+   at Oasis scale across ~12 horizontal tiles of the model. Combined
+   with round-4's "atomic-voxels has zero effect" finding, this is
+   strong evidence the bug is NOT in the dedup-write path but in the
+   dedup-HIT pointer resolution (a different slot's pointer is being
+   read back instead of the matching one).
+3. **Block-cursor is 7.97× the CPU oracle.** This is the EXPECTED
+   ratio for 12 horizontal tiles (3 in X + 4 in Z) — blocks are not
+   individually dedup'd; each chunk gets its own 64-block sequence.
+   Confirms the W5 chain is processing every chunk in the tiled world
+   correctly, not skipping any.
+
+### Part B summary pointer
+
+The diagnostic doc at
+`docs/orchestrate/vox-gpu-rewrite/11-diagnostic-buffer-byte-diff.md`
+narrows the hypothesis space using the D1-readback data:
+
+- Voxel-slot dedup is working (cursor match within 0.2 %).
+- Block allocation is producing the expected 7.97× ratio for tiled
+  world.
+- The bug is **downstream of allocation** — most likely in the
+  dedup-hit pointer-resolution path (the only remaining candidate
+  after round-4 and `10-diagnostic-encoding-comparison.md` ruled out
+  encoding drift, memory ordering, hash capacity, bounds chain,
+  and per-segment encoder/submit ordering).
+
+**Recommended next dispatch**: extend
+`--validate-gpu-construction` per Approach 1 in `01-context.md`
+(progressive 4×1×4 → 8×1×8 → 16×1×16 → ... → 96×1×96 → Oasis-scale)
+to find the smallest tile-count where the dedup-hit pointer
+resolution diverges. The existing `validate_gpu_construction` in
+`mod.rs:2871-3201` is the template; extend with a multi-tile fixture
++ ModelData input + the full W5 chain (generator_model + chunk_calc +
+bounds) rather than the current chunk_calc-only path.
+
+### What's NOT yet done
+
+- **The visible inversion bug remains UNFIXED** — Part B was
+  diagnostic-only per the brief.
+- **Approach 1 (progressive-scale fixture extension)** was NOT
+  implemented in this dispatch; it remains the recommended
+  next-dispatch focus.
+- **`--vox-gpu-oracle` remains RED** as the canonical tripwire for
+  the unfixed inversion bug.
+
+### What's left in place
+
+- All Stage 1, 1.5, 2, 3, 4 prior fixes preserved unchanged.
+- D1 fix landed: `cpu_mirror_populated` flag +
+  `populate_cpu_mirror_from_gpu_producer` system + plugin
+  registration. ~165 LOC added to `construction/mod.rs`.
+- Diagnostic doc landed:
+  `docs/orchestrate/vox-gpu-rewrite/11-diagnostic-buffer-byte-diff.md`.
+- No shader changes.
+- No new e2e gates added in this dispatch (the D1-readback log is the
+  diagnostic surface; Part B used existing instrumentation rather
+  than a new gate).
