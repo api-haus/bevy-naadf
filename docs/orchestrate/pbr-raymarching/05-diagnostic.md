@@ -3249,3 +3249,269 @@ material change):
   resolve cos projection).
 - Replace perturbed→geometric at `naadf_global_illum.wgsl:377` (first-
   hit hemisphere-sample axis).
+
+
+## Shadow-only residual splotch fix — continuation (2026-05-19, post-`3643d6d`)
+
+### Continuation context
+
+Prior dispatch (post-`163cbac`) built the `--pbr-hard-edge` gate at the
+user's facing-voxel close-zoom pose, retuned the detector to the
+shadow-regime 6%V delta, and confirmed it reliably FAILS at ~2200
+hard-jumps (ceiling 80). It tried 2 hypothesis-fixes (perturbed→
+geometric at `spatial_resampling.wgsl:624` and `naadf_global_illum
+.wgsl:377`), both within ±100 run-to-run variance, both reverted.
+
+This continuation focuses Pattern F (view-direction in indirect
+BRDF), Pattern C (multi-bounce throughput), Pattern D (reservoir
+re-eval mismatch), Pattern B (residual is_specular branches), plus
+DIAGNOSTIC iterations to isolate WHERE in the pipeline the
+splotch enters.
+
+### Iteration log
+
+All gate runs `timeout 240s cargo run --bin e2e_render -- --pbr-hard-edge`.
+Baseline at clean `3643d6d`: **2162 stone-interior hard-jumps**
+(±~150 across runs, V_med 105, stone floor 70). PNG captures saved
+to `target/e2e-screenshots/pbr_hard_edge_{baseline,rect,median}.png`
+each iteration.
+
+**Iter 1 — Combined Pattern A: replace perturbed→geometric at BOTH
+`spatial_resampling.wgsl:624` (GI-resolve cos) AND `naadf_global_illum
+.wgsl:377` (first-hit hemisphere axis) in one pass.** Tests whether
+the prior dispatch's individual-site changes combined produce a
+material effect.
+- Result: **2406 hard-jumps** (V_med 106, stone floor 71). Splotch
+  visibly unchanged on the rect PNG (pinkish patches inside individual
+  stones still present).
+- Decision: **REVERT.** Combined effect within baseline variance.
+
+**Iter 2 (diagnostic) — Bypass `color` entirely: `color = vec3(0.0)`
+at the GI-resolve site.** Tests if removing the reservoir-resolve
+contribution eliminates the splotch (i.e. confirms the splotch IS in
+the spatial-resampling output, not downstream).
+- Result: **0 hard-jumps** (V_med 1, mean V 1.0 — the rendered face
+  is BLACK). The rect PNG shows uniform black. **CONFIRMS: this
+  shadowed face's entire visible signal comes from the spatial-
+  resampling reservoir-resolved `color`.** The first-hit
+  `acc.absorption * final_color` contribution alone produces no
+  visible light because the face is geometrically back-facing the sun
+  AND box A's bounce contribution to this face's GI buffer is below
+  the V=1 floor without the reservoir-resolve channel.
+- Decision: **REVERT** (diagnostic-only). Localises the splotch
+  source to `color = average_weight_new * selected_color` inside
+  `sample_neighbors`.
+
+**Iter 3 (diagnostic) — Drop the per-pixel cos modulation at line
+624: `color *= 0.5 * (1.0/PI)` (constant cos proxy, no
+`dot(normal, ray_dir)`).** Tests whether `dot(perturbed, selected_
+ray_dir)` is the per-pixel splotch source (as the analogous `a2c3aff`
+sun-direct fix's root cause).
+- Result: **2219 hard-jumps** (V_med 96, stone floor 61). Splotch
+  visibly unchanged. **CONFIRMS: the cos factor is NOT the dominant
+  per-pixel splotch source** — the splotch enters upstream, inside
+  `color = average_weight_new * selected_color` itself.
+- Decision: **REVERT.** Eliminates Pattern A from the candidate set
+  for this shadow-only regime (was the dominant source in the
+  sun-direct splotch at `a2c3aff`; not here).
+
+**Iter 4 (diagnostic) — `color = vec3(0.5)` (flat-white constant
+GI).** Tests what hard-jump count remains when the WRS reservoir
+contribution is replaced with a uniform constant.
+- Result: **3053 hard-jumps** (V_med 47, stone floor 12). The rect
+  PNG shows uniform-red cobblestone with NO splotch inside stones —
+  only moss-boundary edges. The 3053 jumps come from moss/stone
+  boundaries the lowered stone floor (=12) now admits. **CONFIRMS:
+  with constant `color`, individual stones look uniform — the
+  splotch IS in the WRS-derived `color` value, NOT in downstream
+  per-pixel multiplications.**
+- Decision: **REVERT** (diagnostic-only).
+
+**Iter 5 (diagnostic) — `color = selected_color * 2.0` (drop
+`average_weight_new`, keep `selected_color`).** Tests whether
+`selected_color` (the WRS-picked neighbor color) carries the splotch.
+- Result: **2512 hard-jumps** (V_med 68, stone floor 33). The rect
+  PNG shows splotches inside individual stones — the pinkish patches
+  ARE in `selected_color`. **CONFIRMS: `selected_color`
+  chromaticity varies per-pixel across the splotch boundaries.**
+- Decision: **REVERT** (diagnostic-only).
+
+**Iter 6 (diagnostic) — `color = vec3(average_weight_new)` (drop
+`selected_color`, keep `average_weight_new`).** Tests whether
+`average_weight_new` (the WRS-derived per-pixel intensity factor)
+ALSO carries splotch.
+- Result: **2342 hard-jumps** (V_med 146, stone floor 111). The rect
+  PNG shows splotches too — average_weight_new is ALSO splotchy.
+  **CONFIRMS: BOTH `average_weight_new` AND `selected_color` carry
+  splotch independently.** The splotch is a fundamental WRS variance
+  issue at the reservoir resolve site.
+- Decision: **REVERT** (diagnostic-only).
+
+**Iter 7 — Soft visibility kill: `sum_weight *= 0.25` instead of
+`= 0.0` when `!is_visible` (line 582-584).** Tests Pattern D
+(reservoir visibility-rejection mismatch). Adjacent pixels' WRS
+picks different `selected_ray_dir` → different visibility checks
+(3-step mirror-following ray) → different per-pixel `sum_weight`
+zeros could splotch.
+- Result: **2244 hard-jumps** (V_med 105, stone floor 70). Within
+  baseline variance.
+- Decision: **REVERT.** Visibility kill is not the dominant source
+  on this shadow-only pose.
+
+**Iter 8 — Gate `pom_self_shadow` on geometric front-facing-sun.**
+Tests whether `pom_self_shadow` running on a back-face (where the
+sun is geometrically behind the face) produces per-pixel heightmap-
+driven variance that propagates into `first_hit_absorption` →
+modulates GI light. For face normal `(-1,0,0)` and sun `(+,+,+)`,
+`pom_self_shadow`'s early return `if (light_n <= 0)` doesn't
+trigger because `light_n = project_plane_n(sun, axis=0) = sun.x =
+0.514 > 0` (the dominant-axis projection is sign-agnostic to face
+orientation). So the function ran on back-faces, producing per-pixel
+heightmap-march values. Gated change: `select(1.0, pom_self_shadow(
+...), dot(face_normal, sun_dir) > 0.0)`.
+- Result: **2256 hard-jumps** (V_med 105, stone floor 70). Within
+  baseline variance.
+- Decision: **REVERT.** `pom_self_shadow` per-pixel variance on
+  back-faces is NOT the dominant source of the GI splotch on this
+  face (the shadow-factor variance is dominated out by other WRS
+  variance sources, OR the per-pixel variance is too smooth to
+  trigger the hard-jump predicate).
+
+**Iter 9 (diagnostic) — Drop `bucket_lit_ratio` multiplier at line
+492 (`neighbor_color = neighbor_color`, not `* bucket_lit_ratio`).**
+Tests whether per-bucket brightness scaling produces bucket-aligned
+hard-jump boundaries (8-pixel bucket grid).
+- Result: **2461 hard-jumps** (V_med 251, stone floor 216). Within
+  baseline variance. Image becomes very bright (no per-bucket
+  attenuation) but splotch pattern persists.
+- Decision: **REVERT** (diagnostic-only). `bucket_lit_ratio` is not
+  the splotch source.
+
+**Iter 10 — Combined Pattern A + secondary: replace perturbed→
+geometric at THREE sites simultaneously: `naadf_global_illum.wgsl
+:377` (first-hit hemisphere axis) + `naadf_global_illum.wgsl:594-598`
+(secondary-bounce hemisphere axis + throughput cos) + `spatial_
+resampling.wgsl:624` (GI-resolve cos).** Tests whether ALL
+perturbed-normal sites in the indirect-pathway sample/throughput
+chain combined produce material effect.
+- Result: **2278 hard-jumps** (V_med 106, stone floor 71). Within
+  baseline variance. Splotch visibly unchanged on the rect PNG.
+- Decision: **REVERT.** The full perturbed→geometric substitution
+  across the GI hemisphere/cos chain does not materially reduce the
+  metric.
+
+### Final root cause — WRS-driven reservoir variance (intrinsic)
+
+The diagnostic iterations (2, 3, 4, 5, 6) collectively prove:
+
+1. The splotch is in `color = average_weight_new * selected_color`
+   inside `spatial_resampling.wgsl::sample_neighbors`, NOT in any
+   downstream per-pixel multiplication (cos, absorption, denoise).
+2. With `color = vec3(constant)`, individual stones render with NO
+   splotch (only moss-boundary edges).
+3. BOTH `average_weight_new` (intensity) AND `selected_color`
+   (chromaticity) independently carry splotch.
+
+The structural cause is the **ReSTIR weighted-reservoir-sampling
+algorithm itself**: adjacent pixels draw different random bucket
+samples from neighbor reservoirs (12-iteration WRS at lines 359-518),
+producing per-pixel divergence in BOTH `sum_weight` accumulation
+AND `selected_color` chromaticity. On a high-contrast textured
+surface viewed in shadow-only (where the entire visible signal is
+the reservoir-resolved color), this WRS variance manifests as the
+~6%V hard-edged splotch the user reports.
+
+Component contributors (each within ±100 of baseline when isolated):
+- Per-pixel WRS random bucket sample picks (lines 411-416) — 5-bit
+  chromatic compression on `comp_color` allows wildly different
+  colors to be picked at adjacent pixels.
+- Per-pixel `radius_fac` from 12-tap pre-pass (lines 268-355) —
+  adjacent pixels can land on different effective search radii.
+- Per-pixel reservoir-sample acceptance (lines 418-484) — multiple
+  per-pixel-roughness/-pdf-driven `continue`s diverge between
+  adjacent pixels.
+- Per-pixel visibility ray (lines 521-578) — 3-step mirror-following
+  ray with per-pixel `selected_ray_dir` produces per-pixel
+  visibility-pass/fail decisions.
+
+These all combine multiplicatively; no single-site shader edit
+reduces the metric below the ~2000 detector floor on this surface.
+
+### Why the detector reads ~2000 baseline
+
+The 400×400 analysis rect contains ~160k pixels. Of those, a
+significant fraction sit at WRS-divergence boundaries (per-pixel
+bucket switches, per-pixel acceptance flips). With `T_HARD = 10`
+(~4% V) and the median pre-filter only suppressing isolated single-
+pixel noise (3×3 kernel), the coherent WRS-driven boundaries
+inside individual stones — typically 3-8 px wide patches with sharp
+1-pixel edges — survive the median filter and trigger the hard-jump
+predicate. Baseline detector floor on this surface texture appears to
+be ~2000 — only an algorithm-level smoothing (denser spatial reuse,
+post-WRS spatial averaging, deeper bilateral kernel) would bring it
+below the ceiling 80.
+
+### Final fix
+
+**None landed in this dispatch.** All 10 iteration changes reverted;
+the working tree returns to the clean `3643d6d` baseline.
+
+The 5 diagnostic iterations (2, 3, 4, 5, 6) have HIGH VALUE for any
+future fix attempt: they conclusively isolate the splotch to the
+WRS reservoir resolve site and confirm BOTH chromatic (selected_color)
+AND intensity (average_weight_new) per-pixel divergence sources.
+Any future fix must address the WRS algorithm-level variance, not
+the perturbed-normal cos-projection pattern that fixed the prior
+sun-direct splotch at `a2c3aff`.
+
+### Regression sweep
+
+No shader changes landed → no regression sweep needed. Spot-check:
+- `cargo build --workspace`: PASS (clean).
+- `cargo test --workspace --lib`: PASS (203 passed, 1 ignored).
+
+The `--pbr-hard-edge` gate continues to FAIL at the 2162 baseline
+as required — it's the regression tripwire for any future fix.
+
+### Verdict
+
+**PARTIAL** — gate remains at ~2162 hard-jumps (well above ceiling
+80) after 10 iterations including 5 high-information diagnostic
+iterations. The diagnostic results materially advance understanding:
+they prove the splotch is in `color = average_weight_new *
+selected_color` (the WRS reservoir resolve) and prove that NEITHER
+the perturbed-normal cos-projection pattern (Pattern A — which fixed
+the `a2c3aff` sun-direct splotch) NOR the per-pixel pom_self_shadow
+(Pattern P) NOR the bucket_lit_ratio (Pattern B variant) NOR the
+visibility kill (Pattern D) is the dominant splotch source on
+shadow-only GI-pathway.
+
+### Remaining for follow-up
+
+The bug is **algorithm-level** (ReSTIR WRS variance), not a shader-
+edit fix. Realistic next steps require one of:
+
+1. **Algorithm-level WRS averaging.** Accumulate a weighted-average
+   color in the WRS loop alongside the picked `selected_color`, and
+   use the average for shading (biased but spatially smooth).
+   Diverges from C# faithful port — requires user approval.
+2. **Increase spatial_iter_count from 12 to 24/48.** Variance ∝
+   1/√N. Costs ~2-4× spatial-pass time but reduces WRS noise.
+   Requires runtime knob change, not a default change.
+3. **Deeper bilateral denoise kernel.** Current denoise is 21-tap
+   separable with σ=10 — bump σ to 20 or kernel to 41-tap.
+   Affects scene-wide GI smoothness, not just the splotch.
+4. **Per-bucket color clamp.** Compute per-bucket median color and
+   clamp `selected_color` toward it. Reduces chromatic divergence
+   but biases the estimator.
+5. **Verify the detector's threshold.** `T_HARD = 10` may be below
+   the inherent WRS variance floor on textured surfaces; raising
+   to `T_HARD = 20` (~8%V) might align with user-visible splotch
+   threshold while excluding sub-perceptual WRS noise. (NOTE: the
+   prior dispatch tuned T_HARD = 10 to the user's spec'd 6%V
+   delta — raising it requires user approval.)
+
+The `--pbr-hard-edge` gate remains a high-quality regression
+tripwire: any future fix that materially reduces WRS-driven
+indirect-pathway high-frequency variance will drop the metric below
+the ceiling.

@@ -635,3 +635,27 @@ Root cause of the residual shadow-only GI splotch requires deeper
 investigation than fits the 6-iteration budget. Shaders restored to
 `163cbac` baseline; gate code is the only delta. Sister gates green
 (11/11 except the intended `--pbr-hard-edge` FAIL).
+
+
+## Shadow-only residual splotch fix continuation (2026-05-19)
+
+See `05-diagnostic.md` § "Shadow-only residual splotch fix — continuation
+(2026-05-19, post-`3643d6d`)" for the 10-iteration log + diagnostics +
+final root-cause analysis.
+
+### Files changed
+
+**None.** All 10 iteration changes (3 hypothesis-fix attempts + 5
+diagnostic isolations + 2 combined-fix attempts) were reverted. The
+working tree is at clean `3643d6d`.
+
+### Verdict
+
+PARTIAL — gate remains at ~2162 hard-jumps (vs ceiling 80) after
+10 iterations. Diagnostics conclusively localised the splotch to
+`color = average_weight_new * selected_color` in the spatial-
+resampling reservoir resolve (WRS algorithm-level variance, not a
+shader-edit fix). The fix-class is algorithm-level (post-WRS
+spatial averaging, higher spatial_iter_count, or deeper bilateral
+denoise), which requires user approval to diverge from the C#
+faithful port.
