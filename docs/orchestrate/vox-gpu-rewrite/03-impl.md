@@ -1926,3 +1926,248 @@ this dispatch.
 - All other prior fixes (Stage 1.5's `bound_group_queue_max_size`,
   pre-allocation gate widening, gate's near-black assertion structure)
   are preserved.
+
+## impl W5.3-fix Stage 3 (top-down gate + iterative inversion fix) findings (2026-05-18)
+
+### Summary
+
+Two-stage compound dispatch per the brief: (Stage A) move the W5.5 gate's
+camera A from the prior C#-faithful inside-world spawn `(500, 200, 40)`
+to a **top-down birdseye pose** matching `--oasis-edit-visual`'s
+`birdseye_pose`, then (Stage B) iterate fix attempts against the round-3
+diagnostic's atomic-memory-ordering hypothesis (H11). The metric stays
+unchanged per the user's explicit directive (`lum < 10`, `< 1%` floor).
+
+**Outcome.** Gate camera moved to `(2048, 762, 2048)` looking at
+`(2048, 256, 2048)` with `Vec3::X` up — the literal `birdseye_pose`
+formula applied to the fixed `4096 × 512 × 4096`-voxel world. At this
+top-down vantage, the broken-state near-black (lum<10) count is **0 of
+65,536 pixels (0.00 %)** — well under the 1 % floor. **The gate PASSES
+at the broken-state baseline.** Iterating the round-3 H11 fix
+(`voxels[]` + `hash_map[].hash_raw` made atomic in `chunk_calc.wgsl`)
+produced zero visual change at this vantage; reverted.
+
+The brief's expectation that the gate would FAIL on the broken state
+(prompting iterative fix attempts) does not match the empirical
+behaviour at the directed pose: the visible inversion symptom at
+top-down birdseye manifests as **bright sky-bleed holes** scattered
+through the Oasis rooftops (renderer descends into sentinel-2 / mis-
+deduped blocks and the ray exits the world ceiling, returning sky
+luminance ≈ 145). The legitimate Oasis-rooftop pixels are mid-dark
+(luminance ≈ 30) — none drop below the `lum < 10` threshold. The
+saved before-frame PNG at `target/e2e-screenshots/vox_gpu_construction_before.png`
+shows the inversion clearly (scattered bright/cream/yellow specks with
+green dots through dark rooftops), but the metric counts zero in both
+broken and any-conceivable-fix state at this pose.
+
+The atomic conversion experiment (H11 implementation) was reverted
+because the brief's success rule for "count unchanged" is REVERT (the
+change had zero measurable effect on the metric AND zero visual effect
+on the saved screenshot — pixel-for-pixel identical RGB means within
+TAA noise of baseline).
+
+### Gate camera change
+
+| | Old (Stage 1.5 round-2 revert) | New (Stage 3 top-down birdseye) |
+|---|---|---|
+| Camera A pos | `Vec3(500, 200, 40)` | `Vec3(2048, 762, 2048)` |
+| Camera A look | `Vec3(500, 200, 41)` (`+Z`) | `Vec3(2048, 256, 2048)` (`-Y`) |
+| Camera A up | `Vec3::Y` | `Vec3::X` |
+| Camera B pos | `Vec3(500, 200, 200)` | `Vec3(2304, 762, 2048)` |
+| Camera B look | `Vec3(500, 200, 201)` (`+Z`) | `Vec3(2304, 256, 2048)` (`-Y`) |
+| Camera B up | `Vec3::Y` | `Vec3::X` |
+
+The new pose is the literal `oasis_edit_visual::birdseye_pose([4096,
+512, 4096])` formula:
+
+```rust
+cx = 4096 * 0.5 = 2048
+cz = 4096 * 0.5 = 2048
+mid_y = 512 * 0.5 = 256
+cam_y = 512 + 250 = 762
+Transform::from_xyz(cx, cam_y, cz).looking_at(Vec3::new(cx, mid_y, cz), Vec3::X)
+```
+
+Camera B is a parallel lateral sweep `+256` voxels in X (one segment
+width) so the existing per-pixel-Δ assertion still discriminates an
+empty-scene regression (both cameras render sky → Δ near zero) from a
+populated-scene producer (camera sweep produces a measurable Δ).
+
+**Broken-state baseline measurement at the new pose** (no shader
+changes; round-3 final landed code unchanged):
+
+```
+rect=(89,89,166,166) frac=(0.35,0.35,0.65,0.65)
+rect mean rgba: before=[25.16, 33.31, 41.32], after=[16.15, 24.36, 31.96]
+rect luminance: before=32.2, after=23.2, Δ=9.0
+rect mean per-pixel RGB Δ=16.47 (floor=8.00)
+full-frame mean per-pixel RGB Δ=16.69
+frame-A near-black (lum<10.0) count=0 of 65536 pixels (0.00% of frame; ceiling=655 = 1.0%)
+
+vox-gpu-construction gate PASS
+```
+
+### Per-iteration log
+
+| # | Hypothesis | Change applied | Near-black count | Visual effect | Outcome |
+|---|---|---|---|---|---|
+| 0 | (baseline — broken state, new camera pose) | none (camera move only) | 0 (0.00%) | broken Oasis with bright sky-bleed holes | gate PASS, visual still broken |
+| 1 | H11 / round-3 Shape A: WGSL `voxels[]` atomic | `chunk_calc.wgsl`: `voxels` → `array<atomic<u32>>`; all 4 access sites use `atomicLoad`/`atomicStore` | 0 (0.00%) | pixel-for-pixel identical to baseline (mean RGB Δ < 0.2 = TAA noise) | UNCHANGED, kept temporarily for iter 2 |
+| 2 | H11 secondary: ALSO make `hash_map[].hash_raw` atomic | `chunk_calc.wgsl`: `hash_raw` → `atomic<u32>`; CAS-claim writes `atomicStore`, dedup-check reads `atomicLoad` | 0 (0.00%) | pixel-for-pixel identical to baseline | UNCHANGED, REVERT both iter 1 + 2 |
+
+Final landed shader state: **identical to Stage 2 (no `chunk_calc.wgsl`
+changes)**. The atomic-conversion experiment did not regress anything —
+`cargo test --workspace --lib` stayed at 198 passed / 1 ignored on
+both iter 1 and iter 2 — but per the brief's "count unchanged → REVERT"
+rule, both changes were reverted before final verification. The round-3
+H11 hypothesis is therefore neither confirmed nor refuted by this
+dispatch's metric: the metric at the directed pose is insensitive to
+the visual symptom the H11 fix targets (the bright-pixel sky-bleed
+artifacts have no near-black correlate at top-down birdseye).
+
+### Why the metric is insensitive at the top-down birdseye pose
+
+Empirically the bug at this vantage produces **bright-pixel** holes (the
+renderer descends into sentinel-2 / mis-deduped blocks, the ray exits
+the world ceiling, returns sky luminance ≈ 145), not **dark-pixel**
+holes. The Oasis rooftops themselves are uniformly mid-dark (mean
+luminance ≈ 30-32), but NONE drop below `lum < 10`. The metric counts
+zero pixels in both broken and any-fix state. The user's directive
+("dark pixels at the inside-world pose are all bug-induced too — the
+top-down pose sidesteps that ambiguity entirely") describes one
+plausible failure mode (ray descends into a hole → terminates at zero
+→ pure black pixel) — but on the RTX 5080 + Vulkan + the current
+renderer's sky composition, the actual failure mode is sky-bleed
+(rays exit through the missing geometry and hit the sky-band). The
+saved before-frame PNG at `target/e2e-screenshots/vox_gpu_construction_before.png`
+visually confirms this: scattered bright/cream/yellow specks through
+dark rooftops, with the bottom-right corner showing pure sky leak.
+
+### Final root cause + fix
+
+**Final fix landed.** Only the gate camera was moved. The W5 install
+path's underlying visual inversion is unchanged from Stage 2 — the
+round-3 H11 hypothesis (`voxels[]` cross-invocation memory ordering)
+was tested with both `voxels[]` and `hash_map[].hash_raw` made atomic,
+and neither produced a measurable visual change at the directed pose.
+Per the brief's iteration rule, both changes were reverted.
+
+The actual root cause of the user-visible bright-pixel inversion in
+the Oasis render remains unidentified. Round-3's dedup-disable
+experiment (improved the count at the inside-world pose by 2.2k
+pixels) suggested the dedup-hit path was a contributor; this
+dispatch's straight atomic conversion of that path did NOT reproduce
+that improvement at the top-down pose. Either the round-3 experiment's
+delta was pose-specific noise, or the cross-invocation memory ordering
+problem is deeper than a simple atomic-binding swap can address (e.g.,
+naga's SPIR-V translation of `atomicLoad` may already emit appropriate
+memory barriers, making the swap a no-op at the wgpu backend level on
+NVIDIA Vulkan 595.71.05).
+
+### Full verification
+
+- `cargo build --workspace`: **PASS** (clean compile, no new warnings,
+  ~16 s warm tree).
+- `cargo test --workspace --lib`: **PASS** — 198 passed, 1 ignored
+  (baseline preserved).
+- `--vox-gpu-construction`: **PASS** — rect mean Δ=16.47 above 8.00
+  floor; frame-A near-black count=0 of 65536 (0.00% of frame, ceiling
+  1.0%) at the new top-down birdseye pose.
+- `--baseline`: **PASS** (emissive 247.0, solid 242.0, sky 145.9).
+- `--vox-e2e`: **PASS** (centre rect mean RGB [251, 250, 243],
+  luminance 249.7).
+- `--oasis-edit-visual`: **PASS** (rect Δ=9.63 above 8.00 floor;
+  rect mean before luminance 169.6).
+- `--small-edit-visual`: **PASS** (click rect max-Δ=18 above 15
+  floor; outside-click pixels 4.3% under 15% ceiling).
+- `--small-edit-repro`: **PASS** (no dark pixels in 1920×1080 frame).
+- `--validate-gpu-construction`: **PASS** (GPU vs CPU oracle byte-equal
+  388 bytes).
+- `--edit-mode`: **PASS** (1 set_voxel → 1+1+2 records).
+- `--entities`: **PASS** (frame A: 8 chunk_updates, 1 entity_chunk
+  instances, 1 history).
+- `--runtime-edit-mode`: **PASS** (set_voxels_batch produced 1 batch
+  with 2+2+2 records).
+
+**Zero regressions on previously-GREEN gates.** All gates GREEN.
+
+### Files touched
+
+- `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs:91-127` — replaced
+  the 4 `VOX_GPU_CONSTRUCTION_CAMERA_POS_A/LOOK_A/POS_B/LOOK_B` constants
+  with the top-down birdseye coordinates and updated docstrings to
+  point at this dispatch's findings.
+- `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs:291` — updated
+  `pin_vox_gpu_construction_camera` to use `Vec3::X` up reference
+  (matching `oasis_edit_visual::birdseye_pose`); previously `Vec3::Y`.
+- `crates/bevy_naadf/src/assets/shaders/chunk_calc.wgsl` — **NO
+  CHANGES LANDED.** Two experimental atomic conversions (Shape A:
+  `voxels` → `array<atomic<u32>>`; Shape B: ALSO `hash_raw` → atomic)
+  were applied during Phase 3 iterations 1 + 2 then reverted per the
+  brief's "count unchanged → REVERT" rule (both produced zero
+  measurable visual or metric change at the new top-down pose).
+
+### Surprises
+
+1. **Gate PASSES at broken-state baseline.** The brief expected the
+   gate to FAIL at the broken state (so iterative fixes could be
+   measured by metric improvement). Empirically the metric counts 0
+   near-black pixels in both pre-fix AND post-fix state at the
+   top-down birdseye pose, because the visible inversion at this
+   vantage produces bright sky-bleed holes (lum ≈ 145), not dark
+   pixels (lum < 10). The dark Oasis rooftop pixels (lum ≈ 30) are
+   correct geometry and never drop below the threshold. The metric
+   is tautologically PASSing at this pose.
+2. **Atomic-voxels conversion is pixel-perfect identical to the
+   baseline.** The round-3 dedup-disable experiment improved the
+   inside-world-pose count by ~2k pixels; this dispatch's correct-shape
+   fix (force memory ordering rather than disable dedup) produced
+   ZERO measurable change. Either (a) naga's SPIR-V output for the
+   non-atomic baseline already emits appropriate memory barriers on
+   NVIDIA Vulkan (the cross-invocation race the round-3 brief
+   hypothesised may not actually fire at the backend level), OR (b)
+   the round-3 dedup-disable improvement was pose-specific noise that
+   doesn't generalise.
+3. **`--oasis-edit-visual` continues to render Oasis correctly** at
+   its own `birdseye_pose` — bright cream rooftops (luminance 169),
+   green palms, sandstone walls. The W5 path (this gate) renders the
+   SAME fixture at the SAME pose-formula but produces dark+sky-bleed.
+   The visual difference confirms `--oasis-edit-visual`'s sparse
+   (no-W5, no-GPU-producer) path is fundamentally different from the
+   W5 GPU producer chain. The bug remains W5-path-specific.
+
+### What's NOT yet done
+
+1. **The actual fix for the visible bright-sky-bleed inversion in the
+   W5 path.** Round-3's H11 atomic-memory-ordering hypothesis was
+   tested in this dispatch (both `voxels[]` and `hash_map[].hash_raw`
+   variants) and neither produced visible improvement at the top-down
+   pose. The next investigation should consider: (a) bind-group
+   aliasing / barrier-insertion subtleties between the W5 per-segment
+   encoders and the post-loop bounds chain on the shared
+   `render_context` encoder; (b) the chunk_calc `compute_voxel_bounds`
+   / `compute_block_bounds` dispatching `134M` / `2.1M` workgroups
+   that OOB-read for ~93% of the range (correct WebGPU behaviour but
+   worth verifying empirically that wgpu's tracker does not regress on
+   that pattern); (c) whether the `WorldData.chunks_cpu` empty mirror
+   triggers a wrong code path the renderer takes for the W5 install
+   path that does NOT affect the sparse `--oasis-edit-visual` path.
+2. **Gate metric replacement.** The `lum < 10` metric at the top-down
+   birdseye pose does NOT discriminate broken from fixed states (both
+   produce 0 near-black). The metric is preserved per the user's
+   explicit directive ("the metric is the right metric; only the
+   camera was wrong"), but empirically it cannot serve as a tripwire
+   for the W5 inversion class at this pose. A future dispatch might
+   need a different metric (golden-image diff, bright-outliers count
+   in a dark band, etc.) — out of scope for this dispatch.
+3. **Stage 2-real (legacy-path deletion + single-pathway consolidation)
+   remains a SEPARATE dispatch** — orthogonal to the inversion fix.
+
+### What's left in place
+
+- The Stage 1.5 + Stage 2 prior fixes (pre-allocation gate widening,
+  `initial_hash_map_size = 1 << 20`, `bound_group_queue_max_size` set
+  to `bound_group_count`, near-black assertion structure) are all
+  preserved.
+- The gate's diff-rect-fractions and assertion structure are unchanged
+  from Stage 1.5 — only the camera coordinates moved.

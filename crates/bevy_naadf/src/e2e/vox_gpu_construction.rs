@@ -88,41 +88,38 @@ use crate::e2e::oasis_edit_visual::{oasis_vox_fixture_path, OASIS_VOX_FIXTURE_PA
 // Camera poses — C#-faithful literal voxel coordinates
 // ---------------------------------------------------------------------------
 
-/// C# `WorldRender.cs:48-49` literal camera spawn (`(500, 200, 40)` voxels).
+/// Top-down birdseye camera A pose, mirroring
+/// [`crate::e2e::oasis_edit_visual::birdseye_pose`] for the fixed
+/// 4096×512×4096-voxel world. Computed values:
+///   cx = 2048, cz = 2048, mid_y = 256, cam_y = 512 + 250 = 762.
 ///
-/// vox-gpu-rewrite W5.3-fix Stage 1.5 (round-2 revert, 2026-05-18) —
-/// reverted from the scaled production-faithful `(2000, 800, 160)` Stage 1.5
-/// pose back to the LITERAL C# spawn at the user's explicit request. The
-/// Stage 1.5 move to `(2000, 800, 160)` was a goalpost-shift: the user
-/// reported that the production binary's rendering at the scaled pose
-/// still shows scattered missing voxels POST-FIX, and the prior agent's
-/// own measurement at the LITERAL C# pose `(500, 200, 40)` confirmed the
-/// near-black count did NOT change between pre-fix (35.25%) and post-fix
-/// (35.24%) — only 8 pixels of pure noise. The Stage 1.5 fix landed but
-/// did not actually fix the user-visible inversion. The gate's
-/// measurement MUST reflect what the user sees from the inside-world
-/// spawn, not a moved-goalpost camera above the world that hides the
-/// failure pattern. See
-/// `docs/orchestrate/vox-gpu-rewrite/07-diagnostic-inversion-round-2.md`.
-pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_A: Vec3 = Vec3::new(500.0, 200.0, 40.0);
+/// vox-gpu-rewrite W5.3-fix Stage 3 (top-down gate move, 2026-05-18) —
+/// moved from the prior C#-faithful inside-world spawn `(500, 200, 40)`
+/// to the same top-down birdseye pose `--oasis-edit-visual` uses. From
+/// this vantage holes in Oasis roofs are unmistakable AND there is no
+/// legitimate dark interior to dilute the near-black metric (the camera
+/// looks DOWN at the world ceiling Y=256). The metric (`lum<10`, `<1%`
+/// floor) is unchanged from Stage 1.5; only the vantage is corrected
+/// per the user's directive. See
+/// `docs/orchestrate/vox-gpu-rewrite/08-diagnostic-inversion-round-3.md`
+/// for round-3 findings and the subsequent dispatch's brief.
+pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_A: Vec3 = Vec3::new(2048.0, 762.0, 2048.0);
 
-/// Camera A look-at target: forward `+Z` (same convention as
-/// `from_world_voxels`: identity rotation → look-at `pos + Vec3::Z`). The
-/// C# spawn looks straight forward (no downward tilt) — see
-/// `camera/mod.rs:62`.
-pub const VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A: Vec3 =
-    Vec3::new(500.0, 200.0, 41.0);
+/// Camera A look-at target: world centre at mid-height. Combined with
+/// `Vec3::X` up (in [`pin_vox_gpu_construction_camera`]) this produces
+/// the same top-down framing as
+/// [`crate::e2e::oasis_edit_visual::birdseye_pose`].
+pub const VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A: Vec3 = Vec3::new(2048.0, 256.0, 2048.0);
 
-/// Camera B — translated +Z deeper into the world from camera A (Oasis's
-/// stamped XZ tiling at the chunk-Y=0 layer means moving forward sweeps
-/// architecture through the frustum). +Z chosen instead of lateral +X so
-/// camera B also stays inside the world's 4096×512×4096 voxel extent at
-/// the C# spawn Y=200.
-pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_B: Vec3 = Vec3::new(500.0, 200.0, 200.0);
+/// Camera B — same top-down birdseye, laterally translated +X by 256
+/// voxels (one segment-width) so the sweep Δ assertion catches
+/// architecture sweeping through the frustum from a parallel pose. Both
+/// cameras share the Y=762 altitude and `Vec3::X` up reference; the
+/// look-at follows the camera laterally so the framing stays top-down.
+pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_B: Vec3 = Vec3::new(2304.0, 762.0, 2048.0);
 
-/// Camera B look-at target: matched forward `+Z` (identity rotation).
-pub const VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B: Vec3 =
-    Vec3::new(500.0, 200.0, 201.0);
+/// Camera B look-at target: matched lateral offset, same downward gaze.
+pub const VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B: Vec3 = Vec3::new(2304.0, 256.0, 2048.0);
 
 // ---------------------------------------------------------------------------
 // Diff threshold + bounding box fractions
@@ -288,7 +285,11 @@ pub fn pin_vox_gpu_construction_camera(
             VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A,
         )
     };
-    let pose = Transform::from_translation(pos).looking_at(look_at, Vec3::Y);
+    // Top-down birdseye: look DOWN at the target with `Vec3::X` as the up
+    // reference vector — same convention as `oasis_edit_visual::birdseye_pose`
+    // so the resulting camera Y-axis aligns toward `+Z` (the framebuffer's
+    // up direction).
+    let pose = Transform::from_translation(pos).looking_at(look_at, Vec3::X);
     let (transform, position_split) = &mut *camera;
     **transform = pose;
     **position_split = PositionSplit::from_world(pose.translation);
