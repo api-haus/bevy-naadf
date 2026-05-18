@@ -75,7 +75,12 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] User dispatched W3 diagnostic (option 2)
 - [x] Stage 7 — `13-diagnostic-w3-bounds-calc.md` identified CONCRETE bug **W3-T1 (HIGH confidence)**: `naadf_bounds_compute_node` runs regime-2 BEFORE `add_initial_groups_to_bound_queue` seeds the queue. Seed gated on `gpu_producer_has_run` (flips in Core3d); compute_group_bounds has NO matching gate → drains queue + re-enqueues all 32768 groups at (0,0,0) before real seed lands → only group (0,0,0)'s chunk-AADFs converge; rest stays zero. Default scene escapes by `want_gpu_producer = false` accidentally inverting the gate polarity.
 - [x] Recommended fix: add `if !construction_gpu.bounds_initialized { return; }` early-return to `naadf_bounds_compute_node` at `bounds_calc.rs:311-330` (one-line change)
-- [ ] Hard gate — submit Stage 7: concrete bug found, one-line fix proposed  ← CURRENT
+- [x] W3-T1 fix landed (commit `8039e9b`) — structurally correct but didn't change visible
+- [x] Stage 8 — type-decode diagnostic; Q4 max_storage_buffer_binding_size hypothesis (MEDIUM-HIGH confidence)
+- [x] Q4 verification — REFUTED (Bevy auto-uses adapter max 2047 MiB; bindings fit)
+- [x] Stage 9 — production-scale voxels[] readback at 25 Oasis-populated positions, post-producer AND post-bounds-calc. **25/25 BYTE-MATCH at both checkpoints.** voxels[] IS byte-correct end-to-end at production scale.
+- [x] **Bug now PROVEN to be in renderer/wiring path, NOT producer chain.** Candidates: (1) `prepare.rs:184-450` buffer-handle binding mismatch, (2) `prepare.rs:418-432` `chunks.upload_all(&[0u32], …)` ordering racing producer writes, (3) `world_data_meta.size_in_chunks` mismatch at bind-group construction, (4) `naadf_first_hit.wgsl:227-228` `decompress_voxel_type` / `voxel_types` palette wiring.
+- [ ] Hard gate — submit Stage 9: bug localized to renderer/wiring; 4 specific candidates  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.4 (delete CPU stop-gap)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.6 (document default-scene divergence)

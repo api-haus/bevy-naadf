@@ -81,6 +81,18 @@ fn main() -> ExitCode {
     let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
     let validate_gpu_construction_scaled =
         args.iter().any(|a| a == "--validate-gpu-construction-scaled");
+    // vox-gpu-rewrite Stage 9 — production-scale voxels[] readback diagnostic.
+    // Loads the real Oasis VOX fixture, runs the FULL W5 producer chain at
+    // production scale (256×32×256 chunk fixed world, 512 segments, full
+    // bounds chain), reads back voxels[] at TWO checkpoints (post-producer,
+    // post-bounds), and diffs against the CPU oracle at ~25 sampled
+    // Oasis-populated voxel positions. Discriminating test for whether the
+    // visible "voxel types in thousands" bug is in the producer/bounds path
+    // (corrupted voxels[]) or in the renderer's decode path
+    // (voxels[] byte-correct but read wrongly). See
+    // `docs/orchestrate/vox-gpu-rewrite/15-diagnostic-production-scale-readback.md`.
+    let validate_gpu_construction_production =
+        args.iter().any(|a| a == "--validate-gpu-construction-production");
     let entities_mode = args.iter().any(|a| a == "--entities");
     let edit_mode = args.iter().any(|a| a == "--edit-mode");
     let runtime_edit_mode = args.iter().any(|a| a == "--runtime-edit-mode");
@@ -143,6 +155,22 @@ fn main() -> ExitCode {
             }
             Err(msg) => {
                 eprintln!("scaled byte-diff diagnostic FAILED: {msg}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // vox-gpu-rewrite Stage 9 — production-scale voxels[] readback diagnostic.
+    // Short-circuits before booting the e2e binary. See module-level docs at
+    // `crate::render::construction::validate_gpu_construction_production_scale`
+    // and `docs/orchestrate/vox-gpu-rewrite/15-diagnostic-production-scale-readback.md`.
+    if validate_gpu_construction_production {
+        match bevy_naadf::render::construction::validate_gpu_construction_production_scale() {
+            Ok(_report) => {
+                return ExitCode::from(0);
+            }
+            Err(msg) => {
+                eprintln!("production-scale readback diagnostic FAILED: {msg}");
                 return ExitCode::from(1);
             }
         }
