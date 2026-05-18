@@ -71,8 +71,11 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Stage 5 Part A — D1 fix landed (CPU mirror readback after W5 producer; `seed_block_hashing` reseed); addresses symptom 2 (edit raycast). Verified `chunks_cpu.len() = 2.1M, blocks_cpu = 12.9M, voxels_cpu = 10.5M` post-Oasis-boot.
 - [x] Stage 5 Part B — inferential byte-diff (cursor ratios), no concrete byte evidence
 - [x] Stage 6 — `--validate-gpu-construction-scaled` across 27 fixture configurations including real Oasis: **W5 producer output is BYTE-IDENTICAL to CPU oracle across every fixture**. Generator + chunk_calc{calc_block, compute_voxel_bounds, compute_block_bounds} all byte-equal. Cursor counts match exactly. **The W5 producer chain is provably correct.**
-- [x] Hypothesis re-localized: bug is in `bounds_calc.wgsl::{prepare_group_bounds, compute_group_bounds}` — the **chunk-layer AADF iterative refinement** that runs in a SEPARATE render-graph node (W3, was out-of-scope per original handoff). Multi-frame iterative; at Oasis-scale (32,768 bound groups) may never converge or have scale bug. Explains symptoms 1+3 (inversion = rays approaching surfaces wrong when chunk-AADFs are zero/wrong; short render distance = single-step rays).
-- [ ] Hard gate — submit Stage 6: W5 producer proven CORRECT; bug isolated to W3 bounds_calc chain (originally out-of-scope)  ← CURRENT
+- [x] Hypothesis re-localized: bug is in `bounds_calc.wgsl::{prepare_group_bounds, compute_group_bounds}` — chunk-layer AADF iterative refinement
+- [x] User dispatched W3 diagnostic (option 2)
+- [x] Stage 7 — `13-diagnostic-w3-bounds-calc.md` identified CONCRETE bug **W3-T1 (HIGH confidence)**: `naadf_bounds_compute_node` runs regime-2 BEFORE `add_initial_groups_to_bound_queue` seeds the queue. Seed gated on `gpu_producer_has_run` (flips in Core3d); compute_group_bounds has NO matching gate → drains queue + re-enqueues all 32768 groups at (0,0,0) before real seed lands → only group (0,0,0)'s chunk-AADFs converge; rest stays zero. Default scene escapes by `want_gpu_producer = false` accidentally inverting the gate polarity.
+- [x] Recommended fix: add `if !construction_gpu.bounds_initialized { return; }` early-return to `naadf_bounds_compute_node` at `bounds_calc.rs:311-330` (one-line change)
+- [ ] Hard gate — submit Stage 7: concrete bug found, one-line fix proposed  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.4 (delete CPU stop-gap)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.6 (document default-scene divergence)
