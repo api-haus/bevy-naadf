@@ -122,6 +122,9 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
         GridPreset::ProceduralStreaming { noise_preset, seed } => {
             install_procedural_streaming_world(&mut commands, &args, *noise_preset, *seed);
         }
+        GridPreset::ProceduralStatic { noise_preset, seed } => {
+            install_procedural_static_world(&mut commands, &args, *noise_preset, *seed);
+        }
     }
 }
 
@@ -227,6 +230,111 @@ fn install_procedural_streaming_world(
         args.terrain_amplitude,
         args.vram_budget_mib,
         args.max_segments_per_frame,
+        cam_pos,
+        cam_look,
+    );
+}
+
+/// streaming-world Phase 2.4 — install a procedural-static world. Mirrors
+/// `install_procedural_streaming_world` BUT does **not** insert `Residency`.
+/// Instead inserts a `ProceduralStaticActive` marker resource that drives
+/// the render-world's `(a0b)` one-shot 512-segment dispatch branch (see
+/// `crate::render::construction::naadf_gpu_producer_node`).
+///
+/// World container: identical to streaming preset — empty `WorldData` at
+/// fixed `WORLD_SIZE_IN_CHUNKS = (256, 32, 256)` extent. The GPU producer
+/// populates `WorldGpu::{chunks,blocks,voxels}` once at startup via the
+/// noise → segment_voxel_buffer → chunk_calc → bounds chain.
+///
+/// Camera spawn: world-centre `(2048, sea_level + 32, 2048)` looking +X
+/// with a slight downward angle (matches the streaming preset's pose so
+/// framebuffer assertions are visually comparable across both presets).
+///
+/// Independent of the residency machinery — no `Residency` resource is
+/// inserted; the `pin_streaming_window_camera` helper's
+/// `translate_world_to_window_local` returns identity when no residency
+/// exists, so the camera Transform stays in absolute world-voxel coords
+/// (which is what the static-preset renderer expects: segment `(sx, sy,
+/// sz)` → chunks at world segment positions `(sx, sy, sz)` — no
+/// translation, no origin shift).
+fn install_procedural_static_world(
+    commands: &mut Commands,
+    args: &AppArgs,
+    noise_preset: u32,
+    seed: i32,
+) {
+    use crate::streaming::{chunk_source::NoiseChunkSource, ProceduralStaticActive};
+
+    // Build the palette — same shape as streaming preset.
+    let palette = build_streaming_palette();
+
+    // Empty WorldData at the fixed-world extent (mirrors
+    // `install_procedural_streaming_world` + `install_vox_in_fixed_world`).
+    let mut world_data = WorldData {
+        chunks_cpu: Vec::new(),
+        blocks_cpu: Vec::new(),
+        voxels_cpu: Vec::new(),
+        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
+        bounding_box: IAabb3 {
+            min: IVec3::ZERO,
+            max: IVec3::new(
+                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
+            ),
+        },
+        pending_edits: Default::default(),
+        dense_voxel_types: Vec::new(),
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+    };
+    world_data.seed_block_hashing();
+    commands.insert_resource(world_data);
+    commands.insert_resource(VoxelTypes { types: palette });
+
+    // Phase 2.4 ships one noise preset (SimpleTerrain) — same defaults as
+    // the streaming preset's preset 0 with the args-supplied sea_level and
+    // terrain_amplitude. Choice rationale documented in
+    // `docs/orchestrate/streaming-world/03d-impl-static-noise.md`.
+    let chunk_source = match noise_preset {
+        0 => {
+            let mut cs = NoiseChunkSource::from_seed(seed);
+            cs.sea_level = args.sea_level;
+            cs.terrain_amplitude = args.terrain_amplitude;
+            cs
+        }
+        n => {
+            error!(
+                "streaming-world Phase 2.4: unknown noise_preset={n}; falling \
+                 back to SimpleTerrain (preset 0)",
+            );
+            NoiseChunkSource::from_seed(seed)
+        }
+    };
+    commands.insert_resource(chunk_source);
+
+    // Marker — presence flips `StreamingExtractRender.static_mode_active`
+    // in the render-world extract.
+    commands.insert_resource(ProceduralStaticActive);
+
+    // Camera spawn — same shape as `install_procedural_streaming_world`'s
+    // centre-of-world pose so framebuffer assertions are comparable.
+    let cx = (WORLD_SIZE_IN_VOXELS.x as f32) * 0.5;
+    let cz = (WORLD_SIZE_IN_VOXELS.z as f32) * 0.5;
+    let cam_y = args.sea_level + 32.0;
+    let cam_pos = Vec3::new(cx, cam_y, cz);
+    let cam_look = Vec3::new(cx + 100.0, args.sea_level - 16.0, cz);
+    commands.insert_resource(crate::camera::InitialCameraPose(
+        Transform::from_translation(cam_pos).looking_at(cam_look, Vec3::Y),
+    ));
+
+    info!(
+        "streaming-world Phase 2.4: ProceduralStatic preset installed — \
+         noise_preset={noise_preset}, seed={seed}, sea_level={:.1}, \
+         terrain_amplitude={:.1}; camera spawn at {:?} looking at {:?}. \
+         GPU producer will fire one-shot 512-segment dispatch via the \
+         (a0b) static-preset branch in naadf_gpu_producer_node.",
+        args.sea_level,
+        args.terrain_amplitude,
         cam_pos,
         cam_look,
     );

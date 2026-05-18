@@ -234,12 +234,20 @@ pub struct ConstructionGpu {
     pub noise_terrain_params_buffer: Option<Buffer>,
     /// streaming-world Phase 2 — lazily-queued compute pipeline id for the
     /// noise terrain entry point. Queued on the first frame
-    /// `streaming_extract.streaming_mode_active = true` is observed (the
+    /// `streaming_extract.streaming_mode_active = true` OR
+    /// `streaming_extract.static_mode_active = true` is observed (the
     /// render-world `Assets<Shader>` is reachable from
     /// `prepare_construction`; not from `ConstructionPipelines::from_world`
     /// which runs at `RenderStartup` before any extract has fired).
-    /// `None` when streaming is not active.
+    /// `None` when neither streaming nor static is active.
     pub noise_terrain_pipeline: Option<CachedComputePipelineId>,
+    /// streaming-world Phase 2.4 — `true` once the static-preset one-shot
+    /// 512-segment noise + chunk_calc + bounds dispatch has fired.
+    /// Mirrors `gpu_producer_has_run` for the (a0b) branch in
+    /// `naadf_gpu_producer_node`. The flag prevents the static dispatch
+    /// from re-firing on subsequent frames (the noise output is identical
+    /// across re-dispatches; the cost would be ~300 ms/frame for nothing).
+    pub static_preset_has_run: bool,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -1685,7 +1693,16 @@ pub fn prepare_construction(
         .as_deref()
         .map(|s| s.streaming_mode_active)
         .unwrap_or(false);
-    if streaming_active && construction_config.gpu_construction_enabled {
+    // Phase 2.4 — the static preset shares the noise-terrain allocations
+    // (segment_voxel_buffer, params buffer, pipeline, bind group) with the
+    // streaming preset. The dispatch loop differs (one-shot 512-segment vs
+    // per-frame admissions) but the GPU plumbing is identical.
+    let static_active = streaming_extract
+        .as_deref()
+        .map(|s| s.static_mode_active)
+        .unwrap_or(false);
+    let noise_dispatch_active = streaming_active || static_active;
+    if noise_dispatch_active && construction_config.gpu_construction_enabled {
         // (0) Lazily queue the noise_terrain compute pipeline once the shader
         // handle has been seeded into Assets<Shader> by the streaming plugin's
         // startup system (see `crate::streaming::seed_noise_terrain_shader`).
@@ -1793,8 +1810,9 @@ pub fn prepare_construction(
         // streaming-world Phase 2: skip the bounds-init seed when streaming
         // is active — the streaming branch in naadf_gpu_producer_node runs
         // the full bounds chain per frame, which subsumes the once-at-startup
-        // seed.
-        && !streaming_active
+        // seed. Phase 2.4: same skip for the static preset (the (a0b) branch
+        // runs the bounds chain once at the end of its 512-segment dispatch).
+        && !noise_dispatch_active
     {
         let Some(initial_pipeline) = pipeline_cache
             .get_compute_pipeline(construction_pipelines.bounds_calc_pipeline_add_initial)
@@ -2508,10 +2526,15 @@ pub fn naadf_gpu_producer_node(
         .as_deref()
         .map(|s| s.streaming_mode_active)
         .unwrap_or(false);
+    let static_mode_active = streaming_extract
+        .as_deref()
+        .map(|s| s.static_mode_active)
+        .unwrap_or(false);
     // Streaming preset bypasses the once-at-startup gate (the streaming
-    // dispatch runs every frame any admission/eviction happens). The two
+    // dispatch runs every frame any admission/eviction happens). The
     // non-streaming branches preserve the once-at-startup gate exactly as
-    // before.
+    // before. Phase 2.4: the static preset is also a once-at-startup
+    // producer; it shares `gpu_producer_has_run` with the W5/dense branches.
     if !streaming_mode_active && gpu.gpu_producer_has_run {
         return;
     }
@@ -2548,6 +2571,187 @@ pub fn naadf_gpu_producer_node(
     //       drives the chunk_calc chain; the default-scene path).
     //   (c) else → CPU upload fallback (early-return; the renderer reads the
     //       pre-built CPU mirror via `prepare_world_gpu`).
+    if static_mode_active && !gpu.static_preset_has_run {
+        // === (a0b) streaming-world Phase 2.4 — static-preset one-shot branch ===
+        //
+        // Mirrors the W5 `Default` branch shape: iterates ALL 512 segments of
+        // the fixed `WORLD_SIZE_IN_SEGMENTS = (16, 2, 16)` world once at
+        // startup, dispatching `noise_terrain` → `chunk_calc` per segment on
+        // a fresh per-segment encoder (honours the W5 per-segment-submit
+        // ordering constraint at `:2427-2453`). After the loop, runs the
+        // bounds chain once on the render-context encoder. Flips
+        // `static_preset_has_run = true` AND `gpu_producer_has_run = true`
+        // so subsequent frames short-circuit at the gate above.
+        //
+        // No residency — the camera lives in absolute world voxel coords;
+        // segment `(sx, sy, sz)` writes to chunks at
+        // `(sx*16, sy*16, sz*16) .. + (16,16,16)` in `WorldGpu.chunks_buffer`,
+        // exactly matching the streaming preset's slot 0 layout (origin = 0).
+        let Some(streaming_extract) = streaming_extract else {
+            return;
+        };
+        let Some(p_noise_id) = gpu.noise_terrain_pipeline else {
+            return;
+        };
+        let Some(p_noise) = pipeline_cache.get_compute_pipeline(p_noise_id) else {
+            return;
+        };
+        let Some(noise_bg) =
+            construction_bind_groups.construction_noise_terrain.as_ref()
+        else {
+            return;
+        };
+        let Some(noise_params_buf) = gpu.noise_terrain_params_buffer.as_ref() else {
+            return;
+        };
+        let Some(bounds_params_buf) = gpu.bounds_params_buffer.as_ref() else {
+            return;
+        };
+
+        let segment_chunks: u32 = crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4;
+        let group_size_in_chunks =
+            [segment_chunks, segment_chunks, segment_chunks];
+
+        let mut segments_dispatched: u32 = 0;
+        for sz in 0..crate::WORLD_SIZE_IN_SEGMENTS.z {
+            for sy in 0..crate::WORLD_SIZE_IN_SEGMENTS.y {
+                for sx in 0..crate::WORLD_SIZE_IN_SEGMENTS.x {
+                    let group_offset_in_chunks = [
+                        sx * segment_chunks,
+                        sy * segment_chunks,
+                        sz * segment_chunks,
+                    ];
+                    // World origin in voxels — segment `(sx, sy, sz)` covers
+                    // world voxels `(sx*256 ..= (sx+1)*256 - 1)` per axis.
+                    let seg_origin_v = IVec3::new(
+                        sx as i32 * crate::streaming::SEGMENT_VOXELS,
+                        sy as i32 * crate::streaming::SEGMENT_VOXELS,
+                        sz as i32 * crate::streaming::SEGMENT_VOXELS,
+                    );
+
+                    // Build the noise_terrain params for this segment.
+                    let noise_params = crate::streaming::build_noise_terrain_params(
+                        seg_origin_v,
+                        streaming_extract.as_ref(),
+                        segment_chunks,
+                    );
+                    render_queue.write_buffer(
+                        noise_params_buf,
+                        0,
+                        bytemuck::bytes_of(&noise_params),
+                    );
+
+                    // Build the construction_params uniform for the chunk_calc pass.
+                    let bound_group_count = bounds_calc::bound_group_count_of([
+                        crate::WORLD_SIZE_IN_CHUNKS.x,
+                        crate::WORLD_SIZE_IN_CHUNKS.y,
+                        crate::WORLD_SIZE_IN_CHUNKS.z,
+                    ]);
+                    let construction_params = crate::render::gpu_types::GpuConstructionParams {
+                        size_in_chunks: [
+                            crate::WORLD_SIZE_IN_CHUNKS.x,
+                            crate::WORLD_SIZE_IN_CHUNKS.y,
+                            crate::WORLD_SIZE_IN_CHUNKS.z,
+                        ],
+                        _pad0: 0,
+                        group_size_in_groups: bounds_calc::group_size_in_groups_of([
+                            crate::WORLD_SIZE_IN_CHUNKS.x,
+                            crate::WORLD_SIZE_IN_CHUNKS.y,
+                            crate::WORLD_SIZE_IN_CHUNKS.z,
+                        ]),
+                        _pad1: 0,
+                        bound_group_queue_max_size: bound_group_count.max(1),
+                        hash_map_size: config.initial_hash_map_size,
+                        segment_size_in_chunks: segment_chunks,
+                        max_group_bound_dispatch: config.max_group_bound_dispatch,
+                        chunk_offset: group_offset_in_chunks,
+                        _pad2: 0,
+                        frame_index: 0,
+                        changed_chunk_count: 0,
+                        changed_block_count: 0,
+                        changed_voxel_count: 0,
+                    };
+                    render_queue.write_buffer(
+                        bounds_params_buf,
+                        0,
+                        bytemuck::bytes_of(&construction_params),
+                    );
+
+                    // Per-segment encoder + submit (W5 per-segment ordering
+                    // constraint).
+                    let mut seg_encoder = render_device.create_command_encoder(
+                        &CommandEncoderDescriptor {
+                            label: Some("naadf_static_preset_segment_encoder"),
+                        },
+                    );
+                    {
+                        let mut pass = seg_encoder.begin_compute_pass(
+                            &bevy::render::render_resource::ComputePassDescriptor {
+                                label: Some("naadf_static_preset_noise_terrain_pass"),
+                                timestamp_writes: None,
+                            },
+                        );
+                        pass.set_pipeline(p_noise);
+                        pass.set_bind_group(0, noise_bg, &[]);
+                        pass.dispatch_workgroups(
+                            group_size_in_chunks[0],
+                            group_size_in_chunks[1],
+                            group_size_in_chunks[2],
+                        );
+                    }
+                    chunk_calc::dispatch_calc_block_from_raw_data_world_sized(
+                        &mut seg_encoder,
+                        p_calc,
+                        world_bg,
+                        group_size_in_chunks,
+                    );
+                    render_queue.submit([seg_encoder.finish()]);
+                    segments_dispatched += 1;
+                }
+            }
+        }
+
+        // After the per-segment loop, run the bounds chain once on the
+        // render-context encoder. Mirrors the W5 `Default` branch's
+        // post-loop bounds dispatch (full-world worst-case workgroup count;
+        // extra workgroups are spec-safe no-ops).
+        let encoder = render_context.command_encoder();
+        let world_chunks = crate::WORLD_SIZE_IN_CHUNKS.x
+            * crate::WORLD_SIZE_IN_CHUNKS.y
+            * crate::WORLD_SIZE_IN_CHUNKS.z;
+        let max_blocks_u64 = (world_chunks as u64) * 64;
+        let max_voxels_u64 = max_blocks_u64 * 32;
+        let voxel_workgroups =
+            ((max_voxels_u64 / 32 + 1).max(1)).min(u32::MAX as u64) as u32;
+        let block_workgroups =
+            ((max_blocks_u64 / 64 + 1).max(1)).min(u32::MAX as u64) as u32;
+        chunk_calc::dispatch_compute_voxel_bounds(
+            encoder,
+            p_voxel,
+            world_bg,
+            voxel_workgroups,
+        );
+        chunk_calc::dispatch_compute_block_bounds(
+            encoder,
+            p_block,
+            world_bg,
+            block_workgroups,
+        );
+
+        gpu.static_preset_has_run = true;
+        gpu.gpu_producer_has_run = true;
+        // The bounds chain we just ran replaces the once-at-startup seed.
+        gpu.bounds_initialized = true;
+        bevy::log::info!(
+            "streaming-world Phase 2.4: ProceduralStatic one-shot dispatch \
+             complete — {} segments × (noise_terrain + chunk_calc); bounds \
+             chain ×1; voxel_workgroups={voxel_workgroups}, \
+             block_workgroups={block_workgroups}.",
+            segments_dispatched,
+        );
+        return;
+    }
+
     if streaming_mode_active {
         // === (a0) streaming-world Phase 2 branch ============================
         //

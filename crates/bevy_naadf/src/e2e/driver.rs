@@ -503,7 +503,15 @@ pub fn e2e_driver(
     let streaming_window_mode = app_args
         .as_deref()
         .is_some_and(|a| a.streaming_window_mode);
-    if (oasis_mode || vox_gpu_construction_mode || streaming_window_mode)
+    // streaming-world Phase 2.4 — `--noise-static-world` also reuses the
+    // OasisXxx state machine. The ApplyEdit branch is a no-op (no brush,
+    // no camera walk); the Assert branch dispatches to
+    // `noise_static_world::assert_noise_static_world_landed`.
+    let noise_static_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.noise_static_mode);
+    if (oasis_mode || vox_gpu_construction_mode || streaming_window_mode
+        || noise_static_mode)
         && state.phase == E2ePhase::Warmup
         && state.phase_ticks == 0
     {
@@ -918,6 +926,11 @@ pub fn e2e_driver(
                                 &fb,
                                 super::streaming_window::STREAMING_BEFORE_PNG,
                             );
+                        } else if noise_static_mode {
+                            super::noise_static_world::save_noise_static_screenshot(
+                                &fb,
+                                super::noise_static_world::NOISE_STATIC_BEFORE_PNG,
+                            );
                         } else {
                             super::oasis_edit_visual::save_oasis_screenshot(
                                 &fb,
@@ -993,6 +1006,14 @@ pub fn e2e_driver(
                     super::streaming_window::record_origin_x_at_pose_a(origin_x);
                     let _ = &mut wd;
                     super::streaming_window::promote_camera_to_walk();
+                } else if noise_static_mode {
+                    // streaming-world Phase 2.4 — no brush, no camera walk.
+                    // The static-preset 512-segment dispatch already fired
+                    // on the first frame in `naadf_gpu_producer_node`'s
+                    // (a0b) branch; the OasisWaitPostEdit phase that
+                    // follows is the actual settling time for TAA + GI to
+                    // converge over the populated world.
+                    let _ = &mut wd;
                 } else {
                     super::oasis_edit_visual::apply_erase_brush(&mut wd);
                 }
@@ -1044,6 +1065,11 @@ pub fn e2e_driver(
                             super::streaming_window::save_streaming_window_screenshot(
                                 &fb,
                                 super::streaming_window::STREAMING_AFTER_PNG,
+                            );
+                        } else if noise_static_mode {
+                            super::noise_static_world::save_noise_static_screenshot(
+                                &fb,
+                                super::noise_static_world::NOISE_STATIC_AFTER_PNG,
                             );
                         } else {
                             super::oasis_edit_visual::save_oasis_screenshot(
@@ -1113,6 +1139,16 @@ pub fn e2e_driver(
                         .map(|msg| {
                             println!("e2e_render --streaming-window: {msg}");
                         })
+                    } else if noise_static_mode {
+                        // streaming-world Phase 2.4 — strict assertion on
+                        // the after-capture only (pre/post should be
+                        // near-identical for static preset; the
+                        // before-capture is saved for inspection).
+                        let _ = &a;
+                        super::noise_static_world::assert_noise_static_world_landed(&b)
+                            .map(|msg| {
+                                println!("e2e_render --noise-static-world: {msg}");
+                            })
                     } else {
                         super::oasis_edit_visual::assert_visual_edit_landed(&a, &b)
                             .map(|msg| {
@@ -1149,6 +1185,16 @@ pub fn e2e_driver(
                             super::oasis_edit_visual::OASIS_WARMUP_FRAMES,
                             super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES,
                             super::streaming_window::STREAMING_WALK_DISTANCE_VOXELS,
+                        );
+                    } else if noise_static_mode {
+                        println!(
+                            "e2e_render: noise-static-world PASS — \
+                             {} warmup + {} post-dispatch wait frames; \
+                             one-shot 512-segment dispatch produced \
+                             visible terrain (luminance variance and \
+                             non-sky-pixel ratio above strict floors).",
+                            super::oasis_edit_visual::OASIS_WARMUP_FRAMES,
+                            super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES,
                         );
                     } else {
                         println!(

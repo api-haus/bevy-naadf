@@ -246,6 +246,11 @@ pub struct StreamingExtractRender {
     /// `true` when the main world is running the `ProceduralStreaming` preset.
     /// Off otherwise.
     pub streaming_mode_active: bool,
+    /// `true` when the main world is running the `ProceduralStatic` preset
+    /// (Phase 2.4 — independent of `streaming_mode_active`; the two are
+    /// mutually exclusive). Drives the one-shot full-world dispatch branch
+    /// in `naadf_gpu_producer_node`.
+    pub static_mode_active: bool,
     /// Per-frame admissions (camera-distance-sorted, capped at
     /// `--max-segments-per-frame`).
     pub admissions_this_frame: Vec<(WorldSegmentPos, SlotIndex)>,
@@ -270,6 +275,7 @@ impl Default for StreamingExtractRender {
         // means consumers never read these defaults in practice.
         Self {
             streaming_mode_active: false,
+            static_mode_active: false,
             admissions_this_frame: Vec::new(),
             evictions_this_frame: Vec::new(),
             noise_state: Zeroable::zeroed(),
@@ -284,13 +290,48 @@ impl Default for StreamingExtractRender {
 /// `ExtractSchedule` system — mirror the main-world residency state into the
 /// render-world [`StreamingExtractRender`] resource. Wired by the
 /// [`super::StreamingPlugin`].
+///
+/// Phase 2.4 — also mirrors the `ProceduralStaticActive` marker resource so
+/// the render-world picks up the static preset's one-shot dispatch branch.
+/// The streaming and static branches are mutually exclusive (the install
+/// paths insert exactly one of `Residency` / `ProceduralStaticActive` —
+/// never both).
 pub fn extract_streaming_state(
     mut commands: Commands,
     residency: bevy::render::Extract<Option<Res<Residency>>>,
     chunk_source: bevy::render::Extract<Option<Res<super::chunk_source::NoiseChunkSource>>>,
     shader_handle: bevy::render::Extract<Option<Res<StreamingShaderHandle>>>,
+    static_marker: bevy::render::Extract<
+        Option<Res<super::chunk_source::ProceduralStaticActive>>,
+    >,
 ) {
     let shader = shader_handle.as_deref().map(|s| s.0.clone());
+    let static_active = static_marker.as_deref().is_some();
+    if static_active {
+        // Static preset path: NoiseChunkSource is the only required companion;
+        // there is no Residency.
+        let Some(chunk_source) = chunk_source.as_deref() else {
+            // NoiseChunkSource missing — should never happen if the install
+            // path ran. Emit a default-ish state with the shader handle so
+            // the pipeline-queue path can still progress.
+            let mut default_state = StreamingExtractRender::default();
+            default_state.noise_terrain_shader = shader;
+            commands.insert_resource(default_state);
+            return;
+        };
+        commands.insert_resource(StreamingExtractRender {
+            streaming_mode_active: false,
+            static_mode_active: true,
+            admissions_this_frame: Vec::new(),
+            evictions_this_frame: Vec::new(),
+            noise_state: chunk_source.state,
+            sea_level: chunk_source.sea_level,
+            terrain_amplitude: chunk_source.terrain_amplitude,
+            solid_voxel_type_id: chunk_source.solid_voxel_type_id,
+            noise_terrain_shader: shader,
+        });
+        return;
+    }
     let (Some(residency), Some(chunk_source)) =
         (residency.as_deref(), chunk_source.as_deref())
     else {
@@ -303,6 +344,7 @@ pub fn extract_streaming_state(
     };
     commands.insert_resource(StreamingExtractRender {
         streaming_mode_active: true,
+        static_mode_active: false,
         admissions_this_frame: residency.admissions_this_frame.clone(),
         evictions_this_frame: residency.evictions_this_frame.clone(),
         noise_state: chunk_source.state,

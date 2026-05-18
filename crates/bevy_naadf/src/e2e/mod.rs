@@ -25,6 +25,7 @@ pub mod checks;
 pub mod driver;
 pub mod framebuffer;
 pub mod gates;
+pub mod noise_static_world;
 pub mod oasis_edit_visual;
 pub mod readback;
 pub mod small_edit_repro;
@@ -267,6 +268,12 @@ pub fn add_e2e_systems(app: &mut App) {
                 // birdseye pose when oasis-mode fast-path triggers; the
                 // streaming gate routes via oasis_edit_visual_mode = true).
                 streaming_window::pin_streaming_window_camera
+                    .after(oasis_edit_visual::pin_oasis_camera),
+                // streaming-world Phase 2.4 — pin the camera at the static
+                // preset's centre pose. Runs `.after(pin_oasis_camera)` for
+                // the same reason (overrides the birdseye pose; the
+                // noise-static gate routes via oasis_edit_visual_mode = true).
+                noise_static_world::pin_noise_static_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
                 .before(crate::camera::sync_position_split),

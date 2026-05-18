@@ -127,6 +127,12 @@ fn main() -> ExitCode {
     // and terrain re-populated. See `bevy_naadf::e2e::streaming_window` +
     // `docs/orchestrate/streaming-world/02b-design-plan-b.md` § J.
     let streaming_window_mode = args.iter().any(|a| a == "--streaming-window");
+    // streaming-world Phase 2.4 — viability gate for the static one-shot
+    // 512-segment noise → encode → render chain. Strict luminance variance
+    // + non-sky-pixel ratio floors that fail on sky-only output. See
+    // `bevy_naadf::e2e::noise_static_world` +
+    // `docs/orchestrate/streaming-world/03d-impl-static-noise.md`.
+    let noise_static_mode = args.iter().any(|a| a == "--noise-static-world");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -322,6 +328,11 @@ fn main() -> ExitCode {
         // `ProceduralStreaming` preset + the `--streaming-window` driver
         // branch enabled. See `bevy_naadf::e2e::streaming_window`.
         bevy_naadf::e2e::streaming_window::run_streaming_window()
+    } else if noise_static_mode {
+        // streaming-world Phase 2.4 — boot with the `ProceduralStatic`
+        // preset; strict viability gate for the noise → encode → render
+        // chain. See `bevy_naadf::e2e::noise_static_world`.
+        bevy_naadf::e2e::noise_static_world::run_noise_static_world()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then

@@ -32,7 +32,9 @@ pub mod residency;
 use bevy::prelude::*;
 use bevy::render::{ExtractSchedule, RenderApp};
 
-pub use chunk_source::{ChunkSource, NoiseChunkSource, SegmentSourceKind};
+pub use chunk_source::{
+    ChunkSource, NoiseChunkSource, ProceduralStaticActive, SegmentSourceKind,
+};
 pub use noise_dispatch::{
     build_noise_terrain_params, build_noise_terrain_shader_src,
     create_noise_terrain_params_buffer, extract_streaming_state,

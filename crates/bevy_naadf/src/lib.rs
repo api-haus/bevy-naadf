@@ -88,6 +88,23 @@ pub enum GridPreset {
         /// FNL seed (`FnlState::seed`).
         seed: i32,
     },
+    /// Procedural-static viability preset (streaming-world Phase 2.4). Mirrors
+    /// `ProceduralStreaming` BUT generates the **entire** fixed 512-segment
+    /// world via the WGSL noise → segment_voxel_buffer → chunk_calc chain in
+    /// a single one-shot dispatch at startup (W5-shape loop, like `Default`,
+    /// but with `noise_terrain.wgsl` as the per-segment producer). No
+    /// residency manager. No per-frame admission queue. No sliding window.
+    /// Used by `--noise-static-world` to prove the noise→encoded-chunks→
+    /// visible-render chain works end-to-end, independent of the residency
+    /// machinery. See
+    /// `docs/orchestrate/streaming-world/03d-impl-static-noise.md`.
+    ProceduralStatic {
+        /// Index into the built-in WGSL noise preset table. Phase 2.4 supports
+        /// `0 = SimpleTerrain` only.
+        noise_preset: u32,
+        /// FNL seed (`FnlState::seed`).
+        seed: i32,
+    },
 }
 
 /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#
@@ -414,6 +431,17 @@ pub struct AppArgs {
     /// `docs/orchestrate/streaming-world/02b-design-plan-b.md` § J +
     /// `crate::e2e::streaming_window`.
     pub streaming_window_mode: bool,
+    /// streaming-world Phase 2.4 — runs the `--noise-static-world` e2e gate.
+    /// When `true`, the e2e harness boots a `GridPreset::ProceduralStatic`
+    /// world (the full 512-segment fixed-world container, generated once at
+    /// startup via the noise → segment_voxel_buffer → chunk_calc → bounds
+    /// chain), captures a framebuffer post-warmup, and asserts strict
+    /// luminance variance + non-sky-pixel-ratio floors that fail on
+    /// sky-only output. Proves the noise→encoded-chunks→render chain works
+    /// independent of the residency / sliding-window machinery. See
+    /// `docs/orchestrate/streaming-world/03d-impl-static-noise.md` +
+    /// `crate::e2e::noise_static_world`.
+    pub noise_static_mode: bool,
     /// streaming-world Phase 2 — VRAM budget (in MiB) for the residency slab.
     /// Default `1024`. Asserted at startup install time against the slab's
     /// computed total per `02-design.md` § A.4; panic on under-budget.
@@ -452,6 +480,7 @@ impl Default for AppArgs {
             vox_gpu_oracle_cpu_phase: false,
             vox_gpu_oracle_gpu_phase: false,
             streaming_window_mode: false,
+            noise_static_mode: false,
             vram_budget_mib: 1024,
             max_segments_per_frame: 4,
             sea_level: (WORLD_SIZE_IN_VOXELS.y as f32) * 0.5,

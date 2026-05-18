@@ -51,8 +51,8 @@ consolidated mode disqualified.
 - [ ] **Hard gate (Phase 2)** — submit impl to user; one camera-translation gap surfaced
 - [x] 03c — Diagnostic: read-only investigation of skybox-only false-pass + minutes-long hang
 - [x] **Hard gate (diagnostic)** — user directive: verify noise→visible-terrain in a static scene FIRST, then sliding window
-- [ ] 03d — Phase-2.4: static-scene noise verification — one-shot noise_terrain dispatch over full world + strict `--noise-static-world` gate (no residency)
-- [ ] **Hard gate (Phase 2.4)** — if static-scene gate green → proceed to 2.5; if red → diagnose noise/encoding before residency
+- [x] 03d — Phase-2.4: static-scene noise verification — one-shot noise_terrain dispatch over full world + strict `--noise-static-world` gate (no residency)
+- [x] **Hard gate (Phase 2.4)** — GREEN: viability YES (lum variance 1816, screenshot has visible terrain). Sliding-window bug is provably isolated to residency layer.
 - [ ] 03e — Phase-2.5 fix (contingent on 2.4 passing): `Generating → Resident` transition + sliding-window gate threshold tightening + wall-clock budget
 - [ ] **Hard gate (Phase 2.5)** — confirm visible sliding-window streaming + strict gate passes
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)

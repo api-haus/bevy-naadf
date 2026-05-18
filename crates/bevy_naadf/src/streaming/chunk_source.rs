@@ -24,6 +24,24 @@ pub enum SegmentSourceKind {
     Noise,
 }
 
+/// Marker resource — present iff the world was installed by the
+/// `GridPreset::ProceduralStatic` install path. Drives:
+/// - `StreamingExtractRender.static_mode_active` (via the
+///   `extract_streaming_state` system).
+/// - The `(a0b)` static-preset branch in `naadf_gpu_producer_node`, which
+///   dispatches the full 512-segment noise + chunk_calc + bounds chain
+///   once at startup (gated by `ConstructionGpu::static_preset_has_run`).
+///
+/// Carries no data — its presence alone is the discriminant. The
+/// `NoiseChunkSource` companion resource provides the FnlState + sea_level
+/// + amplitude parameters the static dispatch consumes.
+///
+/// Phase 2.4 deliverable per
+/// `docs/orchestrate/streaming-world/03d-impl-static-noise.md`. Independent
+/// of the residency layer — non-overlapping with `Residency` / `ProceduralStreaming`.
+#[derive(bevy::prelude::Resource, Clone, Copy, Debug, Default)]
+pub struct ProceduralStaticActive;
+
 /// Phase-2 forward-compat seam — every chunk source identifies its kind so the
 /// streaming driver can pick the right dispatch path. Phase 2's lone impl is
 /// [`NoiseChunkSource`]; future `.vox` / Minecraft sources will satisfy the
