@@ -13,7 +13,7 @@ node_modules/
 /e2e/test-results
 /e2e/playwright-report
 
-# Local environment — machine-specific paths (see .envrc.example)
+# Local environment — machine-specific paths.
 .envrc
 
 # Detached-process log from `just`/IDE launches
