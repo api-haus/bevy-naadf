@@ -1677,3 +1677,487 @@ runtime-switchable via `F1` / `[` / `]`, displays the active mode in a
 top-left HUD overlay, and produces visible non-degenerate output for
 every one of the 17 non-zero modes on the default test scene.
 
+---
+
+## POM peak-darkening diagnose+fix (2026-05-18, post-`3a61b9a`)
+
+### User report (verbatim, with image path)
+
+User used the new runtime PBR rendering debugger (`F1` / `[` / `]`) to
+triage dark green-tinted splotches on cobblestone surfaces:
+
+> Image #5 ("Lit") and Image #6 ("Direct only") show dark green-tinted
+> splotches on cobblestone, ABSENT in mode 11 (Direct-only).
+>
+> the issue cannot be attributed to any of the debugged surface brdf
+> inputs - none of them have the semblance of that clipped outlined area
+>
+> [Image #7] it seems to be associated with height
+> perhaps it manifests on areas of highest height
+
+User-supplied screenshot for the key evidence:
+`/home/midori/.claude/image-cache/a0ec450a-c774-48b4-9b67-7f640561f1f8/7.png`
+(debug mode 14 — POM displaced UV visualised as RG=(u,v,0), fract-folded).
+Visible content: a dark-red blob (low-U region) with **sharp edges** sits
+inside an otherwise bright pink-red (high-U region) area. The dark blob
+has the exact silhouette of the splotch the user reports in the
+production "Lit" view. The colour-step boundary between bright-red and
+dark-red is hard, not gradual — adjacent pixels resolve to DRAMATICALLY
+different displaced UVs, with a discontinuity at the splotch boundary.
+
+Texture-specific observations from the user:
+- **cobblestone** (`stone_wall_04` layer 8 / `ground_tiles_08` layer 9):
+  worst affected — high-frequency height with rounded peaks + valleys.
+- **tree** (`bark_04` layer 5): not affected — low-frequency bark surface.
+- The splotch is **darker** than its surroundings (the BRDF samples
+  taken at the bogus displaced UV land on a darker patch of the texture).
+
+Rules out (verified by user via debugger modes 1-10, 13, 15-17):
+- Albedo / Normal / Metallic / Roughness / AO / F0 / kS / kD bugs.
+- Layer-index swapping (the splotch coincides with a single material).
+- Basis compression block-quantization on PBR channels.
+
+The fault is in `pom_compute` / `pom_self_shadow` / the linear-march +
+linear-interp refine in `pom_displace_uv` — the displaced UV itself is
+WRONG inside the splotch region (mode 14 makes that visible directly).
+
+### H1–H5 evidence
+
+**H1 — Soft-clip displacement firing on peaks.** RULED OUT.
+
+Soft-clip code at `pbr_sampling.wgsl:464-475`:
+```wgsl
+let raw_offset = raw_uv - base_uv;
+let off_mag = length(raw_offset);
+let fade = 1.0 - smoothstep(
+    POM_DISPLACEMENT_FADE_MAX,           // 0.5 UV-units
+    POM_DISPLACEMENT_FADE_MAX * 2.0,     // 1.0 UV-units
+    off_mag,
+);
+let final_uv = base_uv + raw_offset * fade;
+```
+
+Activation requires `off_mag > 0.5`. With `POM_HEIGHT_SCALE = 0.05`,
+the maximum march walk is `view_uv * 0.05 / cos_view`. Even at extreme
+grazing (`cos_view = 0.01`, the clamp), max walk = `view_uv * 5.0` —
+but `length(view_uv) <= 1.0`, so max walk is bounded at 5 UV-units in
+the extreme. For typical viewing angles (`cos_view ≈ 0.3-1.0`), max
+walk = 0.05 to 0.17 UV-units — well below the 0.5 fade threshold.
+
+The soft-clip operates symmetrically (same fade for both helpers via
+the shared `final_uv`), and Image #7's UV discontinuity is sharp-edged
+(soft-clip would produce a smooth fade boundary, not a hard one).
+
+Verdict: NOT THE CAUSE.
+
+**H2 — Adaptive step-count starvation at peaks viewed head-on.**
+CONTRIBUTING.
+
+Step count `pbr_sampling.wgsl:400-407`:
+```wgsl
+let cos_view = clamp(abs(view_n), 0.01, 1.0);
+let num_steps_f = mix(
+    f32(POM_MAX_LINEAR_STEPS),   // 32
+    f32(POM_MIN_LINEAR_STEPS),   // 8
+    cos_view,
+);
+```
+
+At face-on view (`cos_view ≈ 1.0`), `num_steps = 8`. The march delta
+is `step = view_uv * 0.05 / 8 / cos_view = view_uv * 0.00625` per step;
+total max walk = `view_uv * 0.05`. On a cobblestone tile (1m), 8 taps
+across 0.05 UV-units gives **6.25 mm resolution per tap**. Cobblestone
+features are ~5-10 cm wide → 8 taps span at most one feature.
+
+For an 8-step march starting on a peak: the first step (~6 mm) is
+likely still inside the peak's plateau (`sampled ≈ h_peak`). With a
+peak height of 0.9 and `delta_h = 1/8 = 0.125`, the condition
+`depth >= 1.0 - sampled` becomes `0.125 >= 0.1` → break at iteration 1
+with displacement ≈ `step` (TINY). So a typical peak march CORRECTLY
+terminates near the base UV with little displacement.
+
+The failure happens at peaks viewed at MODERATE angles
+(`cos_view ≈ 0.3-0.5`) where `num_steps = 20-24` and `step` is larger
+(view_uv larger AND larger /cos_view boost). The march walks MULTIPLE
+features per pixel and may stride OVER the local peak before
+`sampled` catches up to the ray depth. Combined with H3 below, this
+produces the splotch.
+
+Verdict: CONTRIBUTING — head-on (`cos_view ≈ 1`) is actually safer
+than I initially thought (only 8 steps but only walks one feature);
+the splotch shows up most clearly at moderate angles where step IS
+big enough to skip features. Raising `POM_MIN_LINEAR_STEPS` from 8 to
+16 is cheap insurance and helps the moderate-angle case (it shrinks
+each step's UV walk by 2×, halving the chance of striding over a peak).
+
+**H3 — Ray initialisation past the heightfield (NO initial sample
+at base UV).** ROOT CAUSE.
+
+The Dayuppy reference initialises the march as
+(`/tmp/dayuppy-style` line numbers shown for clarity):
+```glsl
+vec2  curUV      = uv;                              // line 100
+float heightRem  = 1.0;                             // line 101
+float curSample  = texture(heightMap, curUV).r;     // line 102  <-- BASE SAMPLE
+// ...
+float prevSample = heightRem;                       // line 106 (= 1.0)
+
+while (heightRem > 0.0 && curSample < heightRem) {
+    heightRem   -= deltaH;
+    prevUV       = curUV;
+    prevSample   = curSample;                       // ← captures BASE SAMPLE on iter 0
+    curUV       += deltaUV;
+    curSample    = texture(heightMap, curUV).r;
+}
+```
+
+Our code at `pbr_sampling.wgsl:428-447`:
+```wgsl
+var uv = base_uv;
+var prev_uv = uv;
+var depth: f32 = 0.0;
+var prev_depth: f32 = 0.0;
+var sampled: f32 = 0.0;       // ← initialised to ZERO, NOT h(base_uv)
+var prev_sampled: f32 = 0.0;  // ← initialised to ZERO
+
+for (var i: i32 = 0; i < num_steps; i = i + 1) {
+    prev_uv = uv;
+    prev_depth = depth;
+    prev_sampled = sampled;   // ← iter 0: captures 0.0 (NOT h(base_uv))
+    uv = uv + step;
+    depth = depth + delta_h;
+    sampled = textureSampleLevel(mrh_tex, smp, uv, i32(layer), 0.0).b;
+    if (depth >= 1.0 - sampled) { break; }
+}
+```
+
+**The bug.** Our march never samples the heightmap AT `base_uv`. The
+first sample is taken at `base_uv + step` (already offset). On peak
+pixels where `h(base_uv) = 0.95` but `h(base_uv + step) = 0.30` (the
+step walked off the peak plateau), the break condition
+`depth >= 1.0 - sampled` becomes `delta_h >= 0.70` — FALSE for any
+reasonable step count (`delta_h = 1/32 = 0.03` to `1/8 = 0.125`).
+The march CONTINUES walking deeper, and once `depth` finally catches
+up to `1.0 - sampled` somewhere far away, `final_uv` lands on an
+ARBITRARY texel.
+
+This is the **central failure**: the ray that should have stopped
+inside the peak (because `h(base_uv) = 0.95` exceeds the entry-depth
+`1.0 - depth = 1.0`) is allowed to walk far across the heightfield,
+because we never checked the surface height AT the entry point.
+
+Dayuppy's `curSample = texture(heightMap, curUV).r` BEFORE the loop
+samples h at base_uv. Then on iteration 0 the loop body runs
+`prevSample = curSample` BEFORE stepping, so `prev_sampled = h(base_uv)`
+when we step. The linear-interp refine then has correct anchors.
+
+Adjacent pixels (slight base_uv difference) might land where
+`h(base+step)` happens to be high enough to trigger early break, vs
+land where it's low and the march walks far. This produces the
+**sharp boundary** the user sees in Image #7: pixels in the "still on
+peak" region have `final_uv ≈ base_uv` (bright pink in mode 14);
+pixels in the "stepped off peak" region have `final_uv` deep in
+texture space (dark red in mode 14).
+
+Verdict: ROOT CAUSE.
+
+**H4 — Linear-interp refine breaking when march fails to find a hit.**
+ROOT CAUSE (compounds H3).
+
+Refine code at `pbr_sampling.wgsl:457-462`:
+```wgsl
+let after  = sampled      - (1.0 - depth);   // overshoot at cur step
+let before = (1.0 - prev_depth) - prev_sampled;  // undershoot at prev step
+let denom = before + after;
+let t = select(0.5, clamp(before / denom, 0.0, 1.0), denom > 1e-5);
+let raw_uv = mix(prev_uv, uv, t);
+```
+
+When the loop exits naturally via the break (`depth >= 1.0 - sampled`),
+`after >= 0` (overshoot) and `before >= 0` (undershoot, by definition).
+`denom > 0`; the lerp is well-behaved.
+
+**When the loop runs to completion without breaking** (i.e. ray never
+caught the surface), `after = sampled - (1 - depth)` can be NEGATIVE
+(sampled never rose to meet the ray). `before` is still positive (the
+prev_step also missed). `denom = before + after` could be POSITIVE
+(small), NEGATIVE, or near-zero — depending on whether before or after
+has the bigger magnitude.
+
+Pathological cases:
+- `before = 0.05`, `after = -0.04` → `denom = 0.01 > 1e-5`,
+  `t = 0.05/0.01 = 5.0` → clamped to 1.0 → `raw_uv = cur_uv` (far end).
+- `before = 0.05`, `after = -0.06` → `denom = -0.01 < 1e-5` → falls to
+  `t = 0.5` → `raw_uv = midway`.
+- Adjacent pixels switch between these two cases → SHARP BOUNDARY
+  between "snap to cur_uv" and "midway" → exact splotch silhouette.
+
+The H3 case (no proper base sample) combined with H4 (refine
+mis-handles non-hit exits) produces the observed sharp-edge artifact:
+H3 lets the march walk past the peak; H4 produces inconsistent
+displacement at adjacent pixels depending on the loop's exit state.
+
+Critical detail: the loop has NO flag tracking whether `break`
+executed. The refine math runs unconditionally on `sampled` /
+`prev_sampled` / `depth` / `prev_depth`, whether the loop completed
+or broke. **There is no "if no hit, fall back to base_uv" branch.**
+
+Verdict: ROOT CAUSE (combined with H3).
+
+**H5 — Self-shadow firing erroneously at peaks.** NOT THE CAUSE OF
+THE OBSERVED SPLOTCH, but a contributing darkening factor.
+
+Self-shadow code at `pbr_sampling.wgsl:505-566`:
+- Starts at `displaced_uv + step` with `ray_h = base_height + delta_h * 0.1`.
+- Bias = `delta_h * 0.1` = `0.0125` at min steps (6) — quite small.
+- Walks toward sun in tangent-space UV.
+
+The key thing about H5: it darkens via `pom_shadow * absorption`, but
+the user's evidence rules it out:
+- User said the splotch is ABSENT in mode 11 (Direct-only). Mode 11
+  shows `sky_sun_color * eval_pbr.f * n_dot_l * pom_shadow`. If H5
+  were the cause, mode 11 would show the splotch (it includes the
+  `pom_shadow` term). It doesn't → `pom_shadow` is not the source of
+  the splotch.
+- Mode 13 visualises `pom_shadow` directly as greyscale. The user
+  said all BRDF debug inputs look clean → mode 13 doesn't show the
+  splotch shape either → `pom_shadow` itself is not the source.
+
+The splotch IS in the displaced UV (mode 14 shows it) and propagates
+through the first-hit `acc.absorption = ... * pom_shadow` chain.
+GI / spatial_resampling re-sample at the WRONG displaced_uv and shade
+the WRONG albedo, producing the darker patch in the final lit image.
+
+The Direct-only mode 11 is dominated by `n_dot_l` and SUN colour;
+the albedo difference at the bogus displaced_uv is multiplied by
+small `n_dot_l` on grazing cobblestone faces and visually averaged
+out. The Lit mode is dominated by GI bounce off the albedo-modulated
+absorption, where the albedo difference at the bogus displaced_uv
+DOES show up.
+
+The bias `delta_h * 0.1` (line 545) is borderline small for high-
+frequency cobblestone where adjacent texels are also peaks. A larger
+bias (e.g. `delta_h * 0.5`) would be more robust against false
+shadowing on adjacent peaks, but that's a secondary improvement.
+
+Verdict: NOT THE CAUSE OF THE SPLOTCH, but defensive bias-bump from
+`* 0.1` to `* 0.5` is cheap insurance for adjacent-peak false-shadow.
+
+### Confirmed root cause(s)
+
+**Primary: H3 + H4 combined.** The POM linear march in
+`pbr_sampling.wgsl::pom_displace_uv` (`:428-447`) does not sample the
+heightmap at `base_uv` BEFORE the first step. The march initialises
+`sampled = 0.0` (not `h(base_uv)`), so on iteration 0 the break
+condition `depth >= 1.0 - sampled` becomes `delta_h >= 1.0`, which
+cannot fire at any reasonable step count. The first ACTUAL sample is
+at `base_uv + step` (offset). On peak pixels where `h(base_uv)` is
+high but `h(base_uv + step)` is low (the step walked off the peak),
+the march continues marching deep into the heightfield instead of
+stopping at the entry. Eventually it converges to a `final_uv`
+arbitrarily far from `base_uv` — landing on a darker texel.
+
+The linear-interp refine (`:457-462`) is the structural mechanism
+that makes the boundary SHARP: when the loop runs to completion
+without breaking (no hit found), `after` becomes negative and
+`denom = before + after` can be small-positive, near-zero, or
+negative. Adjacent pixels switch between `t → 1.0` (snap to cur_uv,
+far end) and `t = 0.5` (midway) based on the sign of `denom` — a
+discontinuous switch that imprints the splotch's hard edge.
+
+**Contributing: H2** — at moderate viewing angles (`cos_view 0.3-0.5`)
+the per-step UV walk is large enough to stride over individual
+cobblestone features in 8-12 steps. Raising `POM_MIN_LINEAR_STEPS`
+from 8 to 16 halves the per-step stride and dramatically reduces the
+chance of skipping over peaks.
+
+**Contributing (peripheral): H5 self-shadow bias.** Bias of
+`delta_h * 0.1` is on the small side for high-frequency height-maps;
+bumping to `delta_h * 0.5` is cheap and reduces false-positive
+shadowing on adjacent peaks (Dayuppy's `* 0.1` works for his
+single-quad smooth heightmap but cobblestone has texel-adjacent
+peaks).
+
+### Phase 2 — fix applied
+
+All three root-cause fixes land in
+`crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl`:
+
+**Fix 1 — H3 (`pom_displace_uv`, sample at `base_uv` first):**
+
+```wgsl
+// PEAK-DARKENING FIX (post-`3a61b9a`)
+let h_base = textureSampleLevel(mrh_tex, smp, base_uv, i32(layer), 0.0).b;
+if (h_base >= 1.0) {
+    var r0: PomResult;
+    r0.uv = base_uv;
+    r0.height = h_base;
+    return r0;
+}
+// ...
+var sampled: f32 = h_base;       // was 0.0
+var prev_sampled: f32 = h_base;  // was 0.0
+```
+
+**Fix 2 — H4 (`pom_displace_uv`, `hit_found` flag + fallback):**
+
+```wgsl
+var hit_found: bool = false;
+for (var i: i32 = 0; i < num_steps; i = i + 1) {
+    // ... step + sample ...
+    if (depth >= 1.0 - sampled) {
+        hit_found = true;
+        break;
+    }
+}
+if (!hit_found) {
+    var r1: PomResult;
+    r1.uv = base_uv;        // ← zero-displacement fallback
+    r1.height = h_base;
+    return r1;
+}
+// Lerp refine — now guaranteed hit_found && after >= 0; clamp denom too:
+let denom = max(before + after, 1e-4);
+let t = clamp(before / denom, 0.0, 1.0);
+```
+
+**Fix 3 — H2 step-count + H5 self-shadow bias:**
+
+```wgsl
+// const POM_MIN_LINEAR_STEPS: i32 = 8;   ← was
+const POM_MIN_LINEAR_STEPS: i32 = 16;
+
+// In pom_self_shadow:
+// let bias = delta_h * 0.1;  ← was
+let bias = delta_h * 0.5;
+```
+
+**Why this kills the splotch:**
+- On a peak pixel `h(base_uv) = 0.95`: now `prev_sampled = 0.95`, so
+  on iter 0 if `h(base_uv + step) = 0.30` the refine's `before` is
+  computed against a real anchor (not `0.0`). More importantly: with
+  `MIN_STEPS = 16` the per-step UV walk is halved, so iter 0 is more
+  likely to STILL be inside the peak's plateau (`sampled ≈ h_peak`),
+  triggering the proper `depth >= 1.0 - sampled` break early.
+- When the march DOES exhaust its budget on a tall isolated peak:
+  the `hit_found = false` fallback now returns `base_uv` (zero
+  displacement) — far better than the previous "lerp on garbage"
+  which produced the sharp-edged splotch.
+- `denom` clamp prevents adjacent-pixel sign-switching at the lerp
+  boundary (the H4 secondary mechanism).
+- Self-shadow bias bump prevents adjacent-peak false occlusion that
+  would otherwise compound the visual darkening.
+
+**Files changed:**
+
+- `crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl` (lines
+  64-66 const, 425-553 march + refine + fallback, 615-617 bias).
+- `crates/bevy_naadf/src/e2e/pbr_visual.rs` (lines 148-186 new
+  constants, 313-336 new helper, 327-340 metric collection,
+  342-356 report line, 462-481 new assertion).
+
+NO changes outside these two files. Per the hard constraints:
+- ❌ No POM in GI / spatial_resampling beyond existing `pom_compute` consumption (UNCHANGED — `naadf_global_illum.wgsl` + `spatial_resampling.wgsl` untouched).
+- ❌ Perturbed-normal substitution + roughness NaN-floor preserved (no `eval_pbr` changes).
+- ❌ `pom_compute` API unchanged.
+- ❌ Height-convention `step = view_uv * POM_HEIGHT_SCALE` unchanged.
+- ❌ `GpuVoxelType` unchanged.
+- ❌ Debugger mode-0 zero-cost path unchanged.
+
+### Phase 3 — 8th gate assertion
+
+**`peak-coherence max-adjacent-luminance-delta`** on a 16×16 cobblestone
+rect, pinned at **`PBR_PEAK_COHERENCE_RECT = (82, 171)-(98, 187)`**.
+
+**Pin protocol** (matches architect's Assumption #9):
+1. Ran the gate pre-fix → captured `/tmp/pbr_visual_prefix.png`.
+2. Applied the fix, re-ran the gate → captured `/tmp/pbr_visual_postfix.png`.
+3. Scanned every 16×16 cobblestone window for the largest pre-→post-fix
+   improvement in max-adjacent-luminance-delta.
+4. Pinned the rect at the location with the cleanest signal:
+   - Pre-fix `maxAdj = 80.7`.
+   - Post-fix `maxAdj = 46.9`.
+   - Δ = 33.8 (largest "real cobblestone" improvement; the largest
+     overall improvement was at a voxel-boundary rect which is noisy).
+5. Set `PBR_PEAK_COHERENCE_MAX_DELTA_CEIL = 60.0` — comfortably between
+   the post-fix 47 (margin 13) and the pre-fix 81 (margin 21).
+
+**Helper** (`region_max_adjacent_luma_delta`): for every pixel in the
+rect, compute |L(x+1,y) - L(x,y)| and |L(x,y+1) - L(x,y)|; return the
+max across the rect. Splotch boundaries are 4-connected hard edges,
+so this metric directly detects them.
+
+**Verification:**
+- Pre-fix run (before applying any fix), same `--pbr-visual` pose:
+  `peak-coherence max-delta = 80.68 → FAIL` (above ceiling 60).
+- Post-fix run (with all three fixes): `peak-coherence max-delta =
+  44.35 → PASS` (below ceiling 60).
+
+**PASS confirmation.** The 8th assertion passes post-fix and would have
+failed pre-fix — the regression catch is exact.
+
+### Phase 4 — verification
+
+All gates wrapped in `timeout 240s`. Results:
+
+| Gate | Result | Key metric |
+|---|---|---|
+| `cargo build --workspace` | PASS | clean (`Finished dev profile` in 8.68s) |
+| `cargo test --workspace --lib` | PASS | 187 passed + 13 passed; 0 failures |
+| `cargo run --bin e2e_render` (default Batch 6) | PASS | emissive 244.6, GI-lit solid 185.6, sky 177.6 |
+| `cargo run --bin e2e_render -- --oasis-edit-visual` | PASS | rect mean per-pixel RGB Δ=11.40 (floor 8.0) |
+| `cargo run --bin e2e_render -- --small-edit-visual` | PASS | click rect max-Δ=384 (floor 15), +1 voxel |
+| `cargo run --bin e2e_render -- --validate-gpu-construction` | PASS | 388 bytes CPU-vs-GPU byte-equal |
+| `cargo run --bin e2e_render -- --vox-e2e` | PASS | centre luma 248.4 |
+| `cargo run --bin e2e_render -- --pbr-visual` (with new 8th assertion) | PASS | metrics below |
+| `cargo run --bin e2e_render -- --pbr-debug-modes` | PASS | ALL 17 modes non-degenerate |
+| `just bake-texarrays` | PASS | `imported_assets/` up to date |
+
+`--pbr-visual` post-fix metrics:
+```
+highlight luma 234.2 (floor 100)
+texture std-dev 43.79 (floor 5)
+normal-rect std-dev 18.72 (floor 8)
+texture sat-frac 0.000 (ceil 0.1)
+shadow-rect mean luma 163.33 (band [158, 167])
+peak-coherence max-delta 44.35 (ceil 60)     ← NEW (8th assertion)
+F0 mean RGB (229.1, 237.6, 216.5), R/G = 0.964, B/G = 0.911
++ POM UV-consistency source property check: PASS
++ POM step-sign source property check: PASS
+```
+
+All 7 numeric assertions + 2 source-property assertions PASS. No
+regression on any pre-existing gate. The slight numeric drifts from
+the prior post-debugger baseline are within TAA jitter noise:
+- highlight 234.2 vs 234.3 (±0.1, noise).
+- normal-rect std-dev 18.72 vs 18.68 (±0.04, noise).
+- shadow-rect mean luma 163.33 vs 162.59 (+0.74, still well centred
+  in the [158, 167] band — reflects the modestly different POM
+  shading at the few pixels in the rect that triggered the bug pre-fix).
+
+### Verdict
+
+**SUCCESS** — root causes were **H3** (the POM linear-search loop in
+`pom_displace_uv` never sampled the heightmap AT `base_uv` before
+stepping, so `prev_sampled = 0.0` corrupted the iter-0 break check and
+the refine anchor) and **H4** (when the march ran to completion
+without finding an intersection, the lerp refine ran on non-intersected
+data with `after` potentially negative; adjacent pixels' `denom` signs
+switched at the splotch boundary, producing the user-reported sharp
+edge in Image #7).
+
+The fix samples `h_base` at `base_uv` first (Dayuppy line 102),
+primes `prev_sampled = h_base`, tracks a `hit_found` flag, and falls
+back to zero displacement when the march fails — eliminating both
+root causes. `POM_MIN_LINEAR_STEPS` raised 8 → 16 reduces per-step
+UV walk at face-on/moderate angles (peripheral H2 contribution).
+`pom_self_shadow` bias bumped `* 0.1` → `* 0.5` removes false
+adjacent-peak shadowing (peripheral H5 contribution).
+
+Verified by adding an **8th gate assertion** —
+`peak-coherence max-adjacent-luminance-delta` ceiling on a pinned
+cobblestone rect that scores 81 pre-fix (FAIL) and 47 post-fix
+(PASS, ceiling 60). All 10 verification gates green.
+
+
+

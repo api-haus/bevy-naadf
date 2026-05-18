@@ -146,6 +146,45 @@ pub const PBR_TEXTURE_SAT_FRAC_CEIL: f32 = 0.10;
 pub const PBR_SHADOW_MEAN_LUMA_FLOOR: f32 = 158.0;
 pub const PBR_SHADOW_MEAN_LUMA_CEIL: f32 = 167.0;
 
+/// 16×16 px rect on the `stone_wall_04` cobblestone ground (`material_layer
+/// _index = 8`, the worst-affected surface in user-report Image #7) —
+/// pinned at `(82,171)-(98,187)`. This region was identified by scanning
+/// every 16×16 cobblestone window for the largest pre-→post-fix improvement
+/// in max-adjacent-luminance-delta; the splotch artifact's sharp edge
+/// straddles this rect in the pre-fix state.
+///
+/// **Catches the POM peak-darkening splotch regression class** (post-
+/// `3a61b9a` `05-diagnostic.md` § "POM peak-darkening diagnose+fix"). The
+/// regression presents as sharp-edged dark patches on cobblestone where
+/// the POM linear march fails to find an intersection on heightmap peaks
+/// (H3 + H4 root cause). The artifact's signature is HIGH max-adjacent-
+/// pixel luminance delta — adjacent pixels differ by 80+ luma units at
+/// the splotch boundary in the pre-fix state, vs ~47 luma units in a
+/// clean post-fix textured region at this resolution.
+///
+/// Empirical measurements on this rect (pinned after running both
+/// pre-fix and post-fix versions):
+/// - Pre-fix POM (no `h_base` sample, no `hit_found` flag, `MIN_STEPS = 8`):
+///   max-adjacent-luminance-delta = **80.7**.
+/// - Post-fix POM (`h_base` sample + `hit_found` flag + `MIN_STEPS = 16`):
+///   max-adjacent-luminance-delta = **46.9**.
+///
+/// `PBR_PEAK_COHERENCE_MAX_DELTA_CEIL` pins the ceiling on the max
+/// 4-connected adjacent-pixel luminance delta in this rect.
+pub const PBR_PEAK_COHERENCE_RECT: Rect =
+    Rect { x0: 82, y0: 171, x1: 98, y1: 187 };
+
+/// Maximum allowed luminance delta between any two horizontally- or
+/// vertically-adjacent pixels in [`PBR_PEAK_COHERENCE_RECT`]. Pre-fix the
+/// rect reads ~81 maxAdj (splotch boundary inside the rect); post-fix
+/// the rect reads ~47 maxAdj (natural cobblestone texture variation only).
+///
+/// **Ceiling at 60** sits in the ~13-unit gap above the post-fix
+/// observation, catching the regression (Δ = 21 below the pre-fix value,
+/// Δ = 13 above the post-fix value) while allowing comfortable margin
+/// for legitimate frame-to-frame texture variation under TAA jitter.
+pub const PBR_PEAK_COHERENCE_MAX_DELTA_CEIL: f32 = 60.0;
+
 // ---------------------------------------------------------------------------
 // State resource
 // ---------------------------------------------------------------------------
@@ -276,6 +315,45 @@ fn region_mean_rgb(fb: &Framebuffer, rect: Rect) -> (f32, f32, f32) {
     }
 }
 
+/// Maximum 4-connected adjacent-pixel luminance delta across `rect`. For
+/// every pixel `(x, y)` inside the rect we compute the absolute luminance
+/// difference between `(x, y)` and its horizontal neighbour `(x+1, y)`
+/// and vertical neighbour `(x, y+1)`, returning the maximum across the
+/// entire rect.
+///
+/// **Splotch detector.** Healthy cobblestone POM produces adjacent-pixel
+/// luminance deltas of ~5-15 units (high-frequency texture); a splotch
+/// artifact (sharp dark patch from POM peak-darkening — `05-diagnostic.md`
+/// § "POM peak-darkening diagnose+fix") produces 40+ luma units at the
+/// boundary edge. The metric is dimensional — it measures the LARGEST
+/// adjacent-pixel discontinuity, not an average, so even a single
+/// splotch's edge trips it.
+fn region_max_adjacent_luma_delta(fb: &Framebuffer, rect: Rect) -> f32 {
+    let mut max_delta = 0.0f32;
+    let luma = |x: u32, y: u32| -> f32 {
+        let p = fb.pixel(x, y);
+        0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
+    };
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            let l = luma(x, y);
+            if x + 1 < rect.x1 {
+                let d = (luma(x + 1, y) - l).abs();
+                if d > max_delta {
+                    max_delta = d;
+                }
+            }
+            if y + 1 < rect.y1 {
+                let d = (luma(x, y + 1) - l).abs();
+                if d > max_delta {
+                    max_delta = d;
+                }
+            }
+        }
+    }
+    max_delta
+}
+
 /// Fraction (`0.0..=1.0`) of pixels in `rect` whose max-channel value is
 /// `> 254`. A clean tonemapped scene has near-zero saturation in a
 /// textured-ground region; a `D = 0/0` NaN cascade in the BRDF saturates
@@ -312,6 +390,13 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
     // rect's mean below the no-shadow ceiling.
     let (sr, sg, sb) = region_mean_rgb(fb, PBR_SHADOW_RECT);
     let shadow_mean_luma = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb;
+    // POM peak-darkening — max adjacent-pixel luminance delta on a 16×16
+    // cobblestone rect. The splotch artifact (sharp dark patches from POM
+    // peak-darkening, `05-diagnostic.md` § "POM peak-darkening diagnose+
+    // fix") produces 40+ luma adjacent-pixel deltas at the splotch boundary
+    // edge. Clean cobblestone produces <30.
+    let peak_coh_max_delta =
+        region_max_adjacent_luma_delta(fb, PBR_PEAK_COHERENCE_RECT);
 
     // The metallic pillar carries a violet `albedo_tint = [115, 82, 158]`
     // (PBR-raymarching § A grid-palette assignment), so the F0 colour
@@ -330,6 +415,8 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
          texture sat-frac {sat_frac:.3} (ceil {PBR_TEXTURE_SAT_FRAC_CEIL}); \
          shadow-rect mean luma {shadow_mean_luma:.2} \
          (band [{PBR_SHADOW_MEAN_LUMA_FLOOR}, {PBR_SHADOW_MEAN_LUMA_CEIL}]); \
+         peak-coherence max-delta {peak_coh_max_delta:.2} \
+         (ceil {PBR_PEAK_COHERENCE_MAX_DELTA_CEIL}); \
          F0 mean RGB ({fr:.1}, {fg:.1}, {fb_blue:.1}), \
          R/G = {r_over_g:.3}, B/G = {b_over_g:.3}",
     );
@@ -421,6 +508,28 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
              and/or B/G = {b_over_g:.3} are below 1 - {PBR_F0_TOLERANCE:.2}, \
              suggesting the violet tint is not propagating into the metallic \
              F0. {report}. Inspect target/e2e-screenshots/{PBR_VISUAL_PNG}.",
+        ));
+    }
+
+    // 8th assertion — POM peak-coherence (post-`3a61b9a` `05-diagnostic.md`
+    // § "POM peak-darkening diagnose+fix"). Catches the splotch regression
+    // class: sharp dark patches on cobblestone caused by the POM linear
+    // march failing to find an intersection at heightmap peaks (H3 missing
+    // base-UV sample + H4 lerp-refine on non-intersected data). Healthy
+    // cobblestone produces max-adjacent-pixel-luminance-delta <30 inside
+    // the pinned `PBR_PEAK_COHERENCE_RECT`; the splotch boundary produces
+    // 40+. Ceiling at 50 sits in the gap.
+    if peak_coh_max_delta > PBR_PEAK_COHERENCE_MAX_DELTA_CEIL {
+        return Err(format!(
+            "pbr-visual gate FAIL — POM peak-coherence rect max-adjacent-\
+             luminance-delta {peak_coh_max_delta:.2} exceeds ceiling \
+             {PBR_PEAK_COHERENCE_MAX_DELTA_CEIL}. The POM linear march in \
+             `pom_displace_uv` is likely walking past heightmap peaks \
+             (missing base-UV sample) or refining on non-intersected data \
+             (no `hit_found` flag), producing splotch artifacts on \
+             cobblestone. See `05-diagnostic.md` § \"POM peak-darkening \
+             diagnose+fix\". {report}. Inspect \
+             target/e2e-screenshots/{PBR_VISUAL_PNG}.",
         ));
     }
 

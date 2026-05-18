@@ -62,7 +62,15 @@ const WORLD_UV_SCALE: f32 = 1.0;
 // at adaptive 8-32 steps the local slope is dense enough that a single
 // linear interpolant matches binary-refine quality.
 const POM_HEIGHT_SCALE: f32 = 0.05;
-const POM_MIN_LINEAR_STEPS: i32 = 8;
+// `POM_MIN_LINEAR_STEPS` raised 8 → 16 (post-`3a61b9a` peak-darkening fix).
+// At moderate viewing angles (`cos_view ≈ 0.3-0.5`) the per-step UV walk on
+// `POM_MIN = 8` was large enough to stride over individual cobblestone
+// features, contributing to the splotch artifact reported on Image #7
+// (`05-diagnostic.md` § "POM peak-darkening diagnose+fix"). 16 halves the
+// per-step UV walk at face-on view — the cost is bounded (face-on is the
+// common case at far distance where the texture is sub-pixel anyway, so the
+// 2× tap cost is on cheap regions of the framebuffer).
+const POM_MIN_LINEAR_STEPS: i32 = 16;
 const POM_MAX_LINEAR_STEPS: i32 = 32;
 
 // Self-shadow march step count: `mix(MAX, MIN, abs(cos_light))`. Sun
@@ -425,17 +433,53 @@ fn pom_displace_uv(
     let step = view_uv * POM_HEIGHT_SCALE * inv_steps / cos_view;
     let delta_h = inv_steps;
 
+    // PEAK-DARKENING FIX (post-`3a61b9a`, `05-diagnostic.md` § "POM peak-
+    // darkening diagnose+fix"). The Dayuppy reference samples the heightmap
+    // at `base_uv` BEFORE entering the linear-search loop. We were
+    // initialising `sampled = 0.0` and `prev_sampled = 0.0`, so the first
+    // iteration's break check `depth >= 1.0 - sampled` reduced to
+    // `delta_h >= 1.0` (cannot fire). On peak pixels (`h(base_uv) ≈ 0.95`,
+    // `h(base_uv + step) ≈ 0.30` when the step walks off the plateau) the
+    // march continued past the peak entirely, eventually converging to a
+    // `final_uv` arbitrarily far from `base_uv` — landing on a darker
+    // texel → the sharp-edged splotch user-reported on Image #7.
+    //
+    // The fix: sample h at `base_uv` first (Dayuppy line 102). If the
+    // ray starts already below the surface (`1.0 <= h_base` i.e. the
+    // heightmap reaches the maximum AT the base UV), we're inside the
+    // peak — return zero displacement immediately. Otherwise prime
+    // `prev_sampled = h_base` so the iter-0 break check is honest.
+    let h_base = textureSampleLevel(mrh_tex, smp, base_uv, i32(layer), 0.0).b;
+    if (h_base >= 1.0) {
+        var r0: PomResult;
+        r0.uv = base_uv;
+        r0.height = h_base;
+        return r0;
+    }
+
     var uv = base_uv;
     var prev_uv = uv;
     var depth: f32 = 0.0;
     var prev_depth: f32 = 0.0;
-    var sampled: f32 = 0.0;
-    var prev_sampled: f32 = 0.0;
+    var sampled: f32 = h_base;
+    var prev_sampled: f32 = h_base;
+    var hit_found: bool = false;
 
     // Linear search. We march until the sampled height rises above the
     // current ray-remaining depth (the surface "catches up" to the ray).
     // `depth` here is "depth into the heightfield from the top", matching
     // the prior convention `depth >= 1.0 - sampled`.
+    //
+    // PEAK-DARKENING FIX: `hit_found` flag tracks whether the loop broke
+    // via the intersection condition. If the loop runs to completion
+    // without `hit_found = true`, the ray never met the surface within
+    // the march budget — fall back to `final_uv = base_uv` (zero
+    // displacement) rather than running the linear-interp refine on
+    // garbage data. Without this flag, adjacent pixels at the splotch
+    // boundary switch between "loop completed with `denom > 0` → t = 5
+    // → clamp to 1.0 → snap to cur_uv (far end)" and "loop completed
+    // with `denom < 0` → fallback t = 0.5 → midway" — producing the
+    // hard edge the user reported.
     for (var i: i32 = 0; i < num_steps; i = i + 1) {
         prev_uv = uv;
         prev_depth = depth;
@@ -443,7 +487,21 @@ fn pom_displace_uv(
         uv = uv + step;
         depth = depth + delta_h;
         sampled = textureSampleLevel(mrh_tex, smp, uv, i32(layer), 0.0).b;
-        if (depth >= 1.0 - sampled) { break; }
+        if (depth >= 1.0 - sampled) {
+            hit_found = true;
+            break;
+        }
+    }
+
+    // PEAK-DARKENING FIX: if the march exhausted its budget without
+    // finding an intersection, zero the displacement. Image #7's hard
+    // splotch boundary came from running the lerp refine on
+    // non-intersected data (the H4 root cause).
+    if (!hit_found) {
+        var r1: PomResult;
+        r1.uv = base_uv;
+        r1.height = h_base;
+        return r1;
     }
 
     // Linear interpolation between the last-before and first-after taps.
@@ -454,10 +512,18 @@ fn pom_displace_uv(
     //
     // The intersection is at `t = before / (before + after)` along the
     // step (the "lerp toward the larger overshoot" Dayuppy trick).
+    //
+    // PEAK-DARKENING FIX: with `hit_found == true` we are guaranteed
+    // `after >= 0` (the break condition `depth >= 1.0 - sampled` ≡
+    // `sampled >= 1.0 - depth` ≡ `after >= 0`). The fallback path above
+    // covers the non-intersected case. Bound the denominator away from
+    // a near-zero crossing with `max(denom, 1e-4)` so adjacent pixels
+    // can't switch between the `> 1e-5 → real t` and `<= 1e-5 → t=0.5`
+    // legs based on FP noise — a secondary hard-edge source.
     let after  = sampled      - (1.0 - depth);
     let before = (1.0 - prev_depth) - prev_sampled;
-    let denom = before + after;
-    let t = select(0.5, clamp(before / denom, 0.0, 1.0), denom > 1e-5);
+    let denom = max(before + after, 1e-4);
+    let t = clamp(before / denom, 0.0, 1.0);
     let raw_uv = mix(prev_uv, uv, t);
     let intersection_height = mix(prev_sampled, sampled, t);
 
@@ -541,8 +607,18 @@ fn pom_self_shadow(
     // Per-step shadow-ray height delta. The ray starts at `base_height +
     // small_bias` and climbs toward 1.0; an occluder at any UV whose
     // height exceeds the ray height blocks the sun.
+    //
+    // PEAK-DARKENING FIX (post-`3a61b9a`, `05-diagnostic.md` § "POM peak-
+    // darkening diagnose+fix"). Bias bumped `* 0.1` → `* 0.5` for cobblestone
+    // — Dayuppy's `* 0.1` is calibrated for a single-quad smooth heightmap
+    // where adjacent texels' heights track each other smoothly. High-
+    // frequency cobblestone has texel-adjacent peaks; a `* 0.1` bias
+    // misses the adjacent peak's height and registers it as an occluder,
+    // producing a false-shadow halo around peaks that compounds the H3 +
+    // H4 splotch. `* 0.5` gives the ray clearance from its starting
+    // texel's neighbours while still being smaller than `delta_h` itself.
     let delta_h = inv_steps;
-    let bias = delta_h * 0.1;
+    let bias = delta_h * 0.5;
 
     var uv = displaced_uv + step;
     var ray_h = base_height + bias;

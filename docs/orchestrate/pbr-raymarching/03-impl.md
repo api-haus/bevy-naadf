@@ -488,3 +488,19 @@ for the design + implementation + verification log.
 ### Verdict
 
 SUCCESS — 17 debug modes available via F1 / `[` / `]`; 10/10 verification gates green.
+
+## POM peak-darkening diagnose+fix (2026-05-18)
+
+See `05-diagnostic.md` § "POM peak-darkening diagnose+fix (2026-05-18,
+post-`3a61b9a`)" for the diagnosis + fix log.
+
+### Files changed
+
+- `crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl` — `pom_displace_uv` reworked: sample `h_base` at `base_uv` BEFORE the linear-search loop, prime `prev_sampled = h_base`, track `hit_found` flag, fall back to `final_uv = base_uv` on non-intersection, clamp lerp denominator with `max(_, 1e-4)`. Raised `POM_MIN_LINEAR_STEPS` 8 → 16. Bumped `pom_self_shadow` bias `* 0.1` → `* 0.5`.
+- `crates/bevy_naadf/src/e2e/pbr_visual.rs` — added 8th assertion `peak-coherence max-adjacent-luminance-delta` ceiling on a 16×16 cobblestone rect `(82,171)-(98,187)`; new helper `region_max_adjacent_luma_delta`; new constants `PBR_PEAK_COHERENCE_RECT`, `PBR_PEAK_COHERENCE_MAX_DELTA_CEIL = 60.0`.
+- `docs/orchestrate/pbr-raymarching/05-diagnostic.md` — diagnose + fix + verification log (Phase 1-5).
+
+### Verdict
+
+SUCCESS — root causes H3 (no `h_base` sample) + H4 (lerp refine on non-intersected data) fixed; 8th gate assertion (peak-coherence max-adjacent-luminance-delta) tightens regression catch; all 10 verification gates pass post-fix.
+
