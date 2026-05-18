@@ -55,6 +55,82 @@ const CANVAS_SETTLE_MS = 10_000;
 const SKYBOX_SETTLE_MS = 5_000;
 
 /**
+ * web-vox-color-divergence (2026-05-18) Decision 4 + Stage A.5 — per-channel
+ * mean-max floor for the loaded canvas's central 40% × 40% rect. Mirrors the
+ * native gate's `VOX_WEB_PARITY_CHANNEL_MAX_FLOOR` (30.0 on 0..255 scale) so
+ * the wasm test fails when the .vox install path produces structurally-correct
+ * but colorless / near-black voxels — the exact regression class the
+ * SSIM-only check is structurally blind to.
+ */
+const VOX_CHANNEL_MAX_FLOOR = 30.0;
+
+/**
+ * Compute the mean-of-channel-maximum over the central 40% × 40% rect of the
+ * canvas's currently-visible framebuffer, by drawing the WebGPU canvas onto
+ * an in-page 2D canvas and reading its `ImageData`. Returns the maximum of
+ * the (mean_R, mean_G, mean_B) values, each in 0..255.
+ *
+ * Why this approach: the WebGPU canvas's `getContext("webgpu")` is the
+ * production context; calling `getContext("2d")` on the same element returns
+ * null (browsers forbid context-type switching). `drawImage(canvas, …)` from
+ * the WebGPU canvas onto a separate 2D canvas is the supported readback
+ * path (Chrome respects the canvas's `preserveDrawingBuffer` heuristic for
+ * the most recent presented frame).
+ */
+async function canvasCentralChannelMax(page: Page): Promise<number> {
+  return await page.evaluate(() => {
+    const canvas = document.querySelector<HTMLCanvasElement>("canvas#bevy");
+    if (!canvas) {
+      throw new Error("canvasCentralChannelMax: canvas#bevy not found");
+    }
+    const w = canvas.width;
+    const h = canvas.height;
+    if (w === 0 || h === 0) {
+      throw new Error(
+        `canvasCentralChannelMax: canvas has zero dimensions (${w}×${h})`,
+      );
+    }
+    // Central 40% × 40% rect in pixel coords.
+    const x0 = Math.floor(w * 0.3);
+    const y0 = Math.floor(h * 0.3);
+    const x1 = Math.floor(w * 0.7);
+    const y1 = Math.floor(h * 0.7);
+    const rw = x1 - x0;
+    const rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) {
+      throw new Error(
+        `canvasCentralChannelMax: degenerate rect ${x0},${y0}..${x1},${y1}`,
+      );
+    }
+    // Blit JUST the central rect onto a small 2D canvas so we don't allocate
+    // a full-canvas-sized ImageData buffer.
+    const blit = document.createElement("canvas");
+    blit.width = rw;
+    blit.height = rh;
+    const ctx = blit.getContext("2d");
+    if (!ctx) {
+      throw new Error("canvasCentralChannelMax: 2D context unavailable");
+    }
+    ctx.drawImage(canvas, x0, y0, rw, rh, 0, 0, rw, rh);
+    const img = ctx.getImageData(0, 0, rw, rh);
+    const data = img.data;
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    const n = rw * rh;
+    for (let i = 0; i < data.length; i += 4) {
+      sumR += data[i];
+      sumG += data[i + 1];
+      sumB += data[i + 2];
+    }
+    const meanR = sumR / n;
+    const meanG = sumG / n;
+    const meanB = sumB / n;
+    return Math.max(meanR, meanG, meanB);
+  });
+}
+
+/**
  * Capture a screenshot of the wasm canvas after the loading overlay clears
  * and the scene has settled for `settleMs` milliseconds. Returns the PNG
  * bytes plus the test-run-local path it was written to.
@@ -328,6 +404,38 @@ test.describe.serial("Web .vox loading", () => {
       ssim.code,
       `--ssim-compare exited non-zero (${ssim.code}) — stdout:\n${ssim.stdout}\nstderr:\n${ssim.stderr}`,
     ).toBe(0);
+
+    // === Phase 6 — per-channel color spread on the loaded canvas ===========
+    //
+    // web-vox-color-divergence (2026-05-18) Decision 4 + Stage A.5. Mirrors
+    // the native `vox_web_parity` gate's `VOX_WEB_PARITY_CHANNEL_MAX_FLOOR`
+    // assertion (`crates/bevy_naadf/src/e2e/vox_web_parity.rs`). The SSIM
+    // compare above is structurally color-blind: a near-black render still
+    // scores SSIM ≈ 0 vs the gradient skybox baseline because silhouettes
+    // differ regardless of color. The per-channel floor catches the
+    // "geometry correct, palette uploaded the wrong default-scene colors"
+    // regression class directly — which is the exact bug this orchestration
+    // fixed.
+    const channelMax = await canvasCentralChannelMax(page);
+    const channelMaxLine = `[vox-color-spread] loaded canvas central rect channel max = ${channelMax.toFixed(1)} (threshold > ${VOX_CHANNEL_MAX_FLOOR.toFixed(0)})`;
+    // eslint-disable-next-line no-console
+    console.log(channelMaxLine);
+    test.info().annotations.push({
+      type: "vox-color-spread",
+      description: channelMaxLine,
+    });
+    expect(
+      channelMax,
+      `near-black voxel render — web-vox-color-divergence regression class. ` +
+        `Loaded canvas central rect channel max = ${channelMax.toFixed(1)} ` +
+        `(threshold > ${VOX_CHANNEL_MAX_FLOOR.toFixed(0)}). The .vox install ` +
+        `path produced structurally correct geometry but colorless / near-black ` +
+        `voxels — likely a regression in the focused-refresh path in ` +
+        `crates/bevy_naadf/src/render/prepare.rs's prepare_world_gpu. The ` +
+        `SSIM-only assertion above is structurally color-blind; this gate ` +
+        `catches the exact regression class the SSIM compare misses.`,
+    ).toBeGreaterThan(VOX_CHANNEL_MAX_FLOOR);
+
     await context.close();
   });
 });

@@ -203,21 +203,21 @@ pub fn install_empty_world(commands: &mut Commands) {
         block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
     };
     commands.insert_resource(world_data);
-    // web-vox-color-divergence diagnose-first (2026-05-18) — pairs with the
-    // [palette-install] log in the .vox + default-scene install sites. The
+    // web-vox-color-divergence (2026-05-18) — pairs with the
+    // `[palette-install]` log in the `.vox` + default-scene install sites. The
     // skybox-only path also installs a default palette; logging it lets us
     // confirm whether the build-once gate sees the skybox palette in the
-    // `--vox-web-parity-skybox` subprocess. Diagnostic instrumentation; to be
-    // demoted to `debug!` per
-    // `docs/orchestrate/web-vox-color-divergence/01-context.md` forbidden
-    // move 11.
+    // `--vox-web-parity-skybox` subprocess. Demoted to `debug!` post-fix
+    // (Decision D-LOGS-DEBUG-NOT-TRACE); reachable via
+    // `RUST_LOG=bevy_naadf=debug` for future regression diagnosis.
+    // **DO NOT REMOVE** — smoke detector for `web-vox-color-divergence`.
     {
         let preview: Vec<(f32, f32, f32)> = palette
             .iter()
             .take(5)
             .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
             .collect();
-        info!(
+        debug!(
             "[palette-install] install_empty_world label=\"skybox-only\" \
              palette_len={} first_5_color_base={:?}",
             palette.len(),
@@ -330,20 +330,20 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
     };
     world_data.seed_block_hashing();
     commands.insert_resource(world_data);
-    // web-vox-color-divergence diagnose-first (2026-05-18) — pairs with the
-    // [palette-install] log in `install_imported_vox` so we can tell the
-    // default-scene install (Startup, before any async .vox lands) from the
-    // .vox install (post-rayon-parse). Diagnostic instrumentation; to be
-    // demoted to `debug!` per
-    // `docs/orchestrate/web-vox-color-divergence/01-context.md` forbidden
-    // move 11. DO NOT REMOVE without that demotion.
+    // web-vox-color-divergence (2026-05-18) — pairs with the
+    // `[palette-install]` log in `install_imported_vox` so we can tell the
+    // default-scene install (Startup, before any async `.vox` lands) from the
+    // `.vox` install (post-rayon-parse). Demoted to `debug!` post-fix
+    // (Decision D-LOGS-DEBUG-NOT-TRACE); reachable via
+    // `RUST_LOG=bevy_naadf=debug` for future regression diagnosis.
+    // **DO NOT REMOVE** — smoke detector for `web-vox-color-divergence`.
     {
         let preview: Vec<(f32, f32, f32)> = palette
             .iter()
             .take(5)
             .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
             .collect();
-        info!(
+        debug!(
             "[palette-install] install_default_embedded_in_fixed_world \
              label=\"default-scene\" palette_len={} first_5_color_base={:?}",
             palette.len(),
@@ -618,15 +618,16 @@ pub fn install_imported_vox(
     };
     world_data.seed_block_hashing();
     commands.insert_resource(world_data);
-    // web-vox-color-divergence diagnose-first (2026-05-18) — one-shot palette
-    // install trace. Logs the main-world palette insertion with the source
-    // label so we can distinguish the .vox install path from
+    // web-vox-color-divergence (2026-05-18) — one-shot palette install trace.
+    // Logs the main-world palette insertion with the source label so we can
+    // distinguish the `.vox` install path from
     // `install_default_embedded_in_fixed_world`. Pair with the
-    // `[palette-upload]` log in `render/prepare.rs` to verify whether the
-    // build-once gate uploaded the .vox palette or the default-scene palette.
-    // To be demoted to `debug!` once the divergence is fixed (per
-    // `docs/orchestrate/web-vox-color-divergence/01-context.md` forbidden
-    // move 11). DO NOT REMOVE without that demotion.
+    // `[palette-upload]` log in `render/prepare.rs` and the new
+    // `[palette-refresh]` log in `render/extract.rs` to verify whether the
+    // refresh path fires on `.vox` install. Demoted to `debug!` post-fix
+    // (Decision D-LOGS-DEBUG-NOT-TRACE); reachable via
+    // `RUST_LOG=bevy_naadf=debug` for future regression diagnosis.
+    // **DO NOT REMOVE** — smoke detector for `web-vox-color-divergence`.
     {
         let preview: Vec<(f32, f32, f32)> = imp
             .palette
@@ -634,7 +635,7 @@ pub fn install_imported_vox(
             .take(5)
             .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
             .collect();
-        info!(
+        debug!(
             "[palette-install] install_imported_vox label={:?} palette_len={} \
              first_5_color_base={:?}",
             source_label,

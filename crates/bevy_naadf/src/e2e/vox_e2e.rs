@@ -125,6 +125,27 @@ const VOX_GEOMETRY_RECT_FRACS: (f32, f32, f32, f32) = (0.30, 0.30, 0.70, 0.70);
 /// has emissive geometry covering the centre passes by a wide margin.
 const SKY_LUMINANCE_CEILING: f32 = 160.0;
 
+/// Per-channel mean-max floor for the central screen region. Calibrated
+/// against the synthesised emissive fixture (which renders fully-saturated
+/// colors) and the near-black regression class (channel max ≈ 8/255). A
+/// non-skybox capture with any meaningful color must exceed this floor;
+/// the near-black regression sits well below it.
+///
+/// **Rationale for 30.0:** the native reference capture
+/// `target/e2e-screenshots/vox_web_parity_loaded.png` (sandy beige + green +
+/// dark roof tiles, per `01-context.md` "Visual evidence") has measured R/G/B
+/// channel means well above 60 in the central region. 30.0 is half the
+/// calibrated reference's lowest channel, leaving 2× headroom against natural
+/// framebuffer noise. The pre-fix near-black render reports channel max ≈ 8
+/// (from `02-research.md` web log readout's implication that absorption *
+/// `Vec3::ZERO` produces near-zero output), which is comfortably below the
+/// floor.
+///
+/// Added by `web-vox-color-divergence` (2026-05-18) Decision 4 — catches the
+/// "structurally correct but colorless" regression class the SKY_LUMINANCE
+/// floor is blind to.
+const VOX_GEOMETRY_CHANNEL_MAX_FLOOR: f32 = 30.0;
+
 /// Build the synthesised multi-model `.vox` fixture as parsed `DotVoxData`.
 ///
 /// Two 12 × 12 × 12 emissive cubes referenced by separate `nSHP` / `nTRN`
@@ -427,6 +448,34 @@ pub fn assert_vox_geometry_visible(fb: &Framebuffer) -> Result<(), String> {
              Inspect target/e2e-screenshots/e2e_latest.png for the \
              captured frame.",
             region.x0, region.y0, region.x1, region.y1
+        ));
+    }
+
+    // web-vox-color-divergence (2026-05-18) Decision 4 — per-channel floor.
+    // Catches the "structurally correct, luminance OK, but every channel near
+    // zero" regression class (which the luminance-only gate above CAN miss
+    // when emissive lighting via `color_layered` survives but `color_base`
+    // collapses to `Vec3::ZERO`). On the synthesised emissive fixture (palette
+    // slot 1 emissive, slot color is the warm-white default), the central rect
+    // measures channel max well above 60. The pre-fix near-black regression
+    // measures channel max ≈ 8.
+    let channel_max = fb.region_channel_max(region);
+    println!(
+        "e2e_render --vox-e2e: vox_geometry channel max (max of mean_R / G / B) \
+         = {channel_max:.1} (threshold > {VOX_GEOMETRY_CHANNEL_MAX_FLOOR:.0} \
+         — non-skybox + meaningful color)",
+    );
+    if channel_max <= VOX_GEOMETRY_CHANNEL_MAX_FLOOR {
+        return Err(format!(
+            "vox-e2e gate FAIL — central screen region channel-max {channel_max:.1} \
+             is at or below the per-channel floor ({VOX_GEOMETRY_CHANNEL_MAX_FLOOR:.0}). \
+             The render produced structurally present geometry but \
+             colorless / near-black voxels. Likely cause: a palette-upload \
+             regression on the build-once GPU resource path \
+             (web-vox-color-divergence class — see \
+             docs/orchestrate/web-vox-color-divergence/). Mean rgba = {mean:?}; \
+             region pixel rect = ({}, {}, {}, {}).",
+            region.x0, region.y0, region.x1, region.y1,
         ));
     }
     Ok(())

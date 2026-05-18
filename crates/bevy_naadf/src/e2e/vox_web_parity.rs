@@ -50,7 +50,7 @@ use bevy::prelude::*;
 use bevy::winit::WinitSettings;
 
 use crate::camera::position_split::PositionSplit;
-use crate::e2e::framebuffer::Framebuffer;
+use crate::e2e::framebuffer::{Framebuffer, Rect};
 use crate::e2e::oasis_edit_visual::{oasis_vox_fixture_path, OASIS_VOX_FIXTURE_PATH};
 
 // ---------------------------------------------------------------------------
@@ -115,6 +115,19 @@ pub const PARITY_DRAIN_FRAMES: u32 = 16;
 /// camera frames mostly sky at this pose). See follow-up dispatch
 /// `04-refactoring.md` "Step 8 — SSIM threshold tuning".
 pub const VOX_WEB_PARITY_SSIM_DISSIMILARITY_MAX: f64 = 0.85;
+
+/// Per-channel mean-max floor on the central rect of the
+/// `vox_web_parity_loaded.png` capture. See
+/// `vox_e2e.rs::VOX_GEOMETRY_CHANNEL_MAX_FLOOR` for the rationale; same
+/// calibration applies. 30.0 leaves 2× headroom above natural noise and well
+/// below the colorful Oasis reference's measured ~60+ R/G/B means.
+///
+/// Added by `web-vox-color-divergence` (2026-05-18) Decision 4 — the SSIM-only
+/// compare at `:307` is structurally color-blind (a near-black render still
+/// scores SSIM ≈ 0 vs the gradient skybox baseline because the geometry's
+/// silhouettes differ regardless of color). The per-channel floor catches the
+/// "geometry correct, colors collapsed" regression class directly.
+pub const VOX_WEB_PARITY_CHANNEL_MAX_FLOOR: f32 = 30.0;
 
 // ---------------------------------------------------------------------------
 // Driver state stash
@@ -303,6 +316,30 @@ pub fn run_vox_web_parity_compare() -> u8 {
             return 1;
         }
     };
+
+    // web-vox-color-divergence (2026-05-18) Decision 4 — the SSIM-only compare
+    // below is color-blind by construction: a structurally-correct but
+    // all-near-black render still scores SSIM ≈ 0 vs the skybox baseline
+    // because the silhouettes differ regardless of color. Add a per-channel
+    // spread assertion on the loaded frame itself BEFORE the SSIM compare so
+    // the most diagnostic error fires first.
+    let central = Rect::from_fractional(&loaded_fb, 0.30, 0.30, 0.70, 0.70);
+    let loaded_channel_max = loaded_fb.region_channel_max(central);
+    println!(
+        "e2e_render --vox-web-parity: loaded frame central rect channel max = \
+         {loaded_channel_max:.1} (threshold > {VOX_WEB_PARITY_CHANNEL_MAX_FLOOR:.0} \
+         — meaningful per-voxel color)",
+    );
+    if loaded_channel_max <= VOX_WEB_PARITY_CHANNEL_MAX_FLOOR {
+        eprintln!(
+            "e2e_render --vox-web-parity: FAIL — loaded frame channel max \
+             {loaded_channel_max:.1} <= floor {VOX_WEB_PARITY_CHANNEL_MAX_FLOOR:.0}. \
+             The .vox install path rendered structurally correct geometry but \
+             colorless / near-black voxels (web-vox-color-divergence class). \
+             Inspect target/e2e-screenshots/{PARITY_LOADED_PNG}.",
+        );
+        return 1;
+    }
 
     let ssim_score = match crate::e2e::ssim::ssim_compare_framebuffers(&skybox_fb, &loaded_fb) {
         Ok(s) => s,
