@@ -406,10 +406,23 @@ fn pom_displace_uv(
     let num_steps = i32(num_steps_f);
     let inv_steps = 1.0 / num_steps_f;
 
-    // Per-step UV delta. The minus sign marches AGAINST view_dir (we step
-    // toward the camera in plane coords). `/cos_view` keeps silhouette
-    // thickness constant across view angles (Dayuppy ref convention).
-    let step = -view_uv * POM_HEIGHT_SCALE * inv_steps / cos_view;
+    // Per-step UV delta. We march IN THE RAY'S TANGENTIAL DIRECTION (the
+    // ray points camera→surface, so as the ray penetrates deeper into the
+    // heightfield it also moves UV along `+view_uv`). `/cos_view` keeps
+    // silhouette thickness constant across view angles.
+    //
+    // Sign convention note: Dayuppy's `psSteepParallax.glsl` uses a `-`
+    // sign because his `tanEyeVec` points FROM surface TO camera (the
+    // opposite of our `ray_dir`), AND his `viewDir.yx` swap is for his
+    // tangent-frame's X/Y convention. Our `view_dir` IS the ray (camera→
+    // surface) and `view_uv` is already the tangent-plane projection in
+    // (U,V) order — so the `-` and the `.yx` swap both cancel and `step
+    // = +view_uv * scale / numSteps / cos_view` is the geometrically
+    // correct match (see `05-diagnostic.md` § "POM height convention flip
+    // (post-`85836ea`)" — the prior `-view_uv` formulation produced an
+    // inverted parallax visible as "surfaces look indented instead of
+    // extruded").
+    let step = view_uv * POM_HEIGHT_SCALE * inv_steps / cos_view;
     let delta_h = inv_steps;
 
     var uv = base_uv;

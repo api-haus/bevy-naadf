@@ -123,17 +123,28 @@ pub const PBR_NORMAL_STD_DEV_FLOOR: f32 = 8.0;
 /// (`05-diagnostic.md` B-extra).
 pub const PBR_TEXTURE_SAT_FRAC_CEIL: f32 = 0.10;
 
-/// Maximum mean luminance of [`PBR_SHADOW_RECT`] (the bark_04 tower face
-/// at glancing-sun angle). Without POM self-shadow the rect's mean is
-/// ~156.5; with self-shadow active it drops to ~152.5 (heightfield
-/// valleys are dimmed by the secondary sun-march in `pom_self_shadow`).
-/// The ceiling is pinned between the two cases at 155.0 so disabling
-/// self-shadow (or accidentally setting `POM_SHADOW_STRENGTH = 0`)
-/// causes the gate to fail.
+/// Mean-luminance band for [`PBR_SHADOW_RECT`] (the bark_04 ground at
+/// glancing-sun angle). The rect's mean luma is a SIGNAL — both ends of
+/// the band are regression catches:
 ///
-/// **Catches the modern POM self-shadow regression class**
-/// (`05-diagnostic.md` "POM rewrite — modern implementation").
-pub const PBR_SHADOW_MEAN_LUMA_CEIL: f32 = 155.0;
+/// * **Floor (`PBR_SHADOW_MEAN_LUMA_FLOOR = 158.0`)** — catches the POM
+///   step-sign regression (`05-diagnostic.md` § "POM height convention
+///   flip (post-`85836ea`)"). With the inverted step sign the parallax
+///   walks UV in the wrong direction; the same rect averages 151-153
+///   ("surfaces look indented instead of extruded"). With the correct
+///   sign the rect averages ~162-163.
+/// * **Ceiling (`PBR_SHADOW_MEAN_LUMA_CEIL = 167.0`)** — catches the POM
+///   self-shadow disablement regression. Without `pom_self_shadow`
+///   active the rect averages ~170+. With self-shadow folded into
+///   `acc.absorption` (current behaviour) the rect stays below the
+///   ceiling.
+///
+/// Both `--pbr-visual` regressions land OUTSIDE the band: a sign flip
+/// drops the mean below the floor; a shadow disablement raises it above
+/// the ceiling. The post-fix observed value is ~162.56, comfortably
+/// centred in the band.
+pub const PBR_SHADOW_MEAN_LUMA_FLOOR: f32 = 158.0;
+pub const PBR_SHADOW_MEAN_LUMA_CEIL: f32 = 167.0;
 
 // ---------------------------------------------------------------------------
 // State resource
@@ -312,7 +323,8 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
          texture std-dev {texture_std:.2} (floor {PBR_TEXTURE_STD_DEV_FLOOR}); \
          normal-rect std-dev {normal_std:.2} (floor {PBR_NORMAL_STD_DEV_FLOOR}); \
          texture sat-frac {sat_frac:.3} (ceil {PBR_TEXTURE_SAT_FRAC_CEIL}); \
-         shadow-rect mean luma {shadow_mean_luma:.2} (ceil {PBR_SHADOW_MEAN_LUMA_CEIL}); \
+         shadow-rect mean luma {shadow_mean_luma:.2} \
+         (band [{PBR_SHADOW_MEAN_LUMA_FLOOR}, {PBR_SHADOW_MEAN_LUMA_CEIL}]); \
          F0 mean RGB ({fr:.1}, {fg:.1}, {fb_blue:.1}), \
          R/G = {r_over_g:.3}, B/G = {b_over_g:.3}",
     );
@@ -360,19 +372,38 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
              Inspect target/e2e-screenshots/{PBR_VISUAL_PNG}.",
         ));
     }
-    // POM self-shadow regression catch: with `pom_self_shadow` returning
-    // anything close to 1.0 (or `POM_SHADOW_STRENGTH = 0`), the
-    // bark_04 tower face at glancing sun angle stays bright. With the
-    // shadow march active the rect mean luminance drops below the
-    // pinned ceiling — see `PBR_SHADOW_MEAN_LUMA_CEIL`.
+    // POM self-shadow regression catch (CEILING): with `pom_self_shadow`
+    // returning anything close to 1.0 (or `POM_SHADOW_STRENGTH = 0`),
+    // the bark ground at glancing sun angle stays bright (rect mean
+    // climbs above ~170). With self-shadow active the mean stays under
+    // the ceiling.
     if shadow_mean_luma > PBR_SHADOW_MEAN_LUMA_CEIL {
         return Err(format!(
             "pbr-visual gate FAIL — POM shadow rect mean luminance \
              {shadow_mean_luma:.2} exceeds ceiling {PBR_SHADOW_MEAN_LUMA_CEIL}. \
              The POM self-shadow march is likely returning 1.0 or \
              `POM_SHADOW_STRENGTH` was reset to 0 — heightfield valleys \
-             on the bark_04 tower face are not darkening as expected. \
+             on the bark ground are not darkening as expected. \
              {report}. Inspect target/e2e-screenshots/{PBR_VISUAL_PNG}.",
+        ));
+    }
+    // POM step-sign regression catch (FLOOR — added with
+    // `05-diagnostic.md` § "POM height convention flip (post-`85836ea`)"):
+    // an inverted step sign (`let step = -view_uv * ...` instead of `let
+    // step = view_uv * ...` in `pom_displace_uv`) makes surfaces look
+    // indented instead of extruded. The same rect averages ~151-153 with
+    // the inverted sign vs ~162-163 with the correct sign. Floor at 158
+    // catches the inversion regression while leaving comfortable margin
+    // for legitimate frame-to-frame jitter.
+    if shadow_mean_luma < PBR_SHADOW_MEAN_LUMA_FLOOR {
+        return Err(format!(
+            "pbr-visual gate FAIL — POM shadow rect mean luminance \
+             {shadow_mean_luma:.2} below floor {PBR_SHADOW_MEAN_LUMA_FLOOR}. \
+             The POM step sign in `pom_displace_uv` is likely inverted \
+             (surfaces appear indented instead of extruded). Check that \
+             `pbr_sampling.wgsl::pom_displace_uv` uses `let step = view_uv * \
+             ...` (NOT `-view_uv`). {report}. Inspect \
+             target/e2e-screenshots/{PBR_VISUAL_PNG}.",
         ));
     }
     // Colour-pull: with the violet tint we expect both ratios > 1 - tol.
@@ -402,6 +433,25 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
         return Err(format!(
             "pbr-visual gate FAIL — POM sample-UV consistency check: {msg}. \
              {report}.",
+        ));
+    }
+
+    // 7th assertion — POM step-sign source-property check. The parallax
+    // march in `pbr_sampling.wgsl::pom_displace_uv` MUST step UV in the
+    // ray's tangential direction (`+view_uv`), NOT the opposite
+    // (`-view_uv`). With `view_dir = ray_dir` (camera→surface), the
+    // tangential component of the ray IS the direction the displaced UV
+    // walks as depth increases. An inverted sign produces the "surfaces
+    // look indented instead of extruded" user-report regression (`05-
+    // diagnostic.md` § "POM height convention flip (post-`85836ea`)").
+    // The runtime catch (PBR_SHADOW_MEAN_LUMA_FLOOR) catches the same
+    // class via the framebuffer mean; this source-property check is the
+    // structural backup — a tightening trip-wire that fires at gate time
+    // and at `cargo test` time without needing a GPU pass.
+    if let Err(msg) = assert_pom_step_sign_source() {
+        return Err(format!(
+            "pbr-visual gate FAIL — POM step-sign source-property check: \
+             {msg}. {report}.",
         ));
     }
 
@@ -470,6 +520,53 @@ pub fn assert_pom_uv_consistency_source() -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 7th assertion — POM step-sign source-property check
+// ---------------------------------------------------------------------------
+
+/// Assert that the `pom_displace_uv` march in `pbr_sampling.wgsl` steps UV
+/// in the ray's tangential direction (`+view_uv * scale / numSteps / cos`),
+/// NOT the opposite (`-view_uv * ...`). With `view_dir = ray_dir` (the
+/// camera→surface ray), `view_uv` already points the way the displaced UV
+/// must walk as `depth` increases — flipping the sign inverts the parallax
+/// and produces the "surfaces look indented instead of extruded" regression
+/// (`05-diagnostic.md` § "POM height convention flip (post-`85836ea`)").
+///
+/// The assertion targets the exact substring inside `pom_displace_uv`. The
+/// presence of `let step = view_uv * POM_HEIGHT_SCALE` (the correct form)
+/// is required AND the buggy `let step = -view_uv *` substring must not
+/// appear anywhere in the same file.
+pub fn assert_pom_step_sign_source() -> Result<(), String> {
+    const PBR_SAMPLING: &str = include_str!(
+        "../assets/shaders/pbr_sampling.wgsl"
+    );
+
+    // Required: the correct PLUS-sign step formulation. Verbatim
+    // substring catches both the assignment and the inline arithmetic.
+    if !PBR_SAMPLING.contains("let step = view_uv * POM_HEIGHT_SCALE") {
+        return Err(
+            "`pbr_sampling.wgsl` is missing the canonical \
+             `let step = view_uv * POM_HEIGHT_SCALE *` POM march step \
+             — the parallax march sign convention may have regressed"
+                .to_string(),
+        );
+    }
+    // Forbidden: the buggy MINUS-sign formulation. If any commit
+    // re-introduces `let step = -view_uv * ...` in `pom_displace_uv`
+    // this fails immediately.
+    if PBR_SAMPLING.contains("let step = -view_uv") {
+        return Err(
+            "`pbr_sampling.wgsl::pom_displace_uv` re-introduced the \
+             inverted POM step sign (`let step = -view_uv * ...`). \
+             With `view_dir = ray_dir` (camera→surface) the march MUST \
+             step `+view_uv`; the inverted sign makes surfaces appear \
+             indented instead of extruded"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +581,19 @@ mod tests {
     fn pom_uv_consistency_source_invariant() {
         if let Err(msg) = assert_pom_uv_consistency_source() {
             panic!("POM UV-consistency source-property check failed: {msg}");
+        }
+    }
+
+    /// Source-level invariant: `pom_displace_uv` MUST step UV with the
+    /// PLUS-sign formulation (`let step = view_uv * POM_HEIGHT_SCALE *
+    /// ...`). The opposite sign inverts parallax and produces the
+    /// "surfaces look indented" regression user-reported on visual
+    /// check #4 (`05-diagnostic.md` § "POM height convention flip
+    /// (post-`85836ea`)").
+    #[test]
+    fn pom_step_sign_invariant() {
+        if let Err(msg) = assert_pom_step_sign_source() {
+            panic!("POM step-sign source-property check failed: {msg}");
         }
     }
 
