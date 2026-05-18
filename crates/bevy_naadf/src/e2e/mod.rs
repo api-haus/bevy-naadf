@@ -26,6 +26,7 @@ pub mod driver;
 pub mod framebuffer;
 pub mod gates;
 pub mod oasis_edit_visual;
+pub mod pbr_debug_modes;
 pub mod pbr_visual;
 pub mod readback;
 pub mod small_edit_repro;
@@ -227,6 +228,10 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<small_edit_visual::SmallEditVisualState>()
         .init_resource::<small_edit_repro::SmallEditReproState>()
         .init_resource::<vox_gpu_oracle::VoxGpuOracleState>()
+        // `PbrVisualState` carries the `--pbr-visual` capture AND the
+        // embedded `PbrDebugModesState` sub-resource for `--pbr-debug-modes`
+        // (merged so the `e2e_driver` system stays under Bevy 0.19's
+        // `SystemParam` tuple-arity ceiling).
         .init_resource::<pbr_visual::PbrVisualState>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
@@ -247,11 +252,13 @@ pub fn add_e2e_systems(app: &mut App) {
                 driver::e2e_driver,
                 oasis_edit_visual::pin_oasis_camera.after(driver::e2e_driver),
                 small_edit_visual::pin_small_edit_camera.after(driver::e2e_driver),
-                small_edit_repro::pin_small_edit_repro_camera.after(driver::e2e_driver),
-                // vox-gpu-rewrite W5.3-fix Stage 1 — runs `.after(pin_oasis_camera)`
-                // so the C# `(500, 200, 40)` pose overrides the birdseye that
-                // `pin_oasis_camera` writes (the vox-gpu-construction gate
-                // shares the Oasis driver flow but needs a different camera).
+                small_edit_repro::pin_small_edit_repro_camera
+                    .after(driver::e2e_driver),
+                // vox-gpu-rewrite W5.3-fix Stage 1 — runs
+                // `.after(pin_oasis_camera)` so the C# `(500, 200, 40)` pose
+                // overrides the birdseye that `pin_oasis_camera` writes (the
+                // vox-gpu-construction gate shares the Oasis driver flow but
+                // needs a different camera).
                 vox_gpu_construction::pin_vox_gpu_construction_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
                 // vox-gpu-rewrite W5.3-fix Stage 4 — oracle gate's shared
@@ -266,6 +273,16 @@ pub fn add_e2e_systems(app: &mut App) {
                 pbr_visual::pin_pbr_visual_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
+                .before(crate::camera::sync_position_split),
+        )
+        // PBR rendering-debugger camera pin — split into its own
+        // `add_systems` call to keep the tuple above under Bevy's
+        // `IntoScheduleConfigs` arity limit. Ordered the same as the
+        // other pins (after `pin_oasis_camera`, before `sync_position_split`).
+        .add_systems(
+            Update,
+            pbr_debug_modes::pin_pbr_debug_modes_camera
+                .after(oasis_edit_visual::pin_oasis_camera)
                 .before(crate::camera::sync_position_split),
         );
 

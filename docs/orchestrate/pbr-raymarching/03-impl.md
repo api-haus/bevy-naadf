@@ -460,3 +460,31 @@ math into `pom_compute` and propagates the displaced UV across all
 three passes that re-shade the first-hit surface. Nine verification
 gates green, including the tightened `--pbr-visual` with the new POM
 UV-consistency source-property check.
+
+## PBR rendering debugger (2026-05-18)
+
+See `05-diagnostic.md` § "PBR rendering debugger (2026-05-18, post-`bf3281f`)"
+for the design + implementation + verification log.
+
+### Files changed
+
+- `crates/bevy_naadf/src/render/gpu_types.rs` — `GpuRenderParams._pad0b` → `debug_view_mode`.
+- `crates/bevy_naadf/src/assets/shaders/render_pipeline_common.wgsl` — same rename.
+- `crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl` — `PbrDebugInputs` + `debug_view_override` + `debug_material_color`.
+- `crates/bevy_naadf/src/assets/shaders/naadf_first_hit.wgsl` — collect inputs + override + TAA-accum stomp on PBR/emissive branches.
+- `crates/bevy_naadf/src/debug_view.rs` (NEW) — `DebugViewMode` enum, `DebugViewState` resource, F1/`[`/`]` keyboard cycler, plugin, 3 unit tests.
+- `crates/bevy_naadf/src/lib.rs` — module registration + `DebugViewPlugin` + `AppArgs.pbr_debug_modes_mode`.
+- `crates/bevy_naadf/src/render/extract.rs` — `ExtractedDebugView` + `extract_debug_view`.
+- `crates/bevy_naadf/src/render/mod.rs` — register the extract + resource.
+- `crates/bevy_naadf/src/render/prepare.rs` — write `debug_view_mode` in `prepare_frame_gpu`.
+- `crates/bevy_naadf/src/editor/hud.rs` — `DebugViewHudText` + `update_debug_view_hud`.
+- `crates/bevy_naadf/src/e2e/pbr_debug_modes.rs` (NEW) — `--pbr-debug-modes` gate.
+- `crates/bevy_naadf/src/e2e/pbr_visual.rs` — embed `PbrDebugModesState` sub-resource.
+- `crates/bevy_naadf/src/e2e/mod.rs` — module + pin-camera registration.
+- `crates/bevy_naadf/src/e2e/driver.rs` — new `PbrDebugModes*` driver phases.
+- `crates/bevy_naadf/src/bin/e2e_render.rs` — `--pbr-debug-modes` flag dispatch.
+- `docs/orchestrate/pbr-raymarching/05-diagnostic.md` — design + impl + verify log.
+
+### Verdict
+
+SUCCESS — 17 debug modes available via F1 / `[` / `]`; 10/10 verification gates green.

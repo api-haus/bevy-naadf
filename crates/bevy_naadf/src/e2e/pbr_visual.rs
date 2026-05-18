@@ -154,6 +154,11 @@ pub const PBR_SHADOW_MEAN_LUMA_CEIL: f32 = 167.0;
 pub struct PbrVisualState {
     pub captured: Option<Framebuffer>,
     pub saved: bool,
+    /// PBR rendering-debugger sub-state — populated only by the
+    /// `--pbr-debug-modes` gate. Inlined here (rather than in its own
+    /// `PbrDebugModesState`) to keep the `e2e_driver` `SystemParam`
+    /// count under Bevy 0.19's `IntoSystemSet` arity ceiling.
+    pub debug_modes: super::pbr_debug_modes::PbrDebugModesState,
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ pub mod aadf;
 pub mod app_mode;
 pub mod baked_material;
 pub mod camera;
+pub mod debug_view;
 pub mod e2e;
 pub mod editor;
 pub mod hud;
@@ -403,6 +404,14 @@ pub struct AppArgs {
     /// albedo variation, metallic F0 colour-pull). See
     /// [`crate::e2e::pbr_visual`] and `02-design.md` § I.
     pub pbr_visual_mode: bool,
+    /// PBR rendering-debugger `--pbr-debug-modes` mode — when `true`, the
+    /// e2e driver iterates every non-zero
+    /// [`crate::debug_view::DebugViewMode`], captures a per-mode
+    /// framebuffer, and asserts each capture is non-degenerate (mean +
+    /// std-dev floors). See [`crate::e2e::pbr_debug_modes`] +
+    /// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+    /// debugger".
+    pub pbr_debug_modes_mode: bool,
 }
 
 impl Default for AppArgs {
@@ -423,6 +432,7 @@ impl Default for AppArgs {
             vox_gpu_oracle_cpu_phase: false,
             vox_gpu_oracle_gpu_phase: false,
             pbr_visual_mode: false,
+            pbr_debug_modes_mode: false,
         }
     }
 }
@@ -697,6 +707,12 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // `prepare_world_gpu` binds them at world `@group(0)` slots 8..12
             // once their `GpuImage`s are uploaded (`02-design.md` § C).
             material_set::MaterialSetPlugin,
+            // PBR rendering debugger — runtime-switchable per-channel
+            // BRDF visualisation. Installs `DebugViewState` resource +
+            // F1 / `[` / `]` key cycling. Production cost when mode == 0:
+            // one uniform load + one compare per pixel (DCE'd by the WGSL
+            // compiler). See `crate::debug_view`.
+            debug_view::DebugViewPlugin,
         ));
 
     // The fly camera + runtime DLSS toggle — production only. The e2e config
@@ -809,6 +825,10 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
                     editor::hud::drag_palette_scrollbar,
                     editor::hud::update_palette_scrollbar,
                     editor::hud::update_editor_hud,
+                    // PBR rendering debugger overlay (top-left) — visible
+                    // only when `DebugViewState.mode != Off`. See
+                    // `crate::debug_view`.
+                    editor::hud::update_debug_view_hud,
                     // Brush input — only active while playing.
                     editor::apply_edit_tool.run_if(in_state(AppMode::Playing)),
                     // Settings overlay input — only active while in settings.

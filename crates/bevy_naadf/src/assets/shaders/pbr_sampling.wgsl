@@ -677,3 +677,116 @@ fn eval_pbr(
     out.f_zero = f_base;
     return out;
 }
+
+// --- PBR rendering debugger ------------------------------------------------
+//
+// Runtime-switchable per-pixel BRDF-channel visualisation. See
+// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+// debugger" for the design + mode table + cost-gate rationale.
+//
+// `debug_view_override` returns the debug RGB colour for a given mode
+// (mode 0 means "production — short-circuit, do not call this function").
+// The caller checks `mode != 0u` BEFORE calling so the production path is
+// untouched (one uniform load + one compare per pixel).
+
+struct PbrDebugInputs {
+    // Surface samples — taken at the POM-displaced UV on the dominant
+    // triplanar plane.
+    albedo:                vec3<f32>,   // sRGB-decoded diffuse RGB × albedo_tint × AO
+    normal_perturbed:      vec3<f32>,   // RNM-blended world-space perturbed normal (unit)
+    normal_geometric:      vec3<f32>,   // axis-aligned voxel face normal (unit)
+    metallic:              f32,
+    roughness:             f32,
+    ao:                    f32,
+    height:                f32,         // MRH.B at the POM-displaced UV
+    // BRDF-derived quantities.
+    f_base:                vec3<f32>,   // F0 = mix(0.04, albedo, metallic)
+    f_fresnel:             vec3<f32>,   // Schlick F at the sun half-vector
+    k_d:                   vec3<f32>,   // (1 - F) * (1 - metallic)
+    // Light-contribution proxies (cheap to compute; not pixel-precise).
+    direct_contribution:   vec3<f32>,   // sun-direct: sun_color * eval_pbr.f * cos(n,l) * self_shadow
+    gi_proxy:              vec3<f32>,   // atmosphere fold + (1 - metallic) * albedo diffuse transport
+    // POM diagnostics.
+    self_shadow:           f32,         // pom_self_shadow factor in [1 - STRENGTH, 1]
+    displaced_uv:          vec2<f32>,   // dominant-plane POM-displaced UV (fractional)
+    // Material classification.
+    material_layer_index:  u32,         // post-variant-select layer index
+    triplanar_weights:     vec3<f32>,   // the three plane blend weights
+    emissive:              vec3<f32>,   // emissive contribution (0 for PBR voxels)
+}
+
+// Hash a u32 material layer index into a saturated false-colour RGB. Hashing
+// keeps adjacent layer indices visually distinct (PCG3D is overkill for a
+// single u32 → use a single PCG round on a 3-component seed derived from
+// `layer`). The returned colour is clamped into the unit cube.
+fn debug_material_color(layer: u32) -> vec3<f32> {
+    var v = vec3<u32>(
+        layer * 0x9E3779B9u + 0x85EBCA6Bu,
+        layer * 0xC2B2AE35u + 0xDEADBEEFu,
+        layer * 0x27D4EB2Fu + 0x165667B1u,
+    );
+    v = v * 1664525u + vec3<u32>(1013904223u);
+    v.x = v.x + v.y * v.z;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    v = v ^ (v >> vec3<u32>(16u));
+    let f = vec3<f32>(
+        f32(v.x & 0xFFFFu) / 65535.0,
+        f32(v.y & 0xFFFFu) / 65535.0,
+        f32(v.z & 0xFFFFu) / 65535.0,
+    );
+    // Saturate (HSV-lift): mix toward the [0.2, 1.0] band so every layer is
+    // visually distinct from black + visually saturated.
+    return mix(vec3<f32>(0.2), vec3<f32>(1.0), f);
+}
+
+fn debug_view_override(mode: u32, ins: PbrDebugInputs) -> vec3<f32> {
+    switch mode {
+        // 1 — Albedo (production diffuse + AO).
+        case 1u: { return ins.albedo; }
+        // 2 — Perturbed normal as RGB. (n + 1) / 2.
+        case 2u: { return ins.normal_perturbed * 0.5 + vec3<f32>(0.5); }
+        // 3 — Geometric voxel face normal as RGB.
+        case 3u: { return ins.normal_geometric * 0.5 + vec3<f32>(0.5); }
+        // 4 — Metallic as greyscale.
+        case 4u: { return vec3<f32>(ins.metallic); }
+        // 5 — Roughness as greyscale.
+        case 5u: { return vec3<f32>(ins.roughness); }
+        // 6 — AO as greyscale.
+        case 6u: { return vec3<f32>(ins.ao); }
+        // 7 — Height (MRH.B at displaced UV) as greyscale.
+        case 7u: { return vec3<f32>(ins.height); }
+        // 8 — F0 as RGB. For dielectrics ~0.04 (dark grey); for metals = albedo.
+        case 8u: { return ins.f_base; }
+        // 9 — Schlick F (Fresnel) at sun half-vector as greyscale (luma).
+        case 9u: {
+            let l = dot(ins.f_fresnel, vec3<f32>(0.2126, 0.7152, 0.0722));
+            return vec3<f32>(l);
+        }
+        // 10 — Diffuse weight kD as greyscale (luma).
+        case 10u: {
+            let l = dot(ins.k_d, vec3<f32>(0.2126, 0.7152, 0.0722));
+            return vec3<f32>(l);
+        }
+        // 11 — Direct-only sun contribution proxy (no occlusion ray).
+        case 11u: { return ins.direct_contribution; }
+        // 12 — GI-only proxy: atmosphere fold + diffuse transport.
+        case 12u: { return ins.gi_proxy; }
+        // 13 — POM self-shadow factor as greyscale.
+        case 13u: { return vec3<f32>(ins.self_shadow); }
+        // 14 — POM displaced UV as RG, B=0; folded into [0,1) via fract.
+        case 14u: {
+            let uv = fract(ins.displaced_uv);
+            return vec3<f32>(uv.x, uv.y, 0.0);
+        }
+        // 15 — Material layer index as PCG-hashed false-colour RGB.
+        case 15u: { return debug_material_color(ins.material_layer_index); }
+        // 16 — Triplanar weights as RGB (one channel per plane).
+        case 16u: { return ins.triplanar_weights; }
+        // 17 — Emissive contribution only.
+        case 17u: { return ins.emissive; }
+        // Mode 0 / unknown — sentinel; caller short-circuits, but return
+        // pink so an accidental "mode 0 hits the override" path is visible.
+        default: { return vec3<f32>(1.0, 0.0, 1.0); }
+    }
+}

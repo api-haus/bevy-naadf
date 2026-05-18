@@ -460,3 +460,27 @@ pub fn extract_gi_config(
         extracted.settings = args.gi;
     }
 }
+
+/// Render-world mirror of [`crate::debug_view::DebugViewState`]. Carries
+/// only the `u32` mode discriminant — `prepare_frame_gpu` reads it once
+/// per frame and writes it into `GpuRenderParams.debug_view_mode`.
+///
+/// See `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+/// debugger".
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct ExtractedDebugView {
+    /// Mode discriminant; 0 = production (no debug override).
+    pub mode: u32,
+}
+
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::debug_view::DebugViewState`] into the render-world
+/// [`ExtractedDebugView`].
+pub fn extract_debug_view(
+    mut extracted: ResMut<ExtractedDebugView>,
+    state: Extract<Option<Res<crate::debug_view::DebugViewState>>>,
+) {
+    if let Some(state) = &*state {
+        extracted.mode = state.mode as u32;
+    }
+}

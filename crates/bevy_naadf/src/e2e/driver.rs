@@ -233,6 +233,17 @@ pub enum E2ePhase {
     /// Drain the async PBR-visual capture, save the PNG to
     /// `pbr_visual_baseline.png`, run the three PBR assertions, exit.
     PbrVisualDrain,
+    /// PBR rendering-debugger gate — initial warmup (TAA/GI convergence).
+    PbrDebugModesWarmup,
+    /// Set the next debug mode, then settle for a few frames.
+    PbrDebugModesSettle,
+    /// Spawn `Screenshot::primary_window()` for the current debug mode.
+    PbrDebugModesShoot,
+    /// Drain the per-mode async capture; stash the framebuffer; advance to
+    /// the next mode or to `PbrDebugModesAssert` when all modes are done.
+    PbrDebugModesDrain,
+    /// Walk every captured framebuffer; assert non-degeneracy; exit.
+    PbrDebugModesAssert,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -551,6 +562,19 @@ pub fn e2e_driver(
         .is_some_and(|a| a.pbr_visual_mode);
     if pbr_visual_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::PbrVisualWarmup;
+        state.phase_ticks = 0;
+    }
+
+    // PBR rendering-debugger `--pbr-debug-modes` fast-path. Routes into
+    // PbrDebugModesWarmup on tick 0 when the flag is set. Camera pose owned
+    // by `super::pbr_debug_modes::pin_pbr_debug_modes_camera`. See
+    // `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+    // debugger".
+    let pbr_debug_modes_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.pbr_debug_modes_mode);
+    if pbr_debug_modes_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+        state.phase = E2ePhase::PbrDebugModesWarmup;
         state.phase_ticks = 0;
     }
 
@@ -1625,6 +1649,149 @@ pub fn e2e_driver(
                 exit.write(AppExit::error());
                 state.phase = E2ePhase::Done;
             }
+        }
+        // ---- PBR rendering-debugger gate phases --------------------------
+        // Camera pose owned by `pin_pbr_debug_modes_camera` (Update system,
+        // `.after(driver::e2e_driver)`). The driver advances
+        // `pbr_visual.debug_modes.mode_cursor` from 1..=NUM_DEBUG_MODES, writing
+        // `DebugViewState.mode` on entry to each `PbrDebugModesSettle`
+        // phase. After all modes are captured, `PbrDebugModesAssert` runs
+        // the per-mode non-degeneracy check and exits.
+        E2ePhase::PbrDebugModesWarmup => {
+            let _ = &mut camera;
+            state.phase_ticks += 1;
+            // Ensure the debug-view starts disabled so the warmup is the
+            // production path (TAA/GI convergence baseline). Mutating the
+            // `DebugViewState` resource via `commands.insert_resource` keeps
+            // the driver's `SystemParam` count below Bevy 0.19's
+            // `IntoSystemSet` arity ceiling.
+            commands.insert_resource(crate::debug_view::DebugViewState {
+                mode: crate::debug_view::DebugViewMode::Off,
+                last_active: None,
+            });
+            if state.phase_ticks >= super::pbr_debug_modes::PBR_DEBUG_MODES_WARMUP_FRAMES {
+                pbr_visual.debug_modes.mode_cursor = 1;
+                pbr_visual.debug_modes.captures.clear();
+                state.phase = E2ePhase::PbrDebugModesSettle;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::PbrDebugModesSettle => {
+            // On tick 0 of this phase, set the next mode.
+            if state.phase_ticks == 0 {
+                let next_mode = crate::debug_view::DebugViewMode::from_u32(
+                    pbr_visual.debug_modes.mode_cursor,
+                );
+                commands.insert_resource(crate::debug_view::DebugViewState {
+                    mode: next_mode,
+                    last_active: Some(next_mode),
+                });
+                println!(
+                    "e2e_render --pbr-debug-modes: settling mode {} ({})",
+                    pbr_visual.debug_modes.mode_cursor,
+                    next_mode.label(),
+                );
+            }
+            state.phase_ticks += 1;
+            if state.phase_ticks >= super::pbr_debug_modes::PBR_DEBUG_MODE_SETTLE_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::PbrDebugModesShoot;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::PbrDebugModesShoot => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::PbrDebugModesDrain;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::PbrDebugModesDrain => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        let mode_id = pbr_visual.debug_modes.mode_cursor;
+                        let mode = crate::debug_view::DebugViewMode::from_u32(mode_id);
+                        let label = mode.label();
+                        super::pbr_debug_modes::save_pbr_debug_mode_png(
+                            &fb, mode_id, label,
+                        );
+                        pbr_visual.debug_modes.captures.push((mode_id, label, fb));
+                        // Advance to next mode or move to assert.
+                        let next_cursor = mode_id + 1;
+                        if next_cursor > crate::debug_view::DebugViewMode::NUM_DEBUG_MODES {
+                            // All modes captured — restore production mode
+                            // and run the assertions.
+                            commands.insert_resource(crate::debug_view::DebugViewState {
+                                mode: crate::debug_view::DebugViewMode::Off,
+                                last_active: None,
+                            });
+                            state.phase = E2ePhase::PbrDebugModesAssert;
+                            state.phase_ticks = 0;
+                        } else {
+                            pbr_visual.debug_modes.mode_cursor = next_cursor;
+                            state.phase = E2ePhase::PbrDebugModesSettle;
+                            state.phase_ticks = 0;
+                        }
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "pbr-debug-modes: mode {} capture decode failed: {msg}",
+                            pbr_visual.debug_modes.mode_cursor,
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::pbr_debug_modes::PBR_DEBUG_MODE_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "pbr-debug-modes: mode {} capture never delivered within {} drain frames",
+                    pbr_visual.debug_modes.mode_cursor,
+                    super::pbr_debug_modes::PBR_DEBUG_MODE_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        E2ePhase::PbrDebugModesAssert => {
+            // Walk every captured framebuffer; build a multi-mode report.
+            let mut failures: Vec<String> = Vec::new();
+            let mut report_lines: Vec<String> = Vec::new();
+            for (mode_id, label, fb) in &pbr_visual.debug_modes.captures {
+                match super::pbr_debug_modes::assert_pbr_debug_mode_non_degenerate(
+                    *mode_id, label, fb,
+                ) {
+                    Ok(line) => report_lines.push(line),
+                    Err(err) => failures.push(err),
+                }
+            }
+            let combined = report_lines.join("\n  ");
+            if failures.is_empty() {
+                println!(
+                    "e2e_render --pbr-debug-modes: ALL {} modes PASS:\n  {}",
+                    pbr_visual.debug_modes.captures.len(),
+                    combined,
+                );
+                outcome.gate_result = Some(Ok(()));
+                exit.write(AppExit::Success);
+            } else {
+                let err = format!(
+                    "pbr-debug-modes: {} of {} modes FAILED:\n  {}\nPassing modes:\n  {}",
+                    failures.len(),
+                    pbr_visual.debug_modes.captures.len(),
+                    failures.join("\n  "),
+                    combined,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+            }
+            state.phase = E2ePhase::Done;
         }
         E2ePhase::Done => {
             // `AppExit` is written; the winit runner sees `should_exit()` and

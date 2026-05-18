@@ -658,6 +658,7 @@ pub fn prepare_frame_gpu(
     extracted_history: Res<ExtractedCameraHistory>,
     extracted_taa: Res<crate::render::extract::ExtractedTaaConfig>,
     extracted_gi: Res<ExtractedGiConfig>,
+    extracted_debug: Res<crate::render::extract::ExtractedDebugView>,
     existing: Option<ResMut<FrameGpu>>,
     existing_gi_bind_groups: Option<Res<GiBindGroups>>,
     taa_gpu: Option<Res<TaaGpu>>,
@@ -763,8 +764,9 @@ pub fn prepare_frame_gpu(
         // the pre-dispatch `MAX_RAY_STEPS_PRIMARY` const. Layout-preserving
         // rename; struct size unchanged.
         max_ray_steps_primary: extracted_gi.settings.max_ray_steps_primary,
-        // Padding — formerly `tone_mapping_fac`, dead since fix #2.
-        _pad0b: 0,
+        // PBR rendering debugger mode index (0 = production / off). See
+        // `crate::debug_view`.
+        debug_view_mode: extracted_debug.mode,
         sky_sun_dir,
         _pad1: 0,
         sun_color: Vec3::new(1.0, 0.95, 0.85),

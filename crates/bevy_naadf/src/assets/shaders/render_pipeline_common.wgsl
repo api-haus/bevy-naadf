@@ -176,8 +176,8 @@ struct GpuCamera {
 //
 // Again no explicit padding — WGSL's `vec3` 16-byte slotting + `vec2` 8-byte
 // alignment reproduce the padded Rust `#[repr(C)]` layout: the four `u32`s sit
-// at 0/4/8/12, `taa_index`/`flags`/`max_ray_steps_primary`/`pad0b` at
-// 16/20/24/28, `sky_sun_dir` slots to 32, `sun_color` to 48, `taa_jitter` to
+// at 0/4/8/12, `taa_index`/`flags`/`max_ray_steps_primary`/`debug_view_mode`
+// at 16/20/24/28, `sky_sun_dir` slots to 32, `sun_color` to 48, `taa_jitter` to
 // 64, `bounding_box_min` to 80, `bounding_box_max` to 96 — total 112 bytes.
 // `max_ray_steps_primary` (offset 24) was `pad0a`, formerly `exposure` /
 // `tone_mapping_fac` — the custom final-blit tonemap constants. The
@@ -201,7 +201,10 @@ struct GpuRenderParams {
     // Default 120 = pre-dispatch const bit-equivalent. Consumer clamps
     // `max(_, 1u)` defensively.
     max_ray_steps_primary: u32,
-    pad0b: u32,
+    // PBR rendering debugger mode index — see
+    // `crate::debug_view::DebugViewMode` + `pbr_sampling.wgsl::debug_view_override`.
+    // Layout-preserving repurpose of `_pad0b`.
+    debug_view_mode: u32,
 
     sky_sun_dir: vec3<f32>,
     sun_color: vec3<f32>,

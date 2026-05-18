@@ -70,8 +70,11 @@
     triplanar_sample_pom, triplanar_sample_normal_pom,
     pom_compute, pom_self_shadow,
     select_layer_variant,
+    eval_pbr, PbrEval,
+    PbrDebugInputs, debug_view_override,
     MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
+#import "shaders/common.wgsl"::PI
 
 // --- @group(1) — frame data -------------------------------------------------
 
@@ -163,6 +166,20 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var cur_pos_int = cam_pos_int;
     var cur_pos_frac = cam_pos_frac;
     let entity = ENTITY_FREE;
+
+    // PBR rendering debugger — when `params.debug_view_mode != 0u`, the
+    // first-hit branches that terminate on a PBR surface (rough-PBR break +
+    // emissive fast-path) populate `debug_color` with the per-pixel debug
+    // RGB. After the loop, the value is stomped into `final_color` and
+    // `taa_sample_accum`, and `acc.absorption` is cleared so downstream
+    // GI / spatial-resampling / sun-direct multiplications all contribute
+    // zero light. Mode 0 leaves `debug_active = false` and the production
+    // path is untouched (zero perf cost — one uniform load + one compare
+    // dead-code-eliminated by the WGSL compiler). See
+    // `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+    // debugger".
+    var debug_active: bool = false;
+    var debug_color: vec3<f32> = vec3<f32>(0.0);
 
     if (volume.hit) {
         // `oldPos = curPosInt + curPosFrac` BEFORE advancing to the volume
@@ -265,11 +282,38 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     pbr_emissive, pbr_sampler,
                     hit_world_pos, blend_weights, layer,
                 ).rgb;
-                acc.light = acc.light
-                    + acc.absorption * emissive_sample * voxel_type.color_layered;
+                let emissive_full = emissive_sample * voxel_type.color_layered;
+                acc.light = acc.light + acc.absorption * emissive_full;
                 distance_ray = dist + volume.dist_min_max.x;
                 voxel_type_raw = ray_result.hit_type;
                 is_diffuse = 1u;
+                // Debug view — emissive fast-path inputs. Most BRDF channels
+                // are degenerate for emissive (no metallic / roughness /
+                // POM), so fill plausible defaults. Mode 17 (Emissive) shows
+                // the actual emissive contribution; modes 1/2/3/16 still
+                // produce signal.
+                if (params.debug_view_mode != 0u) {
+                    var dbg_in: PbrDebugInputs;
+                    dbg_in.albedo               = vec3<f32>(0.0);
+                    dbg_in.normal_perturbed     = face_normal;
+                    dbg_in.normal_geometric     = face_normal;
+                    dbg_in.metallic             = 0.0;
+                    dbg_in.roughness            = 1.0;
+                    dbg_in.ao                   = 1.0;
+                    dbg_in.height               = 0.5;
+                    dbg_in.f_base               = vec3<f32>(0.04);
+                    dbg_in.f_fresnel            = vec3<f32>(0.04);
+                    dbg_in.k_d                  = vec3<f32>(1.0);
+                    dbg_in.direct_contribution  = vec3<f32>(0.0);
+                    dbg_in.gi_proxy             = emissive_full;
+                    dbg_in.self_shadow          = 1.0;
+                    dbg_in.displaced_uv         = vec2<f32>(0.0);
+                    dbg_in.material_layer_index = layer;
+                    dbg_in.triplanar_weights    = blend_weights;
+                    dbg_in.emissive             = emissive_full;
+                    debug_color  = debug_view_override(params.debug_view_mode, dbg_in);
+                    debug_active = true;
+                }
                 break;
             }
 
@@ -395,6 +439,49 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
             is_diffuse = select(
                 1u, 0u, sampled_roughness < ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
             );
+
+            // PBR rendering debugger — populate `PbrDebugInputs` with the
+            // values we just computed for the production path, plus a couple
+            // of derived BRDF quantities for the kS / kD / direct-only /
+            // GI-only modes. Skips entirely when `debug_view_mode == 0u`.
+            // See `docs/orchestrate/pbr-raymarching/05-diagnostic.md` §
+            // "PBR rendering debugger".
+            if (params.debug_view_mode != 0u) {
+                let sun_dir = atmosphere_params.sky_sun_dir;
+                let view_dir = -ray_dir;
+                let n_dot_l = clamp(dot(perturbed_normal, sun_dir), 0.0, 1.0);
+                let pbr_eval = eval_pbr(
+                    sun_dir, view_dir, perturbed_normal,
+                    sampled_albedo, sampled_metallic, sampled_roughness,
+                );
+                let direct = atmosphere_params.sky_sun_color
+                    * pbr_eval.f * n_dot_l * pom_shadow;
+                // GI proxy: atmosphere fold (in `acc.light`) plus the
+                // diffuse colour transport this branch just put into
+                // `acc.absorption`. Coarse but visually informative.
+                let gi_proxy = acc.light + albedo_attenuation;
+                var dbg_in: PbrDebugInputs;
+                dbg_in.albedo               = sampled_albedo;
+                dbg_in.normal_perturbed     = perturbed_normal;
+                dbg_in.normal_geometric     = face_normal;
+                dbg_in.metallic             = sampled_metallic;
+                dbg_in.roughness            = sampled_roughness;
+                dbg_in.ao                   = diffuse_ao.a;
+                dbg_in.height               = mrh.b;
+                dbg_in.f_base               = pbr_eval.f_zero;
+                dbg_in.f_fresnel            = pbr_eval.fresnel;
+                dbg_in.k_d                  = (vec3<f32>(1.0) - pbr_eval.fresnel)
+                                              * (1.0 - sampled_metallic);
+                dbg_in.direct_contribution  = direct;
+                dbg_in.gi_proxy             = gi_proxy;
+                dbg_in.self_shadow          = pom_shadow;
+                dbg_in.displaced_uv         = displaced_uv;
+                dbg_in.material_layer_index = layer;
+                dbg_in.triplanar_weights    = blend_weights;
+                dbg_in.emissive             = vec3<f32>(0.0);
+                debug_color  = debug_view_override(params.debug_view_mode, dbg_in);
+                debug_active = true;
+            }
             break;
         }
 
@@ -413,6 +500,19 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
             atmosphere_params.atmosphere_tex_size_y,
         );
         acc = apply_atmosphere(atmosphere_comp[oct_index], acc, 1.0);
+    }
+
+    // --- PBR debug-view stomp ----------------------------------------------
+    // When the debugger is active for this pixel, overwrite `acc.light`
+    // with the debug colour and clear `acc.absorption` so downstream
+    // GI / spatial-resampling / sun-direct multiplications produce no
+    // additional light. The `taa_sample_accum` write below seeds the TAA
+    // history with the debug colour at weight=1 so the blit reads it
+    // crisply this frame (without it the blit's
+    // `cur_color = rgb / max(1, weight)` would mix in stale history).
+    if (debug_active) {
+        acc.light = debug_color;
+        acc.absorption = vec3<f32>(0.0);
     }
 
     // --- G-buffer + absorption + colour writes -----------------------------
@@ -449,8 +549,20 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Keep `taa_sample_accum` referenced so naga retains the binding in the
     // frame layout — the `base/` first-hit no longer writes it (`ReprojectOld`
-    // + `CalcNewTaaSample` do, Batch 6). A zero-additive no-op write.
-    if (pixel_index == 0xFFFFFFFFu) {
+    // + `CalcNewTaaSample` do, Batch 6). PBR-debugger: when active, stomp
+    // the debug colour into the TAA accumulator with weight=1.0 so the
+    // final blit's `cur_color = rgb / max(1, weight)` returns it bitwise.
+    // Mirrors the encoding in `naadf_final.wgsl::fragment`:
+    //   .x = pack16(weight, R), .y = pack16(G, B)
+    if (debug_active) {
+        let r = clamp(debug_color.x, 0.0, 65000.0);
+        let g = clamp(debug_color.y, 0.0, 65000.0);
+        let b = clamp(debug_color.z, 0.0, 65000.0);
+        taa_sample_accum[pixel_index] = vec2<u32>(
+            pack2x16float(vec2<f32>(1.0, r)),
+            pack2x16float(vec2<f32>(g, b)),
+        );
+    } else if (pixel_index == 0xFFFFFFFFu) {
         taa_sample_accum[pixel_index] = vec2<u32>(0u, 0u);
     }
 }

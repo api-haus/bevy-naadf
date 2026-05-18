@@ -85,10 +85,16 @@ pub struct GpuRenderParams {
     /// `tone_mapping_fac` here as `_pad0a` / `_pad0b`; this dispatch
     /// reclaims `_pad0a` as a real field (layout-preserving rename).
     pub max_ray_steps_primary: u32,
-    /// Padding — formerly the dead `tone_mapping_fac` half of the
-    /// `18-taa-fidelity.md` fix #2 repurpose; kept as a pad to preserve the
-    /// 112-byte layout.
-    pub _pad0b: u32,
+    /// PBR rendering debugger mode index — 0 = production (no debug
+    /// override), 1..N = per-channel BRDF visualisation. See
+    /// `crate::debug_view::DebugViewMode` for the canonical enum + the
+    /// `pbr_sampling.wgsl::debug_view_override` switch for the WGSL
+    /// dispatch. Layout-preserving repurpose of the former `_pad0b` slot
+    /// (the dead `tone_mapping_fac` half of the `18-taa-fidelity` fix #2);
+    /// the 112-byte struct size is unchanged. See
+    /// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR
+    /// rendering debugger".
+    pub debug_view_mode: u32,
 
     /// Direction *towards* the sun (the C# `skySunDir`).
     pub sky_sun_dir: Vec3,

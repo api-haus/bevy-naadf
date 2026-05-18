@@ -119,6 +119,11 @@ fn main() -> ExitCode {
     // signal assertions (specular highlight luma, textured-albedo variation,
     // metallic F0 colour-pull).
     let pbr_visual_mode = args.iter().any(|a| a == "--pbr-visual");
+    // PBR rendering-debugger gate
+    // (`docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+    // debugger"). Iterates every non-zero `DebugViewMode`, captures a
+    // per-mode framebuffer, asserts each is non-degenerate.
+    let pbr_debug_modes_mode = args.iter().any(|a| a == "--pbr-debug-modes");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -305,6 +310,8 @@ fn main() -> ExitCode {
         bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction()
     } else if pbr_visual_mode {
         bevy_naadf::e2e::pbr_visual::run_pbr_visual()
+    } else if pbr_debug_modes_mode {
+        bevy_naadf::e2e::pbr_debug_modes::run_pbr_debug_modes()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then
