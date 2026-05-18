@@ -43,8 +43,8 @@ consolidated mode disqualified.
 - [x] Step 5 — Shared-context files (`README.md`, `01-context.md`)
 - [x] 02 — Architecture design v1 (`delegate-architect` → `02-design.md`, Plan A — CPU noise)
 - [x] **Hard gate v1** — user redirected: Plan B (WGSL noise via GLSL port, W5 gate inverted)
-- [ ] 02b — Architecture design v2 (`delegate-architect` → `02b-design-plan-b.md`)
-- [ ] **Hard gate v2** — submit revised design to user
+- [x] 02b — Architecture design v2 (`delegate-architect` → `02b-design-plan-b.md`)
+- [ ] **Hard gate v2** — submit revised design to user, resolve OQ.2 before Phase 1
 - [ ] 03a — Phase-1 impl: WGSL FastNoiseLite port (`general-purpose` → code + `03a-impl-wgsl-noise.md`)
 - [ ] **Hard gate** — noise port + CPU↔GPU oracle test passes
 - [ ] 03b — Phase-2 impl: residency layer + W5 gate inversion (`general-purpose` → code + `03b-impl-residency.md`)
@@ -93,3 +93,62 @@ Impl scope estimate revised: ~1500–2000 new LOC (most of it shader). The
 **not** wired into `bevy_naadf` as a runtime dep for the streaming preset.
 
 The Q1/Q2/Q3 choices above are unchanged.
+
+### Scope amplifier (post-Q2 confirmation, applies to Phase 1)
+
+User directive after confirming the Plan B design:
+
+> "we dont have to port all of the fastnoiselite controls, but all of its
+> features - yes. we'd like to have a chefs kitchen of tools so that we can
+> mix&match a beautiful fast 3d voxel noise generator for our world, extended
+> with biome types and complex merges and stuff"
+
+**Overrides architect decision D.B2** (which scoped Phase 1 to
+`OpenSimplex2 + Perlin + FBM` only).
+
+**New Phase 1 scope:** port the **full FastNoiseLite feature surface** —
+every noise family, every fractal type, every domain-warp variant, every
+cellular distance/return-type combination. **Controls** can be simplified:
+runtime-configurable via a unified uniform struct that exposes the essential
+parameters; no need to mirror FastNoiseLite's C++-style getter/setter
+pattern. The shader exposes a unified `fnl_get_noise_3d(state, x, y, z) -> f32`
+dispatcher that internally branches on `state.noise_type` + `state.fractal_type`
++ `state.domain_warp_type` (same shape as the GLSL).
+
+**Functions in scope for Phase 1 (full list from `FastNoiseLite.glsl`):**
+
+- **Noise families:** OpenSimplex2 (`_fnlSingleOpenSimplex23D`), OpenSimplex2S
+  (`_fnlSingleOpenSimplex2S3D`), Cellular (`_fnlSingleCellular3D`), Perlin
+  (`_fnlSinglePerlin3D`), Value-Cubic (`_fnlSingleValueCubic3D`), Value
+  (`_fnlSingleValue3D`). All 2D variants too if the GLSL has them (note the
+  user-facing API is 3D-first for voxels; 2D ports are a nice-to-have).
+- **Fractal types:** FBm (`_fnlGenFractalFBM3D`), Ridged (`_fnlGenFractalRidged3D`),
+  PingPong (`_fnlGenFractalPingPong3D`), the plain "fractal off"
+  pass-through.
+- **Domain warps:** OpenSimplex2 (`_fnlSingleDomainWarpOpenSimplex2`),
+  OpenSimplex2Reduced, BasicGrid. Each composes with the FBm / Independent
+  fractal types per the GLSL function table.
+- **Cellular configurations:** all distance functions (`Euclidean`, `EuclideanSq`,
+  `Manhattan`, `Hybrid`) × all return types (`CellValue`, `Distance`, `Distance2`,
+  `Distance2Add`, `Distance2Sub`, `Distance2Mul`, `Distance2Div`).
+- **Hash + gradient tables:** all `_fnlHash`, `_fnlGradCoord*` helpers + the
+  `RAND_VECS_3D` / `GRADIENTS_3D` / `RAND_VECS_2D` / `GRADIENTS_2D` constants
+  the algorithms depend on.
+
+**Phase 1 oracle test (D.B3) scope expands accordingly:** the
+`--wgsl-noise-oracle` gate exercises every noise family × every fractal type
+× a representative subset of domain-warps + cellular configs at fixed sample
+points. Bit-near-equal (`< 1e-5`) against the Rust CPU oracle for every
+combination.
+
+**Phase 1 LOC estimate revised:** shader ~2000–2500 LOC (was ~1000), CPU
+oracle ~600–800 LOC (was ~300), GPU oracle test harness ~200 LOC, e2e gate
+~100 LOC. Total Phase 1 ~2900–3600 LOC, ~2.2× the architect's narrow-scope
+estimate. Phase 2 unchanged at ~960 LOC.
+
+**What "chef's kitchen" implies for the API shape:** the unified uniform
+struct carries the noise-graph configuration. Future biome/composition work
+will read multiple `FnlState`s and combine their outputs (lerp, max, masked
+blend, etc.). The unified dispatcher is the primitive; the composition
+layer is out of scope this session but the API must enable it (multiple
+`FnlState` uniforms or a flat array of them).
