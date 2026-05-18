@@ -37,7 +37,7 @@ use std::num::NonZeroU64;
 use bevy::prelude::*;
 use bevy::render::diagnostic::RecordDiagnostics;
 use bevy::render::render_resource::{
-    binding_types::{storage_buffer_sized, uniform_buffer_sized},
+    binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized},
     BindGroupLayoutDescriptor, BindGroupLayoutEntries, CachedComputePipelineId,
     CommandEncoder, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
     ShaderStages,
@@ -83,6 +83,11 @@ pub fn construction_bounds_world_layout_descriptor() -> BindGroupLayoutDescripto
                 storage_buffer_sized(false, None),
                 // params — uniform.
                 uniform_buffer_sized(false, Some(params_size)),
+                // streaming-world Phase 2.6 — window_indirection (binding 2).
+                // Construction-side bounds_calc uses this to translate
+                // window-local chunk coords to slot-indexed positions.
+                // Placeholder on non-streaming presets (length 1).
+                storage_buffer_read_only_sized(false, None),
             ),
         ),
     )

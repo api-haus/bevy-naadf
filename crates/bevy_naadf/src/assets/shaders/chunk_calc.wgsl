@@ -121,6 +121,42 @@ var<uniform> params: ConstructionParams;
 // `BlockHashingHandler.cs:50-55`.
 @group(0) @binding(7)
 var<storage, read> hash_coefficients: array<u32>;
+// streaming-world Phase 2.6 — window indirection table
+// (`02c-design-windowed-slot-map.md` § E). `array_length(&window_indirection)
+// > 1u` is the streaming-active gate (non-streaming presets bind a 1-u32
+// placeholder).
+@group(0) @binding(8)
+var<storage, read> window_indirection: array<u32>;
+
+// streaming-world Phase 2.6 — translate a window-local chunk-coord through
+// the indirection table to its slot-indexed position in chunks_buffer.
+fn streaming_chunk_index_cc(chunk_pos: vec3<u32>) -> u32 {
+    if (arrayLength(&window_indirection) <= 1u) {
+        return chunk_pos.x
+             + chunk_pos.y * params.size_in_chunks.x
+             + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
+    }
+    let chunks_per_seg: u32 = 16u;
+    let seg_local = vec3<u32>(
+        chunk_pos.x / chunks_per_seg,
+        chunk_pos.y / chunks_per_seg,
+        chunk_pos.z / chunks_per_seg,
+    );
+    let chunk_in_seg = vec3<u32>(
+        chunk_pos.x % chunks_per_seg,
+        chunk_pos.y % chunks_per_seg,
+        chunk_pos.z % chunks_per_seg,
+    );
+    let local_pack = seg_local.x + seg_local.y * 16u + seg_local.z * (16u * 2u);
+    let slot = window_indirection[local_pack];
+    if (slot == 0xFFFFFFFFu) {
+        return 0xFFFFFFFFu;
+    }
+    let chunk_in_seg_idx = chunk_in_seg.x
+        + chunk_in_seg.y * chunks_per_seg
+        + chunk_in_seg.z * chunks_per_seg * chunks_per_seg;
+    return slot * 4096u + chunk_in_seg_idx;
+}
 
 // ─── boundsCommon.fxh helpers (inlined per file header note) ──────────────────
 
@@ -413,18 +449,15 @@ fn calc_block_from_raw_data(
             atomicStore(&insert_block_index, new_base);
             state = new_base | (BLOCK_STATE_CHILD << 30u);
         }
-        // Web-WebGPU migration: chunks is `array<vec2<u32>>`. Write `.x =
-        // state`, `.y = 0u` (no `#ifdef ENTITIES` here; W4's `entity_update`
-        // owns the `.y` channel — `15-design-c.md` §1.7). Indexing uses the
-        // x-fastest flatten over the full world chunk extent (`size_in_chunks`),
-        // inlined to match the codebase pattern (`chunk_index_in_segment`
-        // above is also inlined; `common.wgsl::flatten_index` is the canonical
-        // form, naga-oil composable imports are inconsistent across versions
-        // — see file header comment block).
-        let chunk_idx = chunk_pos.x
-            + chunk_pos.y * params.size_in_chunks.x
-            + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
-        chunks[chunk_idx] = vec2<u32>(state, 0u);
+        // streaming-world Phase 2.6 — routed through `streaming_chunk_index_cc`.
+        // On the streaming preset the index translates to the slot-indexed
+        // layout; on others it's a pass-through to the flat-coord formula.
+        // Guard EMPTY_SLOT (defensive — chunk_calc only dispatches per
+        // resident segment, so this shouldn't fire in practice).
+        let chunk_idx = streaming_chunk_index_cc(chunk_pos);
+        if (chunk_idx != 0xFFFFFFFFu) {
+            chunks[chunk_idx] = vec2<u32>(state, 0u);
+        }
     }
 
     workgroupBarrier();

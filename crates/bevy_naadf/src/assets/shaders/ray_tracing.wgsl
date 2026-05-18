@@ -31,6 +31,7 @@
 #import "shaders/world_data.wgsl"::{
     chunks, blocks, voxels, world_meta,
     entity_chunk_instances, entity_voxel_data,
+    window_indirection, streaming_chunk_index, streaming_chunk_load,
 };
 #import "shaders/common.wgsl"::flatten_index
 
@@ -283,16 +284,13 @@ fn shoot_ray(
         // --- chunk lookup ---------------------------------------------------
         let chunk_pos = vec3<u32>(cur_cell) / 16u;
         let voxel_pos_in_chunk = vec3<u32>(cur_cell) % 16u;
-        // Web-WebGPU migration: chunks is now `array<vec2<u32>>` indexed by
-        // `flatten_index(chunk_pos, sx, sx*sy)` (x-fastest). Field selectors
-        // (`.x` / `.y`) carry forward byte-for-byte; no longer a `vec4<u32>`
-        // from `textureLoad`.
-        let chunk_idx = flatten_index(
-            chunk_pos,
-            world_meta.size_in_chunks.x,
-            world_meta.size_in_chunks.x * world_meta.size_in_chunks.y,
-        );
-        let chunk_texel = chunks[chunk_idx];
+        // streaming-world Phase 2.6: route the read through
+        // `streaming_chunk_load` so on the streaming preset (when
+        // `world_meta.streaming_active == 1u`) the renderer translates
+        // window-local chunk coords through the indirection table to the
+        // correct slot in `chunks_buffer`. Non-streaming presets see the
+        // pass-through flat-coord layout.
+        let chunk_texel = streaming_chunk_load(chunk_pos);
         var cur_node: u32 = chunk_texel.x;
 
         // W4 entity-track — collect this chunk's entity-pointer (`.y`) if

@@ -251,7 +251,7 @@ pub(crate) fn translate_world_to_window_local(
     let Some(residency) = residency else {
         return world_pose;
     };
-    let origin_voxels = (residency.origin * crate::streaming::SEGMENT_VOXELS).as_vec3();
+    let origin_voxels = (residency.origin() * crate::streaming::SEGMENT_VOXELS).as_vec3();
     let mut local = world_pose;
     local.translation -= origin_voxels;
     local
@@ -285,26 +285,38 @@ pub fn pin_streaming_window_camera(
     // gate's `wall_clock_budget_exceeded` enforcement).
     mark_gate_started();
     if wall_clock_budget_exceeded() {
+        // Phase 2.6 (`02c-design-windowed-slot-map.md` D4) — slot state is
+        // implicit under the new `WindowedSlotMap` primitive:
+        //   In free_list         ⇔ "Empty"
+        //   Bound AND in admissions_this_frame ⇔ "Generating"
+        //   Bound AND NOT in admissions_this_frame ⇔ "Resident"
+        // We rebuild the histogram from the new sources for the panic
+        // diagnostic; the diagnostic text is otherwise identical.
         let (admissions_n, evictions_n, generating_n, resident_n, empty_n) =
             residency
                 .as_deref()
                 .map(|r| {
-                    let g = r.slot_state.iter().filter(|s| matches!(
-                        s,
-                        crate::streaming::SlotState::Generating { .. }
-                    )).count();
-                    let res = r.slot_state.iter().filter(|s| matches!(
-                        s,
-                        crate::streaming::SlotState::Resident
-                    )).count();
-                    let e = r.slot_state.iter().filter(|s| matches!(
-                        s,
-                        crate::streaming::SlotState::Empty
-                    )).count();
+                    let in_admissions: std::collections::HashSet<u32> = r
+                        .admissions_this_frame
+                        .iter()
+                        .map(|(_, s)| s.0)
+                        .collect();
+                    let mut generating = 0usize;
+                    let mut resident = 0usize;
+                    for (_, s) in r.window.iter_bound() {
+                        if in_admissions.contains(&s.0) {
+                            generating += 1;
+                        } else {
+                            resident += 1;
+                        }
+                    }
+                    let empty = r.window.free_count() as usize;
                     (
                         r.admissions_this_frame.len(),
                         r.evictions_this_frame.len(),
-                        g, res, e,
+                        generating,
+                        resident,
+                        empty,
                     )
                 })
                 .unwrap_or((0, 0, 0, 0, 0));
@@ -313,12 +325,12 @@ pub fn pin_streaming_window_camera(
              (elapsed = {:?}). Likely cause: the per-frame bounds-chain \
              dispatch is firing every frame (the diagnosed hang in \
              `03c-diagnosis.md` § \"Root cause: minutes-long hang\") — \
-             check that `finalise_admissions_as_resident` is wired into \
-             `StreamingPlugin`'s `Last`-stage so `Generating` slots \
-             transition to `Resident` and `any_admissions_or_evictions` \
-             becomes FALSE on settled frames. Residency state: \
+             check that admissions drain to Resident over multiple ticks \
+             (Phase 2.6 `02c` D4: implicit lifecycle — bound slots that \
+             aren't in admissions_this_frame this tick are Resident). \
+             Residency state: \
              admissions_this_frame={admissions_n}, \
-             evictions_this_frame={evictions_n}, slot_state histogram = \
+             evictions_this_frame={evictions_n}, slot histogram = \
              {{Generating: {generating_n}, Resident: {resident_n}, \
              Empty: {empty_n}}}.",
             STREAMING_GATE_WALL_CLOCK_MAX_SECS,
@@ -527,8 +539,9 @@ mod tests {
     fn pin_translates_world_to_window_local_origin_zero() {
         // With origin = (0, 0, 0) — the initial state before the camera moves —
         // the translation is a no-op: world Transform == local Transform.
-        let mut res = crate::streaming::Residency::empty(4);
-        res.origin = IVec3::ZERO;
+        let res = crate::streaming::Residency::empty(4);
+        // `Residency::empty()` constructs with origin = IVec3::ZERO; no
+        // explicit set required.
         let world = streaming_window_pose(false);
         let local = translate_world_to_window_local(world, Some(&res));
         assert!((local.translation - world.translation).length() < 1e-4);
@@ -541,7 +554,8 @@ mod tests {
         // the post-walk world pose — landing the camera at the SAME window-local
         // X as the pre-walk pose (which had origin (0, 0, 0)).
         let mut res = crate::streaming::Residency::empty(4);
-        res.origin = IVec3::new(4, 0, 0);
+        // Phase 2.6: origin is now mutated via the `WindowedSlotMap` API.
+        res.window.set_origin(IVec3::new(4, 0, 0));
 
         let pose_a_world = streaming_window_pose(false);
         let pose_b_world = streaming_window_pose(true);
@@ -551,8 +565,7 @@ mod tests {
 
         // After origin-shift translation, pose_b_world maps to the same X as
         // pose_a_world at origin (0, 0, 0).
-        let mut res_zero = crate::streaming::Residency::empty(4);
-        res_zero.origin = IVec3::ZERO;
+        let res_zero = crate::streaming::Residency::empty(4);
         let pose_a_local = translate_world_to_window_local(pose_a_world, Some(&res_zero));
         let pose_b_local = translate_world_to_window_local(pose_b_world, Some(&res));
         assert!((pose_b_local.translation - pose_a_local.translation).length() < 1e-4,
@@ -579,7 +592,7 @@ mod tests {
         // The translation is stateless — re-running it with the same origin
         // produces the same result (no drift across repeated invocations).
         let mut res = crate::streaming::Residency::empty(4);
-        res.origin = IVec3::new(4, 0, 2);
+        res.window.set_origin(IVec3::new(4, 0, 2));
         let world = streaming_window_pose(true);
         let once = translate_world_to_window_local(world, Some(&res));
         let twice = translate_world_to_window_local(world, Some(&res));

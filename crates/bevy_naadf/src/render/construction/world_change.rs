@@ -747,6 +747,15 @@ mod tests {
         let bgl_change = cache.get_bind_group_layout(&change_layout);
         let bgl_bounds = cache.get_bind_group_layout(&bounds_layout);
 
+        // Phase 2.6 — window_indirection placeholder (binding 8). 1-u32
+        // buffer; `arrayLength(&window_indirection) <= 1u` short-circuits
+        // the streaming-active branch in the helper.
+        let windir_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("w2_window_indirection_placeholder"),
+            size: 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let world_bg = device.create_bind_group(
             "w2_world_bg",
             &bgl_world,
@@ -759,6 +768,7 @@ mod tests {
                 hmap_buf.as_entire_buffer_binding(),
                 params_buf.as_entire_buffer_binding(),
                 coeffs_buf.as_entire_buffer_binding(),
+                windir_buf.as_entire_buffer_binding(),
             )),
         );
         let change_bg = device.create_bind_group(

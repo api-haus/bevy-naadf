@@ -266,6 +266,15 @@ pub struct StreamingExtractRender {
     /// `noise_terrain` shader handle. `prepare_construction` queues the
     /// pipeline lazily once this becomes `Some`.
     pub noise_terrain_shader: Option<Handle<Shader>>,
+    /// streaming-world Phase 2.6 — flat copy of
+    /// [`Residency::window`]`::indirection_buffer()`. 512 u32s.
+    /// [`upload_window_indirection`] copies this into the GPU buffer at
+    /// `Render::Queue`.
+    pub window_indirection: Vec<u32>,
+    /// streaming-world Phase 2.6 — the live residency origin in segments.
+    /// Used by the streaming dispatch loop to compute window-local positions
+    /// (`local = world_seg - origin`) without needing to know slot indices.
+    pub window_origin: bevy::math::IVec3,
 }
 
 impl Default for StreamingExtractRender {
@@ -283,6 +292,8 @@ impl Default for StreamingExtractRender {
             terrain_amplitude: 1.0,
             solid_voxel_type_id: 1,
             noise_terrain_shader: None,
+            window_indirection: Vec::new(),
+            window_origin: bevy::math::IVec3::ZERO,
         }
     }
 }
@@ -329,6 +340,10 @@ pub fn extract_streaming_state(
             terrain_amplitude: chunk_source.terrain_amplitude,
             solid_voxel_type_id: chunk_source.solid_voxel_type_id,
             noise_terrain_shader: shader,
+            // Static preset never uses the indirection table — it writes at
+            // absolute world chunk coords via the flat-coord layout.
+            window_indirection: Vec::new(),
+            window_origin: bevy::math::IVec3::ZERO,
         });
         return;
     }
@@ -352,7 +367,48 @@ pub fn extract_streaming_state(
         terrain_amplitude: chunk_source.terrain_amplitude,
         solid_voxel_type_id: chunk_source.solid_voxel_type_id,
         noise_terrain_shader: shader,
+        // Phase 2.6 — copy the live indirection table so
+        // `upload_window_indirection` (Render::Queue) can write it to GPU.
+        // 2 KB clone per frame — cheap.
+        window_indirection: residency.window.indirection_buffer().to_vec(),
+        window_origin: residency.window.origin(),
     });
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2.6 — per-frame GPU upload of the window indirection table.
+// -----------------------------------------------------------------------------
+
+/// Render-app `Render::Queue` system — write the
+/// [`StreamingExtractRender::window_indirection`] bytes into the GPU buffer
+/// `ConstructionGpu::window_indirection_buffer` (allocated in
+/// `prepare_construction` on the first streaming-active frame).
+///
+/// Runs in `Render::Queue` so the write_buffer call happens BEFORE the
+/// producer node consumes the bind group (the renderer-side world bind
+/// group binds the same buffer at `@group(0) @binding(8)`).
+///
+/// Per `docs/orchestrate/streaming-world/02c-design-windowed-slot-map.md` § D6
+/// — dedicated upload system, separate from `prepare_construction`'s
+/// allocation site.
+pub fn upload_window_indirection(
+    gpu: Option<bevy::prelude::Res<crate::render::construction::ConstructionGpu>>,
+    streaming_extract: Option<bevy::prelude::Res<StreamingExtractRender>>,
+    render_queue: bevy::prelude::Res<RenderQueue>,
+) {
+    let (Some(gpu), Some(s)) = (gpu, streaming_extract) else {
+        return;
+    };
+    if !s.streaming_mode_active {
+        return;
+    }
+    if s.window_indirection.is_empty() {
+        return;
+    }
+    let Some(buf) = gpu.window_indirection_buffer.as_ref() else {
+        return;
+    };
+    render_queue.write_buffer(buf, 0, bytemuck::cast_slice(&s.window_indirection));
 }
 
 /// Build the [`NoiseTerrainParams`] for one segment admission.

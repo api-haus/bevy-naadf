@@ -93,6 +93,12 @@ pub struct WorldGpu {
     pub entity_voxel_data_placeholder: Buffer,
     /// Phase-C wave-3 — placeholder for `entity_instances_history` (slot 7).
     pub entity_instances_history_placeholder: Buffer,
+    /// streaming-world Phase 2.6 — placeholder for `window_indirection`
+    /// (slot 8). Used on non-streaming presets so the bind-group layout
+    /// is always satisfied; the streaming preset rebuilds the bind group
+    /// in `prepare_construction` with the real
+    /// `ConstructionGpu::window_indirection_buffer`.
+    pub window_indirection_placeholder: Buffer,
 }
 
 /// The per-frame GPU resources (`03-design.md` §4.4 — render-world `FrameGpu`
@@ -197,6 +203,12 @@ pub fn prepare_world_gpu(
     // writes Algorithm 1 outputs into those buffers on the next system
     // (after `prepare_world_gpu`).
     construction_config: Option<Res<crate::render::construction::ConstructionConfig>>,
+    // streaming-world Phase 2.6 — pull the streaming-mode flag from the
+    // extract resource so the `world_meta.streaming_active` uniform field
+    // is correct on the FIRST frame. `prepare_world_gpu` is a build-once
+    // system; the flag is otherwise written by `prepare_construction`
+    // when the indirection buffer is rebuilt.
+    streaming_extract: Option<Res<crate::streaming::StreamingExtractRender>>,
 ) {
     // Build-once: WorldGpu already exists → this system is forever done.
     if existing.is_some() {
@@ -497,9 +509,17 @@ pub fn prepare_world_gpu(
     // camera's entry point lands exactly on a voxel boundary and `floor()`
     // flips per-pixel with f32 noise (the concentric-lines artifact).
     let size_in_voxels = (extracted.bounding_box.max + IVec3::ONE).as_vec3();
+    // Phase 2.6: forward the streaming-mode flag into `world_meta` so the
+    // renderer-side WGSL helpers (`streaming_chunk_index` /
+    // `streaming_chunk_load` in `world_data.wgsl`) translate `chunks[]`
+    // reads through `window_indirection` only on the streaming preset.
+    let streaming_active = streaming_extract
+        .as_deref()
+        .map(|s| s.streaming_mode_active)
+        .unwrap_or(false);
     let world_meta_data = GpuWorldMeta {
         size_in_chunks: size,
-        _pad0: 0,
+        streaming_active: if streaming_active { 1 } else { 0 },
         bounding_box_min: extracted.bounding_box.min.as_vec3() + Vec3::splat(0.1),
         _pad1: 0,
         bounding_box_max: size_in_voxels - Vec3::splat(0.1),
@@ -543,6 +563,19 @@ pub fn prepare_world_gpu(
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    // streaming-world Phase 2.6 — `window_indirection` placeholder. 4 B
+    // (one u32) — the streaming-active runtime branch in the WGSL helpers
+    // short-circuits the indirection read on non-streaming presets, so the
+    // contents are never read. Allocated unconditionally so the bind-group
+    // layout is satisfied; `prepare_construction`'s streaming-active branch
+    // rebuilds the bind group with the production 2 KB
+    // `ConstructionGpu::window_indirection_buffer` instead.
+    let placeholder_window_indirection = render_device.create_buffer(&BufferDescriptor {
+        label: Some("naadf_world_window_indirection_placeholder"),
+        size: 4, // one u32
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
 
     // --- @group(0) bind group ----------------------------------------------
     // Phase-C wave-3 — `world_layout` now has 8 bindings; slots 5/6/7 are the
@@ -561,6 +594,7 @@ pub fn prepare_world_gpu(
             placeholder_entity_chunk_instances.as_entire_buffer_binding(),
             placeholder_entity_voxel_data.as_entire_buffer_binding(),
             placeholder_entity_instances_history.as_entire_buffer_binding(),
+            placeholder_window_indirection.as_entire_buffer_binding(),
         )),
     );
 
@@ -575,6 +609,7 @@ pub fn prepare_world_gpu(
         entity_chunk_instances_placeholder: placeholder_entity_chunk_instances,
         entity_voxel_data_placeholder: placeholder_entity_voxel_data,
         entity_instances_history_placeholder: placeholder_entity_instances_history,
+        window_indirection_placeholder: placeholder_window_indirection,
     });
     // Build-once consumed. Drop the staging resource so its ~48 MiB on
     // Oasis is reclaimed and no future code path can accidentally re-read

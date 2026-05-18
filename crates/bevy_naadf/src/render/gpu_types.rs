@@ -157,8 +157,19 @@ pub const FLAG_BLIT_FINAL_COLOR: u32 = 1 << 4;
 pub struct GpuWorldMeta {
     /// World size in chunks.
     pub size_in_chunks: UVec3,
-    /// Padding to a 16-byte boundary.
-    pub _pad0: u32,
+    /// streaming-world Phase 2.6 — `1` when the renderer should translate
+    /// `chunks` reads through the `window_indirection` table at
+    /// `@group(0) @binding(8)`; `0` for all non-streaming presets
+    /// (`Default` / `Vox` / `ProceduralStatic` / `EntityUpdate`), which
+    /// keep the legacy flat-coord `chunks[…]` reads.
+    ///
+    /// Promoted from the previous `_pad0` slot. The struct stride is
+    /// unchanged: this slot was already 4 B of std140 padding between the
+    /// `vec3<u32> size_in_chunks` (offset 0..12) and the `vec3<f32>
+    /// bounding_box_min` (offset 16..28). The WGSL `GpuWorldMeta` is
+    /// extended in lock-step with `streaming_active: u32` between
+    /// `size_in_chunks` and `bounding_box_min`.
+    pub streaming_active: u32,
     /// Geometry AABB minimum, in voxels — NAADF's `boundingBoxMin` (the
     /// 0.1-voxel-inset world minimum, `WorldData.cs:477`).
     pub bounding_box_min: Vec3,

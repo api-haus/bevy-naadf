@@ -23,13 +23,24 @@
 // `boundingBoxMin/Max` (the voxel-space geometry AABB `rayAABB` clips to) as
 // loose globals; here they are one small uniform.
 //
+// streaming-world Phase 2.6: `streaming_active` (slot 12 — the previously-
+// implicit `_pad0` u32) controls whether the renderer translates `chunks`
+// reads through `window_indirection` (binding 8 below). Promoted from `_pad0`,
+// 0 = direct flat-coord reads (Default/Vox/ProceduralStatic/EntityUpdate
+// presets stay bit-identical); 1 = indirection-translated reads.
+//
 // No explicit padding members (naga-oil's composable-module round-trip rejects
 // them): WGSL slots each `vec3` into a 16-byte aligned slot, reproducing the
-// padded Rust `#[repr(C)]` layout — `size_in_chunks` (0..16),
-// `bounding_box_min` (16..32), `bounding_box_max` (32..48), total 48 bytes.
+// padded Rust `#[repr(C)]` layout — `size_in_chunks` (0..12),
+// `streaming_active` (12..16), `bounding_box_min` (16..32),
+// `bounding_box_max` (32..48), total 48 bytes.
 struct GpuWorldMeta {
     // World size in chunks.
     size_in_chunks: vec3<u32>,
+    // streaming-world Phase 2.6 — 1 when the streaming preset is active; 0
+    // otherwise. Gates the `streaming_chunk_index` indirection-translation
+    // helper below.
+    streaming_active: u32,
     // Geometry AABB minimum, in voxels — NAADF's `boundingBoxMin` (the
     // 0.1-voxel-inset world minimum, `WorldData.cs:477`). `float3`, not
     // integer, faithful to `rayTracing.fxh`'s `float3 boundingBoxMin`.
@@ -128,3 +139,73 @@ struct EntityChunkInstance {
 // branch does not consume the history) — the placeholder is bind-only,
 // never read, never written.
 @group(0) @binding(7) var<storage, read> entity_instances_history: array<vec4<u32>>;
+
+// streaming-world Phase 2.6 — window indirection table
+// (`02c-design-windowed-slot-map.md` § D). Maps
+// `pack(local_xyz) = lx + ly*WINDOW_SIZE_X + lz*WINDOW_SIZE_X*WINDOW_SIZE_Y →
+// SlotIndex`, or `0xFFFFFFFFu` (EMPTY_SLOT) for "no segment bound at this
+// local position".
+//
+// Size: fixed 512 u32 (= WORLD_SIZE_IN_SEGMENTS.x * y * z = 16 * 2 * 16).
+// On non-streaming presets, prepare_world_gpu binds a 1-u32 placeholder
+// here — the `streaming_active == 0` branch in the helpers below short-
+// circuits the read so `array_length(&window_indirection) > 1u` never fires
+// on those presets.
+@group(0) @binding(8) var<storage, read> window_indirection: array<u32>;
+
+// Phase 2.6 — translate a window-local (or absolute, on the streaming preset
+// the camera is pre-translated to window-local frame) chunk-coord through
+// the indirection table to its slot-indexed position in `chunks_buffer`.
+// Returns `0xFFFFFFFFu` ("no chunk") when the local coord points at an empty
+// slot — callers treat this as "sky" (early-exit / empty texel).
+//
+// Non-streaming presets: pass-through to the flat-coord layout, byte-
+// identical to the pre-2.6 read path. The `streaming_active == 0` branch is
+// uniform-flow across the frame (the uniform field doesn't vary by wave) so
+// no real branch divergence.
+fn streaming_chunk_index(chunk_pos: vec3<u32>) -> u32 {
+    if (world_meta.streaming_active == 0u) {
+        return chunk_pos.x
+             + chunk_pos.y * world_meta.size_in_chunks.x
+             + chunk_pos.z * world_meta.size_in_chunks.x * world_meta.size_in_chunks.y;
+    }
+    // Streaming path:
+    //   1. Translate world-local chunk coord to (segment-local, chunk-in-seg).
+    //   2. pack(segment-local) → indirection table index.
+    //   3. indirection[idx] = slot → slot * 4096 + chunk_in_seg_idx.
+    let chunks_per_seg_x: u32 = 16u;
+    let chunks_per_seg_y: u32 = 16u;
+    let chunks_per_seg_z: u32 = 16u;
+    let seg_local = vec3<u32>(
+        chunk_pos.x / chunks_per_seg_x,
+        chunk_pos.y / chunks_per_seg_y,
+        chunk_pos.z / chunks_per_seg_z,
+    );
+    let chunk_in_seg = vec3<u32>(
+        chunk_pos.x % chunks_per_seg_x,
+        chunk_pos.y % chunks_per_seg_y,
+        chunk_pos.z % chunks_per_seg_z,
+    );
+    // pack(local_xyz) for WINDOW_SIZE = (16, 2, 16).
+    let local_pack = seg_local.x + seg_local.y * 16u + seg_local.z * (16u * 2u);
+    let slot = window_indirection[local_pack];
+    if (slot == 0xFFFFFFFFu) {
+        return 0xFFFFFFFFu; // empty — caller treats as sky.
+    }
+    let chunks_per_seg_total: u32 = 4096u; // 16^3.
+    let chunk_in_seg_idx = chunk_in_seg.x
+        + chunk_in_seg.y * chunks_per_seg_x
+        + chunk_in_seg.z * chunks_per_seg_x * chunks_per_seg_y;
+    return slot * chunks_per_seg_total + chunk_in_seg_idx;
+}
+
+// Convenience wrapper — load the chunks vec2<u32> at the streaming-translated
+// position, returning `vec2(0u, 0u)` (the "uniform empty" chunk state) on
+// EMPTY_SLOT.
+fn streaming_chunk_load(chunk_pos: vec3<u32>) -> vec2<u32> {
+    let idx = streaming_chunk_index(chunk_pos);
+    if (idx == 0xFFFFFFFFu) {
+        return vec2<u32>(0u, 0u);
+    }
+    return chunks[idx];
+}

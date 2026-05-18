@@ -97,6 +97,55 @@ struct ConstructionParams {
 var<storage, read_write> chunks: array<vec2<u32>>;
 @group(0) @binding(1)
 var<uniform> params: ConstructionParams;
+// streaming-world Phase 2.6 — window indirection table
+// (`02c-design-windowed-slot-map.md` § E). Maps `pack(local_xyz)` to slot
+// index, with `0xFFFFFFFFu` (EMPTY_SLOT) for unbound positions. The bounds
+// chain runs on the streaming preset (per-frame bounds refresh after
+// admissions/evictions), so we need the same indirection-translated reads
+// the renderer uses. Non-streaming presets bind a 1-u32 placeholder; the
+// `streaming_active` gate (`array_length(&window_indirection) > 1u`) keeps
+// those bit-identical to the pre-2.6 read path.
+@group(0) @binding(2)
+var<storage, read> window_indirection: array<u32>;
+
+// streaming-world Phase 2.6 — translate a window-local chunk-coord through
+// the indirection table to its slot-indexed position in `chunks_buffer`.
+// Non-streaming presets (array_length == 1) take the flat-coord pass-through.
+fn streaming_chunk_index_bc(chunk_pos: vec3<u32>) -> u32 {
+    if (arrayLength(&window_indirection) <= 1u) {
+        return chunk_pos.x
+             + chunk_pos.y * params.size_in_chunks.x
+             + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
+    }
+    let chunks_per_seg: u32 = 16u;
+    let seg_local = vec3<u32>(
+        chunk_pos.x / chunks_per_seg,
+        chunk_pos.y / chunks_per_seg,
+        chunk_pos.z / chunks_per_seg,
+    );
+    let chunk_in_seg = vec3<u32>(
+        chunk_pos.x % chunks_per_seg,
+        chunk_pos.y % chunks_per_seg,
+        chunk_pos.z % chunks_per_seg,
+    );
+    let local_pack = seg_local.x + seg_local.y * 16u + seg_local.z * (16u * 2u);
+    let slot = window_indirection[local_pack];
+    if (slot == 0xFFFFFFFFu) {
+        return 0xFFFFFFFFu;
+    }
+    let chunk_in_seg_idx = chunk_in_seg.x
+        + chunk_in_seg.y * chunks_per_seg
+        + chunk_in_seg.z * chunks_per_seg * chunks_per_seg;
+    return slot * 4096u + chunk_in_seg_idx;
+}
+
+fn streaming_chunk_load_bc(chunk_pos: vec3<u32>) -> vec2<u32> {
+    let idx = streaming_chunk_index_bc(chunk_pos);
+    if (idx == 0xFFFFFFFFu) {
+        return vec2<u32>(0u, 0u);
+    }
+    return chunks[idx];
+}
 
 // `@group(1)` = `construction_bounds_layout` — the W3 bound-queue family.
 @group(1) @binding(0)
@@ -209,10 +258,9 @@ fn add_bounds_group(
     // After the out-of-bounds gate above, `neighbour_chunk_pos` is in
     // `[0, size_in_chunks)` per axis, safe to cast to `vec3<u32>`.
     let neighbour_pos_u = vec3<u32>(neighbour_chunk_pos);
-    let neighbour_idx = neighbour_pos_u.x
-        + neighbour_pos_u.y * params.size_in_chunks.x
-        + neighbour_pos_u.z * params.size_in_chunks.x * params.size_in_chunks.y;
-    let neighbour_x = chunks[neighbour_idx].x;
+    // streaming-world Phase 2.6 — translate through the window indirection
+    // table on the streaming preset.
+    let neighbour_x = streaming_chunk_load_bc(neighbour_pos_u).x;
     // `(neighbour.x >> 30) == BLOCK_STATE_UNIFORM_EMPTY && neighbour.y == 0`
     // — the non-`#ifdef ENTITIES` path collapses `.y` to 0 (W4 owns the
     // widening; until then we have no entity counts and the test is just
@@ -362,10 +410,10 @@ fn compute_group_bounds(
     // `vec3<i32>` constructed from `gp * 4 + local_id` (both non-negative);
     // safe to cast for flatten.
     let chunk_pos_u = vec3<u32>(chunk_pos);
-    let chunk_idx = chunk_pos_u.x
-        + chunk_pos_u.y * params.size_in_chunks.x
-        + chunk_pos_u.z * params.size_in_chunks.x * params.size_in_chunks.y;
-    let cur_chunk_full = chunks[chunk_idx];
+    // streaming-world Phase 2.6 — translate through indirection on streaming.
+    // `chunk_idx` is reused on the write below; recompute via helper.
+    let chunk_idx = streaming_chunk_index_bc(chunk_pos_u);
+    let cur_chunk_full = streaming_chunk_load_bc(chunk_pos_u);
     let cur_chunk_load = cur_chunk_full.x;
     // W4 — preserve `.y` (entity pointer channel) on the write below.
     let entity_y = cur_chunk_full.y;
@@ -402,9 +450,13 @@ fn compute_group_bounds(
     // the W3 background queue would silently zero the entity pointer on
     // every AADF expansion.
     if (is_group_active && cur_chunk_copy != cur_chunk) {
-        // Web-WebGPU migration: write to the flat chunks buffer. `chunk_idx`
-        // was computed alongside the load above (same chunk-pos).
-        chunks[chunk_idx] = vec2<u32>(cur_chunk, entity_y);
+        // streaming-world Phase 2.6 — `chunk_idx` is the helper-translated
+        // index. On streaming with EMPTY_SLOT (chunk not resident — should
+        // never happen because the queue only enqueues groups whose chunks
+        // are resident), skip the write rather than corrupting slot 0.
+        if (chunk_idx != 0xFFFFFFFFu) {
+            chunks[chunk_idx] = vec2<u32>(cur_chunk, entity_y);
+        }
         atomicStore(&any_bounds_increase, 1u);
     }
 

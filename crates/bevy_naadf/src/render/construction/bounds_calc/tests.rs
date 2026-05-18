@@ -536,12 +536,20 @@ fn build_w3_fixture(
     let bounds_bgl = cache.get_bind_group_layout(&bounds_layout);
     let dispatch_bgl = cache.get_bind_group_layout(&dispatch_layout);
 
+    // Phase 2.6 — window_indirection placeholder (binding 2).
+    let windir_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("w3_window_indirection_placeholder"),
+        size: 4,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let world_bg = device.create_bind_group(
         "w3_world_bg",
         &world_bgl,
         &BindGroupEntries::sequential((
             chunks_buffer.as_entire_buffer_binding(),
             params_buffer.as_entire_buffer_binding(),
+            windir_buf.as_entire_buffer_binding(),
         )),
     );
     let bounds_bg = device.create_bind_group(

@@ -1001,7 +1001,7 @@ pub fn e2e_driver(
                     // the shift after the WaitPostEdit phase.
                     let origin_x = residency
                         .as_deref()
-                        .map(|r| r.origin.x)
+                        .map(|r| r.origin().x)
                         .unwrap_or(i32::MIN);
                     super::streaming_window::record_origin_x_at_pose_a(origin_x);
                     let _ = &mut wd;
@@ -1124,7 +1124,7 @@ pub fn e2e_driver(
                             super::streaming_window::origin_x_at_pose_a();
                         let origin_now = residency
                             .as_deref()
-                            .map(|r| r.origin.x)
+                            .map(|r| r.origin().x)
                             .unwrap_or(i32::MAX);
                         let shift = if origin_a == i32::MIN || origin_now == i32::MAX {
                             // Never snapshotted / no current Residency — let

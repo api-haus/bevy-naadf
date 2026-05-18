@@ -86,6 +86,14 @@ pub fn construction_world_layout_descriptor() -> BindGroupLayoutDescriptor {
                 uniform_buffer_sized(false, Some(params_size)),
                 // hash_coefficients — ro storage (W1 deviation, see file doc).
                 storage_buffer_read_only_sized(false, None),
+                // streaming-world Phase 2.6 — window_indirection (binding 8).
+                // `array<u32>` (length 512 on streaming preset, length 1
+                // placeholder elsewhere). Construction shaders read this
+                // table via `streaming_chunk_index` to translate
+                // window-local chunk coords to slot-indexed positions in
+                // `chunks_buffer`. Gated by `arrayLength(&window_indirection)
+                // > 1u` at the shader-side helper.
+                storage_buffer_read_only_sized(false, None),
             ),
         ),
     )

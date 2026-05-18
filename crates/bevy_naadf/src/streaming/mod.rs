@@ -28,9 +28,10 @@ pub mod noise_dispatch;
 pub mod noise_fastnoiselite;
 pub mod noise_fastnoiselite_cpu_oracle;
 pub mod residency;
+pub mod windowed_slot_map;
 
 use bevy::prelude::*;
-use bevy::render::{ExtractSchedule, RenderApp};
+use bevy::render::{ExtractSchedule, Render, RenderApp, RenderSystems};
 
 pub use chunk_source::{
     ChunkSource, NoiseChunkSource, ProceduralStaticActive, SegmentSourceKind,
@@ -40,15 +41,15 @@ pub use noise_dispatch::{
     create_noise_terrain_params_buffer, extract_streaming_state,
     noise_terrain_layout_descriptor, queue_noise_terrain_pipeline,
     queue_noise_terrain_pipeline_with_handle, seed_noise_terrain_shader,
-    NoiseTerrainParams, StreamingExtractRender, StreamingShaderHandle,
-    NOISE_TERRAIN_SHADER_PATH, NOISE_TERRAIN_SHADER_SRC,
+    upload_window_indirection, NoiseTerrainParams, StreamingExtractRender,
+    StreamingShaderHandle, NOISE_TERRAIN_SHADER_PATH, NOISE_TERRAIN_SHADER_SRC,
 };
 pub use residency::{
-    assert_vram_budget_sufficient, compute_slab_total_mib, finalise_admissions_as_resident,
-    mark_admissions_resident, residency_driver, segment_to_voxel_origin,
-    target_origin_for_camera_seg, world_voxel_to_segment, Residency, SlotIndex, SlotState,
-    WorldSegmentPos, SEGMENT_CHUNKS, SEGMENT_VOXELS,
+    assert_vram_budget_sufficient, compute_slab_total_mib, residency_driver,
+    segment_to_voxel_origin, target_origin_for_camera_seg, world_voxel_to_segment,
+    Residency, SlotIndex, WorldSegmentPos, SEGMENT_CHUNKS, SEGMENT_VOXELS,
 };
+pub use windowed_slot_map::{WindowedSlotMap, EMPTY_SLOT};
 
 /// Phase-2 `StreamingPlugin` — wires:
 /// - The main-world `PreUpdate` `residency_driver` system.
@@ -70,20 +71,30 @@ impl Plugin for StreamingPlugin {
         // Main-world residency driver. `PreUpdate` so the per-frame
         // admissions/evictions are visible to the render extract that follows.
         app.add_systems(PreUpdate, residency_driver);
-        // Phase 2.5 root-cause fix (`03c-diagnosis.md` § "Root cause: false
-        // pass"): flip `Generating → Resident` for the segments admitted this
-        // frame. Runs in `Last` — after the render world has extracted the
-        // admissions list and dispatched the per-segment noise + chunk_calc
-        // passes. Without this, `process_pending_admissions` re-picks the
-        // same 4 camera-closest Generating slots every frame and the
-        // remaining 508/512 slots stay zero-filled forever (sky-only render).
-        app.add_systems(Last, finalise_admissions_as_resident);
+        // Phase 2.6 (`02c-design-windowed-slot-map.md` § G.4 + D4): the
+        // explicit `Generating → Resident` `Last`-stage system from Phase 2.5
+        // is GONE — slot lifecycle is now implicit (bound ∩
+        // admissions_this_frame ⇒ generating; bound \ admissions_this_frame ⇒
+        // resident). Phase 2.6's `WindowedSlotMap` invariants make the
+        // transition unnecessary: the driver clears
+        // `admissions_this_frame` at the next `PreUpdate` entry, which IS
+        // the Generating→Resident transition (the slot is still in
+        // world_to_slot but no longer in admissions_this_frame).
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
         render_app
             .init_resource::<StreamingExtractRender>()
-            .add_systems(ExtractSchedule, extract_streaming_state);
+            .add_systems(ExtractSchedule, extract_streaming_state)
+            // Phase 2.6 — upload the WindowedSlotMap indirection buffer
+            // to the GPU each frame the streaming preset is active. Runs in
+            // `Render::Queue` (after the ExtractSchedule populates
+            // `StreamingExtractRender.window_indirection`, before the producer
+            // node consumes the renderer's chunks bind group).
+            .add_systems(
+                Render,
+                upload_window_indirection.in_set(RenderSystems::Queue),
+            );
     }
 }

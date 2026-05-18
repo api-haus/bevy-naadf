@@ -248,6 +248,15 @@ pub struct ConstructionGpu {
     /// from re-firing on subsequent frames (the noise output is identical
     /// across re-dispatches; the cost would be ~300 ms/frame for nothing).
     pub static_preset_has_run: bool,
+
+    /// streaming-world Phase 2.6 — the `window_indirection` storage buffer
+    /// (`02c-design-windowed-slot-map.md` § D). Fixed 2 KB
+    /// `array<u32, 512>` table the renderer reads at `@group(0) @binding(8)`.
+    /// Per-frame upload via `streaming::upload_window_indirection` (runs in
+    /// `Render::Queue`). Allocated lazily on the first streaming-active
+    /// frame; absent on non-streaming presets (the renderer-side bind group
+    /// then carries the `WorldGpu::window_indirection_placeholder` instead).
+    pub window_indirection_buffer: Option<Buffer>,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -1495,12 +1504,22 @@ pub fn prepare_construction(
         if let Some(params_buf) = gpu.bounds_params_buffer.as_ref() {
             let bgl = pipeline_cache
                 .get_bind_group_layout(&construction_pipelines.construction_bounds_world_layout);
+            // Phase 2.6 — binding 2 = window_indirection. Use production
+            // buffer when streaming-active; placeholder otherwise.
+            let indirection_binding = gpu
+                .window_indirection_buffer
+                .as_ref()
+                .map(|b| b.as_entire_buffer_binding())
+                .unwrap_or_else(|| {
+                    world_gpu.window_indirection_placeholder.as_entire_buffer_binding()
+                });
             let bg = render_device.create_bind_group(
                 "naadf_construction_bounds_world_bind_group",
                 &bgl,
                 &BindGroupEntries::sequential((
                     world_gpu.chunks_buffer.as_entire_buffer_binding(),
                     params_buf.as_entire_buffer_binding(),
+                    indirection_binding,
                 )),
             );
             bind_groups.construction_bounds_world = Some(bg);
@@ -1759,6 +1778,35 @@ pub fn prepare_construction(
             );
             gpu.noise_terrain_params_buffer = Some(buf);
             bind_groups.construction_noise_terrain = None;
+        }
+
+        // (2.5) streaming-world Phase 2.6 —
+        // `window_indirection_buffer` (`02c-design-windowed-slot-map.md` § D).
+        // Fixed 2 KB `array<u32, 512>` table; allocated ONLY on the
+        // streaming preset (the static preset's `chunks` layout is flat
+        // absolute-coord — `streaming_active = 0` short-circuits the
+        // indirection read).
+        if streaming_active && gpu.window_indirection_buffer.is_none() {
+            const WINDOW_INDIRECTION_CAPACITY: u64 = 512;
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("naadf_streaming_window_indirection"),
+                size: WINDOW_INDIRECTION_CAPACITY * 4, // 2048 B.
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // Initialise to EMPTY_SLOT (0xFFFFFFFFu) — the first extract
+            // overwrites this with the live indirection table.
+            let zero: Vec<u32> =
+                vec![crate::streaming::EMPTY_SLOT; WINDOW_INDIRECTION_CAPACITY as usize];
+            render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&zero));
+            gpu.window_indirection_buffer = Some(buf);
+            // Force rebuild of every bind group that binds the indirection
+            // buffer (renderer-side world, construction_world,
+            // construction_bounds_world) so they pick up the production
+            // buffer instead of the placeholder.
+            gpu.world_bind_group_has_entities = false;
+            bind_groups.construction_world = None;
+            bind_groups.construction_bounds_world = None;
         }
 
         // (3) Build the noise-terrain bind group when missing AND both
@@ -2105,6 +2153,14 @@ pub fn prepare_construction(
             // view-recorded access types.)
             let bgl = pipeline_cache
                 .get_bind_group_layout(&construction_pipelines.construction_world_layout);
+            // Phase 2.6 — binding 8 = window_indirection.
+            let indirection_binding = gpu
+                .window_indirection_buffer
+                .as_ref()
+                .map(|b| b.as_entire_buffer_binding())
+                .unwrap_or_else(|| {
+                    world_gpu.window_indirection_placeholder.as_entire_buffer_binding()
+                });
             let bg = render_device.create_bind_group(
                 "naadf_construction_world_bind_group",
                 &bgl,
@@ -2117,6 +2173,7 @@ pub fn prepare_construction(
                     hmap.as_entire_buffer_binding(),
                     params.as_entire_buffer_binding(),
                     coeffs.as_entire_buffer_binding(),
+                    indirection_binding,
                 )),
             );
             bind_groups.construction_world = Some(bg);
@@ -2402,6 +2459,9 @@ pub fn prepare_construction(
                     std::mem::size_of::<crate::render::gpu_types::GpuWorldMeta>() as u64,
                 )
                 .unwrap();
+                // Phase 2.6 — layout is 9 bindings (binding 8 =
+                // `window_indirection`); mirrors
+                // `NaadfPipelines::world_layout` exactly.
                 let world_layout_desc = bevy::render::render_resource::BindGroupLayoutDescriptor::new(
                     "naadf_world_bind_group_layout",
                     &BindGroupLayoutEntries::sequential(
@@ -2417,10 +2477,23 @@ pub fn prepare_construction(
                             storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
                             storage_buffer_read_only_sized(false, None),
+                            // Phase 2.6 — window_indirection (slot 8).
+                            storage_buffer_read_only_sized(false, None),
                         ),
                     ),
                 );
                 let bgl = pipeline_cache.get_bind_group_layout(&world_layout_desc);
+                // Phase 2.6 — pick the indirection binding: production
+                // buffer when streaming-active, placeholder otherwise.
+                // The entity-rebuild path can co-exist with streaming-OFF
+                // (default) configs; we use the placeholder there.
+                let indirection_binding = gpu
+                    .window_indirection_buffer
+                    .as_ref()
+                    .map(|b| b.as_entire_buffer_binding())
+                    .unwrap_or_else(|| {
+                        world_gpu.window_indirection_placeholder.as_entire_buffer_binding()
+                    });
                 let rebuilt = render_device.create_bind_group(
                     "naadf_world_bind_group_with_entities",
                     &bgl,
@@ -2433,11 +2506,105 @@ pub fn prepare_construction(
                         eci_rw.as_entire_buffer_binding(),
                         evd.as_entire_buffer_binding(),
                         eih_rw.as_entire_buffer_binding(),
+                        indirection_binding,
                     )),
                 );
                 world_gpu.bind_group = rebuilt;
                 gpu.world_bind_group_has_entities = true;
             }
+        }
+    }
+
+    // streaming-world Phase 2.6 — rebuild the renderer-side world bind group
+    // with the production `window_indirection` buffer in place of the
+    // `prepare_world_gpu` placeholder, on the first frame the streaming
+    // preset's indirection buffer is allocated. Mirrors the entity-rebuild
+    // path above; runs OUTSIDE the `entities_enabled` gate (streaming and
+    // entities are mutually exclusive at install time, but a non-entity
+    // streaming session needs the same rebuild).
+    //
+    // Also handles updating `world_meta.streaming_active`: prepare_world_gpu
+    // builds it with whatever value was on the FIRST frame; if the
+    // streaming preset comes online later, we re-upload world_meta here.
+    if streaming_active
+        && gpu.window_indirection_buffer.is_some()
+        && !construction_config.entities_enabled
+    {
+        // Phase 2.6 — guard via a fresh flag so we rebuild ONCE per
+        // (re-)allocation of the indirection buffer.
+        // We piggyback on `world_bind_group_has_entities` as the rebuild
+        // signal: when streaming starts, the buffer allocation above clears
+        // it to false (forces this branch to fire).
+        if !gpu.world_bind_group_has_entities {
+            use bevy::render::render_resource::{
+                binding_types::{storage_buffer_read_only_sized, uniform_buffer_sized},
+                BindGroupLayoutEntries, ShaderStages,
+            };
+            use std::num::NonZeroU64;
+            let world_meta_size = NonZeroU64::new(
+                std::mem::size_of::<crate::render::gpu_types::GpuWorldMeta>() as u64,
+            )
+            .unwrap();
+            let world_layout_desc = bevy::render::render_resource::BindGroupLayoutDescriptor::new(
+                "naadf_world_bind_group_layout",
+                &BindGroupLayoutEntries::sequential(
+                    ShaderStages::COMPUTE,
+                    (
+                        storage_buffer_read_only_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
+                        uniform_buffer_sized(false, Some(world_meta_size)),
+                        storage_buffer_read_only_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
+                    ),
+                ),
+            );
+            let bgl = pipeline_cache.get_bind_group_layout(&world_layout_desc);
+            let indirection_buf = gpu
+                .window_indirection_buffer
+                .as_ref()
+                .expect("guarded above");
+            let rebuilt = render_device.create_bind_group(
+                "naadf_world_bind_group_streaming",
+                &bgl,
+                &BindGroupEntries::sequential((
+                    world_gpu.chunks_buffer.as_entire_buffer_binding(),
+                    world_gpu.blocks.buffer().as_entire_buffer_binding(),
+                    world_gpu.voxels.buffer().as_entire_buffer_binding(),
+                    world_gpu.voxel_types.buffer().as_entire_buffer_binding(),
+                    world_gpu.world_meta.as_entire_buffer_binding(),
+                    world_gpu.entity_chunk_instances_placeholder.as_entire_buffer_binding(),
+                    world_gpu.entity_voxel_data_placeholder.as_entire_buffer_binding(),
+                    world_gpu.entity_instances_history_placeholder.as_entire_buffer_binding(),
+                    indirection_buf.as_entire_buffer_binding(),
+                )),
+            );
+            world_gpu.bind_group = rebuilt;
+            // Re-upload the world_meta uniform with streaming_active = 1
+            // (in case prepare_world_gpu ran before the streaming extract
+            // populated the flag).
+            let size_in_chunks = world_gpu.chunks_size_in_chunks;
+            let world_meta_data = crate::render::gpu_types::GpuWorldMeta {
+                size_in_chunks,
+                streaming_active: 1,
+                bounding_box_min: bevy::math::Vec3::splat(0.1),
+                _pad1: 0,
+                bounding_box_max: bevy::math::Vec3::new(
+                    (crate::WORLD_SIZE_IN_VOXELS.x as f32) - 0.1,
+                    (crate::WORLD_SIZE_IN_VOXELS.y as f32) - 0.1,
+                    (crate::WORLD_SIZE_IN_VOXELS.z as f32) - 0.1,
+                ),
+                _pad2: 0,
+            };
+            render_queue.write_buffer(
+                &world_gpu.world_meta,
+                0,
+                bytemuck::bytes_of(&world_meta_data),
+            );
+            gpu.world_bind_group_has_entities = true;
         }
     }
 
@@ -2802,23 +2969,68 @@ pub fn naadf_gpu_producer_node(
         let group_size_in_chunks =
             [segment_chunks, segment_chunks, segment_chunks];
 
+        // Phase 2.6 — the streaming-extract carries the indirection table
+        // origin implicitly via admissions_this_frame. We need the current
+        // window origin to compute window-local positions, so reconstruct
+        // it from any one bound admission: `local = world_seg - origin`.
+        // The streaming dispatch loop uses local positions to build
+        // chunk_offset; the shader-side helper then translates back through
+        // the indirection table to the actual slot index (which may differ
+        // from any geometric mapping under pool-driven allocation).
         let mut segments_dispatched: u32 = 0;
         for (world_seg, slot) in admissions.iter() {
             // World origin in voxels — `WorldSegmentPos.0 * SEGMENT_VOXELS`.
             let seg_origin_v = world_seg.0
                 * (crate::streaming::SEGMENT_VOXELS);
 
-            // Slot → window-local segment coords → chunk offset (where in
-            // `WorldGpu.chunks_buffer` this segment's output lands). The
-            // chunk_calc dispatch writes into chunks at
-            // `chunk_offset + (gx, gy, gz)` per the construction_params
-            // uniform.
-            let [lx, ly, lz] = crate::streaming::Residency::local_of(slot.0);
+            // Phase 2.6 (`02c-design-windowed-slot-map.md` § F): the
+            // chunk_offset math STAYS the same — `[local.x*16, local.y*16,
+            // local.z*16]`. What changes is the source of `local`: it's the
+            // WORLD SEGMENT'S window-local position
+            // (`world_seg - origin`), NOT a function of the slot index
+            // (slot.0 is now pool-allocated, not geometrically tied to
+            // window position).
+            //
+            // The shader's `streaming_chunk_index(chunk_pos)` then computes
+            // `seg_local = chunk_pos / 16` (which equals `local`), looks up
+            // `window_indirection[pack(seg_local)] = slot.0` (the bound
+            // slot), and emits `slot.0 * 4096 + chunk_in_seg_idx` — the
+            // slot-indexed `chunks_buffer` address.
+            //
+            // The window origin is implicit in the indirection table: the
+            // streaming residency driver binds `world_seg → slot` with
+            // `indirection[pack(world_seg - origin)] = slot.0` on the main
+            // world; the indirection table is uploaded to GPU by
+            // `upload_window_indirection` in Render::Queue (before this
+            // dispatch fires).
+            //
+            // To recover `local` here, we use the slot.0 as a proxy: the
+            // slot's window-local position can ALWAYS be derived from
+            // `pack^-1(indirection.position_of(slot.0))`. Simpler: stash
+            // the window origin on the StreamingExtractRender and compute
+            // `local = world_seg - origin` directly.
+            //
+            // We don't have origin on the extract yet — use a heuristic
+            // that works for the streaming preset's typical case (residency
+            // is centered on camera; the renderer pre-translates camera to
+            // local frame). For the first frame after a shift, all bound
+            // segments have `local in [0, window_size)`. We compute local
+            // by asserting `world_seg` is in the window and finding its
+            // local position via a different path.
+            //
+            // SIMPLER FIX: stash the window origin on
+            // StreamingExtractRender. Done below — see
+            // `noise_dispatch.rs::extract_streaming_state`.
+            let origin = streaming_extract.window_origin;
+            let local_x = world_seg.0.x - origin.x;
+            let local_y = world_seg.0.y - origin.y;
+            let local_z = world_seg.0.z - origin.z;
             let group_offset_in_chunks = [
-                lx * segment_chunks,
-                ly * segment_chunks,
-                lz * segment_chunks,
+                local_x.max(0) as u32 * segment_chunks,
+                local_y.max(0) as u32 * segment_chunks,
+                local_z.max(0) as u32 * segment_chunks,
             ];
+            let _ = slot;
 
             // Build the noise_terrain params.
             let noise_params = crate::streaming::build_noise_terrain_params(
@@ -3828,6 +4040,13 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     let render_app = app.get_sub_app(RenderApp).unwrap();
     let cache = render_app.world().resource::<PipelineCache>();
     let bgl = cache.get_bind_group_layout(&layout);
+    // Phase 2.6 — window_indirection placeholder.
+    let validate_windir_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("validate_window_indirection_placeholder"),
+        size: 4,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let bind_group = device.create_bind_group(
         "validate_bind_group",
         &bgl,
@@ -3840,6 +4059,7 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
             gpu_hash_map.as_entire_buffer_binding(),
             params_buffer.as_entire_buffer_binding(),
             gpu_coeffs.as_entire_buffer_binding(),
+            validate_windir_buf.as_entire_buffer_binding(),
         )),
     );
 
@@ -5551,6 +5771,13 @@ fn run_one_fixture_byte_diff(
     let render_app = app.get_sub_app(RenderApp).unwrap();
     let cache = render_app.world().resource::<PipelineCache>();
     let bgl = cache.get_bind_group_layout(&layout);
+    // Phase 2.6 — window_indirection placeholder.
+    let scaled_windir_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("scaled_window_indirection_placeholder"),
+        size: 4,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let bind_group = device.create_bind_group(
         "scaled_bind_group",
         &bgl,
@@ -5563,6 +5790,7 @@ fn run_one_fixture_byte_diff(
             gpu_hash_map.as_entire_buffer_binding(),
             params_buffer.as_entire_buffer_binding(),
             gpu_coeffs.as_entire_buffer_binding(),
+            scaled_windir_buf.as_entire_buffer_binding(),
         )),
     );
 
@@ -6048,6 +6276,13 @@ fn run_one_fixture_multiseg_byte_diff(
     let render_app = app.get_sub_app(RenderApp).unwrap();
     let cache = render_app.world().resource::<PipelineCache>();
     let bgl = cache.get_bind_group_layout(&layout);
+    // Phase 2.6 — window_indirection placeholder.
+    let ms_windir_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("ms_window_indirection_placeholder"),
+        size: 4,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let bind_group = device.create_bind_group(
         "ms_bind_group",
         &bgl,
@@ -6060,6 +6295,7 @@ fn run_one_fixture_multiseg_byte_diff(
             gpu_hash_map.as_entire_buffer_binding(),
             params_buffer.as_entire_buffer_binding(),
             gpu_coeffs.as_entire_buffer_binding(),
+            ms_windir_buf.as_entire_buffer_binding(),
         )),
     );
 
@@ -6791,6 +7027,13 @@ fn run_one_tiled_byte_diff(
         )),
     );
     let calc_bgl = cache.get_bind_group_layout(&calc_layout);
+    // Phase 2.6 — window_indirection placeholder.
+    let tile_windir_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("tile_window_indirection_placeholder"),
+        size: 4,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let calc_bg = device.create_bind_group(
         "tile_calc_bg",
         &calc_bgl,
@@ -6803,6 +7046,7 @@ fn run_one_tiled_byte_diff(
             gpu_hash_map.as_entire_buffer_binding(),
             calc_params_buf.as_entire_buffer_binding(),
             gpu_coeffs.as_entire_buffer_binding(),
+            tile_windir_buf.as_entire_buffer_binding(),
         )),
     );
 
@@ -7376,6 +7620,13 @@ fn run_oasis_segment_byte_diff(
             gen_params_buf.as_entire_buffer_binding(),
         )),
     );
+    // Phase 2.6 — window_indirection placeholder.
+    let oasis_windir_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("oasis_window_indirection_placeholder"),
+        size: 4,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let calc_bgl = cache.get_bind_group_layout(&calc_layout);
     let calc_bg = device.create_bind_group(
         "oasis_calc_bg",
@@ -7389,6 +7640,7 @@ fn run_oasis_segment_byte_diff(
             gpu_hash_map.as_entire_buffer_binding(),
             calc_params_buf.as_entire_buffer_binding(),
             gpu_coeffs.as_entire_buffer_binding(),
+            oasis_windir_buf.as_entire_buffer_binding(),
         )),
     );
 
@@ -8923,6 +9175,15 @@ mod tests_w1 {
         let render_app = app.get_sub_app(RenderApp).unwrap();
         let cache = render_app.world().resource::<PipelineCache>();
         let bgl = cache.get_bind_group_layout(&layout);
+        // Phase 2.6 — window_indirection placeholder (binding 8). The
+        // streaming-active gate (`arrayLength <= 1u`) keeps the helper on
+        // the flat-coord path for this test.
+        let windir_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("w1_window_indirection_placeholder"),
+            size: 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group = device.create_bind_group(
             "w1_construction_world_bind_group",
             &bgl,
@@ -8935,6 +9196,7 @@ mod tests_w1 {
                 gpu_hash_map.as_entire_buffer_binding(),
                 gpu_params.as_entire_buffer_binding(),
                 gpu_hash_coefficients.as_entire_buffer_binding(),
+                windir_buf.as_entire_buffer_binding(),
             )),
         );
 

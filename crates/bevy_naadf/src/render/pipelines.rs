@@ -334,6 +334,14 @@ impl FromWorld for NaadfPipelines {
                     storage_buffer_read_only_sized(false, None), // entity_chunk_instances: array<EntityChunkInstance>
                     storage_buffer_read_only_sized(false, None), // entity_voxel_data: array<u32>
                     storage_buffer_read_only_sized(false, None), // entity_instances_history: array<vec4<u32>>
+                    // streaming-world Phase 2.6 — window_indirection buffer
+                    // (`02c-design-windowed-slot-map.md` § D). Fixed 2 KB
+                    // `array<u32, 512>` table mapping `pack(local_xyz)` →
+                    // `SlotIndex`. Always bound — 1-element placeholder when
+                    // the streaming preset is OFF (the
+                    // `streaming_active = 0` branch in the WGSL helpers
+                    // short-circuits the indirection read).
+                    storage_buffer_read_only_sized(false, None), // window_indirection: array<u32>
                 ),
             ),
         );

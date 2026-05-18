@@ -124,6 +124,52 @@ var<storage, read_write> hash_map: array<HashValueSlot>;
 var<uniform> params: ConstructionParams;
 @group(0) @binding(7)
 var<storage, read> hash_coefficients: array<u32>;
+// streaming-world Phase 2.6 — window indirection table
+// (`02c-design-windowed-slot-map.md` § E). Phase 2.6 design § F notes that
+// the streaming preset DOES use W2 for evictions. `array_length(&window_
+// indirection) > 1u` is the runtime streaming-active gate (non-streaming
+// presets bind a 1-u32 placeholder).
+@group(0) @binding(8)
+var<storage, read> window_indirection: array<u32>;
+
+// streaming-world Phase 2.6 — translate a window-local chunk-coord through
+// the indirection table. Non-streaming presets pass through to the flat
+// layout.
+fn streaming_chunk_index_wc(chunk_pos: vec3<u32>) -> u32 {
+    if (arrayLength(&window_indirection) <= 1u) {
+        return chunk_pos.x
+             + chunk_pos.y * params.size_in_chunks.x
+             + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
+    }
+    let chunks_per_seg: u32 = 16u;
+    let seg_local = vec3<u32>(
+        chunk_pos.x / chunks_per_seg,
+        chunk_pos.y / chunks_per_seg,
+        chunk_pos.z / chunks_per_seg,
+    );
+    let chunk_in_seg = vec3<u32>(
+        chunk_pos.x % chunks_per_seg,
+        chunk_pos.y % chunks_per_seg,
+        chunk_pos.z % chunks_per_seg,
+    );
+    let local_pack = seg_local.x + seg_local.y * 16u + seg_local.z * (16u * 2u);
+    let slot = window_indirection[local_pack];
+    if (slot == 0xFFFFFFFFu) {
+        return 0xFFFFFFFFu;
+    }
+    let chunk_in_seg_idx = chunk_in_seg.x
+        + chunk_in_seg.y * chunks_per_seg
+        + chunk_in_seg.z * chunks_per_seg * chunks_per_seg;
+    return slot * 4096u + chunk_in_seg_idx;
+}
+
+fn streaming_chunk_load_wc(chunk_pos: vec3<u32>) -> vec2<u32> {
+    let idx = streaming_chunk_index_wc(chunk_pos);
+    if (idx == 0xFFFFFFFFu) {
+        return vec2<u32>(0u, 0u);
+    }
+    return chunks[idx];
+}
 
 // `@group(1)` = `construction_change_layout` (W2-owned, 4 bindings) — the 4
 // CPU-staged upload buffers consumed by the 4 apply passes.
@@ -317,10 +363,10 @@ fn apply_group_change(
     // chunks-pair, `.x` carries the construction state + AADF, `.y` carries
     // the entity pointer / counter. Web-WebGPU migration: chunks is
     // `array<vec2<u32>>` indexed by `flatten_index(chunk_pos, sx, sx*sy)`.
-    let chunk_idx = chunk_pos.x
-        + chunk_pos.y * params.size_in_chunks.x
-        + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
-    let cur_chunk_load = chunks[chunk_idx];
+    // streaming-world Phase 2.6: routed through `streaming_chunk_index_wc`
+    // so the streaming preset's slot-indexed layout works.
+    let chunk_idx = streaming_chunk_index_wc(chunk_pos);
+    let cur_chunk_load = streaming_chunk_load_wc(chunk_pos);
     let cur_chunk_x = cur_chunk_load.x;
     let cur_chunk_y = cur_chunk_load.y;
 
@@ -379,7 +425,10 @@ fn apply_group_change(
         lowest_z = min(lowest_z, min(new_bound_zm, new_bound_zp));
 
         // **Preserve the `.y` entity-pointer channel** — W2 contract.
-        chunks[chunk_idx] = vec2<u32>(new_chunk_x, cur_chunk_y);
+        // Phase 2.6: skip the write on EMPTY_SLOT (chunk not resident).
+        if (chunk_idx != 0xFFFFFFFFu) {
+            chunks[chunk_idx] = vec2<u32>(new_chunk_x, cur_chunk_y);
+        }
     }
 
     workgroupBarrier();
@@ -447,11 +496,12 @@ fn apply_chunk_change(
     );
     // Web-WebGPU migration: chunks is `array<vec2<u32>>`. Load to preserve
     // `.y` (entity pointer channel) — W2 contract — then write the pair.
-    let chunk_idx = chunk_pos.x
-        + chunk_pos.y * params.size_in_chunks.x
-        + chunk_pos.z * params.size_in_chunks.x * params.size_in_chunks.y;
-    let cur = chunks[chunk_idx];
-    chunks[chunk_idx] = vec2<u32>(change.y, cur.y);
+    // streaming-world Phase 2.6: routed through helper. Skip EMPTY_SLOT.
+    let chunk_idx = streaming_chunk_index_wc(chunk_pos);
+    if (chunk_idx != 0xFFFFFFFFu) {
+        let cur = chunks[chunk_idx];
+        chunks[chunk_idx] = vec2<u32>(change.y, cur.y);
+    }
 }
 
 // ─── Entry point 3: apply_block_change — fx:130-147 ───────────────────────────
