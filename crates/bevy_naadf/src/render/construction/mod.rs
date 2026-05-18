@@ -3415,6 +3415,2729 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
     Ok(bytes_compared)
 }
 
+/// vox-gpu-rewrite — concrete byte-level diagnostic for GPU vs CPU chunk_calc
+/// divergence (`12-diagnostic-byte-diff-concrete.md`).
+///
+/// Drives the same W5 chunk_calc chain as [`validate_gpu_construction`] but
+/// across a sweep of progressively-larger fixtures, emitting the first
+/// divergent u32 index per buffer (chunks / blocks / voxels) for each fixture
+/// — both via raw byte-equality and via semantic pointer-following
+/// comparison. The raw-byte form is sensitive to nondeterministic atomic
+/// ordering (`atomicAdd` cursor races across mixed chunks) and will report
+/// divergences that are semantically benign; the pointer-following form
+/// reports only divergences in the actual referenced content.
+///
+/// Output: a multi-fixture report printed to stderr; the function returns
+/// `Ok(report_string)` on completion regardless of whether divergences were
+/// found (this is a DIAGNOSTIC, not a gate).
+pub fn validate_gpu_construction_scaled() -> Result<String, String> {
+    let mut report = String::new();
+    report.push_str("=== vox-gpu-rewrite scaled byte-diff diagnostic ===\n\n");
+
+    // Fixture sweep — three diversity modes per scale to triangulate where
+    // bytes diverge:
+    //   "uniform":  every chunk has identical mixed content (1 voxel at
+    //               block-corner) — heavy dedup-hit traffic, all blocks
+    //               funnel to one voxel slot.
+    //   "diverse":  every chunk has a UNIQUE mixed content (different voxel
+    //               position per chunk) — no dedup hits, every chunk claims
+    //               its own slot. Stresses CAS slot-claim path.
+    //   "mixed":    half chunks unique, half identical — both dedup-hit and
+    //               new-slot CAS are exercised in the same dispatch.
+    let fixtures: &[(&str, [u32; 3], FixtureMode)] = &[
+        ("2x1x2-uniform",   [2, 1, 2],   FixtureMode::Uniform),
+        ("4x1x4-mixed",     [4, 1, 4],   FixtureMode::Mixed),
+        ("16x1x16-mixed",   [16, 1, 16], FixtureMode::Mixed),
+        ("32x2x32-diverse", [32, 2, 32], FixtureMode::Diverse),
+        ("64x4x64-mixed",   [64, 4, 64], FixtureMode::Mixed),
+    ];
+
+    for (label, dims, mode) in fixtures {
+        report.push_str(&format!("--- fixture {label}: {:?} chunks, mode={:?} (single-dispatch) ---\n", dims, mode));
+        match run_one_fixture_byte_diff(*dims, *mode) {
+            Ok(s) => {
+                report.push_str(&s);
+                report.push('\n');
+            }
+            Err(e) => {
+                report.push_str(&format!("FIXTURE FAILED: {e}\n\n"));
+            }
+        }
+    }
+
+    // Multi-segment dispatch sweep — mirrors the production W5 segment loop:
+    // hash_map is allocated once + reused across all per-segment dispatches.
+    // Each segment dispatches generator_model + calc_block_from_raw_data
+    // for its own chunk_offset (the segment buffer is reused per segment).
+    // This exercises cross-segment hash_map state accumulation that the
+    // single-dispatch fixtures cannot reach.
+    let multi_seg_fixtures: &[(&str, [u32; 3], u32, FixtureMode)] = &[
+        // (label, world_chunks, segment_size_in_chunks, mode)
+        ("4x4x4-seg2-mixed",   [4, 4, 4],   2, FixtureMode::Mixed),
+        ("8x4x8-seg4-mixed",   [8, 4, 8],   4, FixtureMode::Mixed),
+        ("16x4x16-seg4-mixed", [16, 4, 16], 4, FixtureMode::Mixed),
+        ("32x4x32-seg4-mixed", [32, 4, 32], 4, FixtureMode::Mixed),
+        ("64x16x64-seg16-mixed",[64, 16, 64], 16, FixtureMode::Mixed),
+        // Closest to Oasis-class scale with a sane CPU oracle footprint.
+        // 128x16x128 = 262144 chunks. CPU `DenseVolume::voxels` is
+        // (128*16)*(16*16)*(128*16) = 2048*256*2048 ≈ 1 G voxels (~ 1 GB for
+        // u16 voxel-types). Larger world sizes overflow u32 voxel-count
+        // (e.g. 256x32x256 → 8.5 G voxels → u32 wrap → empty Vec → panic).
+        ("128x16x128-seg16-mixed", [128, 16, 128], 16, FixtureMode::Mixed),
+    ];
+
+    for (label, dims, seg_size, mode) in multi_seg_fixtures {
+        report.push_str(&format!(
+            "--- fixture {label}: {:?} chunks, seg={seg_size}, mode={:?} (multi-segment) ---\n",
+            dims, mode
+        ));
+        match run_one_fixture_multiseg_byte_diff(*dims, *seg_size, *mode) {
+            Ok(s) => {
+                report.push_str(&s);
+                report.push('\n');
+            }
+            Err(e) => {
+                report.push_str(&format!("FIXTURE FAILED: {e}\n\n"));
+            }
+        }
+    }
+
+    // ── Generator_model.wgsl byte-diff ──────────────────────────────────────
+    // Compares the generator_model.wgsl GPU output against the
+    // `generate_segment_cpu` Rust oracle (the bit-exact port). Both consume a
+    // `ModelData` and produce the same `segment_voxel_buffer` layout that
+    // chunk_calc reads. If THIS diverges, the bug is upstream of chunk_calc
+    // (in generator_model itself).
+    report.push_str("\n=== Generator_model.wgsl GPU vs CPU oracle byte-diff ===\n");
+    let gen_fixtures: &[(&str, [u32; 3], [u32; 3], [u32; 3])] = &[
+        // (label, model_size_in_chunks, group_size_in_chunks, group_offset_in_chunks)
+        ("model-1x1x1-seg-1x1x1",   [1, 1, 1],   [1, 1, 1],  [0, 0, 0]),
+        ("model-2x1x2-seg-4x4x4",   [2, 1, 2],   [4, 4, 4],  [0, 0, 0]),
+        ("model-4x2x4-seg-8x4x8",   [4, 2, 4],   [8, 4, 8],  [0, 0, 0]),
+        ("model-8x2x8-seg-16x16x16",[8, 2, 8],   [16, 16, 16],[0, 0, 0]),
+        // Offset matters — test a non-zero offset to exercise the Y-clamp
+        // and the world-extent gate.
+        ("model-2x1x2-seg-4x4x4-off2-1-2", [2, 1, 2], [4, 4, 4], [2, 1, 2]),
+    ];
+    for (label, model_dims, seg_dims, off) in gen_fixtures {
+        report.push_str(&format!(
+            "--- gen fixture {label}: model={:?} seg={:?} off={:?} ---\n",
+            model_dims, seg_dims, off
+        ));
+        match run_one_generator_model_byte_diff(*model_dims, *seg_dims, *off) {
+            Ok(s) => {
+                report.push_str(&s);
+                report.push('\n');
+            }
+            Err(e) => {
+                report.push_str(&format!("FIXTURE FAILED: {e}\n\n"));
+            }
+        }
+    }
+
+    // ── TILED ModelData: small model tiled into a larger world ─────────────
+    // Mirrors production behavior: a small ModelData (a "tile") gets repeated
+    // across the larger fixed world via the generator's `voxelPos % modelSize`
+    // wraparound. The repeated tiles produce many chunks with identical
+    // content, hitting the chunk_calc dedup path heavily.
+    report.push_str("\n=== Tiled ModelData (small model, large world) generator+chunk_calc byte-diff ===\n");
+    let tiled_fixtures: &[(&str, [u32; 3], [u32; 3])] = &[
+        ("model-2x1x2_world-4x1x4",  [2, 1, 2], [4, 1, 4]),
+        ("model-4x1x4_world-16x1x16",[4, 1, 4], [16, 1, 16]),
+        ("model-4x2x4_world-16x4x16",[4, 2, 4], [16, 4, 16]),
+        ("model-8x2x8_world-32x4x32",[8, 2, 8], [32, 4, 32]),
+        // Closest to Oasis tile ratio: 93x34x84 model in 256x32x256 world =
+        // ~3x4 horizontal tiles. Use 32x16x32 model in 96x16x96 world for
+        // 3x3 = 9-tile equivalent.
+        ("model-32x16x32_world-96x16x96",  [32, 16, 32], [96, 16, 96]),
+    ];
+    for (label, model_dims, world_dims) in tiled_fixtures {
+        report.push_str(&format!(
+            "--- tiled fixture {label}: model={:?} world={:?} ---\n",
+            model_dims, world_dims
+        ));
+        match run_one_tiled_byte_diff(*model_dims, *world_dims) {
+            Ok(s) => report.push_str(&s),
+            Err(e) => report.push_str(&format!("FAILED: {e}\n")),
+        }
+        report.push('\n');
+    }
+
+    // ── Real Oasis model loaded from disk ───────────────────────────────────
+    // Load the actual oasis_hard_cover.vox into a ModelData and exercise the
+    // generator+chunk_calc chain on a few segments. Compares the per-segment
+    // GPU output to the CPU oracle (generate_segment_cpu + construct of the
+    // resulting DenseVolume). If THIS diverges where synthesized fixtures
+    // didn't, the bug is triggered by the real-world model's specific
+    // structure.
+    report.push_str("\n=== Real Oasis ModelData + per-segment generator+chunk_calc byte-diff ===\n");
+    let oasis_path = std::path::Path::new(
+        "crates/bevy_naadf/assets/test/oasis_hard_cover.vox",
+    );
+    match load_oasis_model_data(oasis_path) {
+        Ok(model) => {
+            report.push_str(&format!(
+                "Loaded Oasis ModelData: {}×{}×{} chunks (data_chunk={} data_block={} data_voxel={})\n",
+                model.size_in_chunks[0], model.size_in_chunks[1], model.size_in_chunks[2],
+                model.data_chunk.len(), model.data_block.len(), model.data_voxel.len(),
+            ));
+            // Run on a 4x4x4-chunk segment at offset (0,0,0) — should land
+            // in the densely-populated corner of the model.
+            for &(off, seg) in &[
+                // Cover model interior — pick offsets inside the 93×34×84
+                // model where content actually lives.
+                ([0u32, 0, 0], [16u32, 16, 16]),
+                ([16, 0, 16], [16, 16, 16]),
+                ([32, 0, 32], [16, 16, 16]),
+                ([48, 0, 48], [16, 16, 16]),
+                ([60, 0, 60], [16, 16, 16]),
+                // Edge-of-model segment to test wrap behaviour.
+                ([76, 0, 64], [16, 16, 16]),
+                // Segment that straddles the model's vertical extent (y=16+
+                // crosses model y=2 boundary at chunk y=2).
+                ([16, 0, 16], [16, 16, 16]),
+            ] {
+                report.push_str(&format!(
+                    "--- oasis segment off={:?} seg={:?} ---\n", off, seg
+                ));
+                match run_oasis_segment_byte_diff(&model, off, seg) {
+                    Ok(s) => report.push_str(&s),
+                    Err(e) => report.push_str(&format!("FAILED: {e}\n")),
+                }
+                report.push('\n');
+            }
+        }
+        Err(e) => {
+            report.push_str(&format!("Failed to load Oasis VOX fixture: {e}\n"));
+        }
+    }
+
+    eprintln!("{report}");
+    Ok(report)
+}
+
+/// Per-chunk content diversity mode for the scaled byte-diff fixture sweep.
+#[derive(Clone, Copy, Debug)]
+enum FixtureMode {
+    /// All mixed blocks across all chunks have identical content — dedup-hit
+    /// path dominates.
+    Uniform,
+    /// Every chunk has UNIQUE mixed-block content — new-slot CAS dominates.
+    Diverse,
+    /// Half chunks uniform, half diverse — exercises both paths in one
+    /// dispatch.
+    Mixed,
+}
+
+/// Run the W5 chunk_calc chain on a single fixture and report byte-level +
+/// semantic-content divergence vs the CPU oracle.
+fn run_one_fixture_byte_diff(
+    size_in_chunks: [u32; 3],
+    mode: FixtureMode,
+) -> Result<String, String> {
+    use bevy::app::App;
+    use bevy::asset::{AssetPlugin, Assets};
+    use bevy::image::ImagePlugin;
+    use bevy::shader::Shader;
+    use bevy::render::render_resource::{
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+        MapMode, PipelineCache, PollType,
+    };
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use bevy::render::settings::RenderCreation;
+    use bevy::render::{RenderApp, RenderPlugin};
+    use bevy::MinimalPlugins;
+
+    use crate::aadf::cell::{BlockCell, ChunkCell};
+    use crate::aadf::construct::{construct, DenseVolume};
+    use crate::render::construction::chunk_calc::{
+        construction_world_layout_descriptor, dispatch_calc_block_from_raw_data_world_sized,
+        dispatch_compute_block_bounds, dispatch_compute_voxel_bounds,
+        queue_block_bounds_pipeline_with_handle, queue_calc_block_pipeline_with_handle,
+        queue_voxel_bounds_pipeline_with_handle, CHUNK_CALC_SHADER_SRC,
+    };
+    use crate::render::construction::hashing::hash_coefficients;
+    use crate::render::gpu_types::GpuConstructionParams;
+    use crate::voxel::VoxelTypeId;
+
+    // ── Build the fixture volume ──────────────────────────────────────────────
+    // Each chunk gets ONE mixed block (block (0,0,0) of the chunk) with one
+    // full voxel. The voxel's position inside the block depends on `mode`:
+    //   Uniform: voxel at (0,0,0) of the block — every mixed block has
+    //            identical content → all dedup-hit.
+    //   Diverse: voxel position varies per chunk (cycles through 64 positions)
+    //            → every mixed block claims a unique slot.
+    //   Mixed:   even-parity chunks uniform, odd-parity chunks diverse.
+    let mut volume = DenseVolume::empty(size_in_chunks);
+    let sv = volume.size_in_voxels();
+    for cz in 0..size_in_chunks[2] {
+        for cy in 0..size_in_chunks[1] {
+            for cx in 0..size_in_chunks[0] {
+                let chunk_idx = cx + cy * size_in_chunks[0]
+                    + cz * size_in_chunks[0] * size_in_chunks[1];
+                let pos_in_block: u32 = match mode {
+                    FixtureMode::Uniform => 0,
+                    FixtureMode::Diverse => chunk_idx % 64,
+                    FixtureMode::Mixed => {
+                        if chunk_idx % 2 == 0 { 0 } else { (chunk_idx / 2) % 64 }
+                    }
+                };
+                // Decode pos_in_block (0..64) into (lx, ly, lz) within the
+                // 4×4×4 block.
+                let lx = pos_in_block % 4;
+                let ly = (pos_in_block / 4) % 4;
+                let lz = pos_in_block / 16;
+                // Block (0,0,0) of this chunk — its world voxel base is
+                // (cx*16, cy*16, cz*16); add (lx, ly, lz).
+                let vx = cx * 16 + lx;
+                let vy = cy * 16 + ly;
+                let vz = cz * 16 + lz;
+                if vx < sv[0] && vy < sv[1] && vz < sv[2] {
+                    volume.set([vx, vy, vz], VoxelTypeId(7));
+                }
+            }
+        }
+    }
+
+    let oracle = construct(&volume);
+
+    // ── Boot headless render world ────────────────────────────────────────────
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(AssetPlugin::default())
+        .add_plugins(ImagePlugin::default())
+        .add_plugins(RenderPlugin {
+            render_creation: RenderCreation::Automatic(Box::default()),
+            synchronous_pipeline_compilation: true,
+            debug_flags: Default::default(),
+        });
+    app.finish();
+    app.cleanup();
+
+    let shader = Shader::from_wgsl(CHUNK_CALC_SHADER_SRC, "shaders/chunk_calc.wgsl");
+    let shader_clone = shader.clone();
+    let shader_handle = app.world_mut().resource_mut::<Assets<Shader>>().add(shader);
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        return Err("no RenderApp sub-app available".into());
+    };
+    {
+        let mut pipeline_cache = render_app.world_mut().resource_mut::<PipelineCache>();
+        pipeline_cache.set_shader(shader_handle.id(), shader_clone);
+    }
+    let device = render_app
+        .world()
+        .get_resource::<RenderDevice>()
+        .ok_or("no RenderDevice")?
+        .clone();
+    let queue = render_app
+        .world()
+        .get_resource::<RenderQueue>()
+        .ok_or("no RenderQueue")?
+        .clone();
+
+    // ── Allocate GPU buffers ──────────────────────────────────────────────────
+    // For a fixture extent S = size_in_chunks, the segment buffer holds S^3
+    // chunks × 2048 u32s per chunk = S^3 * 2048 u32s; the GPU uses
+    // `params.segment_size_in_chunks` to index, so set it to max(size_in_chunks)
+    // and dispatch the actual world extent via `_world_sized`.
+    let segment_size_in_chunks: u32 = size_in_chunks[0].max(size_in_chunks[1]).max(size_in_chunks[2]);
+    let segment_voxels = build_segment_voxel_buffer_for_world(&volume, segment_size_in_chunks);
+
+    // Worst-case block/voxel sizing for the GPU buffers (cursor seed = 64 ;
+    // chunks × 64 blocks/chunk for blocks ; chunks × 64 voxels/chunk ×
+    // (1 u32 / 2 voxels) = chunks × 32 u32s for voxels). We pad generously.
+    let chunk_count = (size_in_chunks[0] * size_in_chunks[1] * size_in_chunks[2]) as usize;
+    let max_blocks = 64 + chunk_count * 64;
+    let max_voxels_u32 = 64 + chunk_count * 64 * 32; // worst case no dedup
+    // Cap the hash map at 1M slots (16 MB) — large enough that any fixture's
+    // expected unique-block count fits with low load factor, but small
+    // enough that allocation never fails silently at million-chunk scale.
+    // Production uses 256K initially per `ConstructionConfig::initial_hash_map_size`.
+    let hash_map_size_slots: u32 = 1 << 20;
+    let hash_map_init = vec![0u32; (hash_map_size_slots as usize) * 4];
+    let block_voxel_count_init = vec![64u32, 64];
+    let coeffs = hash_coefficients().to_vec();
+
+    let mk_storage = |label: &'static str, data: &[u32]| {
+        let data = if data.is_empty() { &[0u32][..] } else { data };
+        let size = (data.len() * 4) as u64;
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        buffer
+    };
+
+    let gpu_blocks = mk_storage("scaled_blocks", &vec![0u32; max_blocks]);
+    let gpu_voxels = mk_storage("scaled_voxels", &vec![0u32; max_voxels_u32]);
+    let gpu_block_voxel_count = mk_storage("scaled_bvc", &block_voxel_count_init);
+    let gpu_segment = mk_storage("scaled_segment", &segment_voxels);
+    let gpu_hash_map = mk_storage("scaled_hashmap", &hash_map_init);
+    let gpu_coeffs = mk_storage("scaled_coeffs", &coeffs);
+
+    let params = GpuConstructionParams {
+        size_in_chunks,
+        _pad0: 0,
+        group_size_in_groups: [1, 1, 1],
+        _pad1: 0,
+        bound_group_queue_max_size: 1,
+        hash_map_size: hash_map_size_slots,
+        segment_size_in_chunks,
+        max_group_bound_dispatch: 0,
+        chunk_offset: [0, 0, 0],
+        _pad2: 0,
+        frame_index: 0,
+        changed_chunk_count: 0,
+        changed_block_count: 0,
+        changed_voxel_count: 0,
+    };
+    let params_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("scaled_params"),
+        size: std::mem::size_of::<GpuConstructionParams>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+    let zero_chunks: Vec<[u32; 2]> = vec![[0u32, 0u32]; chunk_count];
+    let chunks_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("scaled_chunks"),
+        size: (chunk_count as u64) * 8,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&zero_chunks));
+
+    // ── Pipelines ────────────────────────────────────────────────────────────
+    let layout = construction_world_layout_descriptor();
+    let (id_calc, id_voxel, id_block) = {
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        let a = queue_calc_block_pipeline_with_handle(cache, layout.clone(), shader_handle.clone());
+        let b = queue_voxel_bounds_pipeline_with_handle(cache, layout.clone(), shader_handle.clone());
+        let c = queue_block_bounds_pipeline_with_handle(cache, layout.clone(), shader_handle.clone());
+        (a, b, c)
+    };
+
+    let mut pipelines: Option<Vec<bevy::render::render_resource::ComputePipeline>> = None;
+    let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+    for _ in 0..64 {
+        let mut pipeline_cache = render_app.world_mut().resource_mut::<PipelineCache>();
+        pipeline_cache.process_queue();
+        let cache = render_app.world().resource::<PipelineCache>();
+        if let (Some(a), Some(b), Some(c)) = (
+            cache.get_compute_pipeline(id_calc),
+            cache.get_compute_pipeline(id_voxel),
+            cache.get_compute_pipeline(id_block),
+        ) {
+            pipelines = Some(vec![a.clone(), b.clone(), c.clone()]);
+            break;
+        }
+    }
+    let pipelines = pipelines.ok_or("pipelines did not compile")?;
+
+    // ── Bind group ───────────────────────────────────────────────────────────
+    let render_app = app.get_sub_app(RenderApp).unwrap();
+    let cache = render_app.world().resource::<PipelineCache>();
+    let bgl = cache.get_bind_group_layout(&layout);
+    let bind_group = device.create_bind_group(
+        "scaled_bind_group",
+        &bgl,
+        &BindGroupEntries::sequential((
+            chunks_buffer.as_entire_buffer_binding(),
+            gpu_blocks.as_entire_buffer_binding(),
+            gpu_voxels.as_entire_buffer_binding(),
+            gpu_block_voxel_count.as_entire_buffer_binding(),
+            gpu_segment.as_entire_buffer_binding(),
+            gpu_hash_map.as_entire_buffer_binding(),
+            params_buffer.as_entire_buffer_binding(),
+            gpu_coeffs.as_entire_buffer_binding(),
+        )),
+    );
+
+    // ── Dispatch chunk_calc over the actual world extent ─────────────────────
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("scaled_calc_block"),
+    });
+    dispatch_calc_block_from_raw_data_world_sized(
+        &mut encoder,
+        &pipelines[0],
+        &bind_group,
+        size_in_chunks,
+    );
+    queue.submit([encoder.finish()]);
+
+    // Read cursor counts to size the bounds dispatches faithfully.
+    let cursor_pair = {
+        let size = 2u64 * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("scaled_cursor_staging"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("scaled_cursor_readback"),
+        });
+        enc.copy_buffer_to_buffer(&gpu_block_voxel_count, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let voxel_workgroups = cursor_pair[0] / 64;
+    let block_workgroups = cursor_pair[1] / 64;
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("scaled_bounds"),
+    });
+    dispatch_compute_voxel_bounds(&mut encoder, &pipelines[1], &bind_group, voxel_workgroups);
+    dispatch_compute_block_bounds(&mut encoder, &pipelines[2], &bind_group, block_workgroups);
+    queue.submit([encoder.finish()]);
+
+    // ── Read back the three buffers ──────────────────────────────────────────
+    let read_u32 = |buf: &bevy::render::render_resource::Buffer, n: u64| {
+        let size = n * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("scaled_readback"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("scaled_readback_enc"),
+        });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+
+    let gpu_blocks_out = read_u32(&gpu_blocks, max_blocks as u64);
+    let gpu_voxels_out = read_u32(&gpu_voxels, max_voxels_u32 as u64);
+
+    let staging_size = (chunk_count as u64) * 8;
+    let staging = device.create_buffer(&BufferDescriptor {
+        label: Some("scaled_chunks_readback"),
+        size: staging_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("scaled_chunks_readback_enc"),
+    });
+    enc.copy_buffer_to_buffer(&chunks_buffer, 0, &staging, 0, staging_size);
+    queue.submit([enc.finish()]);
+    let slice = staging.slice(..);
+    slice.map_async(MapMode::Read, |r| r.unwrap());
+    device.poll(PollType::wait_indefinitely()).unwrap();
+    let raw = slice.get_mapped_range();
+    let pairs: &[[u32; 2]] = bytemuck::cast_slice(&raw);
+    let gpu_chunks_out: Vec<u32> = pairs.iter().map(|p| p[0]).collect();
+    drop(raw);
+    staging.unmap();
+
+    // ── Diagnostic output ────────────────────────────────────────────────────
+    let mut s = String::new();
+    s.push_str(&format!(
+        "cursors: voxel_pairs={} block_u32s={}\n",
+        cursor_pair[0], cursor_pair[1]
+    ));
+    s.push_str(&format!(
+        "CPU oracle: chunks={} blocks={} voxels={}\n",
+        oracle.chunks.len(), oracle.blocks.len(), oracle.voxels.len()
+    ));
+
+    // === Part 1: semantic content comparison (pointer-following) =============
+    // For each chunk_idx, decode both CPU and GPU chunk; if both mixed, walk
+    // their respective block groups; for each block_idx in the chunk, if both
+    // mixed, walk their respective voxel groups. Compare semantic content
+    // (block type/aadf/voxel u32s) — not raw pointer values, since pointers
+    // are nondeterministic across CPU vs GPU.
+    let mut sem_chunk_mismatch: Option<(usize, ChunkCell, ChunkCell, u32, u32)> = None;
+    let mut sem_block_mismatch: Option<(usize, usize, BlockCell, BlockCell, u32, u32)> = None;
+    let mut sem_voxel_mismatch: Option<(usize, usize, usize, u32, u32)> = None;
+    let mut mixed_chunks_cpu = 0usize;
+    let mut mixed_chunks_gpu = 0usize;
+    let mut mixed_blocks_cpu = 0usize;
+    let mut mixed_blocks_gpu = 0usize;
+    'outer: for ci in 0..chunk_count {
+        let cpu_chunk = ChunkCell::decode(oracle.chunks[ci]);
+        let gpu_chunk = ChunkCell::decode(gpu_chunks_out[ci]);
+        // Classification mismatch (Empty/Uniform/Mixed) is a real divergence.
+        let cpu_kind = chunk_kind(&cpu_chunk);
+        let gpu_kind = chunk_kind(&gpu_chunk);
+        if cpu_kind != gpu_kind {
+            sem_chunk_mismatch = Some((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+            break 'outer;
+        }
+        // For non-mixed: compare encoded u32 directly.
+        match (cpu_chunk, gpu_chunk) {
+            (ChunkCell::Mixed(cpu_ptr), ChunkCell::Mixed(gpu_ptr)) => {
+                mixed_chunks_cpu += 1;
+                mixed_chunks_gpu += 1;
+                // Walk 64 blocks at each side's pointer.
+                for bi in 0..64usize {
+                    let cpu_b_raw = oracle.blocks.get(cpu_ptr.0 as usize + bi).copied().unwrap_or(0);
+                    let gpu_b_raw = gpu_blocks_out.get(gpu_ptr.0 as usize + bi).copied().unwrap_or(0);
+                    let cpu_b = BlockCell::decode(cpu_b_raw);
+                    let gpu_b = BlockCell::decode(gpu_b_raw);
+                    let cpu_bk = block_kind(&cpu_b);
+                    let gpu_bk = block_kind(&gpu_b);
+                    if cpu_bk != gpu_bk {
+                        sem_block_mismatch = Some((ci, bi, cpu_b, gpu_b, cpu_b_raw, gpu_b_raw));
+                        break 'outer;
+                    }
+                    match (cpu_b, gpu_b) {
+                        (BlockCell::Mixed(cpu_v), BlockCell::Mixed(gpu_v)) => {
+                            mixed_blocks_cpu += 1;
+                            mixed_blocks_gpu += 1;
+                            for vi in 0..32usize {
+                                let cpu_vw = oracle.voxels.get(cpu_v.0 as usize + vi).copied().unwrap_or(0);
+                                let gpu_vw = gpu_voxels_out.get(gpu_v.0 as usize + vi).copied().unwrap_or(0);
+                                if cpu_vw != gpu_vw {
+                                    sem_voxel_mismatch = Some((ci, bi, vi, cpu_vw, gpu_vw));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        (BlockCell::UniformFull(t1), BlockCell::UniformFull(t2)) => {
+                            if t1 != t2 {
+                                sem_block_mismatch = Some((ci, bi, cpu_b, gpu_b, cpu_b_raw, gpu_b_raw));
+                                break 'outer;
+                            }
+                        }
+                        (BlockCell::Empty(a1), BlockCell::Empty(a2)) => {
+                            if a1.d != a2.d {
+                                sem_block_mismatch = Some((ci, bi, cpu_b, gpu_b, cpu_b_raw, gpu_b_raw));
+                                break 'outer;
+                            }
+                        }
+                        _ => {
+                            sem_block_mismatch = Some((ci, bi, cpu_b, gpu_b, cpu_b_raw, gpu_b_raw));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            (ChunkCell::UniformFull(t1), ChunkCell::UniformFull(t2)) => {
+                if t1 != t2 {
+                    sem_chunk_mismatch = Some((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+                    break 'outer;
+                }
+            }
+            (ChunkCell::Empty(a1), ChunkCell::Empty(a2)) => {
+                if a1.d != a2.d {
+                    sem_chunk_mismatch = Some((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+                    break 'outer;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    s.push_str(&format!(
+        "mixed chunks: cpu={mixed_chunks_cpu} gpu={mixed_chunks_gpu} ; mixed blocks: cpu={mixed_blocks_cpu} gpu={mixed_blocks_gpu}\n"
+    ));
+
+    s.push_str("[semantic pointer-following diff]\n");
+    if let Some((ci, cpu_c, gpu_c, cpu_raw, gpu_raw)) = sem_chunk_mismatch {
+        s.push_str(&format!(
+            "  CHUNK MISMATCH @ ci={ci}: cpu={:?} (raw={:#010x}) gpu={:?} (raw={:#010x}) XOR={:#010x}\n",
+            cpu_c, cpu_raw, gpu_c, gpu_raw, cpu_raw ^ gpu_raw
+        ));
+    } else {
+        s.push_str("  chunks: all 'kind' classifications match\n");
+    }
+    if let Some((ci, bi, cpu_b, gpu_b, cpu_raw, gpu_raw)) = sem_block_mismatch {
+        s.push_str(&format!(
+            "  BLOCK MISMATCH @ ci={ci} bi={bi}: cpu={:?} (raw={:#010x}) gpu={:?} (raw={:#010x}) XOR={:#010x} (bits {:032b})\n",
+            cpu_b, cpu_raw, gpu_b, gpu_raw, cpu_raw ^ gpu_raw, cpu_raw ^ gpu_raw
+        ));
+    } else {
+        s.push_str("  blocks: all referenced blocks match semantically\n");
+    }
+    if let Some((ci, bi, vi, cpu_v, gpu_v)) = sem_voxel_mismatch {
+        s.push_str(&format!(
+            "  VOXEL MISMATCH @ ci={ci} bi={bi} vi={vi}: cpu={:#010x} gpu={:#010x} XOR={:#010x} (bits {:032b})\n",
+            cpu_v, gpu_v, cpu_v ^ gpu_v, cpu_v ^ gpu_v
+        ));
+    } else {
+        s.push_str("  voxels: all referenced voxels match\n");
+    }
+
+    // === Part 2: raw byte equality (sensitive to atomic ordering) ============
+    s.push_str("[raw u32 byte-equality (sensitive to nondeterministic atomicAdd ordering)]\n");
+    let first_chunk_diff = oracle
+        .chunks
+        .iter()
+        .zip(gpu_chunks_out.iter())
+        .position(|(a, b)| a != b);
+    if let Some(i) = first_chunk_diff {
+        let a = oracle.chunks[i];
+        let b = gpu_chunks_out[i];
+        s.push_str(&format!(
+            "  chunks[{i}]: cpu={a:#010x} gpu={b:#010x} XOR={:#010x}\n",
+            a ^ b
+        ));
+    } else {
+        s.push_str("  chunks: byte-equal\n");
+    }
+    // For blocks/voxels: account for the GPU's +64 / +64-into-voxels seed.
+    // CPU oracle voxels[0..] live at GPU voxels[gpu_voxel_seed..]; CPU oracle
+    // blocks[0..] live at GPU blocks[64..]. Compare the relative-offset views.
+    let first_block_diff = oracle
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(i, a)| {
+            let b = gpu_blocks_out.get(64 + i).copied().unwrap_or(0);
+            (*a != b).then_some((i, *a, b))
+        });
+    if let Some((i, a, b)) = first_block_diff {
+        s.push_str(&format!(
+            "  blocks[64+{i}={}]: cpu={a:#010x} gpu={b:#010x} XOR={:#010x} (bits {:032b})\n",
+            64 + i,
+            a ^ b,
+            a ^ b
+        ));
+    } else {
+        s.push_str("  blocks: byte-equal (after +64 seed offset)\n");
+    }
+    let first_voxel_diff = oracle
+        .voxels
+        .iter()
+        .enumerate()
+        .find_map(|(i, a)| {
+            let b = gpu_voxels_out.get(32 + i).copied().unwrap_or(0);
+            (*a != b).then_some((i, *a, b))
+        });
+    if let Some((i, a, b)) = first_voxel_diff {
+        s.push_str(&format!(
+            "  voxels[32+{i}={}]: cpu={a:#010x} gpu={b:#010x} XOR={:#010x} (bits {:032b})\n",
+            32 + i,
+            a ^ b,
+            a ^ b
+        ));
+    } else {
+        s.push_str("  voxels: byte-equal (after +32 seed offset)\n");
+    }
+
+    Ok(s)
+}
+
+/// Multi-segment variant: dispatch chunk_calc per-segment with shared
+/// hash_map. Mirrors the production W5 loop in `naadf_gpu_producer_node`.
+fn run_one_fixture_multiseg_byte_diff(
+    world_size_in_chunks: [u32; 3],
+    segment_size_in_chunks: u32,
+    mode: FixtureMode,
+) -> Result<String, String> {
+    use bevy::app::App;
+    use bevy::asset::{AssetPlugin, Assets};
+    use bevy::image::ImagePlugin;
+    use bevy::shader::Shader;
+    use bevy::render::render_resource::{
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+        MapMode, PipelineCache, PollType,
+    };
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use bevy::render::settings::RenderCreation;
+    use bevy::render::{RenderApp, RenderPlugin};
+    use bevy::MinimalPlugins;
+
+    use crate::aadf::cell::{BlockCell, ChunkCell};
+    use crate::aadf::construct::{construct, DenseVolume};
+    use crate::render::construction::chunk_calc::{
+        construction_world_layout_descriptor, dispatch_calc_block_from_raw_data_world_sized,
+        dispatch_compute_block_bounds, dispatch_compute_voxel_bounds,
+        queue_block_bounds_pipeline_with_handle, queue_calc_block_pipeline_with_handle,
+        queue_voxel_bounds_pipeline_with_handle, CHUNK_CALC_SHADER_SRC,
+    };
+    use crate::render::construction::hashing::hash_coefficients;
+    use crate::render::gpu_types::GpuConstructionParams;
+    use crate::voxel::VoxelTypeId;
+
+    // Validate parameters: world dims must be exact multiples of segment size.
+    let sx = world_size_in_chunks[0];
+    let sy = world_size_in_chunks[1];
+    let sz = world_size_in_chunks[2];
+    if sx % segment_size_in_chunks != 0
+        || sy % segment_size_in_chunks != 0
+        || sz % segment_size_in_chunks != 0
+    {
+        return Err(format!(
+            "world size {:?} not divisible by segment size {segment_size_in_chunks}",
+            world_size_in_chunks
+        ));
+    }
+    let seg_count_x = sx / segment_size_in_chunks;
+    let seg_count_y = sy / segment_size_in_chunks;
+    let seg_count_z = sz / segment_size_in_chunks;
+    let n_segments = seg_count_x * seg_count_y * seg_count_z;
+
+    // ── Build fixture volume ─────────────────────────────────────────────────
+    let mut volume = DenseVolume::empty(world_size_in_chunks);
+    let sv = volume.size_in_voxels();
+    for cz in 0..sz {
+        for cy in 0..sy {
+            for cx in 0..sx {
+                let chunk_idx = cx + cy * sx + cz * sx * sy;
+                let pos_in_block: u32 = match mode {
+                    FixtureMode::Uniform => 0,
+                    FixtureMode::Diverse => chunk_idx % 64,
+                    FixtureMode::Mixed => {
+                        if chunk_idx % 2 == 0 { 0 } else { (chunk_idx / 2) % 64 }
+                    }
+                };
+                let lx = pos_in_block % 4;
+                let ly = (pos_in_block / 4) % 4;
+                let lz = pos_in_block / 16;
+                let vx = cx * 16 + lx;
+                let vy = cy * 16 + ly;
+                let vz = cz * 16 + lz;
+                if vx < sv[0] && vy < sv[1] && vz < sv[2] {
+                    volume.set([vx, vy, vz], VoxelTypeId(7));
+                }
+            }
+        }
+    }
+
+    let oracle = construct(&volume);
+
+    // ── Boot headless ────────────────────────────────────────────────────────
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(AssetPlugin::default())
+        .add_plugins(ImagePlugin::default())
+        .add_plugins(RenderPlugin {
+            render_creation: RenderCreation::Automatic(Box::default()),
+            synchronous_pipeline_compilation: true,
+            debug_flags: Default::default(),
+        });
+    app.finish();
+    app.cleanup();
+
+    let shader = Shader::from_wgsl(CHUNK_CALC_SHADER_SRC, "shaders/chunk_calc.wgsl");
+    let shader_clone = shader.clone();
+    let shader_handle = app.world_mut().resource_mut::<Assets<Shader>>().add(shader);
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        return Err("no RenderApp".into());
+    };
+    {
+        let mut pc = render_app.world_mut().resource_mut::<PipelineCache>();
+        pc.set_shader(shader_handle.id(), shader_clone);
+    }
+    let device = render_app
+        .world()
+        .get_resource::<RenderDevice>()
+        .ok_or("no device")?
+        .clone();
+    let queue = render_app
+        .world()
+        .get_resource::<RenderQueue>()
+        .ok_or("no queue")?
+        .clone();
+
+    // ── Allocate buffers ─────────────────────────────────────────────────────
+    let chunk_count = (sx * sy * sz) as usize;
+    // Mode=Mixed / Diverse fixtures dedup-collapse to ≤64 unique block
+    // patterns. The voxel buffer can be bounded much tighter than the
+    // naive worst-case (chunks * 64 * 32 = 2 GB for the largest fixture).
+    // Cap at the smaller of (worst-case, 256 MB-of-u32s) so the GPU
+    // allocation always succeeds; the hash dedup keeps real usage well
+    // under this.
+    let max_blocks = (64 + chunk_count * 64).max(64);
+    let max_voxels_u32_uncapped: usize = 64usize.saturating_add(chunk_count.saturating_mul(64 * 32));
+    let max_voxels_u32 = max_voxels_u32_uncapped.min(256 * 1024 * 1024 / 4); // 256 MB
+    let hash_map_size_slots: u32 = 1 << 20; // fixed 16 MB / 1M slots
+    let hash_map_init = vec![0u32; (hash_map_size_slots as usize) * 4];
+    let block_voxel_count_init = vec![64u32, 64];
+    let coeffs = hash_coefficients().to_vec();
+
+    // Segment buffer size: exactly one segment's worth.
+    let seg = segment_size_in_chunks as usize;
+    let segment_buf_u32s = seg * seg * seg * 2048;
+
+    let mk_storage = |label: &'static str, data: &[u32]| {
+        let data = if data.is_empty() { &[0u32][..] } else { data };
+        let size = (data.len() * 4) as u64;
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        buffer
+    };
+
+    let gpu_blocks = mk_storage("ms_blocks", &vec![0u32; max_blocks]);
+    let gpu_voxels = mk_storage("ms_voxels", &vec![0u32; max_voxels_u32]);
+    let gpu_block_voxel_count = mk_storage("ms_bvc", &block_voxel_count_init);
+    let gpu_segment = mk_storage("ms_segment", &vec![0u32; segment_buf_u32s]);
+    let gpu_hash_map = mk_storage("ms_hashmap", &hash_map_init);
+    let gpu_coeffs = mk_storage("ms_coeffs", &coeffs);
+
+    let params_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("ms_params"),
+        size: std::mem::size_of::<GpuConstructionParams>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let zero_chunks: Vec<[u32; 2]> = vec![[0u32, 0u32]; chunk_count];
+    let chunks_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("ms_chunks"),
+        size: (chunk_count as u64) * 8,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&zero_chunks));
+
+    // ── Pipelines ───────────────────────────────────────────────────────────
+    let layout = construction_world_layout_descriptor();
+    let (id_calc, id_voxel, id_block) = {
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        (
+            queue_calc_block_pipeline_with_handle(cache, layout.clone(), shader_handle.clone()),
+            queue_voxel_bounds_pipeline_with_handle(cache, layout.clone(), shader_handle.clone()),
+            queue_block_bounds_pipeline_with_handle(cache, layout.clone(), shader_handle.clone()),
+        )
+    };
+    let mut pipelines: Option<Vec<bevy::render::render_resource::ComputePipeline>> = None;
+    let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+    for _ in 0..64 {
+        let mut pc = render_app.world_mut().resource_mut::<PipelineCache>();
+        pc.process_queue();
+        let cache = render_app.world().resource::<PipelineCache>();
+        if let (Some(a), Some(b), Some(c)) = (
+            cache.get_compute_pipeline(id_calc),
+            cache.get_compute_pipeline(id_voxel),
+            cache.get_compute_pipeline(id_block),
+        ) {
+            pipelines = Some(vec![a.clone(), b.clone(), c.clone()]);
+            break;
+        }
+    }
+    let pipelines = pipelines.ok_or("pipelines did not compile")?;
+
+    let render_app = app.get_sub_app(RenderApp).unwrap();
+    let cache = render_app.world().resource::<PipelineCache>();
+    let bgl = cache.get_bind_group_layout(&layout);
+    let bind_group = device.create_bind_group(
+        "ms_bind_group",
+        &bgl,
+        &BindGroupEntries::sequential((
+            chunks_buffer.as_entire_buffer_binding(),
+            gpu_blocks.as_entire_buffer_binding(),
+            gpu_voxels.as_entire_buffer_binding(),
+            gpu_block_voxel_count.as_entire_buffer_binding(),
+            gpu_segment.as_entire_buffer_binding(),
+            gpu_hash_map.as_entire_buffer_binding(),
+            params_buffer.as_entire_buffer_binding(),
+            gpu_coeffs.as_entire_buffer_binding(),
+        )),
+    );
+
+    // ── Per-segment loop: write segment buffer + params + dispatch ──────────
+    for sz_i in 0..seg_count_z {
+        for sy_i in 0..seg_count_y {
+            for sx_i in 0..seg_count_x {
+                let chunk_offset = [
+                    sx_i * segment_size_in_chunks,
+                    sy_i * segment_size_in_chunks,
+                    sz_i * segment_size_in_chunks,
+                ];
+                // Build segment voxel buffer for THIS segment's region.
+                let seg_voxels = build_segment_voxel_buffer_for_region(
+                    &volume,
+                    chunk_offset,
+                    segment_size_in_chunks,
+                );
+                queue.write_buffer(&gpu_segment, 0, bytemuck::cast_slice(&seg_voxels));
+
+                let params = GpuConstructionParams {
+                    size_in_chunks: world_size_in_chunks,
+                    _pad0: 0,
+                    group_size_in_groups: [1, 1, 1],
+                    _pad1: 0,
+                    bound_group_queue_max_size: 1,
+                    hash_map_size: hash_map_size_slots,
+                    segment_size_in_chunks,
+                    max_group_bound_dispatch: 0,
+                    chunk_offset,
+                    _pad2: 0,
+                    frame_index: 0,
+                    changed_chunk_count: 0,
+                    changed_block_count: 0,
+                    changed_voxel_count: 0,
+                };
+                queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+                // Per-segment encoder + submit (mirrors production W5 loop).
+                let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("ms_segment_enc"),
+                });
+                dispatch_calc_block_from_raw_data_world_sized(
+                    &mut enc,
+                    &pipelines[0],
+                    &bind_group,
+                    [segment_size_in_chunks; 3],
+                );
+                queue.submit([enc.finish()]);
+            }
+        }
+    }
+
+    // Cursor readback.
+    let cursor_pair = {
+        let size = 2u64 * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("ms_cursor_st"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("ms_cursor_enc"),
+        });
+        enc.copy_buffer_to_buffer(&gpu_block_voxel_count, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let voxel_workgroups = cursor_pair[0] / 64;
+    let block_workgroups = cursor_pair[1] / 64;
+
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("ms_bounds"),
+    });
+    dispatch_compute_voxel_bounds(&mut enc, &pipelines[1], &bind_group, voxel_workgroups);
+    dispatch_compute_block_bounds(&mut enc, &pipelines[2], &bind_group, block_workgroups);
+    queue.submit([enc.finish()]);
+
+    // Readback all three buffers.
+    let read_u32 = |buf: &bevy::render::render_resource::Buffer, n: u64| {
+        let size = n * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("ms_rb"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("ms_rb_enc"),
+        });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let gpu_blocks_out = read_u32(&gpu_blocks, max_blocks as u64);
+    let gpu_voxels_out = read_u32(&gpu_voxels, max_voxels_u32 as u64);
+
+    let staging_size = (chunk_count as u64) * 8;
+    let staging = device.create_buffer(&BufferDescriptor {
+        label: Some("ms_chunks_rb"),
+        size: staging_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("ms_chunks_rb_enc"),
+    });
+    enc.copy_buffer_to_buffer(&chunks_buffer, 0, &staging, 0, staging_size);
+    queue.submit([enc.finish()]);
+    let slice = staging.slice(..);
+    slice.map_async(MapMode::Read, |r| r.unwrap());
+    device.poll(PollType::wait_indefinitely()).unwrap();
+    let raw = slice.get_mapped_range();
+    let pairs: &[[u32; 2]] = bytemuck::cast_slice(&raw);
+    let gpu_chunks_out: Vec<u32> = pairs.iter().map(|p| p[0]).collect();
+    drop(raw);
+    staging.unmap();
+
+    // ── Diagnostic ──────────────────────────────────────────────────────────
+    let mut s = String::new();
+    s.push_str(&format!(
+        "n_segments={n_segments} cursors: voxel_pairs={} block_u32s={}\n",
+        cursor_pair[0], cursor_pair[1]
+    ));
+    s.push_str(&format!(
+        "CPU oracle: chunks={} blocks={} voxels={}\n",
+        oracle.chunks.len(), oracle.blocks.len(), oracle.voxels.len()
+    ));
+
+    let mut sem_chunk_mismatch: Option<(usize, ChunkCell, ChunkCell, u32, u32)> = None;
+    let mut sem_block_mismatch: Option<(usize, usize, BlockCell, BlockCell, u32, u32)> = None;
+    let mut sem_voxel_mismatch: Option<(usize, usize, usize, u32, u32)> = None;
+    let mut total_mismatches: u32 = 0;
+    let mut first_mismatch_chunk: Option<usize> = None;
+    'outer: for ci in 0..chunk_count {
+        let cpu_chunk = ChunkCell::decode(oracle.chunks[ci]);
+        let gpu_chunk = ChunkCell::decode(gpu_chunks_out[ci]);
+        if chunk_kind(&cpu_chunk) != chunk_kind(&gpu_chunk) {
+            if sem_chunk_mismatch.is_none() {
+                sem_chunk_mismatch = Some((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+                first_mismatch_chunk = Some(ci);
+            }
+            total_mismatches += 1;
+            continue;
+        }
+        match (cpu_chunk, gpu_chunk) {
+            (ChunkCell::Mixed(cpu_ptr), ChunkCell::Mixed(gpu_ptr)) => {
+                for bi in 0..64usize {
+                    let cpu_b_raw = oracle.blocks.get(cpu_ptr.0 as usize + bi).copied().unwrap_or(0);
+                    let gpu_b_raw = gpu_blocks_out.get(gpu_ptr.0 as usize + bi).copied().unwrap_or(0);
+                    let cpu_b = BlockCell::decode(cpu_b_raw);
+                    let gpu_b = BlockCell::decode(gpu_b_raw);
+                    if block_kind(&cpu_b) != block_kind(&gpu_b) {
+                        if sem_block_mismatch.is_none() {
+                            sem_block_mismatch =
+                                Some((ci, bi, cpu_b, gpu_b, cpu_b_raw, gpu_b_raw));
+                            first_mismatch_chunk = first_mismatch_chunk.or(Some(ci));
+                        }
+                        total_mismatches += 1;
+                        continue;
+                    }
+                    match (cpu_b, gpu_b) {
+                        (BlockCell::Mixed(cpu_v), BlockCell::Mixed(gpu_v)) => {
+                            for vi in 0..32usize {
+                                let cpu_vw = oracle.voxels.get(cpu_v.0 as usize + vi).copied().unwrap_or(0);
+                                let gpu_vw = gpu_voxels_out.get(gpu_v.0 as usize + vi).copied().unwrap_or(0);
+                                if cpu_vw != gpu_vw {
+                                    if sem_voxel_mismatch.is_none() {
+                                        sem_voxel_mismatch = Some((ci, bi, vi, cpu_vw, gpu_vw));
+                                        first_mismatch_chunk = first_mismatch_chunk.or(Some(ci));
+                                    }
+                                    total_mismatches += 1;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        (BlockCell::UniformFull(t1), BlockCell::UniformFull(t2)) if t1 != t2 => {
+                            if sem_block_mismatch.is_none() {
+                                sem_block_mismatch =
+                                    Some((ci, bi, cpu_b, gpu_b, cpu_b_raw, gpu_b_raw));
+                            }
+                            total_mismatches += 1;
+                        }
+                        (BlockCell::Empty(a1), BlockCell::Empty(a2)) if a1.d != a2.d => {
+                            if sem_block_mismatch.is_none() {
+                                sem_block_mismatch =
+                                    Some((ci, bi, cpu_b, gpu_b, cpu_b_raw, gpu_b_raw));
+                            }
+                            total_mismatches += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (ChunkCell::UniformFull(t1), ChunkCell::UniformFull(t2)) if t1 != t2 => {
+                if sem_chunk_mismatch.is_none() {
+                    sem_chunk_mismatch =
+                        Some((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+                }
+                total_mismatches += 1;
+            }
+            (ChunkCell::Empty(a1), ChunkCell::Empty(a2)) if a1.d != a2.d => {
+                if sem_chunk_mismatch.is_none() {
+                    sem_chunk_mismatch =
+                        Some((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+                }
+                total_mismatches += 1;
+            }
+            _ => {}
+        }
+    }
+
+    s.push_str("[semantic pointer-following diff]\n");
+    if let Some((ci, cpu_c, gpu_c, cpu_raw, gpu_raw)) = sem_chunk_mismatch {
+        s.push_str(&format!(
+            "  CHUNK MISMATCH @ ci={ci}: cpu={:?} (raw={:#010x}) gpu={:?} (raw={:#010x}) XOR={:#010x}\n",
+            cpu_c, cpu_raw, gpu_c, gpu_raw, cpu_raw ^ gpu_raw
+        ));
+    } else {
+        s.push_str("  chunks: all 'kind' match\n");
+    }
+    if let Some((ci, bi, cpu_b, gpu_b, cpu_raw, gpu_raw)) = sem_block_mismatch {
+        s.push_str(&format!(
+            "  BLOCK MISMATCH @ ci={ci} bi={bi}: cpu={:?} (raw={:#010x}) gpu={:?} (raw={:#010x}) XOR={:#010x} (bits {:032b})\n",
+            cpu_b, cpu_raw, gpu_b, gpu_raw, cpu_raw ^ gpu_raw, cpu_raw ^ gpu_raw
+        ));
+    } else {
+        s.push_str("  blocks: all kinds match semantically\n");
+    }
+    if let Some((ci, bi, vi, cpu_v, gpu_v)) = sem_voxel_mismatch {
+        s.push_str(&format!(
+            "  VOXEL MISMATCH @ ci={ci} bi={bi} vi={vi}: cpu={:#010x} gpu={:#010x} XOR={:#010x} (bits {:032b})\n",
+            cpu_v, gpu_v, cpu_v ^ gpu_v, cpu_v ^ gpu_v
+        ));
+    } else {
+        s.push_str("  voxels: all referenced voxels match\n");
+    }
+    s.push_str(&format!(
+        "  total semantic mismatches: {total_mismatches} (first @ chunk {:?})\n",
+        first_mismatch_chunk
+    ));
+    Ok(s)
+}
+
+/// Drive `generator_model.wgsl` for one (model, segment) configuration and
+/// byte-compare its `segment_voxel_buffer` output against the
+/// `generate_segment_cpu` Rust oracle.
+fn run_one_generator_model_byte_diff(
+    model_size_in_chunks: [u32; 3],
+    group_size_in_chunks: [u32; 3],
+    group_offset_in_chunks: [u32; 3],
+) -> Result<String, String> {
+    use bevy::app::App;
+    use bevy::asset::{AssetPlugin, Assets};
+    use bevy::image::ImagePlugin;
+    use bevy::shader::Shader;
+    use bevy::render::render_resource::{
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+        MapMode, PipelineCache, PollType,
+    };
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use bevy::render::settings::RenderCreation;
+    use bevy::render::{RenderApp, RenderPlugin};
+    use bevy::MinimalPlugins;
+
+    use crate::aadf::generator::{
+        generate_segment_cpu, CHUNK_DATA_U32S,
+    };
+    use crate::render::construction::generator_model::{
+        create_storage_buffer_u32, create_params_uniform,
+        generator_model_layout_descriptor, queue_generator_model_pipeline_with_handle,
+        dispatch_generator_model_with_encoder, GpuGeneratorModelParams,
+        GENERATOR_MODEL_SHADER_SRC,
+    };
+
+    // Build a "mixed" ModelData with varied per-chunk content. Use the model's
+    // chunks/blocks/voxels layout from the encoding contract.
+    let model = build_mixed_model_data(model_size_in_chunks);
+
+    let world_size_in_voxels = [
+        group_size_in_chunks[0] * 16 + group_offset_in_chunks[0] * 16,
+        group_size_in_chunks[1] * 16 + group_offset_in_chunks[1] * 16,
+        group_size_in_chunks[2] * 16 + group_offset_in_chunks[2] * 16,
+    ];
+
+    // CPU oracle.
+    let cpu_out = generate_segment_cpu(
+        &model,
+        group_offset_in_chunks,
+        group_size_in_chunks,
+        world_size_in_voxels,
+    );
+
+    // ── Boot headless ────────────────────────────────────────────────────────
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(AssetPlugin::default())
+        .add_plugins(ImagePlugin::default())
+        .add_plugins(RenderPlugin {
+            render_creation: RenderCreation::Automatic(Box::default()),
+            synchronous_pipeline_compilation: true,
+            debug_flags: Default::default(),
+        });
+    app.finish();
+    app.cleanup();
+
+    let shader = Shader::from_wgsl(GENERATOR_MODEL_SHADER_SRC, "shaders/generator_model.wgsl");
+    let shader_clone = shader.clone();
+    let shader_handle = app.world_mut().resource_mut::<Assets<Shader>>().add(shader);
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        return Err("no RenderApp".into());
+    };
+    {
+        let mut pc = render_app.world_mut().resource_mut::<PipelineCache>();
+        pc.set_shader(shader_handle.id(), shader_clone);
+    }
+    let device = render_app
+        .world()
+        .get_resource::<RenderDevice>()
+        .ok_or("no device")?
+        .clone();
+    let queue = render_app
+        .world()
+        .get_resource::<RenderQueue>()
+        .ok_or("no queue")?
+        .clone();
+
+    // ── Allocate buffers ─────────────────────────────────────────────────────
+    let total_chunks =
+        group_size_in_chunks[0] * group_size_in_chunks[1] * group_size_in_chunks[2];
+    let chunk_data_u32s = (total_chunks * CHUNK_DATA_U32S) as usize;
+    let chunk_data_init = vec![0u32; chunk_data_u32s];
+
+    let chunk_data_buf =
+        create_storage_buffer_u32(&device, &queue, "gen_chunk_data_rw", &chunk_data_init);
+    let model_chunk_buf =
+        create_storage_buffer_u32(&device, &queue, "gen_model_chunk_ro", &model.data_chunk);
+    let model_block_buf =
+        create_storage_buffer_u32(&device, &queue, "gen_model_block_ro", &model.data_block);
+    let model_voxel_buf =
+        create_storage_buffer_u32(&device, &queue, "gen_model_voxel_ro", &model.data_voxel);
+
+    let params = GpuGeneratorModelParams {
+        size_in_voxels: world_size_in_voxels,
+        _pad0: 0,
+        model_size_in_chunks,
+        _pad1: 0,
+        group_offset_in_chunks,
+        group_size_in_chunks_x: group_size_in_chunks[0],
+        group_size_in_chunks_y: group_size_in_chunks[1],
+        _pad2: 0,
+        _pad3: 0,
+        _pad4: 0,
+    };
+    let params_buf = create_params_uniform(&device, &queue, &params);
+
+    // ── Pipeline ────────────────────────────────────────────────────────────
+    let layout = generator_model_layout_descriptor();
+    let id = {
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        queue_generator_model_pipeline_with_handle(cache, layout.clone(), shader_handle.clone())
+    };
+    let mut pipeline: Option<bevy::render::render_resource::ComputePipeline> = None;
+    let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+    for _ in 0..64 {
+        let mut pc = render_app.world_mut().resource_mut::<PipelineCache>();
+        pc.process_queue();
+        let cache = render_app.world().resource::<PipelineCache>();
+        if let Some(p) = cache.get_compute_pipeline(id) {
+            pipeline = Some(p.clone());
+            break;
+        }
+    }
+    let pipeline = pipeline.ok_or("generator pipeline did not compile")?;
+
+    let render_app = app.get_sub_app(RenderApp).unwrap();
+    let cache = render_app.world().resource::<PipelineCache>();
+    let bgl = cache.get_bind_group_layout(&layout);
+    let bind_group = device.create_bind_group(
+        "gen_bg",
+        &bgl,
+        &BindGroupEntries::sequential((
+            chunk_data_buf.as_entire_buffer_binding(),
+            model_chunk_buf.as_entire_buffer_binding(),
+            model_block_buf.as_entire_buffer_binding(),
+            model_voxel_buf.as_entire_buffer_binding(),
+            params_buf.as_entire_buffer_binding(),
+        )),
+    );
+
+    // ── Dispatch ────────────────────────────────────────────────────────────
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("gen_dispatch"),
+    });
+    dispatch_generator_model_with_encoder(&mut enc, &pipeline, &bind_group, group_size_in_chunks);
+    queue.submit([enc.finish()]);
+
+    // ── Readback ────────────────────────────────────────────────────────────
+    let staging_size = (chunk_data_u32s as u64) * 4;
+    let staging = device.create_buffer(&BufferDescriptor {
+        label: Some("gen_rb"),
+        size: staging_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("gen_rb_enc"),
+    });
+    enc.copy_buffer_to_buffer(&chunk_data_buf, 0, &staging, 0, staging_size);
+    queue.submit([enc.finish()]);
+    let slice = staging.slice(..);
+    slice.map_async(MapMode::Read, |r| r.unwrap());
+    device.poll(PollType::wait_indefinitely()).unwrap();
+    let data = slice.get_mapped_range();
+    let gpu_out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    staging.unmap();
+
+    // ── Compare ─────────────────────────────────────────────────────────────
+    let mut s = String::new();
+    s.push_str(&format!(
+        "CPU oracle: {} u32s ; GPU: {} u32s\n",
+        cpu_out.len(),
+        gpu_out.len()
+    ));
+
+    let first_diff = cpu_out
+        .iter()
+        .zip(gpu_out.iter())
+        .enumerate()
+        .find(|(_, (a, b))| a != b);
+    if let Some((i, (a, b))) = first_diff {
+        let xor = a ^ b;
+        s.push_str(&format!(
+            "  FIRST DIVERGENT INDEX: {i}  cpu={a:#010x}  gpu={b:#010x}  XOR={xor:#010x}  bits={xor:032b}\n",
+        ));
+        // Also count total divergent u32s.
+        let n_diff: usize = cpu_out
+            .iter()
+            .zip(gpu_out.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        let pct = n_diff as f64 * 100.0 / cpu_out.len() as f64;
+        s.push_str(&format!(
+            "  total divergent u32s: {n_diff} / {} ({pct:.2}%)\n",
+            cpu_out.len()
+        ));
+        // Decode the divergent position back to (group, local, i) to localize.
+        let chunk_data_per = CHUNK_DATA_U32S as usize;
+        let group_index = i / chunk_data_per;
+        let within = i % chunk_data_per;
+        let local_index = within / 32;
+        let pair_i = within % 32;
+        let gx = (group_index as u32) % group_size_in_chunks[0];
+        let gy = ((group_index as u32) / group_size_in_chunks[0])
+            % group_size_in_chunks[1];
+        let gz = (group_index as u32) / (group_size_in_chunks[0] * group_size_in_chunks[1]);
+        s.push_str(&format!(
+            "  decoded: group={gx},{gy},{gz} local_index={local_index} pair_i={pair_i}\n"
+        ));
+    } else {
+        s.push_str("  GENERATOR BYTE-EQUAL: cpu == gpu across all u32s\n");
+    }
+
+    Ok(s)
+}
+
+/// Tiled-model variant: small `ModelData` gets tiled into a larger world via
+/// the per-segment generator chain (matches production Oasis behavior). The
+/// CPU oracle builds the tiled volume by decoding `generate_segment_cpu`
+/// output for every segment, then runs `construct()` on the assembled
+/// world-volume.
+fn run_one_tiled_byte_diff(
+    model_size_in_chunks: [u32; 3],
+    world_size_in_chunks: [u32; 3],
+) -> Result<String, String> {
+    use bevy::app::App;
+    use bevy::asset::{AssetPlugin, Assets};
+    use bevy::image::ImagePlugin;
+    use bevy::shader::Shader;
+    use bevy::render::render_resource::{
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+        MapMode, PipelineCache, PollType,
+    };
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use bevy::render::settings::RenderCreation;
+    use bevy::render::{RenderApp, RenderPlugin};
+    use bevy::MinimalPlugins;
+
+    use crate::aadf::cell::{BlockCell, ChunkCell};
+    use crate::aadf::construct::{construct, DenseVolume};
+    use crate::aadf::generator::generate_segment_cpu;
+    use crate::render::construction::chunk_calc::{
+        construction_world_layout_descriptor, dispatch_calc_block_from_raw_data_world_sized,
+        dispatch_compute_block_bounds, dispatch_compute_voxel_bounds,
+        queue_block_bounds_pipeline_with_handle, queue_calc_block_pipeline_with_handle,
+        queue_voxel_bounds_pipeline_with_handle, CHUNK_CALC_SHADER_SRC,
+    };
+    use crate::render::construction::generator_model::{
+        create_storage_buffer_u32, create_params_uniform,
+        generator_model_layout_descriptor, queue_generator_model_pipeline_with_handle,
+        dispatch_generator_model_with_encoder, GpuGeneratorModelParams,
+        GENERATOR_MODEL_SHADER_SRC,
+    };
+    use crate::render::construction::hashing::hash_coefficients;
+    use crate::render::gpu_types::GpuConstructionParams;
+
+    // Build the tile model — non-trivial mixed content so tiles actually
+    // contribute geometry.
+    let model = build_mixed_model_data(model_size_in_chunks);
+
+    let world_size_in_voxels = [
+        world_size_in_chunks[0] * 16,
+        world_size_in_chunks[1] * 16,
+        world_size_in_chunks[2] * 16,
+    ];
+
+    // Segment shape: matches production's `WORLD_GEN_SEGMENT_SIZE_IN_GROUPS *
+    // 4 = 16`. If the world is smaller than 16 per axis, use the full world
+    // as one segment.
+    let seg = world_size_in_chunks[0].min(world_size_in_chunks[1]).min(world_size_in_chunks[2]).min(16);
+    if world_size_in_chunks[0] % seg != 0
+        || world_size_in_chunks[1] % seg != 0
+        || world_size_in_chunks[2] % seg != 0
+    {
+        return Err(format!(
+            "world {:?} not divisible by seg {seg}",
+            world_size_in_chunks
+        ));
+    }
+    let seg_count = [
+        world_size_in_chunks[0] / seg,
+        world_size_in_chunks[1] / seg,
+        world_size_in_chunks[2] / seg,
+    ];
+    let n_segments = seg_count[0] * seg_count[1] * seg_count[2];
+
+    // ── CPU oracle: build full world by tiling, then construct() ────────────
+    let mut volume = DenseVolume::empty(world_size_in_chunks);
+    for sz_i in 0..seg_count[2] {
+        for sy_i in 0..seg_count[1] {
+            for sx_i in 0..seg_count[0] {
+                let off = [sx_i * seg, sy_i * seg, sz_i * seg];
+                let cpu_seg = generate_segment_cpu(
+                    &model,
+                    off,
+                    [seg, seg, seg],
+                    world_size_in_voxels,
+                );
+                // Stamp the segment's voxels into the global volume.
+                decode_segment_voxels_into_volume(&cpu_seg, off, [seg, seg, seg], &mut volume);
+            }
+        }
+    }
+    let oracle = construct(&volume);
+
+    // ── Boot headless ───────────────────────────────────────────────────────
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(AssetPlugin::default())
+        .add_plugins(ImagePlugin::default())
+        .add_plugins(RenderPlugin {
+            render_creation: RenderCreation::Automatic(Box::default()),
+            synchronous_pipeline_compilation: true,
+            debug_flags: Default::default(),
+        });
+    app.finish();
+    app.cleanup();
+
+    let gen_shader = Shader::from_wgsl(GENERATOR_MODEL_SHADER_SRC, "shaders/generator_model.wgsl");
+    let gen_shader_clone = gen_shader.clone();
+    let gen_shader_handle = app
+        .world_mut()
+        .resource_mut::<Assets<Shader>>()
+        .add(gen_shader);
+    let calc_shader = Shader::from_wgsl(CHUNK_CALC_SHADER_SRC, "shaders/chunk_calc.wgsl");
+    let calc_shader_clone = calc_shader.clone();
+    let calc_shader_handle = app
+        .world_mut()
+        .resource_mut::<Assets<Shader>>()
+        .add(calc_shader);
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        return Err("no RenderApp".into());
+    };
+    {
+        let mut pc = render_app.world_mut().resource_mut::<PipelineCache>();
+        pc.set_shader(gen_shader_handle.id(), gen_shader_clone);
+        pc.set_shader(calc_shader_handle.id(), calc_shader_clone);
+    }
+    let device = render_app
+        .world()
+        .get_resource::<RenderDevice>()
+        .ok_or("no device")?
+        .clone();
+    let queue = render_app
+        .world()
+        .get_resource::<RenderQueue>()
+        .ok_or("no queue")?
+        .clone();
+
+    // ── Buffers ─────────────────────────────────────────────────────────────
+    let segment_buf_u32s = (seg as usize) * (seg as usize) * (seg as usize) * 2048;
+    let chunk_count = (world_size_in_chunks[0] * world_size_in_chunks[1] * world_size_in_chunks[2]) as usize;
+    let max_blocks = (64 + chunk_count * 64).max(64);
+    let max_voxels_u32 = (64usize.saturating_add(chunk_count.saturating_mul(64 * 32))).min(256 * 1024 * 1024 / 4);
+    let hash_map_size_slots: u32 = 1 << 20;
+    let hash_map_init = vec![0u32; (hash_map_size_slots as usize) * 4];
+    let block_voxel_count_init = vec![64u32, 64];
+    let coeffs = hash_coefficients().to_vec();
+
+    let segment_buf = create_storage_buffer_u32(&device, &queue, "tile_seg", &vec![0u32; segment_buf_u32s]);
+    let model_chunk_buf =
+        create_storage_buffer_u32(&device, &queue, "tile_mc", &model.data_chunk);
+    let model_block_buf =
+        create_storage_buffer_u32(&device, &queue, "tile_mb", &model.data_block);
+    let model_voxel_buf =
+        create_storage_buffer_u32(&device, &queue, "tile_mv", &model.data_voxel);
+    let gen_params_buf = create_params_uniform(
+        &device,
+        &queue,
+        &GpuGeneratorModelParams {
+            size_in_voxels: world_size_in_voxels,
+            _pad0: 0,
+            model_size_in_chunks: model.size_in_chunks,
+            _pad1: 0,
+            group_offset_in_chunks: [0, 0, 0],
+            group_size_in_chunks_x: seg,
+            group_size_in_chunks_y: seg,
+            _pad2: 0,
+            _pad3: 0,
+            _pad4: 0,
+        },
+    );
+
+    let mk_storage = |label: &'static str, data: &[u32]| {
+        let data = if data.is_empty() { &[0u32][..] } else { data };
+        let size = (data.len() * 4) as u64;
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        buffer
+    };
+
+    let gpu_blocks = mk_storage("tile_blocks", &vec![0u32; max_blocks]);
+    let gpu_voxels = mk_storage("tile_voxels", &vec![0u32; max_voxels_u32]);
+    let gpu_block_voxel_count = mk_storage("tile_bvc", &block_voxel_count_init);
+    let gpu_hash_map = mk_storage("tile_hashmap", &hash_map_init);
+    let gpu_coeffs = mk_storage("tile_coeffs", &coeffs);
+
+    let calc_params_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("tile_calc_params"),
+        size: std::mem::size_of::<GpuConstructionParams>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let zero_chunks: Vec<[u32; 2]> = vec![[0u32, 0u32]; chunk_count];
+    let chunks_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("tile_chunks"),
+        size: (chunk_count as u64) * 8,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&zero_chunks));
+
+    let gen_layout = generator_model_layout_descriptor();
+    let calc_layout = construction_world_layout_descriptor();
+    let (id_gen, id_calc, id_voxel, id_block) = {
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        (
+            queue_generator_model_pipeline_with_handle(cache, gen_layout.clone(), gen_shader_handle.clone()),
+            queue_calc_block_pipeline_with_handle(cache, calc_layout.clone(), calc_shader_handle.clone()),
+            queue_voxel_bounds_pipeline_with_handle(cache, calc_layout.clone(), calc_shader_handle.clone()),
+            queue_block_bounds_pipeline_with_handle(cache, calc_layout.clone(), calc_shader_handle.clone()),
+        )
+    };
+    let mut pipelines: Option<(_, _, _, _)> = None;
+    let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+    for _ in 0..64 {
+        let mut pc = render_app.world_mut().resource_mut::<PipelineCache>();
+        pc.process_queue();
+        let cache = render_app.world().resource::<PipelineCache>();
+        if let (Some(g), Some(a), Some(b), Some(c)) = (
+            cache.get_compute_pipeline(id_gen),
+            cache.get_compute_pipeline(id_calc),
+            cache.get_compute_pipeline(id_voxel),
+            cache.get_compute_pipeline(id_block),
+        ) {
+            pipelines = Some((g.clone(), a.clone(), b.clone(), c.clone()));
+            break;
+        }
+    }
+    let (p_gen, p_calc, p_voxel, p_block) =
+        pipelines.ok_or("tiled pipelines did not compile")?;
+
+    let render_app = app.get_sub_app(RenderApp).unwrap();
+    let cache = render_app.world().resource::<PipelineCache>();
+    let gen_bgl = cache.get_bind_group_layout(&gen_layout);
+    let gen_bg = device.create_bind_group(
+        "tile_gen_bg",
+        &gen_bgl,
+        &BindGroupEntries::sequential((
+            segment_buf.as_entire_buffer_binding(),
+            model_chunk_buf.as_entire_buffer_binding(),
+            model_block_buf.as_entire_buffer_binding(),
+            model_voxel_buf.as_entire_buffer_binding(),
+            gen_params_buf.as_entire_buffer_binding(),
+        )),
+    );
+    let calc_bgl = cache.get_bind_group_layout(&calc_layout);
+    let calc_bg = device.create_bind_group(
+        "tile_calc_bg",
+        &calc_bgl,
+        &BindGroupEntries::sequential((
+            chunks_buffer.as_entire_buffer_binding(),
+            gpu_blocks.as_entire_buffer_binding(),
+            gpu_voxels.as_entire_buffer_binding(),
+            gpu_block_voxel_count.as_entire_buffer_binding(),
+            segment_buf.as_entire_buffer_binding(),
+            gpu_hash_map.as_entire_buffer_binding(),
+            calc_params_buf.as_entire_buffer_binding(),
+            gpu_coeffs.as_entire_buffer_binding(),
+        )),
+    );
+
+    // ── Per-segment dispatch loop (matches production W5) ───────────────────
+    for sz_i in 0..seg_count[2] {
+        for sy_i in 0..seg_count[1] {
+            for sx_i in 0..seg_count[0] {
+                let off = [sx_i * seg, sy_i * seg, sz_i * seg];
+                // Generator uniform — model + segment offset.
+                let gen_p = GpuGeneratorModelParams {
+                    size_in_voxels: world_size_in_voxels,
+                    _pad0: 0,
+                    model_size_in_chunks: model.size_in_chunks,
+                    _pad1: 0,
+                    group_offset_in_chunks: off,
+                    group_size_in_chunks_x: seg,
+                    group_size_in_chunks_y: seg,
+                    _pad2: 0,
+                    _pad3: 0,
+                    _pad4: 0,
+                };
+                queue.write_buffer(&gen_params_buf, 0, bytemuck::bytes_of(&gen_p));
+                // Chunk_calc uniform — world size + segment offset.
+                let calc_p = GpuConstructionParams {
+                    size_in_chunks: world_size_in_chunks,
+                    _pad0: 0,
+                    group_size_in_groups: [1, 1, 1],
+                    _pad1: 0,
+                    bound_group_queue_max_size: 1,
+                    hash_map_size: hash_map_size_slots,
+                    segment_size_in_chunks: seg,
+                    max_group_bound_dispatch: 0,
+                    chunk_offset: off,
+                    _pad2: 0,
+                    frame_index: 0,
+                    changed_chunk_count: 0,
+                    changed_block_count: 0,
+                    changed_voxel_count: 0,
+                };
+                queue.write_buffer(&calc_params_buf, 0, bytemuck::bytes_of(&calc_p));
+
+                let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("tile_seg_enc"),
+                });
+                dispatch_generator_model_with_encoder(&mut enc, &p_gen, &gen_bg, [seg, seg, seg]);
+                dispatch_calc_block_from_raw_data_world_sized(&mut enc, &p_calc, &calc_bg, [seg, seg, seg]);
+                queue.submit([enc.finish()]);
+            }
+        }
+    }
+
+    // Readback cursor + run bounds dispatches.
+    let cursor_pair = {
+        let size = 2u64 * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("tile_cur"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("tile_cur_enc"),
+        });
+        enc.copy_buffer_to_buffer(&gpu_block_voxel_count, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let voxel_wg = cursor_pair[0] / 64;
+    let block_wg = cursor_pair[1] / 64;
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("tile_bnd"),
+    });
+    dispatch_compute_voxel_bounds(&mut enc, &p_voxel, &calc_bg, voxel_wg);
+    dispatch_compute_block_bounds(&mut enc, &p_block, &calc_bg, block_wg);
+    queue.submit([enc.finish()]);
+
+    // Readback buffers.
+    let read_u32 = |buf: &bevy::render::render_resource::Buffer, n: u64| {
+        let size = n * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("tile_rb"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("tile_rb_enc"),
+        });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let gpu_blocks_out = read_u32(&gpu_blocks, max_blocks as u64);
+    let gpu_voxels_out = read_u32(&gpu_voxels, max_voxels_u32 as u64);
+
+    let staging_size = (chunk_count as u64) * 8;
+    let staging = device.create_buffer(&BufferDescriptor {
+        label: Some("tile_chunks_rb"),
+        size: staging_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("tile_chunks_rb_enc"),
+    });
+    enc.copy_buffer_to_buffer(&chunks_buffer, 0, &staging, 0, staging_size);
+    queue.submit([enc.finish()]);
+    let slice = staging.slice(..);
+    slice.map_async(MapMode::Read, |r| r.unwrap());
+    device.poll(PollType::wait_indefinitely()).unwrap();
+    let raw = slice.get_mapped_range();
+    let pairs: &[[u32; 2]] = bytemuck::cast_slice(&raw);
+    let gpu_chunks_out: Vec<u32> = pairs.iter().map(|p| p[0]).collect();
+    drop(raw);
+    staging.unmap();
+
+    // ── Semantic diff ───────────────────────────────────────────────────────
+    let mut s = String::new();
+    s.push_str(&format!(
+        "n_segments={n_segments} seg={seg} cursors: voxel_pairs={} block_u32s={}\n",
+        cursor_pair[0], cursor_pair[1]
+    ));
+    s.push_str(&format!(
+        "CPU oracle: chunks={} blocks={} voxels={}\n",
+        oracle.chunks.len(), oracle.blocks.len(), oracle.voxels.len()
+    ));
+
+    let mut sem_chunk_mm: Option<(usize, ChunkCell, ChunkCell, u32, u32)> = None;
+    let mut sem_block_mm: Option<(usize, usize, BlockCell, BlockCell, u32, u32)> = None;
+    let mut sem_voxel_mm: Option<(usize, usize, usize, u32, u32)> = None;
+    let mut total_mm: u32 = 0;
+    let mut first_mismatch_chunk: Option<usize> = None;
+    'outer: for ci in 0..chunk_count {
+        let cpu_chunk = ChunkCell::decode(oracle.chunks[ci]);
+        let gpu_chunk = ChunkCell::decode(gpu_chunks_out[ci]);
+        if chunk_kind(&cpu_chunk) != chunk_kind(&gpu_chunk) {
+            if sem_chunk_mm.is_none() {
+                sem_chunk_mm = Some((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+                first_mismatch_chunk = Some(ci);
+            }
+            total_mm += 1;
+            continue;
+        }
+        match (cpu_chunk, gpu_chunk) {
+            (ChunkCell::Mixed(cp), ChunkCell::Mixed(gp)) => {
+                for bi in 0..64usize {
+                    let cb_raw = oracle.blocks.get(cp.0 as usize + bi).copied().unwrap_or(0);
+                    let gb_raw = gpu_blocks_out.get(gp.0 as usize + bi).copied().unwrap_or(0);
+                    let cb = BlockCell::decode(cb_raw);
+                    let gb = BlockCell::decode(gb_raw);
+                    if block_kind(&cb) != block_kind(&gb) {
+                        if sem_block_mm.is_none() {
+                            sem_block_mm = Some((ci, bi, cb, gb, cb_raw, gb_raw));
+                            first_mismatch_chunk = first_mismatch_chunk.or(Some(ci));
+                        }
+                        total_mm += 1;
+                        continue;
+                    }
+                    match (cb, gb) {
+                        (BlockCell::Mixed(cv), BlockCell::Mixed(gv)) => {
+                            for vi in 0..32usize {
+                                let cv_w = oracle.voxels.get(cv.0 as usize + vi).copied().unwrap_or(0);
+                                let gv_w = gpu_voxels_out.get(gv.0 as usize + vi).copied().unwrap_or(0);
+                                if cv_w != gv_w {
+                                    if sem_voxel_mm.is_none() {
+                                        sem_voxel_mm = Some((ci, bi, vi, cv_w, gv_w));
+                                        first_mismatch_chunk = first_mismatch_chunk.or(Some(ci));
+                                    }
+                                    total_mm += 1;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        (BlockCell::UniformFull(a), BlockCell::UniformFull(b)) if a != b => {
+                            if sem_block_mm.is_none() {
+                                sem_block_mm = Some((ci, bi, cb, gb, cb_raw, gb_raw));
+                            }
+                            total_mm += 1;
+                        }
+                        (BlockCell::Empty(a1), BlockCell::Empty(a2)) if a1.d != a2.d => {
+                            if sem_block_mm.is_none() {
+                                sem_block_mm = Some((ci, bi, cb, gb, cb_raw, gb_raw));
+                            }
+                            total_mm += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (ChunkCell::UniformFull(a), ChunkCell::UniformFull(b)) if a != b => {
+                if sem_chunk_mm.is_none() {
+                    sem_chunk_mm = Some((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+                }
+                total_mm += 1;
+            }
+            (ChunkCell::Empty(_), ChunkCell::Empty(_)) => {
+                // Empty-chunk AADFs are set by bounds_calc (not run here).
+            }
+            _ => {}
+        }
+    }
+
+    s.push_str(&format!(
+        "  total semantic mismatches: {total_mm} (first @ chunk {:?}; Empty-chunk AADFs ignored)\n",
+        first_mismatch_chunk
+    ));
+    if let Some((ci, cc, gc, cr, gr)) = sem_chunk_mm {
+        s.push_str(&format!(
+            "    CHUNK MM @ ci={ci}: cpu={:?} (raw={:#010x}) gpu={:?} (raw={:#010x}) XOR={:#010x}\n",
+            cc, cr, gc, gr, cr ^ gr,
+        ));
+    }
+    if let Some((ci, bi, cb, gb, cr, gr)) = sem_block_mm {
+        s.push_str(&format!(
+            "    BLOCK MM @ ci={ci} bi={bi}: cpu={:?} (raw={:#010x}) gpu={:?} (raw={:#010x}) XOR={:#010x} (bits {:032b})\n",
+            cb, cr, gb, gr, cr ^ gr, cr ^ gr,
+        ));
+    }
+    if let Some((ci, bi, vi, cw, gw)) = sem_voxel_mm {
+        s.push_str(&format!(
+            "    VOXEL MM @ ci={ci} bi={bi} vi={vi}: cpu={:#010x} gpu={:#010x} XOR={:#010x} (bits {:032b})\n",
+            cw, gw, cw ^ gw, cw ^ gw,
+        ));
+    }
+
+    Ok(s)
+}
+
+/// Decode a segment_voxel_buffer-formatted vector and stamp its decoded
+/// voxels into the given DenseVolume at the given chunk offset.
+fn decode_segment_voxels_into_volume(
+    seg_buf: &[u32],
+    chunk_offset: [u32; 3],
+    group_size_in_chunks: [u32; 3],
+    volume: &mut crate::aadf::construct::DenseVolume,
+) {
+    use crate::voxel::VoxelTypeId;
+    let gscx = group_size_in_chunks[0] as usize;
+    let gscy = group_size_in_chunks[1] as usize;
+    let gscz = group_size_in_chunks[2] as usize;
+    let sv = volume.size_in_voxels();
+    for cz in 0..gscz {
+        for cy in 0..gscy {
+            for cx in 0..gscx {
+                let chunk_index_in_segment = cx + cy * gscx + cz * gscx * gscy;
+                let chunk_base = chunk_index_in_segment * 2048;
+                let world_cx = chunk_offset[0] as usize + cx;
+                let world_cy = chunk_offset[1] as usize + cy;
+                let world_cz = chunk_offset[2] as usize + cz;
+                for bz in 0..4 {
+                    for by in 0..4 {
+                        for bx in 0..4 {
+                            let block_index = bx + by * 4 + bz * 16;
+                            let block_base = chunk_base + block_index * 32;
+                            for vi in 0..32 {
+                                let pair = seg_buf[block_base + vi];
+                                let lo = (pair & 0xFFFF) as u16;
+                                let hi = ((pair >> 16) & 0xFFFF) as u16;
+                                for (slot, half) in [(0, lo), (1, hi)].iter() {
+                                    let voxel_idx = vi * 2 + slot;
+                                    let lx = voxel_idx % 4;
+                                    let ly = (voxel_idx / 4) % 4;
+                                    let lz = voxel_idx / 16;
+                                    let vx = world_cx * 16 + bx * 4 + lx;
+                                    let vy = world_cy * 16 + by * 4 + ly;
+                                    let vz = world_cz * 16 + bz * 4 + lz;
+                                    if vx >= sv[0] as usize || vy >= sv[1] as usize || vz >= sv[2] as usize {
+                                        continue;
+                                    }
+                                    let ty_bits = *half & 0x7FFF;
+                                    let full = *half & 0x8000 != 0;
+                                    let ty = if full {
+                                        VoxelTypeId(ty_bits)
+                                    } else {
+                                        VoxelTypeId::EMPTY
+                                    };
+                                    volume.set([vx as u32, vy as u32, vz as u32], ty);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load the Oasis VOX file from disk as a `ModelData` (same way
+/// `install_vox_in_fixed_world` does).
+fn load_oasis_model_data(
+    path: &std::path::Path,
+) -> Result<crate::aadf::generator::ModelData, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+    let data = dot_vox::load_bytes(&bytes).map_err(|e| format!("parse: {e}"))?;
+    let imp = crate::voxel::vox_import::parse_dot_vox_data(&data)
+        .map_err(|e| format!("import: {e:?}"))?;
+    Ok(crate::aadf::generator::ModelData {
+        size_in_chunks: imp.world.size_in_chunks,
+        data_chunk: imp.world.chunks,
+        data_block: imp.world.blocks,
+        data_voxel: imp.world.voxels,
+    })
+}
+
+/// Drive `generator_model.wgsl` + `chunk_calc.wgsl` for one segment of a
+/// real `ModelData`, then byte-diff the GPU output against a CPU oracle
+/// built from the same segment's voxels.
+fn run_oasis_segment_byte_diff(
+    model: &crate::aadf::generator::ModelData,
+    group_offset_in_chunks: [u32; 3],
+    group_size_in_chunks: [u32; 3],
+) -> Result<String, String> {
+    use bevy::app::App;
+    use bevy::asset::{AssetPlugin, Assets};
+    use bevy::image::ImagePlugin;
+    use bevy::shader::Shader;
+    use bevy::render::render_resource::{
+        BindGroupEntries, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+        MapMode, PipelineCache, PollType,
+    };
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use bevy::render::settings::RenderCreation;
+    use bevy::render::{RenderApp, RenderPlugin};
+    use bevy::MinimalPlugins;
+
+    use crate::aadf::cell::{BlockCell, ChunkCell};
+    use crate::aadf::construct::construct;
+    use crate::aadf::generator::{generate_segment_cpu, CHUNK_DATA_U32S};
+    use crate::render::construction::chunk_calc::{
+        construction_world_layout_descriptor, dispatch_calc_block_from_raw_data_world_sized,
+        dispatch_compute_block_bounds, dispatch_compute_voxel_bounds,
+        queue_block_bounds_pipeline_with_handle, queue_calc_block_pipeline_with_handle,
+        queue_voxel_bounds_pipeline_with_handle, CHUNK_CALC_SHADER_SRC,
+    };
+    use crate::render::construction::generator_model::{
+        create_storage_buffer_u32, create_params_uniform,
+        generator_model_layout_descriptor, queue_generator_model_pipeline_with_handle,
+        dispatch_generator_model_with_encoder, GpuGeneratorModelParams,
+        GENERATOR_MODEL_SHADER_SRC,
+    };
+    use crate::render::construction::hashing::hash_coefficients;
+    use crate::render::gpu_types::GpuConstructionParams;
+
+    // The "world" size for purposes of voxel-position bounds-check =
+    // (offset + segment) * 16 voxels per axis. This matches what production
+    // passes to generator_model when running on the Oasis fixed world.
+    let world_size_in_voxels = [
+        (group_offset_in_chunks[0] + group_size_in_chunks[0]) * 16,
+        (group_offset_in_chunks[1] + group_size_in_chunks[1]) * 16,
+        (group_offset_in_chunks[2] + group_size_in_chunks[2]) * 16,
+    ];
+
+    // ── CPU oracle: generator output ────────────────────────────────────────
+    let cpu_seg_voxels = generate_segment_cpu(
+        model,
+        group_offset_in_chunks,
+        group_size_in_chunks,
+        world_size_in_voxels,
+    );
+
+    // Build a DenseVolume of just this segment's voxels by decoding
+    // `cpu_seg_voxels` (which is in the segment_voxel_buffer encoding:
+    // chunk_index_in_segment * 2048 + local_index * 32 + i). Then run
+    // construct() as the chunk_calc CPU oracle.
+    let seg_volume = decode_segment_voxels_to_volume(&cpu_seg_voxels, group_size_in_chunks);
+    let oracle = construct(&seg_volume);
+
+    // ── Boot headless ────────────────────────────────────────────────────────
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(AssetPlugin::default())
+        .add_plugins(ImagePlugin::default())
+        .add_plugins(RenderPlugin {
+            render_creation: RenderCreation::Automatic(Box::default()),
+            synchronous_pipeline_compilation: true,
+            debug_flags: Default::default(),
+        });
+    app.finish();
+    app.cleanup();
+
+    let gen_shader = Shader::from_wgsl(GENERATOR_MODEL_SHADER_SRC, "shaders/generator_model.wgsl");
+    let gen_shader_clone = gen_shader.clone();
+    let gen_shader_handle = app
+        .world_mut()
+        .resource_mut::<Assets<Shader>>()
+        .add(gen_shader);
+    let calc_shader = Shader::from_wgsl(CHUNK_CALC_SHADER_SRC, "shaders/chunk_calc.wgsl");
+    let calc_shader_clone = calc_shader.clone();
+    let calc_shader_handle = app
+        .world_mut()
+        .resource_mut::<Assets<Shader>>()
+        .add(calc_shader);
+
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        return Err("no RenderApp".into());
+    };
+    {
+        let mut pc = render_app.world_mut().resource_mut::<PipelineCache>();
+        pc.set_shader(gen_shader_handle.id(), gen_shader_clone);
+        pc.set_shader(calc_shader_handle.id(), calc_shader_clone);
+    }
+    let device = render_app
+        .world()
+        .get_resource::<RenderDevice>()
+        .ok_or("no device")?
+        .clone();
+    let queue = render_app
+        .world()
+        .get_resource::<RenderQueue>()
+        .ok_or("no queue")?
+        .clone();
+
+    // ── Allocate buffers ────────────────────────────────────────────────────
+    let total_chunks =
+        group_size_in_chunks[0] * group_size_in_chunks[1] * group_size_in_chunks[2];
+    let chunk_data_u32s = (total_chunks * CHUNK_DATA_U32S) as usize;
+    let chunk_count = total_chunks as usize;
+    let max_blocks = (64 + chunk_count * 64).max(64);
+    let max_voxels_u32 = (64 + chunk_count * 64 * 32).min(256 * 1024 * 1024 / 4);
+    let hash_map_size_slots: u32 = 1 << 20;
+    let hash_map_init = vec![0u32; (hash_map_size_slots as usize) * 4];
+    let block_voxel_count_init = vec![64u32, 64];
+    let coeffs = hash_coefficients().to_vec();
+
+    let segment_buf = create_storage_buffer_u32(
+        &device,
+        &queue,
+        "oasis_seg_buf",
+        &vec![0u32; chunk_data_u32s],
+    );
+    let model_chunk_buf =
+        create_storage_buffer_u32(&device, &queue, "oasis_model_chunk", &model.data_chunk);
+    let model_block_buf =
+        create_storage_buffer_u32(&device, &queue, "oasis_model_block", &model.data_block);
+    let model_voxel_buf =
+        create_storage_buffer_u32(&device, &queue, "oasis_model_voxel", &model.data_voxel);
+
+    let gen_params = GpuGeneratorModelParams {
+        size_in_voxels: world_size_in_voxels,
+        _pad0: 0,
+        model_size_in_chunks: model.size_in_chunks,
+        _pad1: 0,
+        group_offset_in_chunks,
+        group_size_in_chunks_x: group_size_in_chunks[0],
+        group_size_in_chunks_y: group_size_in_chunks[1],
+        _pad2: 0,
+        _pad3: 0,
+        _pad4: 0,
+    };
+    let gen_params_buf = create_params_uniform(&device, &queue, &gen_params);
+
+    // chunk_calc resources — note that chunks/blocks/voxels target the
+    // segment as if it were a self-contained world of `group_size_in_chunks`.
+    let mk_storage = |label: &'static str, data: &[u32]| {
+        let data = if data.is_empty() { &[0u32][..] } else { data };
+        let size = (data.len() * 4) as u64;
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        buffer
+    };
+
+    let gpu_blocks = mk_storage("oasis_blocks", &vec![0u32; max_blocks]);
+    let gpu_voxels = mk_storage("oasis_voxels", &vec![0u32; max_voxels_u32]);
+    let gpu_block_voxel_count = mk_storage("oasis_bvc", &block_voxel_count_init);
+    let gpu_hash_map = mk_storage("oasis_hashmap", &hash_map_init);
+    let gpu_coeffs = mk_storage("oasis_coeffs", &coeffs);
+
+    let calc_params = GpuConstructionParams {
+        size_in_chunks: group_size_in_chunks,
+        _pad0: 0,
+        group_size_in_groups: [1, 1, 1],
+        _pad1: 0,
+        bound_group_queue_max_size: 1,
+        hash_map_size: hash_map_size_slots,
+        segment_size_in_chunks: group_size_in_chunks[0]
+            .max(group_size_in_chunks[1])
+            .max(group_size_in_chunks[2]),
+        max_group_bound_dispatch: 0,
+        chunk_offset: [0, 0, 0],
+        _pad2: 0,
+        frame_index: 0,
+        changed_chunk_count: 0,
+        changed_block_count: 0,
+        changed_voxel_count: 0,
+    };
+    let calc_params_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("oasis_calc_params"),
+        size: std::mem::size_of::<GpuConstructionParams>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&calc_params_buf, 0, bytemuck::bytes_of(&calc_params));
+
+    let zero_chunks: Vec<[u32; 2]> = vec![[0u32, 0u32]; chunk_count];
+    let chunks_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("oasis_chunks"),
+        size: (chunk_count as u64) * 8,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&zero_chunks));
+
+    // ── Pipelines ───────────────────────────────────────────────────────────
+    let gen_layout = generator_model_layout_descriptor();
+    let calc_layout = construction_world_layout_descriptor();
+    let (id_gen, id_calc, id_voxel, id_block) = {
+        let render_app = app.get_sub_app(RenderApp).unwrap();
+        let cache = render_app.world().resource::<PipelineCache>();
+        (
+            queue_generator_model_pipeline_with_handle(cache, gen_layout.clone(), gen_shader_handle.clone()),
+            queue_calc_block_pipeline_with_handle(cache, calc_layout.clone(), calc_shader_handle.clone()),
+            queue_voxel_bounds_pipeline_with_handle(cache, calc_layout.clone(), calc_shader_handle.clone()),
+            queue_block_bounds_pipeline_with_handle(cache, calc_layout.clone(), calc_shader_handle.clone()),
+        )
+    };
+    let mut pipelines: Option<(
+        bevy::render::render_resource::ComputePipeline,
+        bevy::render::render_resource::ComputePipeline,
+        bevy::render::render_resource::ComputePipeline,
+        bevy::render::render_resource::ComputePipeline,
+    )> = None;
+    let render_app = app.get_sub_app_mut(RenderApp).unwrap();
+    for _ in 0..64 {
+        let mut pc = render_app.world_mut().resource_mut::<PipelineCache>();
+        pc.process_queue();
+        let cache = render_app.world().resource::<PipelineCache>();
+        if let (Some(g), Some(a), Some(b), Some(c)) = (
+            cache.get_compute_pipeline(id_gen),
+            cache.get_compute_pipeline(id_calc),
+            cache.get_compute_pipeline(id_voxel),
+            cache.get_compute_pipeline(id_block),
+        ) {
+            pipelines = Some((g.clone(), a.clone(), b.clone(), c.clone()));
+            break;
+        }
+    }
+    let (p_gen, p_calc, p_voxel, p_block) =
+        pipelines.ok_or("oasis pipelines did not compile")?;
+
+    let render_app = app.get_sub_app(RenderApp).unwrap();
+    let cache = render_app.world().resource::<PipelineCache>();
+
+    let gen_bgl = cache.get_bind_group_layout(&gen_layout);
+    let gen_bg = device.create_bind_group(
+        "oasis_gen_bg",
+        &gen_bgl,
+        &BindGroupEntries::sequential((
+            segment_buf.as_entire_buffer_binding(),
+            model_chunk_buf.as_entire_buffer_binding(),
+            model_block_buf.as_entire_buffer_binding(),
+            model_voxel_buf.as_entire_buffer_binding(),
+            gen_params_buf.as_entire_buffer_binding(),
+        )),
+    );
+    let calc_bgl = cache.get_bind_group_layout(&calc_layout);
+    let calc_bg = device.create_bind_group(
+        "oasis_calc_bg",
+        &calc_bgl,
+        &BindGroupEntries::sequential((
+            chunks_buffer.as_entire_buffer_binding(),
+            gpu_blocks.as_entire_buffer_binding(),
+            gpu_voxels.as_entire_buffer_binding(),
+            gpu_block_voxel_count.as_entire_buffer_binding(),
+            segment_buf.as_entire_buffer_binding(),
+            gpu_hash_map.as_entire_buffer_binding(),
+            calc_params_buf.as_entire_buffer_binding(),
+            gpu_coeffs.as_entire_buffer_binding(),
+        )),
+    );
+
+    // ── Dispatch generator → chunk_calc → bounds ─────────────────────────────
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("oasis_dispatch"),
+    });
+    dispatch_generator_model_with_encoder(&mut enc, &p_gen, &gen_bg, group_size_in_chunks);
+    dispatch_calc_block_from_raw_data_world_sized(&mut enc, &p_calc, &calc_bg, group_size_in_chunks);
+    queue.submit([enc.finish()]);
+
+    // Readback cursor for bounds.
+    let cursor_pair = {
+        let size = 2u64 * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("oasis_cur"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("oasis_cur_enc"),
+        });
+        enc.copy_buffer_to_buffer(&gpu_block_voxel_count, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let voxel_wg = cursor_pair[0] / 64;
+    let block_wg = cursor_pair[1] / 64;
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("oasis_bnd"),
+    });
+    dispatch_compute_voxel_bounds(&mut enc, &p_voxel, &calc_bg, voxel_wg);
+    dispatch_compute_block_bounds(&mut enc, &p_block, &calc_bg, block_wg);
+    queue.submit([enc.finish()]);
+
+    // ── Verify generator output ALSO matches CPU oracle ─────────────────────
+    let gpu_seg_voxels = {
+        let size = (chunk_data_u32s as u64) * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("oasis_seg_rb"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("oasis_seg_rb_enc"),
+        });
+        enc.copy_buffer_to_buffer(&segment_buf, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let gen_first_diff = cpu_seg_voxels
+        .iter()
+        .zip(gpu_seg_voxels.iter())
+        .enumerate()
+        .find(|(_, (a, b))| a != b);
+
+    // ── Readback chunks/blocks/voxels ────────────────────────────────────────
+    let read_u32 = |buf: &bevy::render::render_resource::Buffer, n: u64| {
+        let size = n * 4;
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some("oasis_rb"),
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("oasis_rb_enc"),
+        });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        let v: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        v
+    };
+    let gpu_blocks_out = read_u32(&gpu_blocks, max_blocks as u64);
+    let gpu_voxels_out = read_u32(&gpu_voxels, max_voxels_u32 as u64);
+    let staging_size = (chunk_count as u64) * 8;
+    let staging = device.create_buffer(&BufferDescriptor {
+        label: Some("oasis_chunks_rb"),
+        size: staging_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("oasis_chunks_rb_enc"),
+    });
+    enc.copy_buffer_to_buffer(&chunks_buffer, 0, &staging, 0, staging_size);
+    queue.submit([enc.finish()]);
+    let slice = staging.slice(..);
+    slice.map_async(MapMode::Read, |r| r.unwrap());
+    device.poll(PollType::wait_indefinitely()).unwrap();
+    let raw = slice.get_mapped_range();
+    let pairs: &[[u32; 2]] = bytemuck::cast_slice(&raw);
+    let gpu_chunks_out: Vec<u32> = pairs.iter().map(|p| p[0]).collect();
+    drop(raw);
+    staging.unmap();
+
+    // ── Diagnostic ──────────────────────────────────────────────────────────
+    let mut s = String::new();
+    s.push_str(&format!(
+        "cursors: voxel_pairs={} block_u32s={} ; CPU oracle: chunks={} blocks={} voxels={}\n",
+        cursor_pair[0],
+        cursor_pair[1],
+        oracle.chunks.len(),
+        oracle.blocks.len(),
+        oracle.voxels.len(),
+    ));
+
+    if let Some((i, (a, b))) = gen_first_diff {
+        let xor = a ^ b;
+        s.push_str(&format!(
+            "  GENERATOR DIVERGED @ u32[{i}]: cpu={a:#010x} gpu={b:#010x} XOR={xor:#010x}\n",
+        ));
+    } else {
+        s.push_str("  generator: byte-equal ({} u32s)\n");
+    }
+
+    // Semantic pointer-following diff (same as the other multi-fixture path).
+    let mut sem_chunk_mm: Option<(usize, ChunkCell, ChunkCell, u32, u32)> = None;
+    let mut sem_block_mm: Option<(usize, usize, BlockCell, BlockCell, u32, u32)> = None;
+    let mut sem_voxel_mm: Option<(usize, usize, usize, u32, u32)> = None;
+    let mut total_mm: u32 = 0;
+    'outer: for ci in 0..chunk_count {
+        let cpu_chunk = ChunkCell::decode(oracle.chunks[ci]);
+        let gpu_chunk = ChunkCell::decode(gpu_chunks_out[ci]);
+        if chunk_kind(&cpu_chunk) != chunk_kind(&gpu_chunk) {
+            sem_chunk_mm.get_or_insert((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+            total_mm += 1;
+            continue;
+        }
+        match (cpu_chunk, gpu_chunk) {
+            (ChunkCell::Mixed(cp), ChunkCell::Mixed(gp)) => {
+                for bi in 0..64usize {
+                    let cb_raw = oracle.blocks.get(cp.0 as usize + bi).copied().unwrap_or(0);
+                    let gb_raw = gpu_blocks_out.get(gp.0 as usize + bi).copied().unwrap_or(0);
+                    let cb = BlockCell::decode(cb_raw);
+                    let gb = BlockCell::decode(gb_raw);
+                    if block_kind(&cb) != block_kind(&gb) {
+                        sem_block_mm.get_or_insert((ci, bi, cb, gb, cb_raw, gb_raw));
+                        total_mm += 1;
+                        continue;
+                    }
+                    match (cb, gb) {
+                        (BlockCell::Mixed(cv), BlockCell::Mixed(gv)) => {
+                            for vi in 0..32usize {
+                                let cv_w = oracle.voxels.get(cv.0 as usize + vi).copied().unwrap_or(0);
+                                let gv_w = gpu_voxels_out.get(gv.0 as usize + vi).copied().unwrap_or(0);
+                                if cv_w != gv_w {
+                                    sem_voxel_mm.get_or_insert((ci, bi, vi, cv_w, gv_w));
+                                    total_mm += 1;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        (BlockCell::UniformFull(a), BlockCell::UniformFull(b)) if a != b => {
+                            sem_block_mm.get_or_insert((ci, bi, cb, gb, cb_raw, gb_raw));
+                            total_mm += 1;
+                        }
+                        (BlockCell::Empty(a1), BlockCell::Empty(a2)) if a1.d != a2.d => {
+                            sem_block_mm.get_or_insert((ci, bi, cb, gb, cb_raw, gb_raw));
+                            total_mm += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (ChunkCell::UniformFull(a), ChunkCell::UniformFull(b)) if a != b => {
+                sem_chunk_mm.get_or_insert((ci, cpu_chunk, gpu_chunk, oracle.chunks[ci], gpu_chunks_out[ci]));
+                total_mm += 1;
+            }
+            (ChunkCell::Empty(_), ChunkCell::Empty(_)) => {
+                // Chunk-AADFs for Empty chunks are set by `bounds_calc.wgsl`,
+                // not by `chunk_calc.wgsl`. The CPU oracle (`construct()`)
+                // computes chunk-AADFs via `compute_aadf_layer` as part of
+                // its single function call, but this diagnostic runs only
+                // chunk_calc + the block/voxel bounds — NOT the chunk
+                // bounds. Therefore, Empty(AADF) differences here are EXPECTED
+                // and NOT a bug.
+            }
+            _ => {}
+        }
+    }
+
+    s.push_str(&format!(
+        "  [semantic diff] total mismatches: {total_mm} (NB: Empty-chunk AADFs ignored — bounds_calc not run)\n"
+    ));
+    if let Some((ci, cc, gc, cr, gr)) = sem_chunk_mm {
+        s.push_str(&format!(
+            "    CHUNK MM @ ci={ci}: cpu={:?} (raw={:#010x}) gpu={:?} (raw={:#010x}) XOR={:#010x}\n",
+            cc, cr, gc, gr, cr ^ gr,
+        ));
+    }
+    if let Some((ci, bi, cb, gb, cr, gr)) = sem_block_mm {
+        s.push_str(&format!(
+            "    BLOCK MM @ ci={ci} bi={bi}: cpu={:?} (raw={:#010x}) gpu={:?} (raw={:#010x}) XOR={:#010x} (bits {:032b})\n",
+            cb, cr, gb, gr, cr ^ gr, cr ^ gr,
+        ));
+    }
+    if let Some((ci, bi, vi, cw, gw)) = sem_voxel_mm {
+        s.push_str(&format!(
+            "    VOXEL MM @ ci={ci} bi={bi} vi={vi}: cpu={:#010x} gpu={:#010x} XOR={:#010x} (bits {:032b})\n",
+            cw, gw, cw ^ gw, cw ^ gw,
+        ));
+    }
+
+    Ok(s)
+}
+
+/// Decode a `segment_voxel_buffer`-formatted vector back into a `DenseVolume`
+/// of `group_size_in_chunks` extent. Inverse of `build_segment_voxel_buffer`.
+fn decode_segment_voxels_to_volume(
+    seg: &[u32],
+    group_size_in_chunks: [u32; 3],
+) -> crate::aadf::construct::DenseVolume {
+    use crate::voxel::VoxelTypeId;
+    let mut volume = crate::aadf::construct::DenseVolume::empty(group_size_in_chunks);
+    let gscx = group_size_in_chunks[0] as usize;
+    let gscy = group_size_in_chunks[1] as usize;
+    let gscz = group_size_in_chunks[2] as usize;
+    for cz in 0..gscz {
+        for cy in 0..gscy {
+            for cx in 0..gscx {
+                let chunk_index_in_segment = cx + cy * gscx + cz * gscx * gscy;
+                let chunk_base = chunk_index_in_segment * 2048;
+                for bz in 0..4 {
+                    for by in 0..4 {
+                        for bx in 0..4 {
+                            let block_index = bx + by * 4 + bz * 16;
+                            let block_base = chunk_base + block_index * 32;
+                            for vi in 0..32 {
+                                let pair = seg[block_base + vi];
+                                let lo = (pair & 0xFFFF) as u16;
+                                let hi = ((pair >> 16) & 0xFFFF) as u16;
+                                for (slot, half) in [(0, lo), (1, hi)].iter() {
+                                    let voxel_idx = vi * 2 + slot;
+                                    let lx = voxel_idx % 4;
+                                    let ly = (voxel_idx / 4) % 4;
+                                    let lz = voxel_idx / 16;
+                                    let vx = cx * 16 + bx * 4 + lx;
+                                    let vy = cy * 16 + by * 4 + ly;
+                                    let vz = cz * 16 + bz * 4 + lz;
+                                    let ty_bits = *half & 0x7FFF;
+                                    let full = *half & 0x8000 != 0;
+                                    let ty = if full {
+                                        VoxelTypeId(ty_bits)
+                                    } else {
+                                        VoxelTypeId::EMPTY
+                                    };
+                                    volume.set([vx as u32, vy as u32, vz as u32], ty);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    volume
+}
+
+/// Build a `ModelData` with diverse per-chunk content. Each chunk has
+/// `(chunk_idx % 3)` classification: 0 = empty, 1 = uniform-full of type
+/// `(chunk_idx % 256 + 1)`, 2 = mixed with one solid voxel at position
+/// `(chunk_idx % 64)` of block (0,0,0).
+fn build_mixed_model_data(model_size_in_chunks: [u32; 3]) -> crate::aadf::generator::ModelData {
+    let chunk_count = (model_size_in_chunks[0]
+        * model_size_in_chunks[1]
+        * model_size_in_chunks[2]) as usize;
+    let mut data_chunk = vec![0u32; chunk_count];
+    let mut data_block: Vec<u32> = Vec::new();
+    let mut data_voxel: Vec<u32> = Vec::new();
+    for ci in 0..chunk_count {
+        let kind = ci % 3;
+        match kind {
+            0 => {
+                // empty
+                data_chunk[ci] = 0u32;
+            }
+            1 => {
+                // uniform-full
+                let ty = ((ci % 255) + 1) as u32;
+                data_chunk[ci] = (1u32 << 30) | (ty & 0x3FFF_FFFF);
+            }
+            _ => {
+                // mixed: 64 blocks for this chunk, only block 0 is mixed
+                // (one voxel at position `ci % 64` of block 0).
+                let block_base = data_block.len() as u32;
+                data_chunk[ci] = (2u32 << 30) | block_base;
+                // Reserve 64 blocks.
+                data_block.resize(data_block.len() + 64, 0u32);
+                // Block 0: mixed, voxels base.
+                let voxel_base = data_voxel.len() as u32;
+                data_block[block_base as usize] = (2u32 << 30) | voxel_base;
+                // 32 voxel-pairs = 64 voxels for block 0.
+                data_voxel.resize(data_voxel.len() + 32, 0u32);
+                let pos: u32 = (ci % 64) as u32;
+                // Place full voxel type 0x42 at position `pos`. Pos 0..64
+                // decodes to lx=pos%4, ly=(pos/4)%4, lz=pos/16 — voxel
+                // index in block is pos. In data_voxel, voxel index ÷ 2 =
+                // pair index; even slot is low half, odd slot is high half.
+                let pair = pos / 2;
+                let voxel_word = if pos % 2 == 0 {
+                    (1u32 << 15) | 0x42 // even slot, low half
+                } else {
+                    ((1u32 << 15) | 0x42) << 16 // odd slot, high half
+                };
+                data_voxel[voxel_base as usize + pair as usize] = voxel_word;
+            }
+        }
+    }
+    crate::aadf::generator::ModelData {
+        data_chunk,
+        data_block: if data_block.is_empty() { vec![0] } else { data_block },
+        data_voxel: if data_voxel.is_empty() { vec![0] } else { data_voxel },
+        size_in_chunks: model_size_in_chunks,
+    }
+}
+
+/// Build a segment voxel buffer for ONE segment (chunks at offset
+/// `chunk_offset` with extent `segment_size_in_chunks` per axis). Only the
+/// chunks inside the segment are populated; out-of-volume chunks (if the
+/// segment partially extends beyond the volume) are zero.
+fn build_segment_voxel_buffer_for_region(
+    volume: &crate::aadf::construct::DenseVolume,
+    chunk_offset: [u32; 3],
+    segment_size_in_chunks: u32,
+) -> Vec<u32> {
+    let seg = segment_size_in_chunks as usize;
+    let total_u32s = seg * seg * seg * 2048;
+    let mut out = vec![0u32; total_u32s];
+    let sc = volume.size_in_chunks;
+    for lcz in 0..seg {
+        let cz = chunk_offset[2] as usize + lcz;
+        if cz >= sc[2] as usize { continue; }
+        for lcy in 0..seg {
+            let cy = chunk_offset[1] as usize + lcy;
+            if cy >= sc[1] as usize { continue; }
+            for lcx in 0..seg {
+                let cx = chunk_offset[0] as usize + lcx;
+                if cx >= sc[0] as usize { continue; }
+                let chunk_index_in_segment = lcx + lcy * seg + lcz * seg * seg;
+                let chunk_base = chunk_index_in_segment * 2048;
+                for bz in 0..4 {
+                    for by in 0..4 {
+                        for bx in 0..4 {
+                            let block_index = bx + by * 4 + bz * 16;
+                            let block_base = chunk_base + block_index * 32;
+                            for vi in 0..32 {
+                                let lo = voxel_at_block_local(
+                                    volume, [cx, cy, cz], [bx, by, bz], vi * 2,
+                                );
+                                let hi = voxel_at_block_local(
+                                    volume, [cx, cy, cz], [bx, by, bz], vi * 2 + 1,
+                                );
+                                out[block_base + vi] = (lo as u32) | ((hi as u32) << 16);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn chunk_kind(c: &crate::aadf::cell::ChunkCell) -> u8 {
+    match c {
+        crate::aadf::cell::ChunkCell::Empty(_) => 0,
+        crate::aadf::cell::ChunkCell::UniformFull(_) => 1,
+        crate::aadf::cell::ChunkCell::Mixed(_) => 2,
+    }
+}
+
+fn block_kind(b: &crate::aadf::cell::BlockCell) -> u8 {
+    match b {
+        crate::aadf::cell::BlockCell::Empty(_) => 0,
+        crate::aadf::cell::BlockCell::UniformFull(_) => 1,
+        crate::aadf::cell::BlockCell::Mixed(_) => 2,
+    }
+}
+
+/// Build `segment_voxel_buffer` for a fixture using the full world's
+/// dimensions, indexed via `chunk_index = cx + cy*S + cz*S*S` where
+/// `S = segment_size_in_chunks = max(size_in_chunks)`. Chunks outside the
+/// volume's extent are left zero.
+fn build_segment_voxel_buffer_for_world(
+    volume: &crate::aadf::construct::DenseVolume,
+    segment_size_in_chunks: u32,
+) -> Vec<u32> {
+    let seg = segment_size_in_chunks as usize;
+    let sc = volume.size_in_chunks;
+    // Size precisely: the max chunk_index_in_segment accessed is
+    // `(sc[0]-1) + (sc[1]-1)*seg + (sc[2]-1)*seg*seg`, each chunk consumes
+    // 2048 u32s. Add 1 for the inclusive bound.
+    let max_chunk_idx = (sc[0] as usize - 1)
+        + (sc[1] as usize - 1) * seg
+        + (sc[2] as usize - 1) * seg * seg;
+    let total_u32s = (max_chunk_idx + 1) * 2048;
+    let mut out = vec![0u32; total_u32s];
+
+    for cz in 0..(sc[2] as usize) {
+        for cy in 0..(sc[1] as usize) {
+            for cx in 0..(sc[0] as usize) {
+                let chunk_index_in_segment = cx + cy * seg + cz * seg * seg;
+                let chunk_base = chunk_index_in_segment * 2048;
+
+                for bz in 0..4 {
+                    for by in 0..4 {
+                        for bx in 0..4 {
+                            let block_index = bx + by * 4 + bz * 16;
+                            let block_base = chunk_base + block_index * 32;
+                            for vi in 0..32 {
+                                let lo = voxel_at_block_local(
+                                    volume,
+                                    [cx, cy, cz],
+                                    [bx, by, bz],
+                                    vi * 2,
+                                );
+                                let hi = voxel_at_block_local(
+                                    volume,
+                                    [cx, cy, cz],
+                                    [bx, by, bz],
+                                    vi * 2 + 1,
+                                );
+                                out[block_base + vi] =
+                                    (lo as u32) | ((hi as u32) << 16);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// W4 — entry point for `bevy-naadf e2e_render --entities`.
 ///
 /// Runs `EntityHandler::update` for a small fixture (one moving entity in a

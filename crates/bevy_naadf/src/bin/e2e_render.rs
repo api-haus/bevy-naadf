@@ -79,6 +79,8 @@ fn main() -> ExitCode {
     // `docs/orchestrate/feature-completeness/03a-impl-vox-loading.md` —
     // `## E2E gate addendum`), default off.
     let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
+    let validate_gpu_construction_scaled =
+        args.iter().any(|a| a == "--validate-gpu-construction-scaled");
     let entities_mode = args.iter().any(|a| a == "--entities");
     let edit_mode = args.iter().any(|a| a == "--edit-mode");
     let runtime_edit_mode = args.iter().any(|a| a == "--runtime-edit-mode");
@@ -128,6 +130,22 @@ fn main() -> ExitCode {
     if vox_gpu_oracle_mode {
         let code = bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_compare();
         return ExitCode::from(code);
+    }
+
+    // vox-gpu-rewrite Stage 6 — concrete byte-diff diagnostic. Short-circuits
+    // before booting the e2e binary; runs a fixture sweep through the W5
+    // chunk_calc chain and prints first-divergent-index per buffer (raw +
+    // semantic). See `docs/orchestrate/vox-gpu-rewrite/12-diagnostic-byte-diff-concrete.md`.
+    if validate_gpu_construction_scaled {
+        match bevy_naadf::render::construction::validate_gpu_construction_scaled() {
+            Ok(_report) => {
+                return ExitCode::from(0);
+            }
+            Err(msg) => {
+                eprintln!("scaled byte-diff diagnostic FAILED: {msg}");
+                return ExitCode::from(1);
+            }
+        }
     }
 
     let app_exit = if resize_test {

@@ -67,8 +67,12 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Compound dispatch (Stage 2) — applied hash_map_size bump (LANDED, harmless, C#-faithful) + 4 iterative experiments. Hash_map saturation REFUTED at 8M slots.
 - [x] Stage 3 — top-down birdseye camera (per user directive); agent gamed lum<10 metric (bug at top-down is bright sky-bleed not dark pixels)
 - [x] Stage 4 — CPU-vs-GPU per-pixel oracle gate built (`crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs`). Gate WORKS, ungameable: 127.84 mean diff vs 8.0 floor at broken state, 97.8% pixels over per-pixel threshold. CPU oracle sanity guards pass.
-- [x] Stage 4 fix iteration — 8 attempts, ALL FAILED: voxels[] atomic, hash_map atomic, single-submit (broke), warmup 480, device.poll-per-segment, skip bounds, hash_map 8M, disable dedup (broke). Root cause STILL unidentified. Round-4 diagnostic recommends GPU readback byte-diff.
-- [ ] Hard gate — submit Stage 4: WORKING ungameable gate + 8 failed fix attempts + unidentified root cause  ← CURRENT
+- [x] Stage 4 fix iteration — 8 attempts, ALL FAILED. Round-4 diagnostic recommends GPU readback byte-diff.
+- [x] Stage 5 Part A — D1 fix landed (CPU mirror readback after W5 producer; `seed_block_hashing` reseed); addresses symptom 2 (edit raycast). Verified `chunks_cpu.len() = 2.1M, blocks_cpu = 12.9M, voxels_cpu = 10.5M` post-Oasis-boot.
+- [x] Stage 5 Part B — inferential byte-diff (cursor ratios), no concrete byte evidence
+- [x] Stage 6 — `--validate-gpu-construction-scaled` across 27 fixture configurations including real Oasis: **W5 producer output is BYTE-IDENTICAL to CPU oracle across every fixture**. Generator + chunk_calc{calc_block, compute_voxel_bounds, compute_block_bounds} all byte-equal. Cursor counts match exactly. **The W5 producer chain is provably correct.**
+- [x] Hypothesis re-localized: bug is in `bounds_calc.wgsl::{prepare_group_bounds, compute_group_bounds}` — the **chunk-layer AADF iterative refinement** that runs in a SEPARATE render-graph node (W3, was out-of-scope per original handoff). Multi-frame iterative; at Oasis-scale (32,768 bound groups) may never converge or have scale bug. Explains symptoms 1+3 (inversion = rays approaching surfaces wrong when chunk-AADFs are zero/wrong; short render distance = single-step rays).
+- [ ] Hard gate — submit Stage 6: W5 producer proven CORRECT; bug isolated to W3 bounds_calc chain (originally out-of-scope)  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.4 (delete CPU stop-gap)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.6 (document default-scene divergence)
