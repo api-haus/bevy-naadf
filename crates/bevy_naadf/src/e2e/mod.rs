@@ -32,6 +32,7 @@ pub mod small_edit_visual;
 pub mod vox_e2e;
 pub mod vox_gpu_construction;
 pub mod vox_gpu_oracle;
+pub mod wgsl_noise_oracle;
 
 use bevy::camera::Hdr;
 use bevy::core_pipeline::tonemapping::Tonemapping;

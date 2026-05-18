@@ -17,6 +17,7 @@ pub mod editor;
 pub mod hud;
 pub mod panel;
 pub mod render;
+pub mod streaming;
 pub mod texture_array;
 pub mod voxel;
 pub mod world;

@@ -114,6 +114,14 @@ fn main() -> ExitCode {
     let vox_gpu_oracle_mode = args.iter().any(|a| a == "--vox-gpu-oracle");
     let vox_gpu_oracle_cpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-cpu");
     let vox_gpu_oracle_gpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-gpu");
+    // streaming-world Phase 1 — WGSL FastNoiseLite ↔ CPU oracle gate.
+    // Pure compute (no window). Boots a headless `MinimalPlugins +
+    // RenderPlugin` app, dispatches the WGSL noise port against a
+    // deterministic test matrix, reads back, compares to the Rust CPU
+    // oracle (`< 1e-5` non-cellular, `< 1e-4` cellular). See
+    // `bevy_naadf::e2e::wgsl_noise_oracle` +
+    // `docs/orchestrate/streaming-world/02b-design-plan-b.md` § C.
+    let wgsl_noise_oracle_mode = args.iter().any(|a| a == "--wgsl-noise-oracle");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -142,6 +150,12 @@ fn main() -> ExitCode {
     if vox_gpu_oracle_mode {
         let code = bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_compare();
         return ExitCode::from(code);
+    }
+
+    // streaming-world Phase 1 — short-circuit BEFORE the windowed e2e boot.
+    // Headless compute-only gate; reports its own ExitCode.
+    if wgsl_noise_oracle_mode {
+        return bevy_naadf::e2e::wgsl_noise_oracle::run_wgsl_noise_oracle_gate();
     }
 
     // vox-gpu-rewrite Stage 6 — concrete byte-diff diagnostic. Short-circuits

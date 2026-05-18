@@ -45,11 +45,11 @@ consolidated mode disqualified.
 - [x] **Hard gate v1** — user redirected: Plan B (WGSL noise via GLSL port, W5 gate inverted)
 - [x] 02b — Architecture design v2 (`delegate-architect` → `02b-design-plan-b.md`)
 - [ ] **Hard gate v2** — submit revised design to user, resolve OQ.2 before Phase 1
-- [ ] 03a — Phase-1 impl: WGSL FastNoiseLite port (`general-purpose` → code + `03a-impl-wgsl-noise.md`)
-- [ ] **Hard gate** — noise port + CPU↔GPU oracle test passes
-- [ ] 03b — Phase-2 impl: residency layer + W5 gate inversion (`general-purpose` → code + `03b-impl-residency.md`)
-- [ ] **Hard gate** — submit impl to user
-- [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator)
+- [x] 03a — Phase-1 impl: WGSL FastNoiseLite port (`general-purpose` → code + `03a-impl-wgsl-noise.md`)
+- [x] **Hard gate (Phase 1)** — user confirmed, Phase 2 OQ.1/OQ.3 + composition scope resolved
+- [ ] 03b — Phase-2 impl: residency + noise_terrain.wgsl + W5 gate inversion + --streaming-window gate (`general-purpose` → code + `03b-impl-residency.md`)
+- [ ] **Hard gate (Phase 2)** — submit impl to user
+- [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user
 
@@ -152,3 +152,14 @@ will read multiple `FnlState`s and combine their outputs (lerp, max, masked
 blend, etc.). The unified dispatcher is the primitive; the composition
 layer is out of scope this session but the API must enable it (multiple
 `FnlState` uniforms or a flat array of them).
+
+### Phase 2 design refinements (post-Phase-1 hard-gate Q&A)
+
+After Phase 1 landed and the user confirmed, three Phase-2 questions were
+resolved via Step-4-shape Q&A:
+
+| Question | Choice |
+|---|---|
+| OQ.1 — Noise → solid/empty classification | **Height-relative (Minecraft-style)** — `noise(x,y,z) + (sea_level - world_y) / amplitude > 0 → solid`. Produces ground + rolling hills + caves. `noise_terrain.wgsl` carries `sea_level: f32` + `terrain_amplitude: f32` uniforms in addition to `FnlState`. CLI knobs: `--sea-level` (default at half world-height in voxels) + `--terrain-amplitude` (default architect-picks-a-reasonable-value, justify in `03b-impl-residency.md`). |
+| Composition scope (new question) | **Single FnlState noise only** in Phase 2. One noise call per voxel, single classification, single palette assignment. Multi-noise biome composition (terrain + caves + biome temperature/humidity) is deferred to a Phase 3 follow-up. The WGSL primitives from Phase 1 already support it — Phase 3 is a localised edit. |
+| OQ.3 — Bounds-chain refresh policy on user edits | **Inherit existing W2 edit behavior.** Streaming admissions / evictions re-run the full bounds chain (per D.B7); user brush edits do NOT (matches existing `world_change.wgsl` path). No edits to W2 in Phase 2. |
