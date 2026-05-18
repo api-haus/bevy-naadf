@@ -71,7 +71,7 @@ pub mod world_change;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, Buffer, BufferDescriptor, BufferUsages,
-    CachedComputePipelineId, PipelineCache,
+    CachedComputePipelineId, CommandEncoderDescriptor, PipelineCache,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{GpuResourceAppExt, Render, RenderApp, RenderSystems};
@@ -2099,6 +2099,12 @@ pub fn naadf_gpu_producer_node(
     // (one rewrite per segment). `RenderContext::command_encoder` does not
     // expose `write_buffer`; the staging-belt write APIs live on the queue.
     render_queue: Res<RenderQueue>,
+    // vox-gpu-rewrite W5.3-fix Stage 1 — needed by the W5 branch to create a
+    // fresh `CommandEncoder` per segment. `wgpu::Queue::write_buffer`
+    // schedules writes BEFORE the next submit; a per-segment submit ensures
+    // each segment's params are visible to its OWN dispatches (rather than
+    // all 512 dispatches seeing the last segment's params, the pre-fix bug).
+    render_device: Res<RenderDevice>,
     // vox-gpu-rewrite W5.3 — drives the three-way branch ladder. Present iff a
     // `.vox` file was loaded into the fixed world via
     // `install_vox_in_fixed_world` (W5.1).
@@ -2185,13 +2191,33 @@ pub fn naadf_gpu_producer_node(
         let group_size_in_chunks =
             [segment_chunks, segment_chunks, segment_chunks];
 
-        let encoder = render_context.command_encoder();
-
-        // C#-faithful loop order: outer Z, middle Y, inner X (`WorldData.cs:
-        // 136-140`). Iteration order is observationally invariant for the
-        // dispatch outcome (each segment writes its own segment_voxel_buffer
-        // slice, consumed by the next chunk_calc dispatch in the same
-        // iteration), but matching C# is the faithful-port discipline.
+        // vox-gpu-rewrite W5.3-fix Stage 1 — wgpu's `Queue::write_buffer`
+        // writes are scheduled BEFORE the next `Queue::submit`; the writes
+        // do NOT interleave with dispatches recorded in the same
+        // command-encoder. Pre-fix, 512 write_buffer calls + 512
+        // encoder.dispatch calls into ONE encoder + ONE submit meant ALL
+        // dispatches saw the LAST write (segment 511's params) — so every
+        // segment's chunk_calc.calc_block dispatch wrote to chunk position
+        // [60, 4, 60] (the last segment's chunk_offset) instead of its own
+        // offset. Result: 511 of the 512 segments' worth of generator output
+        // was discarded; only the last segment's chunks landed at the
+        // intended world position.
+        //
+        // Fix: per-segment fresh encoder + submit. `render_queue.write_buffer`
+        // is now ordered with the per-segment submit; each submit sees only
+        // its own segment's writes; each dispatch uses the correct params.
+        //
+        // Trade-off: 512 submits/frame instead of 1. The W5 producer runs
+        // ONCE per app lifecycle (gated by `gpu_producer_has_run`), so this
+        // is a one-time cost at startup, not a per-frame cost. C# behaves
+        // identically (`WorldData.cs:120-156` submits per segment via the
+        // DirectX immediate context — each `ApplyCompute()` + `DispatchCompute()`
+        // is independently submitted with the latest parameter values).
+        //
+        // The bounds chain AFTER the loop continues to use the
+        // `render_context` encoder, since it does NOT need per-segment
+        // params rewrites (the bounds chain reads from blocks/voxels, not
+        // params.chunk_offset).
         let mut segment_count: u32 = 0;
         for sz in 0..crate::WORLD_SIZE_IN_SEGMENTS.z {
             for sy in 0..crate::WORLD_SIZE_IN_SEGMENTS.y {
@@ -2227,22 +2253,7 @@ pub fn naadf_gpu_producer_node(
                     );
 
                     // 2) Per-segment construction params — mirrors C#
-                    //    `WorldData.cs:492-503` `CalculateChunkBlocks`:
-                    //      chunkOffsetX/Y/Z    ← segmentPosInChunks
-                    //      segmentSizeInChunks ← worldGenSegmentSizeInChunks (16)
-                    //    The chunk_calc.wgsl shader reads both fields from the
-                    //    `params` uniform bound on `construction_world`:
-                    //      chunk_pos = group_id + params.chunk_offset (line 356)
-                    //      chunk_index_in_segment uses params.segment_size_in_chunks
-                    //      as the X/Y stride into segment_voxel_buffer
-                    //      (line 351-353).
-                    //    The other fields (size_in_chunks, group_size_in_groups,
-                    //    bound_group_queue_max_size, hash_map_size,
-                    //    max_group_bound_dispatch, frame_index, change counters)
-                    //    are pinned at construction-startup values by the
-                    //    `prepare_construction` build-once block at
-                    //    `mod.rs:1167-1201`; we re-derive them here to avoid a
-                    //    GPU readback.
+                    //    `WorldData.cs:492-503` `CalculateChunkBlocks`.
                     let construction_params = crate::render::gpu_types::GpuConstructionParams {
                         size_in_chunks: [
                             crate::WORLD_SIZE_IN_CHUNKS.x,
@@ -2274,87 +2285,86 @@ pub fn naadf_gpu_producer_node(
                         bytemuck::bytes_of(&construction_params),
                     );
 
-                    // 3) Generator → segment_voxel_buffer (shape [16,16,16]).
+                    // 3 + 4) Generator → segment_voxel_buffer +
+                    //    chunk_calc.calc_block_from_raw_data, per-segment
+                    //    encoder + submit (see comment block above).
+                    let mut seg_encoder = render_device.create_command_encoder(
+                        &CommandEncoderDescriptor {
+                            label: Some("naadf_w5_segment_encoder"),
+                        },
+                    );
                     generator_model::dispatch_generator_model_with_encoder(
-                        encoder,
+                        &mut seg_encoder,
                         p_gen,
                         gen_bg,
                         group_size_in_chunks,
                     );
-
-                    // 4) chunk_calc.calc_block_from_raw_data over the same
-                    //    per-segment extent (matches C#
-                    //    `WorldData.cs:506`:
-                    //    `DispatchCompute(worldGenSegmentSizeInChunks, ..., ...)`).
                     chunk_calc::dispatch_calc_block_from_raw_data_world_sized(
-                        encoder,
+                        &mut seg_encoder,
                         p_calc,
                         world_bg,
                         group_size_in_chunks,
                     );
+                    render_queue.submit([seg_encoder.finish()]);
 
                     segment_count += 1;
                 }
             }
         }
 
+        // The bounds chain dispatches on the shared `render_context`
+        // encoder — no per-segment params needed, so it can share the
+        // single submit at the end of the frame.
+        let encoder = render_context.command_encoder();
+
         // After the per-segment loop, run the bounds chain ONCE (mirrors C#
         // `WorldData.cs:158-210`'s post-loop `ComputeVoxelBounds` +
         // `ComputeBlockBounds` invocations).
         //
-        // Workgroup-count sanity check (vox-gpu-rewrite design Assumption #11):
-        // for the W5 path `world_data_meta.{blocks,voxels}_cpu_len` are 0 (the
-        // W5 install path leaves the CPU mirror empty), so we cannot derive
-        // the actual GPU output count without a CPU readback (not possible
-        // inside a render-graph node). We need an UPPER BOUND that:
-        //   - covers every block / every voxel the GPU might have written;
-        //   - stays inside wgpu's `max_compute_workgroups_per_dimension` cap
-        //     (standard 65535 per axis — see
-        //     `assets/shaders/sample_refine.wgsl:77-90`).
+        // vox-gpu-rewrite W5.3-fix Stage 1 — for the W5 path
+        // `world_data_meta.{blocks,voxels}_cpu_len` are 0 (the W5 install
+        // path leaves the CPU mirror empty), so we cannot derive the actual
+        // GPU output count without a mid-frame CPU readback (not possible
+        // inside a render-graph node). C# DOES readback the cursor each
+        // segment (`WorldData.cs:148-151`) and dispatches the bounds chain
+        // with `(voxelCount/64, 1, 1)` / `(blockCount/64, 1, 1)`; the Rust
+        // port must cover the full-world worst case in one shot.
         //
-        // The full-world cubic over-bound (`WORLD_SIZE_IN_CHUNKS.x*y*z = 2.1M`
-        // chunks → ~2.1M block_workgroups, ~134M voxel_workgroups) EXCEEDS
-        // 65535 by 32×–2046×; dispatching with those args would either fail
-        // wgpu validation or silently be replaced with `(0,0,0)` by wgpu's
-        // indirect-validation pass. Clamping to 65535 under-dispatches
-        // (workgroups past index 65534 of `blocks[]`/`voxels[]` skip the
-        // AADF bounds pass), but the resulting AADFs are valid for the
-        // FIRST 65535 mixed-blocks (~4M voxels) — enough to render Oasis
-        // visibly. Missing AADFs reduce raycast traversal efficiency but
-        // do NOT produce incorrect geometry: the renderer reads `blocks[]`
-        // for state + voxel_pointer (correctly written by
-        // `calc_block_from_raw_data`); the AADF bits drive only
-        // empty-region skip. The W3 `bounds_calc` chain (running after
-        // `gpu_producer_has_run` flips, per the seed at
-        // `:1240-1266`) fills in the remaining AADFs over subsequent
-        // frames as the bound-queue scans the world.
+        // PRE-FIX: the dispatch helpers took a 1D `workgroups: u32` and the
+        // call site clamped to wgpu's 65535/axis cap. That under-dispatched
+        // by 32×–2046× and left the AADF bits empty on most of the world.
         //
-        // Per-segment dispatch (one bounds chain per segment instead of one
-        // after the loop) would not help — per-segment max
-        // voxel_workgroups = 16³ * 64 = 262144, still over 65535.
+        // POST-FIX: the dispatch helpers
+        // (`chunk_calc::dispatch_compute_voxel_bounds` /
+        // `dispatch_compute_block_bounds`) repack the 1D count into a 3D
+        // shape (`split_3d_dispatch`); the WGSL entry points flatten
+        // `(group_id, num_workgroups)` back into a 1D `block_index` /
+        // `chunk_index`. Extra workgroups past the actual count read zero
+        // blocks (the buffers are sized to worst-case in
+        // `render/prepare.rs::prepare_world_gpu`) and are correct no-ops.
         //
-        // A future improvement would issue an indirect dispatch sourcing the
-        // workgroup count from `block_voxel_count[0..1]` (the GPU cursor),
-        // sidestepping CPU readback. Out of scope for W5.3.
-        const WGPU_MAX_WORKGROUPS_PER_DIM: u32 = 65535;
+        // Upper bound derivation: assume every chunk is mixed and every
+        // block is mixed (the absolute worst case for the AADF bounds
+        // chain). For the 256×32×256 chunk fixed world:
+        //   world_chunks         = 2,097,152
+        //   max_blocks_u64       = 134,217,728   (chunks * 64)
+        //   max_voxels_u64       = 4,294,967,296 (max_blocks * 32)
+        //   voxel_workgroups raw = 134,217,729   (voxels/32 + 1; one wg/mixed block)
+        //   block_workgroups raw =   2,097,153   (blocks/64 + 1; one wg/chunk)
+        //
+        // `split_3d_dispatch` repacks these to 3D shapes within the 65535
+        // per-axis cap; the WGSL flattens.
         let world_chunks = crate::WORLD_SIZE_IN_CHUNKS.x
             * crate::WORLD_SIZE_IN_CHUNKS.y
             * crate::WORLD_SIZE_IN_CHUNKS.z;
-        // Upper bound on mixed-block count = chunks * 64; upper bound on
-        // mixed-voxel-pairs-u32 count = mixed_blocks * 32.
-        // voxel_workgroups = (voxels_u32 / 32 + 1) per the
-        // chunk_calc.compute_voxel_bounds shape (1 workgroup per mixed block);
-        // block_workgroups = (blocks_u32 / 64 + 1) (1 workgroup per chunk).
         let max_blocks_u64 = (world_chunks as u64) * 64;
         let max_voxels_u64 = max_blocks_u64 * 32;
-        let raw_voxel_workgroups =
-            ((max_voxels_u64 / 32 + 1).max(1)).min(u32::MAX as u64) as u32;
-        let raw_block_workgroups =
-            ((max_blocks_u64 / 64 + 1).max(1)).min(u32::MAX as u64) as u32;
         let voxel_workgroups =
-            raw_voxel_workgroups.min(WGPU_MAX_WORKGROUPS_PER_DIM);
+            ((max_voxels_u64 / 32 + 1).max(1)).min(u32::MAX as u64) as u32;
         let block_workgroups =
-            raw_block_workgroups.min(WGPU_MAX_WORKGROUPS_PER_DIM);
+            ((max_blocks_u64 / 64 + 1).max(1)).min(u32::MAX as u64) as u32;
+        let voxel_dispatch = chunk_calc::split_3d_dispatch(voxel_workgroups);
+        let block_dispatch = chunk_calc::split_3d_dispatch(block_workgroups);
 
         chunk_calc::dispatch_compute_voxel_bounds(
             encoder,
@@ -2373,9 +2383,17 @@ pub fn naadf_gpu_producer_node(
         info!(
             "vox-gpu-rewrite W5 — per-segment GPU producer chain DISPATCHED \
              ({} segments × (generator_model + calc_block); bounds chain ×1; \
-             voxel_workgroups={voxel_workgroups} (raw {raw_voxel_workgroups}), \
-             block_workgroups={block_workgroups} (raw {raw_block_workgroups})).",
+             voxel_workgroups={voxel_workgroups} dispatched as 3D {:?} \
+             (= {} total workgroups, covers {} requested), \
+             block_workgroups={block_workgroups} dispatched as 3D {:?} \
+             (= {} total workgroups, covers {} requested)).",
             segment_count,
+            voxel_dispatch,
+            voxel_dispatch[0] as u64 * voxel_dispatch[1] as u64 * voxel_dispatch[2] as u64,
+            voxel_workgroups,
+            block_dispatch,
+            block_dispatch[0] as u64 * block_dispatch[1] as u64 * block_dispatch[2] as u64,
+            block_workgroups,
         );
         return;
     }

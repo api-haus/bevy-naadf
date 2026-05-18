@@ -1,143 +1,125 @@
-//! `--vox-gpu-construction` mode — regression gate for the vox-gpu-rewrite
-//! W5 GPU producer chain (`docs/orchestrate/vox-gpu-rewrite/`).
+//! `--vox-gpu-construction` mode — PRODUCTION-PATH gate for the
+//! vox-gpu-rewrite W5 GPU producer chain
+//! (`docs/orchestrate/vox-gpu-rewrite/`).
 //!
 //! ## Goal
 //!
-//! End-to-end gate that:
-//!   1. Loads the in-tree Oasis fixture ([`OASIS_VOX_FIXTURE_PATH`],
-//!      `e2e/oasis_edit_visual.rs:81`) through the production W5.1
-//!      [`crate::voxel::grid::install_vox_in_fixed_world`] path.
-//!   2. Boots the e2e harness with `fixed_world_size = true` +
-//!      `construction_config.gpu_construction_enabled = true` (the
-//!      `bevy-naadf::main` shape, per `lib.rs:393` + `:143`) so the new
-//!      `ModelData → ModelDataRender → W5 per-segment dispatch → chunk_calc`
-//!      chain runs against the production buffers.
-//!   3. Asserts the framebuffer captured at the standard e2e camera pose
-//!      ([`crate::e2e::gates::e2e_camera_transform`]) is non-empty —
-//!      a region-mean luminance above a "captured something" floor.
+//! End-to-end gate that exercises **the same code path** as the production
+//! binary `cargo run --release --bin bevy-naadf -- --vox <path>` and asserts
+//! that the world is actually populated — not just that the framebuffer is
+//! non-pure-black.
 //!
-//! Per Q3 decision (`01-context.md`): no `AppArgs::vox_gpu_construction_mode`
-//! flag. The new e2e module sets `AppArgs.fixed_world_size = true` +
-//! `construction_config.gpu_construction_enabled = true` +
-//! `grid_preset = GridPreset::Vox { path: OASIS_VOX_FIXTURE_PATH, tiles: 1 }`
-//! directly. The driver runs the existing Warmup→Motion→Settle→Shoot flow;
-//! no driver-flow customisation.
+//! ### Why the W5.3 "sky-band luminance > 40" floor was rejected
 //!
-//! Per Q4 decision (`01-context.md`): the W5.5 gate reuses
-//! [`OASIS_VOX_FIXTURE_PATH`] (`crates/bevy_naadf/assets/test/oasis_hard_cover.vox`,
-//! Git LFS-tracked).
+//! The original W5.5 gate passed when the W5 GPU producer chain dispatched
+//! WITHOUT writing meaningful geometry — sky luminance 146.2 cleared the 40
+//! floor even though the chunks buffer was populated with state pointers
+//! that indexed into UNWRITTEN regions of an undersized blocks/voxels
+//! buffer (see `docs/orchestrate/vox-gpu-rewrite/05-diagnostic.md`). The
+//! gate gave a green signal for an empty scene; the user's live visual
+//! check caught the regression that the gate missed.
 //!
-//! ## Camera / Oasis off-frame state
+//! ## Mechanism — two-frame camera-sweep Δ
 //!
-//! The e2e harness uses a fixed pose at NAADF `(86, 42, 90)` looking at
-//! `(32, 16, 32)` — calibrated against the legacy `64 × 32 × 64`-voxel
-//! default scene. The Oasis fixture is `~93 × 34 × 84` chunks
-//! (`~1488 × 544 × 1344` voxels); when loaded through the fixed-size
-//! `4096 × 512 × 4096`-voxel world the populated region sits in the OPPOSITE
-//! hemisphere from the e2e camera. The framebuffer therefore captures sky /
-//! atmosphere tint at the central 40 % × 40 % rect, NOT visible Oasis
-//! geometry.
+//! Mirrors `--oasis-edit-visual`'s Δ-based assertion shape, but with a
+//! **camera-translation Δ** instead of a brush-edit Δ. The W5 install
+//! path leaves `WorldData.chunks_cpu / blocks_cpu / voxels_cpu = Vec::new()`
+//! by design (the GPU producer is the source of truth); the CPU
+//! `sphere_brush` writes through `chunks_cpu[ci]` indexing and silently
+//! no-ops on the empty mirror, so a brush-edit Δ would always be zero. A
+//! camera-sweep Δ achieves the same regression signal — moving the camera
+//! through a populated world sweeps geometry through the framebuffer
+//! (large Δ); moving the camera through an empty world shows sky on both
+//! frames (Δ near zero).
 //!
-//! Per the `02-design.md` § Decisions — `InitialCameraPose` for the W5.5
-//! gate decision: the e2e harness IGNORES `InitialCameraPose` (uses
-//! [`crate::e2e::setup_e2e_camera`] verbatim). Overriding the camera would
-//! require a driver-mode flag (rejected by Q3) or a per-mode Startup-system
-//! patch (more invasive than W5.5's scope). The gate therefore uses the
-//! standard e2e pose and the assertion accepts an Oasis-off-frame view.
+//! 1. Load `OASIS_VOX_FIXTURE_PATH` through the production
+//!    `install_vox_in_fixed_world` W5 GPU producer chain (the *same* code
+//!    path the binary runs when given `--vox <path>`).
+//! 2. Pin camera A at C#'s literal `(500, 200, 40)` voxel spawn pose
+//!    (`WorldRender.cs:48-49`) looking `+Z`.
+//! 3. Warmup → capture frame A.
+//! 4. `OasisApplyEdit` phase: instead of a brush, *promote the camera*
+//!    via the `oasis.edit_applied` flag — the pin function reads the flag
+//!    and switches to camera B at `(500, 200, 200)` (160 voxels forward,
+//!    still inside the populated Oasis tile).
+//! 5. Wait ~5 s for TAA + GI convergence at the new pose → capture frame B.
+//! 6. Assert per-pixel mean RGB Δ over a central rect exceeds
+//!    [`VOX_GPU_CONSTRUCTION_DIFF_FLOOR`].
 //!
-//! ## Assertion strategy
+//! ## Why this catches the empty-scene regression
 //!
-//! [`assert_frame_not_black`] samples the central 40 % × 40 % region and
-//! requires region-mean luminance above [`NOT_BLACK_LUMINANCE_FLOOR`] — a
-//! "captured something" floor well below the measured sky band (~146 per
-//! `vox_e2e.rs:88`) and well above pure black (0). This:
-//!
-//!   - PASSES when the harness boots, the render graph runs, and the
-//!     framebuffer captures the atmosphere-tinted sky (the expected
-//!     state at the e2e camera pose, both pre- and post-W5.3).
-//!   - FAILS when the harness boots but the framebuffer is pure-black —
-//!     the load-bearing regression signal. Pure-black indicates the GPU
-//!     producer chain crashed silently, a pipeline failed to compile,
-//!     a bind group was misbound, or buffer alloc failed (W5.2's
-//!     surface area).
-//!
-//! Per `02-design.md` § Assumptions made (#8): the framebuffer assertion
-//! choice was made on first run. The custom `assert_frame_not_black` floor
-//! was chosen over `vox_e2e_mode = true` (which reuses
-//! [`crate::e2e::vox_e2e::assert_vox_geometry_visible`]'s 160-luminance
-//! threshold) because the Oasis-off-frame state lands the central rect on
-//! sky band (~146), which trips the 160 ceiling. The "not black" floor is
-//! the correct shape for catching W5.2 / W5.3 regressions without false
-//! positives from the deliberate Oasis-off-frame state.
+//! In a populated world, the camera at camera-A pose sees Oasis geometry
+//! (mixed colours, variance high) and the camera at camera-B pose sees a
+//! DIFFERENT view of geometry — moving 160 voxels forward sweeps blocks
+//! in and out of the frustum, producing a substantial per-pixel Δ. In an
+//! EMPTY world (the W5.3 regression state), both camera A and camera B
+//! render the atmosphere-tinted sky (luminance ~146, near-constant across
+//! the framebuffer); the per-pixel Δ collapses to near-zero (TAA noise
+//! floor only). **Δ below [`VOX_GPU_CONSTRUCTION_DIFF_FLOOR`] is the
+//! load-bearing regression signal.**
 
 use std::path::PathBuf;
 
-use bevy::prelude::AppExit;
+use bevy::prelude::*;
 
+use crate::camera::position_split::PositionSplit;
 use crate::e2e::framebuffer::{Framebuffer, Rect};
 use crate::e2e::oasis_edit_visual::{oasis_vox_fixture_path, OASIS_VOX_FIXTURE_PATH};
 
-/// Screen-rect fractional bounds the [`assert_frame_not_black`] gate
-/// samples — a central 40 % × 40 % region (same shape as
-/// [`crate::e2e::vox_e2e`]'s `VOX_GEOMETRY_RECT_FRACS`). The standard
-/// e2e camera pose ([`crate::e2e::gates::e2e_camera_transform`] at
-/// `(86, 42, 90)` looking at `(32, 16, 32)`) does NOT frame the populated
-/// region of `oasis_hard_cover.vox` (the Oasis model occupies
-/// `~93 × 34 × 84` chunks ≈ `1488 × 544 × 1344` voxels — far outside the
-/// e2e camera's calibrated `64 × 32 × 64`-voxel view box).
-///
-/// See the module-level "Camera / Oasis off-frame state" section — for the
-/// W5.5 gate the framebuffer floor assertion uses a coarse "framebuffer is
-/// not pure-black" check rather than a "see the model" check.
-const FRAME_REGION_FRACS: (f32, f32, f32, f32) = (0.30, 0.30, 0.70, 0.70);
+// ---------------------------------------------------------------------------
+// Camera poses — C#-faithful literal voxel coordinates
+// ---------------------------------------------------------------------------
 
-/// Mean luminance floor: any frame above this value has captured
-/// *something*. Calibration baselines (from `vox_e2e.rs:88` and the
-/// `03a-impl-vox-loading.md` post-Track-A run):
-///
-/// | Frame content                          | Luminance |
-/// |----------------------------------------|-----------|
-/// | Pure black (no render delivered)       | 0.0       |
-/// | Atmosphere-tinted sky band (no geom)   | ~146      |
-/// | Default-scene solid (GI-lit diffuse)   | ~242      |
-/// | Default-scene emissive                 | ~247      |
-///
-/// Threshold set to **40.0** — well below the measured sky band (~146) so
-/// any frame with even atmospheric tint passes; well above 0 so a
-/// pure-black "render graph delivered nothing" failure trips. Catches
-/// catastrophic failures (pipeline compile errors, bind-group misbindings,
-/// buffer alloc failures).
-///
-/// **First-run baseline (pre-W5.3, 2026-05-17):** with the W5 segment loop
-/// NOT yet landed, the W5 prepare block allocates buffers + builds the
-/// bind group, but `naadf_gpu_producer_node` does NOT dispatch the
-/// generator pass — so `gpu_producer_has_run` never flips on the W5 path,
-/// `WorldGpu::chunks` stays zeroed, AND nine downstream render-graph nodes
-/// (naadf_first_hit, naadf_taa_reproject, naadf_ray_queue, naadf_global_illum,
-/// naadf_sample_refine, naadf_spatial_resampling, naadf_denoise,
-/// naadf_calc_new_taa_sample, naadf_final_blit) never dispatch because
-/// their `WorldGpu`-readiness preconditions are unmet. The standard e2e
-/// driver therefore fails the node-dispatch + luminance + region gates;
-/// the framebuffer is pure-black (luminance ~0.7). This module's
-/// `assert_frame_not_black` floor (40.0) would also trip — by design:
-/// pre-W5.3 the gate is EXPECTED to fail. Post-W5.3, when the segment
-/// loop dispatches and `WorldGpu::chunks` populates, the downstream nodes
-/// run, the sky band lifts the framebuffer to ~146 luminance (well above
-/// 40), and this gate passes.
-const NOT_BLACK_LUMINANCE_FLOOR: f32 = 40.0;
+/// C# `WorldRender.cs:48-49` literal camera spawn: `(500, 200, 40)` voxels,
+/// looking `+Z`. For the 4096×512×4096 fixed world this puts the camera at
+/// `Y=200 < ceiling 512` (well inside the world). Pose A — used for frame
+/// A (pre-camera-promotion).
+pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_A: Vec3 = Vec3::new(500.0, 200.0, 40.0);
 
-/// Boot the e2e harness with the production W5 GPU producer path enabled.
+/// Camera B — translated 160 voxels in the `+Z` direction (still inside
+/// the populated Oasis tile; Oasis's first XZ tile spans
+/// `0..1488 × 0..544 × 0..1344` voxels). Pose B — used for frame B
+/// (post-camera-promotion). The translation is large enough that the
+/// per-pixel Δ between A and B is well above the TAA-noise floor for a
+/// populated world (geometry sweeps through the frustum), but small
+/// enough that B still sits inside the same tile as A (no chunk-pointer
+/// edge cases to worry about).
+pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_B: Vec3 = Vec3::new(500.0, 200.0, 200.0);
+
+// ---------------------------------------------------------------------------
+// Diff threshold + bounding box fractions
+// ---------------------------------------------------------------------------
+
+/// Central rect fractions for the per-pixel Δ assertion (same shape as
+/// `--oasis-edit-visual`'s 30 % × 30 % rect). The brush at `(500, 200,
+/// 100)` projects to the central region of the framebuffer for the camera
+/// pose at `(500, 200, 40)` looking `+Z`.
+pub const VOX_GPU_CONSTRUCTION_DIFF_RECT_FRACS: (f32, f32, f32, f32) =
+    (0.35, 0.35, 0.65, 0.65);
+
+/// Minimum mean per-pixel RGB Δ over the central rect for the gate to
+/// PASS. Generous floor matched to `--oasis-edit-visual`'s 8.0; a real
+/// brush stroke into populated geometry produces a Δ of 30+ (sphere
+/// replaces sky-band ~150 with emissive ~250 over ~10-20 % of the rect).
+/// A regression that leaves the world empty produces Δ near zero (no
+/// geometry → brush adds voxels into an empty world but the renderer's
+/// chunks pointers are still bogus → framebuffer unchanged).
+pub const VOX_GPU_CONSTRUCTION_DIFF_FLOOR: f32 = 8.0;
+
+// ---------------------------------------------------------------------------
+// Entry point — invoked from `bin/e2e_render.rs`
+// ---------------------------------------------------------------------------
+
+/// Boot the e2e harness with the production W5 GPU producer path enabled
+/// AND the `--oasis-edit-visual`-shape brush-edit driver flow.
 ///
-/// Returns the harness's `AppExit`. The actual framebuffer assertion is
-/// run by the driver: [`crate::AppArgs::vox_e2e_mode`] is intentionally
-/// NOT set — the gate uses the standard default-scene region gates
-/// (sky / solid / emissive) which at this pose will all sample sky or
-/// adjacent atmosphere; a non-black readback is the correct signal here
-/// (see module-level docs). The driver's degenerate-frame check + the
-/// `PipelineCache` scan + the node-dispatch check provide the catastrophic-
-/// failure coverage; the custom [`assert_frame_not_black`] gate is the
-/// load-bearing W5.5-specific assertion (callable by tests / future
-/// driver integrations).
+/// Returns the harness's `AppExit`. The driver routes through the
+/// `OasisWarmup → ... → OasisAssert` phases (selected when EITHER
+/// `oasis_edit_visual_mode` OR `vox_gpu_construction_mode` is `true`); the
+/// camera is overridden by [`pin_vox_gpu_construction_camera`] (which
+/// runs `.after(pin_oasis_camera)` so it takes precedence over the
+/// birdseye); the brush is overridden by `apply_erase_brush`'s mode-aware
+/// branch to spawn at [`VOX_GPU_CONSTRUCTION_BRUSH_POS`].
 pub fn run_vox_gpu_construction() -> AppExit {
     let path = oasis_vox_fixture_path();
     if !path.exists() {
@@ -153,9 +135,14 @@ pub fn run_vox_gpu_construction() -> AppExit {
     }
     println!(
         "e2e_render --vox-gpu-construction: loading Oasis VOX fixture from \
-         {} ({} bytes) into the W5 GPU producer chain",
+         {} ({} bytes) into the W5 GPU producer chain (production-path \
+         camera-sweep gate; camera A at C# {:?} → camera B at {:?}, both \
+         looking +Z; expecting per-pixel RGB Δ ≥ {:.2} over central rect)",
         path.display(),
         std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
+        VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
+        VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
     );
 
     let mut app_args = crate::AppArgs::default();
@@ -167,79 +154,210 @@ pub fn run_vox_gpu_construction() -> AppExit {
     };
     app_args.fixed_world_size = true;
     app_args.construction_config.gpu_construction_enabled = true;
-    // NOTE: `vox_e2e_mode` is intentionally NOT set. The Oasis fixture's
-    // populated region sits in the opposite hemisphere from the e2e camera
-    // (see module docs), so the central rect samples sky band (~146) — that
-    // would trip the `--vox-e2e` driver's `SKY_LUMINANCE_CEILING = 160`
-    // gate. The custom `assert_frame_not_black` floor in this module is
-    // the correct shape for this off-frame state. The driver's standard
-    // PipelineCache scan + node-dispatch check + degenerate-frame floor
-    // still run and cover catastrophic GPU-producer failures.
+    // Route through the Oasis brush-edit driver flow. The driver's
+    // `OasisWarmup` fast-path triggers when EITHER `oasis_edit_visual_mode`
+    // OR `vox_gpu_construction_mode` is set; the brush + assertion mechanics
+    // are identical, the camera + brush position are mode-specific.
+    // NOTE: we deliberately do NOT also set `oasis_edit_visual_mode = true`
+    // — `pin_oasis_camera` would write a birdseye pose every tick that
+    // `pin_vox_gpu_construction_camera` would then override; cleaner to
+    // skip the birdseye write entirely.
+    app_args.vox_gpu_construction_mode = true;
 
     crate::run_e2e_render_with_args(app_args)
 }
 
 /// Re-export the resolved path for the `AppArgs::grid_preset`. Mirrors the
-/// shape of `oasis_edit_visual.rs::run_oasis_edit_visual` so the same path
-/// the existence-check used is the same path the load-bearing
-/// `GridPreset::Vox` carries.
+/// shape of `oasis_edit_visual.rs::run_oasis_edit_visual`.
 fn app_path_for_args(p: &std::path::Path) -> PathBuf {
     p.to_path_buf()
 }
 
-/// Region-luminance gate: framebuffer must have captured SOMETHING —
-/// region-mean luminance above the not-black floor.
-///
-/// Per the module-level docs, this is a coarse "did we get a frame at all"
-/// gate; the load-bearing signal is that the harness boots, the render
-/// graph runs to completion, and the framebuffer is not pure-black. A
-/// regression in W5.2's bind-group setup or W5.3's segment loop that
-/// crashes the device, fails to compile a pipeline, or leaves the
-/// framebuffer untouched will trip this floor.
-///
-/// Returns `Ok(())` on success; an `Err(String)` describing the failure
-/// on a sub-floor luminance.
-pub fn assert_frame_not_black(fb: &Framebuffer) -> Result<(), String> {
-    let (fx0, fy0, fx1, fy1) = FRAME_REGION_FRACS;
-    let region = Rect::from_fractional(fb, fx0, fy0, fx1, fy1);
-    let mean = fb.region_mean(region);
-    let lum = Framebuffer::luminance(mean);
+// ---------------------------------------------------------------------------
+// Camera pin — overrides `pin_oasis_camera`'s birdseye
+// ---------------------------------------------------------------------------
 
-    println!(
-        "e2e_render --vox-gpu-construction: region mean rgba {mean:?}, \
-         luminance {lum:.1} (floor > {NOT_BLACK_LUMINANCE_FLOOR:.0})",
-    );
-
-    if lum <= NOT_BLACK_LUMINANCE_FLOOR {
-        return Err(format!(
-            "vox-gpu-construction gate FAIL — central region mean \
-             luminance {lum:.1} is at or below the not-black floor \
-             {NOT_BLACK_LUMINANCE_FLOOR:.0}. The W5 GPU producer chain \
-             likely failed (a pipeline failed to compile, the segment \
-             loop didn't run, the dispatch silently crashed the device, \
-             or a bind group was misbound — W5.2 / W5.3 surface area). \
-             Inspect target/e2e-screenshots/vox_gpu_construction_latest.png \
-             + run with `RUST_LOG=debug` for shader-cache + dispatch \
-             traces.",
-        ));
+/// `Update` system: pin the camera at one of the two C#-faithful poses
+/// (A pre-promotion, B post-promotion). The "promotion" is the
+/// `OasisEditVisualState.edit_applied` flag, which the driver flips on
+/// `OasisApplyEdit` — this gate hijacks that flag as the "promote to
+/// camera B" trigger (instead of "apply brush"); the `OasisApplyEdit`
+/// branch in `driver.rs` is mode-aware and skips the brush call entirely
+/// for vox-gpu-construction mode.
+///
+/// Wired only when `AppArgs.vox_gpu_construction_mode == true`; runs
+/// `.after(pin_oasis_camera)` so it overrides the birdseye pose the
+/// Oasis pin would write (the Oasis driver fast-path doubles as our
+/// fast-path; we need the brush-edit phases but NOT the birdseye camera).
+pub fn pin_vox_gpu_construction_camera(
+    args: Option<Res<crate::AppArgs>>,
+    oasis: Option<Res<crate::e2e::oasis_edit_visual::OasisEditVisualState>>,
+    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
+) {
+    let Some(args) = args else { return; };
+    if !args.vox_gpu_construction_mode {
+        return;
     }
-    Ok(())
+    let promoted = oasis.as_deref().is_some_and(|o| o.edit_applied);
+    let pos = if promoted {
+        VOX_GPU_CONSTRUCTION_CAMERA_POS_B
+    } else {
+        VOX_GPU_CONSTRUCTION_CAMERA_POS_A
+    };
+    let pose = Transform::from_translation(pos).looking_at(pos + Vec3::Z, Vec3::Y);
+    let (transform, position_split) = &mut *camera;
+    **transform = pose;
+    **position_split = PositionSplit::from_world(pose.translation);
+    let _ = promoted; // referenced by camera pos choice above
 }
 
-/// Save a vox-gpu-construction-specific PNG alongside the standard
-/// `e2e_latest.png` slot. Best-effort — the gate verdict is unchanged
-/// either way.
-pub fn save_vox_gpu_construction_screenshot(fb: &Framebuffer) {
-    let path = std::path::Path::new(crate::e2e::E2E_SCREENSHOT_DIR)
-        .join("vox_gpu_construction_latest.png");
+// ---------------------------------------------------------------------------
+// Camera-promotion stub — replaces the brush call in OasisApplyEdit
+// ---------------------------------------------------------------------------
+
+/// Driver-stub for the `OasisApplyEdit` phase in vox-gpu-construction mode.
+/// Does NOT touch `WorldData` (the W5 install path leaves the CPU mirror
+/// empty; `sphere_brush` would silently no-op on the empty mirror). The
+/// load-bearing side effect is `oasis.edit_applied = true` — which the
+/// driver sets after returning from this function — which
+/// `pin_vox_gpu_construction_camera` reads to promote the camera from
+/// pose A to pose B.
+pub fn promote_camera_to_pose_b() {
+    println!(
+        "e2e_render --vox-gpu-construction: promoting camera A→B \
+         (pose A {:?} → pose B {:?}) — no brush; W5 install path's empty \
+         CPU mirror would silently no-op a sphere_brush call",
+        VOX_GPU_CONSTRUCTION_CAMERA_POS_A, VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Assertion — per-pixel mean RGB Δ over the central rect
+// ---------------------------------------------------------------------------
+
+/// Compute the central-rect mean per-pixel RGB Δ between `before` and
+/// `after`; assert it exceeds [`VOX_GPU_CONSTRUCTION_DIFF_FLOOR`].
+///
+/// Returns `Ok(report)` on PASS; `Err(report)` on FAIL.
+pub fn assert_vox_gpu_construction_landed(
+    before: &Framebuffer,
+    after: &Framebuffer,
+) -> Result<String, String> {
+    if before.width() != after.width() || before.height() != after.height() {
+        return Err(format!(
+            "frame A {}×{} vs frame B {}×{} — dimensions changed mid-run",
+            before.width(),
+            before.height(),
+            after.width(),
+            after.height()
+        ));
+    }
+
+    let (fx0, fy0, fx1, fy1) = VOX_GPU_CONSTRUCTION_DIFF_RECT_FRACS;
+    let rect = Rect::from_fractional(after, fx0, fy0, fx1, fy1);
+
+    let mean_before = before.region_mean(rect);
+    let mean_after = after.region_mean(rect);
+    let lum_before = Framebuffer::luminance(mean_before);
+    let lum_after = Framebuffer::luminance(mean_after);
+
+    let rect_delta = region_mean_pixel_delta(before, after, rect);
+    let full_delta = before.mean_pixel_delta(after);
+
+    let report = format!(
+        "rect=({},{},{},{}) frac=({:.2},{:.2},{:.2},{:.2}); \
+         rect mean rgba: before={:?}, after={:?}; \
+         rect luminance: before={:.1}, after={:.1}, Δ={:.1}; \
+         rect mean per-pixel RGB Δ={:.2} (floor={:.2}); \
+         full-frame mean per-pixel RGB Δ={:.2}",
+        rect.x0,
+        rect.y0,
+        rect.x1,
+        rect.y1,
+        fx0,
+        fy0,
+        fx1,
+        fy1,
+        mean_before,
+        mean_after,
+        lum_before,
+        lum_after,
+        (lum_after - lum_before).abs(),
+        rect_delta,
+        VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
+        full_delta,
+    );
+    println!("e2e_render --vox-gpu-construction: {report}");
+
+    if rect_delta < VOX_GPU_CONSTRUCTION_DIFF_FLOOR {
+        return Err(format!(
+            "vox-gpu-construction gate FAIL — rect mean per-pixel RGB Δ \
+             {rect_delta:.2} is below the floor {:.2}. The camera-A→B \
+             translation (pose A {:?} → pose B {:?}) did NOT produce a \
+             measurable per-pixel framebuffer change. \
+             {report}. \
+             This is the W5.3 empty-scene regression class: the W5 GPU \
+             producer chain dispatched but the chunks buffer points at \
+             unwritten blocks/voxels regions (likely buffer underallocation \
+             — see `docs/orchestrate/vox-gpu-rewrite/05-diagnostic.md`), so \
+             the renderer reads zero bytes for every chunk and treats the \
+             world as empty. Both camera poses render the atmosphere-tinted \
+             sky (~146 luminance), so the per-pixel Δ collapses. Inspect \
+             target/e2e-screenshots/vox_gpu_construction_before.png + \
+             vox_gpu_construction_after.png.",
+            VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
+            VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
+            VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
+        ));
+    }
+
+    Ok(format!("vox-gpu-construction gate PASS — {report}"))
+}
+
+/// Per-rect mean per-pixel RGB delta (channels averaged 0..3). Same shape
+/// as `oasis_edit_visual::region_mean_pixel_delta`.
+fn region_mean_pixel_delta(a: &Framebuffer, b: &Framebuffer, rect: Rect) -> f32 {
+    if a.width() != b.width() || a.height() != b.height() {
+        return f32::MAX;
+    }
+    let mut acc = 0.0f64;
+    let mut n = 0u64;
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            let pa = a.pixel(x, y);
+            let pb = b.pixel(x, y);
+            for c in 0..3 {
+                acc += (pa[c] as f64 - pb[c] as f64).abs();
+            }
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        (acc / (n as f64 * 3.0)) as f32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot saves (best-effort)
+// ---------------------------------------------------------------------------
+
+/// PNG saved for the pre-edit capture.
+pub const VOX_GPU_CONSTRUCTION_BEFORE_PNG: &str = "vox_gpu_construction_before.png";
+/// PNG saved for the post-edit capture.
+pub const VOX_GPU_CONSTRUCTION_AFTER_PNG: &str = "vox_gpu_construction_after.png";
+
+/// Save a framebuffer to `target/e2e-screenshots/<filename>`. Best-effort.
+pub fn save_vox_gpu_construction_screenshot(fb: &Framebuffer, filename: &str) {
+    let path = std::path::Path::new(crate::e2e::E2E_SCREENSHOT_DIR).join(filename);
     match fb.save_png(&path) {
         Ok(()) => println!(
             "e2e_render --vox-gpu-construction: screenshot saved to {}",
             path.display()
         ),
         Err(e) => eprintln!(
-            "e2e_render --vox-gpu-construction: vox_gpu_construction_latest.png \
-             save failed: {e}"
+            "e2e_render --vox-gpu-construction: {filename} save failed: {e}"
         ),
     }
 }

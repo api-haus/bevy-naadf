@@ -991,3 +991,334 @@ condition for "setup hasn't run yet"). Documented in the comment block at
   dispatch sourcing the workgroup count from `block_voxel_count[]` to
   avoid the over-dispatch entirely. Flagged in code comment. Out of
   W5.3 scope.
+
+---
+
+## impl W5.3-fix Stage 1 findings (2026-05-17)
+
+### Summary
+
+W5.3 landed but the user's live visual check of the production binary
+(`cargo run --release --bin bevy-naadf -- --vox /home/midori/Downloads/Oasis_Hard_Cover.vox`)
+showed an EMPTY scene. The diagnostic at `05-diagnostic.md` identified
+buffer underallocation as the primary cause. Investigation during this
+dispatch surfaced a THIRD load-bearing bug not captured in the diagnostic:
+wgpu's `Queue::write_buffer` ordering means the per-segment uniform
+rewrites the W5.3 impl introduced were NOT actually per-segment — all 512
+dispatches saw the LAST segment's params. Stage 1 fixes ALL THREE
+(primary + workgroup distribution + per-segment submit) and rewrites the
+e2e gate to a production-path-faithful camera-sweep Δ assertion that
+catches the empty-scene regression.
+
+### Files touched
+
+- `crates/bevy_naadf/src/render/prepare.rs:312-381` — Fix #1: buffer
+  sizing is now `chunks * 64` blocks + `chunks * 128` voxels when the
+  CPU mirror is empty AND `gpu_producer_enabled = true` (mirrors C#
+  `WorldData.cs:77-79`). One-line info log of the actual allocation
+  added for diagnostic clarity.
+- `crates/bevy_naadf/src/assets/shaders/chunk_calc.wgsl:438-463, :500-525`
+  — `compute_voxel_bounds` and `compute_block_bounds` now compute a flat
+  workgroup id from `group_id + num_workgroups`, supporting 3D dispatch
+  shapes that exceed wgpu's 65535/axis cap.
+- `crates/bevy_naadf/src/render/construction/chunk_calc.rs:217-313` —
+  added `WGPU_MAX_WORKGROUPS_PER_DIM` constant + `split_3d_dispatch`
+  helper. Modified `dispatch_compute_voxel_bounds` /
+  `dispatch_compute_block_bounds` to split 1D workgroup counts into 3D
+  dispatch shapes.
+- `crates/bevy_naadf/src/render/construction/mod.rs:72-75, :2089-2107,
+  :2188-2305, :2340-2410` — added `CommandEncoderDescriptor` import +
+  `render_device: Res<RenderDevice>` to producer node signature; replaced
+  the over-clamped 1D bounds-chain dispatch with the new 3D-aware
+  helpers; CRITICALLY moved the per-segment generator + chunk_calc
+  dispatches off the shared `render_context` encoder onto fresh
+  per-segment encoders that are submitted via `render_queue.submit(...)`
+  so each segment's `write_buffer` writes are visible to its own
+  dispatches.
+- `crates/bevy_naadf/src/lib.rs:336-355, :409` — added
+  `AppArgs::vox_gpu_construction_mode: bool` (Q3 deviation; see below).
+- `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs` — rewritten end to
+  end. Two-frame camera-sweep Δ assertion (camera A at C# `(500, 200, 40)`
+  → camera B at `(500, 200, 200)`), mode-aware brush replacement
+  (`promote_camera_to_pose_b()`), production-path-faithful camera pose.
+- `crates/bevy_naadf/src/e2e/driver.rs:449-471, :859-861, :918-940,
+  :965-980, :1009-1031` — driver routes through `OasisWarmup → ... →
+  OasisAssert` when EITHER `oasis_edit_visual_mode` OR
+  `vox_gpu_construction_mode` is set; the `OasisApplyEdit` /
+  screenshot-save / `OasisAssert` branches are mode-aware (vox-gpu
+  mode promotes the camera + saves vox-gpu PNGs + runs the vox-gpu
+  assertion; oasis mode keeps the brush + erase Δ assertion).
+- `crates/bevy_naadf/src/e2e/mod.rs:248-254` — registered
+  `pin_vox_gpu_construction_camera` as Update system `.after(pin_oasis_camera)`
+  so the C# `(500, 200, 40)` pose overrides the birdseye when in
+  vox-gpu mode.
+
+### Fix #1 confirmation (buffer sizing)
+
+The new `blocks_alloc_len` / `voxels_alloc_len` computation in
+`prepare.rs:352-378`:
+
+```rust
+let chunk_count_u64 = (size.x as u64) * (size.y as u64) * (size.z as u64);
+let blocks_alloc_len = if gpu_producer_enabled {
+    let from_cpu_with_headroom = ((cpu_blocks_len + 64) as u64) * W2_BUFFER_HEADROOM_MUL;
+    let from_chunks = chunk_count_u64.saturating_mul(64);
+    from_chunks.max(from_cpu_with_headroom).max(64) as usize
+} else { blocks_with_headroom.max(1) as usize };
+let voxels_alloc_len = if gpu_producer_enabled {
+    let from_cpu_with_headroom = ((cpu_voxels_len + 32) as u64) * W2_BUFFER_HEADROOM_MUL;
+    let from_chunks = chunk_count_u64.saturating_mul(128);
+    from_chunks.max(from_cpu_with_headroom).max(32) as usize
+} else { voxels_with_headroom.max(1) as usize };
+```
+
+Runtime confirmation for the 256×32×256 Oasis-fixed-world case (per the
+diagnostic info log fired at startup):
+
+```
+prepare_world_gpu allocating buffers: chunks=2097152 u32-pairs (16 MiB),
+blocks=134217728 u32s (512 MiB), voxels=268435456 u32s (1024 MiB)
+(gpu_producer_enabled=true, cpu_blocks_len=1, cpu_voxels_len=1,
+chunk_count=2097152).
+```
+
+The pre-fix `((1 + 64) * 2).max(64) = 130 u32s` blocks (520 B) + 66 u32s
+voxels (264 B) is now 134,217,728 / 268,435,456 u32s = 512 MiB / 1 GiB.
+Both fit the device's reported limits
+(`max_buffer_size = 1 048 576 MiB`,
+`max_storage_buffer_binding_size = 2047 MiB` on the RTX 5080 / Vulkan).
+
+### Workgroup distribution strategy
+
+C# `WorldData.cs:204,207` dispatches `(voxelCount/64, 1, 1)` and
+`(blockCount/64, 1, 1)` — 1D dispatches sized from a CPU readback of
+the cursor. C# DirectX 11 has the same 65535/axis cap; for Oasis-class
+workloads `voxelCount/64` and `blockCount/64` can exceed 65535. The
+Rust port has no mid-frame CPU readback (impossible inside a render-graph
+node), so it dispatches the full-world worst case (`chunks * 64` mixed
+blocks = 2.1M; `chunks * 2048 / 32` voxel workgroups = 134M).
+
+Strategy chosen: **3D dispatch with WGSL flattening**. The WGSL entry
+points compute a flat workgroup id from `group_id + num_workgroups`:
+
+```wgsl
+let block_index = group_id.x
+    + group_id.y * num_workgroups_in.x
+    + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
+```
+
+`split_3d_dispatch(count)` repacks a 1D count into a 3D shape:
+- `count ≤ 65535` → `(count, 1, 1)` (1D; matches C# semantically).
+- `count ≤ 65535²` → `(65535, ceil(count/65535), 1)`.
+- else → `(65535, 65535, ceil(count / 65535²))`.
+
+Runtime confirmation (Oasis fixed world):
+- `voxel_workgroups = 134,217,729` → 3D `[65535, 2049, 1]` = 134,281,215
+  total (covers 134,217,729 requested; ~64K over-dispatch).
+- `block_workgroups = 2,097,153` → 3D `[65535, 33, 1]` = 2,162,655 total
+  (covers 2,097,153 requested; ~65K over-dispatch).
+
+Both per-axis dimensions ≤ 65535. Extra workgroups read OOB
+(zero-initialised past the cursor) and the bounds computation on zeros
+is a correct no-op (the AADF bits stay zero — empty regions don't get
+acceleration bits, but they also don't have data to skip).
+
+### CRITICAL: per-segment submit fix (NOT in the original diagnostic)
+
+The diagnostic + brief assumed Fix #1 + workgroup distribution would
+suffice. They did not. After Fix #1 landed (verified by the new alloc
+log + `gpu_producer_enabled=true`), the e2e gate STILL showed identical
+pre/post framebuffers (Δ = 0.00 exactly) and pure sky.
+
+Root cause: **wgpu's `Queue::write_buffer` ordering.** Per wgpu's
+queue model, `write_buffer` calls schedule writes that happen BEFORE
+the next `Queue::submit`. The pre-fix W5 producer loop made 512
+`write_buffer` calls (interleaved with 512 dispatch encodings into a
+SHARED `render_context.command_encoder()`); at end of frame, the engine
+submitted the encoder ONCE — at which point ALL 512 writes had landed
+in the params buffers, leaving only the LAST segment's params visible.
+All 512 dispatches therefore operated on segment 511's params
+(`chunk_offset = [60, 4, 60]`, `group_offset_in_chunks = [60, 4, 60]`),
+writing all 512 segments' worth of chunks to a single 16³-chunk region
+of the world. The rest of the world was unwritten (zero state pointers).
+
+Fix: per-segment fresh encoder + per-segment submit (still issued from
+inside the render-graph node, in parallel to the shared
+`render_context` encoder):
+
+```rust
+for segment {
+    render_queue.write_buffer(params_buf, 0, ...);    // pending
+    render_queue.write_buffer(bounds_params_buf, 0, ...); // pending
+    let mut seg_encoder = render_device.create_command_encoder(...);
+    generator_model::dispatch_generator_model_with_encoder(&mut seg_encoder, ...);
+    chunk_calc::dispatch_calc_block_from_raw_data_world_sized(&mut seg_encoder, ...);
+    render_queue.submit([seg_encoder.finish()]);  // pending writes + this encoder
+}
+// bounds chain stays on the shared encoder (no per-segment params)
+let encoder = render_context.command_encoder();
+chunk_calc::dispatch_compute_voxel_bounds(encoder, ...);
+chunk_calc::dispatch_compute_block_bounds(encoder, ...);
+```
+
+This is exactly C#'s shape: `WorldData.cs:120-156` submits per segment
+via DirectX immediate context (`Effect.Parameters[...].SetValue()`
+followed by `Pass.ApplyCompute()` + `DispatchCompute()` each
+independently submitted). The Rust port now matches the C# submit
+discipline.
+
+Trade-off: 512 submits/frame instead of 1. Since the W5 producer runs
+ONCE per app lifecycle (gated by `gpu_producer_has_run`), this is a
+startup-only cost, not a per-frame cost.
+
+**This is THE load-bearing fix.** Fix #1 alone left the framebuffer
+empty; only Fix #1 + workgroup distribution + per-segment submit
+together render geometry.
+
+### W5.5 gate rewrite
+
+The rewritten gate (`crates/bevy_naadf/src/e2e/vox_gpu_construction.rs`):
+
+- **Camera A**: `Vec3(500.0, 200.0, 40.0)` voxels (C# `WorldRender.cs:48-49`
+  literal spawn) looking `+Z`.
+- **Camera B**: `Vec3(500.0, 200.0, 200.0)` voxels (160 voxels forward,
+  still inside the populated Oasis tile) looking `+Z`.
+- **Driver shape**: reuses `OasisWarmup → OasisShootBefore →
+  OasisDrainBefore → OasisApplyEdit → OasisWaitPostEdit → OasisShootAfter
+  → OasisDrainAfter → OasisAssert` phases (same as `--oasis-edit-visual`).
+- **Brush replacement**: the `OasisApplyEdit` phase calls
+  `promote_camera_to_pose_b()` (a no-op printing the promotion) instead
+  of `apply_erase_brush()`. The `oasis.edit_applied = true` flag (set
+  by the driver after this call) is read by `pin_vox_gpu_construction_camera`
+  on subsequent ticks to switch from pose A to pose B.
+- **Assertion**: rect `(89, 89)..(166, 166)` (central 30 %×30 %),
+  `mean per-pixel RGB Δ` floor `8.0` (matches `--oasis-edit-visual`).
+- **Per-pixel Δ value the gate logged on PASS run**:
+  `rect mean per-pixel RGB Δ=16.81 (floor=8.00); full-frame mean
+  per-pixel RGB Δ=9.67` — well above floor.
+- **Pre/post rect mean rgba**:
+  `before=[44.7, 57.2, 68.8], after=[52.7, 68.1, 82.7]`,
+  `luminance: before=55.4, after=65.9`. Both values are FAR below the
+  146 sky band (== the regression state), demonstrating the framebuffer
+  shows geometry (darker than sky).
+
+Why this catches the empty-scene regression: the saved `before` /
+`after` PNGs (at `target/e2e-screenshots/vox_gpu_construction_*.png`)
+show recognisable voxel structures (~city-block silhouettes from Oasis).
+The pre-fix run had luminance 143.9 = pure sky (Δ = 0.00 exactly);
+post-fix has luminance 55-66 = geometry-dominated. The Δ floor catches
+"both frames render sky" trivially.
+
+### Q3 deviation
+
+`AppArgs::vox_gpu_construction_mode: bool` was added (per the brief's
+allowance: "If you must add an `AppArgs::vox_gpu_construction_mode:
+bool` to drive the camera override, do so + note the Q3 deviation"). Q3
+was originally rejected on the grounds that no driver-flow customisation
+was needed; the rewrite needs camera-pose customisation (C# `(500, 200, 40)`
+vs the e2e standard `(86, 42, 90)`), so the flag is required. The
+driver's OasisWarmup fast-path now triggers when EITHER flag is set;
+the per-mode pin systems disambiguate the camera pose.
+
+The brief justified this deviation: "the production-path e2e gate is
+more valuable than preserving Q3." Recorded here per the rule.
+
+### Verification results
+
+All gates run via `cargo run --release --bin e2e_render -- <flag>`:
+
+- `cargo build --workspace`: **PASS** — clean compile, no new warnings.
+- `cargo test --workspace --lib`: **PASS** — 198 passed, 1 ignored
+  (matches baseline; W5 unit test `generator_model_gpu_vs_cpu_bit_exact`
+  still GREEN).
+- `--baseline`: **PASS** (sky 145.9, solid 242.0, emissive 247.0).
+- `--vox-e2e`: **PASS** (vox geometry region luminance 249.6, above
+  160 threshold).
+- `--oasis-edit-visual`: **PASS** (rect mean per-pixel RGB Δ=9.76,
+  above 8.00 floor).
+- `--small-edit-visual`: **PASS** (click rect max-Δ=18 above 15 floor;
+  adj rects 1.79-9.59 below 50 ceiling; CPU non-empty Δ=1).
+- `--small-edit-repro`: **PASS** (no pitch-black pixels in 1920×1080
+  frame).
+- `--validate-gpu-construction`: **PASS** (GPU vs CPU oracle byte-equal
+  388 bytes).
+- `--edit-mode`: **PASS** (1 set_voxel → 1+1+2 records).
+- `--entities`: **PASS** (frame A: 8 chunk_updates, 1 entity_chunk
+  instances, 1 history).
+- `--runtime-edit-mode`: **PASS** (set_voxels_batch produced 1 batch
+  with 2+2+2 records).
+- `--vox-gpu-construction`: **PASS** (rect mean per-pixel RGB
+  Δ=16.81, above 8.00 floor; cameras A→B sweep shows geometry).
+
+**Zero regressions.** Every pre-GREEN gate stayed GREEN. The new W5.5
+gate flipped from "wrong-assertion PASS-with-empty-scene" (W5.3 logged
+146 sky-band PASS) to "correct-assertion PASS-with-geometry" (Δ=16.81
+on populated world).
+
+### Per-pixel Δ value (verbatim from gate log)
+
+```
+e2e_render --vox-gpu-construction: rect=(89,89,166,166) frac=(0.35,0.35,0.65,0.65);
+rect mean rgba: before=[44.714287, 57.214874, 68.84028, 255.0],
+after=[52.73115, 68.1464, 82.717995, 255.0];
+rect luminance: before=55.4, after=65.9, Δ=10.5;
+rect mean per-pixel RGB Δ=16.81 (floor=8.00);
+full-frame mean per-pixel RGB Δ=9.67
+```
+
+### Design adherence
+
+Followed `05-diagnostic.md`'s Fix #1 (buffer sizing) EXACTLY as drafted.
+Followed the user's workgroup-distribution directive ("C# version did
+not suffer from clamping, then we HAVE to distribute work over multiple
+dispatches") — chose 3D-dispatch + WGSL flattening (C# uses 1D-with-
+CPU-readback, which the Rust port can't; 3D distribution is the
+no-readback equivalent that matches C#'s "dispatch the full count, not
+a clamped subset" guarantee).
+
+**One material deviation from the diagnostic**: the diagnostic identified
+only Fix #1 + workgroup clamping. It did NOT identify the per-segment
+submit bug. That bug is INDEPENDENTLY load-bearing — Fix #1 + workgroup
+distribution alone left the framebuffer empty. The per-segment submit
+fix is the actual root cause of the empty scene (per-segment params not
+visible to per-segment dispatches).
+
+### Surprises
+
+1. **wgpu's `Queue::write_buffer` ordering surprised everyone, including
+   the W5.3 impl log author who flagged per-segment uniform rewrites as
+   "Critical fidelity detail not in the design spec" but didn't notice
+   the writes don't actually interleave with dispatches in the same
+   submit batch.** Per-segment submit was non-obvious and required
+   examining wgpu's queue model directly.
+2. **Fix #1 IS necessary but NOT sufficient.** The diagnostic's
+   confidence-HIGH for Fix #1 as the root cause was wrong about
+   sufficiency; the buffer underallocation IS a real bug, but fixing it
+   alone leaves the empty-scene symptom in place because all the
+   correctly-sized writes still land at chunk position [60, 4, 60] (the
+   last segment's offset).
+3. **`sphere_brush` no-ops on empty CPU mirror.** The W5 install path
+   leaves `chunks_cpu = Vec::new()`; `set_voxels_batch_oracle` (called
+   by `sphere_brush`) silently skips chunks past `chunks_cpu.len()` →
+   `0`. The original brush-edit gate plan in the brief therefore would
+   have produced Δ = 0 regardless of the W5 chain's correctness. The
+   camera-sweep Δ approach achieves the same regression signal without
+   depending on the broken brush path. Stage 2 (consolidating CPU mirror
+   to also be populated on the W5 path) would enable the brush-edit
+   gate.
+
+### What's NOT yet done
+
+**Stage 2 is a SEPARATE dispatch.** This dispatch's scope per the brief:
+- Stage 1 = fix the empty-scene bug + production-faithful e2e gate.
+  **Done.**
+- Stage 2 = legacy-path deletion (`install_vox_sized_to_model` /
+  `build_world_from_vox` / `replicate_buckets_xz` / `load_vox_tiled` /
+  `parse_dot_vox_data_tiled` / `--vox-grid` flag / `tiles` field) +
+  CPU stop-gap deletion + single-pathway consolidation. **NOT done.**
+- Stage 2 also includes: making `sphere_brush` work on the W5 install
+  path (currently broken because `chunks_cpu` is empty). The W5 install
+  path's empty CPU mirror means CPU-side editing tools no-op. Either
+  populate `chunks_cpu` after the GPU producer runs (via GPU readback)
+  or rework editing tools to address chunks via GPU-only state.
+

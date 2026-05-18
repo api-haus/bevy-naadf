@@ -244,6 +244,12 @@ pub fn add_e2e_systems(app: &mut App) {
                 oasis_edit_visual::pin_oasis_camera.after(driver::e2e_driver),
                 small_edit_visual::pin_small_edit_camera.after(driver::e2e_driver),
                 small_edit_repro::pin_small_edit_repro_camera.after(driver::e2e_driver),
+                // vox-gpu-rewrite W5.3-fix Stage 1 — runs `.after(pin_oasis_camera)`
+                // so the C# `(500, 200, 40)` pose overrides the birdseye that
+                // `pin_oasis_camera` writes (the vox-gpu-construction gate
+                // shares the Oasis driver flow but needs a different camera).
+                vox_gpu_construction::pin_vox_gpu_construction_camera
+                    .after(oasis_edit_visual::pin_oasis_camera),
             )
                 .before(crate::camera::sync_position_split),
         );

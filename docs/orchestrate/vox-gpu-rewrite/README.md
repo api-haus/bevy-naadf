@@ -57,8 +57,12 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Hard gate — user live-tested W5.3, reported empty scene
 - [x] Diagnostic dispatch — `05-diagnostic.md` identified TWO bugs: (1) `prepare_world_gpu` buffer underallocation; (2) `InitialCameraPose::from_world_voxels` puts camera Y above world ceiling
 - [x] Hard gate — diagnostic submitted, user confirmed Fix #1 + workgroup-distribution; REJECTED Fix #2 (user: "would have surfaced millennia ago")
-- [ ] Step 6 — Checkpoint commit + W5.3 fix dispatch (Fix #1 prepare.rs buffer sizing + workgroup distribution for bounds chain, NO camera change)  ← CURRENT
-- [ ] Hard gate — user live-tests; expect geometry visible
+- [x] Hard gate — user directive: NO parallel paths; staged consolidation (Stage 1 = Fix #1 + workgroup distribution + production-path gate; Stage 2 = legacy-path deletion)
+- [x] Step 6 — Checkpoint commit + W5.3-fix Stage 1 dispatch (commit `a4f2697` checkpoint; Stage 1 uncommitted pending next checkpoint)
+- [x] Step 6 — Stage 1 landed: 3 fixes (buffer sizing, 3D workgroup distribution, **per-segment encoder/submit — TRUE ROOT CAUSE not in diagnostic**) + W5.5 rewritten as two-frame camera-sweep Δ gate; all 10/10 e2e gates GREEN
+- [x] Hard gate — user live-tested; Oasis renders but surfaces inverted (screenshot shared)
+- [x] Diagnostic dispatch — `06-diagnostic-inversion.md` identified ROOT CAUSE: `prepare_construction:925-930` gate requires `dense_voxel_types` non-empty → W5 path skips production hash_map + hash_coefficients allocation → every mixed block hashes to 0 → CAS collisions → scattered missing voxels
+- [ ] Step 6 — Checkpoint commit + inversion-fix dispatch (extend gate + guard segment_voxel_buffer dense-derived allocation; ALSO fix `bound_group_queue_max_size = 1` per-segment overwrite — perf-only secondary bug)  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.4 (delete CPU stop-gap)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.6 (document default-scene divergence)

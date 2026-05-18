@@ -436,13 +436,31 @@ fn calc_block_from_raw_data(
 }
 
 // ─── Entry point 2: compute_voxel_bounds — `chunkCalc.fx:193-217` ─────────────
+//
+// vox-gpu-rewrite W5.3-fix Stage 1 — `block_index` is computed from a flat
+// workgroup id that combines all three dispatch axes. The dispatch helper
+// (`render/construction/chunk_calc.rs::dispatch_compute_voxel_bounds`) packs
+// the 1D mixed-block count into a 3D dispatch shape (x, y, z) so the total
+// `x * y * z` workgroups can exceed wgpu's per-axis 65535 limit. C# is 1D
+// because DirectX 11's `(blockCount/64, 1, 1)` for a CPU-readback-informed
+// `blockCount` fits the 65535 cap on the kinds of workloads C# emits at
+// build-time; the Rust port has no mid-frame CPU readback and must cover the
+// full-world worst case (chunks × 64 ≈ 2.1M blocks for the fixed world), so
+// 3D distribution is the only way to dispatch the full set in one pass
+// without per-axis violation. Extra workgroups past the real mixed-block
+// count read zero blocks (the buffer is sized to the worst case and
+// zero-initialised past the actual cursor); compute_bounds_4 on zero blocks
+// is a correct no-op (the AADF bits stay zero).
 
 @compute @workgroup_size(64, 1, 1)
 fn compute_voxel_bounds(
     @builtin(workgroup_id) group_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups_in: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
 ) {
-    let block_index = group_id.x;
+    let block_index = group_id.x
+        + group_id.y * num_workgroups_in.x
+        + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
     let voxel_index = block_index * 64u + local_index;
 
     let cur_voxel_pair = voxels[voxel_index / 2u];
@@ -482,13 +500,19 @@ fn compute_voxel_bounds(
 }
 
 // ─── Entry point 3: compute_block_bounds — `chunkCalc.fx:219-241` ─────────────
+//
+// vox-gpu-rewrite W5.3-fix Stage 1 — same flat-id pattern as
+// `compute_voxel_bounds`. See its comment block above for the rationale.
 
 @compute @workgroup_size(64, 1, 1)
 fn compute_block_bounds(
     @builtin(workgroup_id) group_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups_in: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
 ) {
-    let chunk_index = group_id.x;
+    let chunk_index = group_id.x
+        + group_id.y * num_workgroups_in.x
+        + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
     let block_index = chunk_index * 64u + local_index;
 
     let cur_block = blocks[block_index];

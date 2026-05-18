@@ -451,10 +451,22 @@ pub fn e2e_driver(
     // is set. The camera pose is overwritten every tick by
     // `super::oasis_edit_visual::pin_oasis_camera` (Update system,
     // `.after(e2e_driver)`), so whatever pose this driver writes is harmless.
+    //
+    // `vox-gpu-rewrite W5.3-fix Stage 1` — the vox-gpu-construction gate
+    // reuses the Oasis warm/shoot/edit/wait/shoot/assert flow but pins the
+    // camera to C# `(500, 200, 40)` via `pin_vox_gpu_construction_camera`
+    // (runs `.after(pin_oasis_camera)`) and substitutes the brush call at
+    // `OasisApplyEdit`. The flag is OR'd into the Oasis route-in trigger.
     let oasis_mode = app_args
         .as_deref()
         .is_some_and(|a| a.oasis_edit_visual_mode);
-    if oasis_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+    let vox_gpu_construction_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.vox_gpu_construction_mode);
+    if (oasis_mode || vox_gpu_construction_mode)
+        && state.phase == E2ePhase::Warmup
+        && state.phase_ticks == 0
+    {
         state.phase = E2ePhase::OasisWarmup;
         state.phase_ticks = 0;
     }
@@ -844,10 +856,17 @@ pub fn e2e_driver(
                             fb.width(),
                             fb.height()
                         );
-                        super::oasis_edit_visual::save_oasis_screenshot(
-                            &fb,
-                            super::oasis_edit_visual::OASIS_EDIT_BEFORE_PNG,
-                        );
+                        if vox_gpu_construction_mode {
+                            super::vox_gpu_construction::save_vox_gpu_construction_screenshot(
+                                &fb,
+                                super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_BEFORE_PNG,
+                            );
+                        } else {
+                            super::oasis_edit_visual::save_oasis_screenshot(
+                                &fb,
+                                super::oasis_edit_visual::OASIS_EDIT_BEFORE_PNG,
+                            );
+                        }
                         oasis.before = Some(fb);
                         state.phase = E2ePhase::OasisApplyEdit;
                         state.phase_ticks = 0;
@@ -885,7 +904,25 @@ pub fn e2e_driver(
                 state.phase = E2ePhase::OasisWaitPostEdit;
                 state.phase_ticks = 0;
             } else if let Some(mut wd) = world_data {
-                super::oasis_edit_visual::apply_erase_brush(&mut wd);
+                // vox-gpu-rewrite W5.3-fix Stage 1 — the vox-gpu-construction
+                // gate shares this phase with `--oasis-edit-visual` but uses
+                // a camera-translation Δ (no brush) instead of a brush-edit Δ.
+                // The W5 install path leaves `chunks_cpu / blocks_cpu /
+                // voxels_cpu = Vec::new()` by design; `sphere_brush` indexes
+                // into `chunks_cpu[ci]` and silently no-ops on the empty
+                // mirror, so a brush-edit Δ would always be zero. Setting
+                // `oasis.edit_applied = true` promotes the camera A→B via
+                // `pin_vox_gpu_construction_camera`'s read of the flag —
+                // moving the camera through a populated world sweeps
+                // geometry through the framebuffer (large Δ); moving
+                // through an empty world shows sky on both frames (Δ near
+                // zero — regression signal).
+                if vox_gpu_construction_mode {
+                    let _ = &mut wd;
+                    super::vox_gpu_construction::promote_camera_to_pose_b();
+                } else {
+                    super::oasis_edit_visual::apply_erase_brush(&mut wd);
+                }
                 oasis.edit_applied = true;
                 state.phase = E2ePhase::OasisWaitPostEdit;
                 state.phase_ticks = 0;
@@ -925,10 +962,17 @@ pub fn e2e_driver(
                             fb.width(),
                             fb.height()
                         );
-                        super::oasis_edit_visual::save_oasis_screenshot(
-                            &fb,
-                            super::oasis_edit_visual::OASIS_EDIT_AFTER_PNG,
-                        );
+                        if vox_gpu_construction_mode {
+                            super::vox_gpu_construction::save_vox_gpu_construction_screenshot(
+                                &fb,
+                                super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_AFTER_PNG,
+                            );
+                        } else {
+                            super::oasis_edit_visual::save_oasis_screenshot(
+                                &fb,
+                                super::oasis_edit_visual::OASIS_EDIT_AFTER_PNG,
+                            );
+                        }
                         oasis.after = Some(fb);
                         state.phase = E2ePhase::OasisAssert;
                         state.phase_ticks = 0;
@@ -962,10 +1006,19 @@ pub fn e2e_driver(
             let after = oasis.after.take();
             let result = match (before, after) {
                 (Some(a), Some(b)) => {
-                    super::oasis_edit_visual::assert_visual_edit_landed(&a, &b)
+                    if vox_gpu_construction_mode {
+                        super::vox_gpu_construction::assert_vox_gpu_construction_landed(
+                            &a, &b,
+                        )
                         .map(|msg| {
-                            println!("e2e_render --oasis-edit-visual: {msg}");
+                            println!("e2e_render --vox-gpu-construction: {msg}");
                         })
+                    } else {
+                        super::oasis_edit_visual::assert_visual_edit_landed(&a, &b)
+                            .map(|msg| {
+                                println!("e2e_render --oasis-edit-visual: {msg}");
+                            })
+                    }
                 }
                 _ => Err(
                     "oasis-edit-visual: OasisAssert reached without both \
@@ -975,16 +1028,30 @@ pub fn e2e_driver(
             };
             match &result {
                 Ok(()) => {
-                    println!(
-                        "e2e_render: oasis-edit-visual PASS — \
-                         {} warmup + {} post-edit wait frames; erase \
-                         sphere @ r={:.1} voxels produced rect mean per-\
-                         pixel RGB Δ above {:.2} floor.",
-                        super::oasis_edit_visual::OASIS_WARMUP_FRAMES,
-                        super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES,
-                        super::oasis_edit_visual::OASIS_ERASE_RADIUS,
-                        super::oasis_edit_visual::OASIS_EDIT_DIFF_FLOOR,
-                    );
+                    if vox_gpu_construction_mode {
+                        println!(
+                            "e2e_render: vox-gpu-construction PASS — \
+                             {} warmup + {} post-promote wait frames; \
+                             camera A {:?} → camera B {:?} produced \
+                             rect mean per-pixel RGB Δ above {:.2} floor.",
+                            super::oasis_edit_visual::OASIS_WARMUP_FRAMES,
+                            super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES,
+                            super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
+                            super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
+                            super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
+                        );
+                    } else {
+                        println!(
+                            "e2e_render: oasis-edit-visual PASS — \
+                             {} warmup + {} post-edit wait frames; erase \
+                             sphere @ r={:.1} voxels produced rect mean per-\
+                             pixel RGB Δ above {:.2} floor.",
+                            super::oasis_edit_visual::OASIS_WARMUP_FRAMES,
+                            super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES,
+                            super::oasis_edit_visual::OASIS_ERASE_RADIUS,
+                            super::oasis_edit_visual::OASIS_EDIT_DIFF_FLOOR,
+                        );
+                    }
                     exit.write(AppExit::Success);
                 }
                 Err(msg) => {

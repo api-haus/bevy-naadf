@@ -353,6 +353,27 @@ pub struct AppArgs {
     /// regression that `--small-edit-visual` does not catch. See
     /// [`crate::e2e::small_edit_repro`].
     pub small_edit_repro_mode: bool,
+    /// `vox-gpu-rewrite W5.3-fix Stage 1` — when `true`, the e2e driver runs
+    /// the **vox-gpu-construction production-path gate**: load the Oasis VOX
+    /// fixture through `install_vox_in_fixed_world`'s W5 GPU producer chain
+    /// (`fixed_world_size = true`, `gpu_construction_enabled = true`), pin
+    /// the camera to C#'s literal `(500, 200, 40)` voxel spawn
+    /// (`WorldRender.cs:48-49`), capture frame A, dispatch a sphere brush
+    /// directly in front of the camera, wait ~5 s for W2 / GI / TAA to
+    /// converge, capture frame B, assert the per-pixel RGB Δ over a central
+    /// rect exceeds the floor (the `--oasis-edit-visual` assertion shape).
+    ///
+    /// The gate routes through the same `OasisWarmup → OasisShootBefore →
+    /// OasisApplyEdit → OasisWaitPostEdit → OasisShootAfter → OasisAssert`
+    /// driver phases as `--oasis-edit-visual` (the brush + capture +
+    /// assertion mechanics are identical), but the camera and brush
+    /// position are mode-specific. The flag IS load-bearing: it deviates
+    /// from Q3 (`docs/orchestrate/vox-gpu-rewrite/01-context.md`) which
+    /// rejected this flag, but the user's "why the fuck does this 'e2e'
+    /// test avoid the same production path?" frustration justifies the
+    /// deviation — the production-path-faithful gate is more valuable than
+    /// preserving Q3.
+    pub vox_gpu_construction_mode: bool,
     /// `2026-05-17` — C#-faithful world initialisation. When `true`,
     /// [`crate::voxel::grid::setup_test_grid`] always allocates the fixed
     /// [`WORLD_SIZE_IN_CHUNKS`] world (`256×32×256` chunks = `4096×512×4096`
@@ -388,6 +409,7 @@ impl Default for AppArgs {
             oasis_edit_visual_mode: false,
             small_edit_visual_mode: false,
             small_edit_repro_mode: false,
+            vox_gpu_construction_mode: false,
             // Off by default — the e2e gates depend on the legacy small-world
             // layout. `bevy-naadf::main` flips it on for the production binary.
             fixed_world_size: false,

@@ -214,8 +214,63 @@ pub fn dispatch_calc_block_from_raw_data_world_sized(
     );
 }
 
+/// Wgpu's per-dispatch-axis workgroup-count cap (the WebGPU spec minimum;
+/// the native wgpu default). When a 1D workgroup count exceeds this, the
+/// dispatch is repacked into a 3D shape via [`split_3d_dispatch`] so the
+/// shader can flatten the dispatch ID back into a 1D index.
+pub const WGPU_MAX_WORKGROUPS_PER_DIM: u32 = 65535;
+
+/// Repack a 1D workgroup count into a 3D dispatch shape `(x, y, z)` where
+/// `x * y * z >= count` and `max(x, y, z) <= WGPU_MAX_WORKGROUPS_PER_DIM`.
+///
+/// vox-gpu-rewrite W5.3-fix Stage 1 — the W5 GPU producer chain's
+/// bounds-chain dispatch may need up to `chunks * 64 ≈ 2.1M` workgroups for
+/// `compute_block_bounds` and `chunks * 64 / 2 ≈ 4.2M` for
+/// `compute_voxel_bounds` on the 256×32×256 fixed world. Neither fits the
+/// 65535/axis cap. The chunk_calc WGSL entry points were updated to compute
+/// a flat workgroup id from `group_id.x + group_id.y * num_workgroups.x +
+/// group_id.z * num_workgroups.x * num_workgroups.y`, so this helper
+/// distributes the count across axes:
+///   - if `count <= cap`: `(count, 1, 1)` (1D fast path; matches C#).
+///   - else if `count <= cap * cap`: `(cap, ceil(count / cap), 1)`.
+///   - else: `(cap, cap, ceil(count / (cap * cap)))`.
+///
+/// The total dispatched workgroup count `x * y * z` may exceed `count` by
+/// up to `(cap - 1) + (cap*cap - 1)` workgroups; the extra workgroups read
+/// past the valid block/voxel data and OOB writes are spec-defined no-ops
+/// (WebGPU §Storage Buffer Access) — provided the buffers are sized at or
+/// above the worst-case (`chunks * 64` blocks, `chunks * 128` voxels;
+/// guaranteed by `render/prepare.rs::prepare_world_gpu`'s W5-aware
+/// sizing). The shader processes zero blocks / voxels in those extra
+/// groups, yielding zero AADF bits — a correct no-op.
+pub fn split_3d_dispatch(count: u32) -> [u32; 3] {
+    if count == 0 {
+        return [0, 0, 0];
+    }
+    let cap = WGPU_MAX_WORKGROUPS_PER_DIM;
+    if count <= cap {
+        return [count, 1, 1];
+    }
+    let cap_u64 = cap as u64;
+    let count_u64 = count as u64;
+    if count_u64 <= cap_u64 * cap_u64 {
+        // Two-axis distribution. y = ceil(count / cap).
+        let y = ((count_u64 + cap_u64 - 1) / cap_u64) as u32;
+        return [cap, y, 1];
+    }
+    // Three-axis distribution. z = ceil(count / (cap * cap)).
+    let cap_sq = cap_u64 * cap_u64;
+    let z = ((count_u64 + cap_sq - 1) / cap_sq) as u32;
+    [cap, cap, z]
+}
+
 /// Dispatch `compute_voxel_bounds` over `block_count` blocks (one workgroup
 /// per block, 64 threads/group = 64 voxels per block).
+///
+/// vox-gpu-rewrite W5.3-fix Stage 1 — when `block_count` exceeds wgpu's
+/// per-axis 65535 limit, the dispatch is split across axes via
+/// [`split_3d_dispatch`]; the WGSL entry point flattens
+/// `(group_id, num_workgroups)` back into a 1D `block_index`.
 pub fn dispatch_compute_voxel_bounds(
     encoder: &mut CommandEncoder,
     pipeline: &bevy::render::render_resource::ComputePipeline,
@@ -225,17 +280,20 @@ pub fn dispatch_compute_voxel_bounds(
     if block_count == 0 {
         return;
     }
+    let [x, y, z] = split_3d_dispatch(block_count);
     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("naadf_chunk_calc_voxel_bounds_pass"),
         timestamp_writes: None,
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups(block_count, 1, 1);
+    pass.dispatch_workgroups(x, y, z);
 }
 
 /// Dispatch `compute_block_bounds` over `chunk_count` chunks (one workgroup
 /// per chunk, 64 threads/group = 64 blocks per chunk).
+///
+/// vox-gpu-rewrite W5.3-fix Stage 1 — see [`dispatch_compute_voxel_bounds`].
 pub fn dispatch_compute_block_bounds(
     encoder: &mut CommandEncoder,
     pipeline: &bevy::render::render_resource::ComputePipeline,
@@ -245,11 +303,12 @@ pub fn dispatch_compute_block_bounds(
     if chunk_count == 0 {
         return;
     }
+    let [x, y, z] = split_3d_dispatch(chunk_count);
     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("naadf_chunk_calc_block_bounds_pass"),
         timestamp_writes: None,
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups(chunk_count, 1, 1);
+    pass.dispatch_workgroups(x, y, z);
 }

@@ -318,16 +318,61 @@ pub fn prepare_world_gpu(
     // future iteration adds dynamic growth on cursor-overflow detection.
     let blocks_with_headroom = (cpu_blocks_len as u64) * W2_BUFFER_HEADROOM_MUL;
     let voxels_with_headroom = (cpu_voxels_len as u64) * W2_BUFFER_HEADROOM_MUL;
+    // vox-gpu-rewrite W5.3-fix Stage 1 — when the GPU producer is the source
+    // of truth (the W5 `.vox` install path inserts `chunks_cpu / blocks_cpu
+    // / voxels_cpu = Vec::new()` by design — `voxel/grid.rs:409-425`), the
+    // CPU mirror's length is ZERO and cannot be used to size the GPU output
+    // buffers. The original `((1 + 64) * 2).max(64) = 130 u32s` allocation
+    // for blocks (520 B) plus the matching 66 u32s for voxels (264 B)
+    // silently drops every atomic-cursor write past the first ~2 mixed
+    // chunks (WebGPU spec §Storage Buffer Access: OOB writes are no-ops).
+    // The result is `chunks` populated with state pointers that index into
+    // unwritten regions of `blocks` / `voxels`; the renderer dereferences
+    // those pointers, reads zero bytes, and treats every chunk as empty.
+    //
+    // Fix: when the CPU mirror is empty AND the GPU producer is enabled,
+    // derive an upper bound from `size_in_chunks` instead. Mirrors C#
+    // `WorldData.cs:77-79`'s up-front per-segment-cubic allocation, scaled
+    // to cover the full-world cumulative cursor output (C# additionally
+    // grows per segment via `SetNewMinCount` at `:148-151`; the Rust port
+    // doesn't implement per-segment grow, so the static allocation must
+    // cover the worst case up front).
+    //
+    // Sizing for the 256×32×256 chunk fixed world (the W5 install path's
+    // target via `lib.rs:WORLD_SIZE_IN_CHUNKS`):
+    //   chunk_count          = 2,097,152
+    //   blocks_alloc_len     = chunk_count * 64    = 134,217,728 u32s = 512 MiB
+    //   voxels_alloc_len     = chunk_count * 128   = 268,435,456 u32s =   1 GiB
+    //
+    // Both fit comfortably within wgpu's default `max_buffer_size`
+    // (typically 2 GiB) on desktop Vulkan / Metal / DX12 backends. The
+    // voxel cap uses `chunks * 128` (= chunks * 64 mixed blocks * 32
+    // voxel-pair u32s / 16 sparsity factor) — empirically generous for
+    // stamp-block layouts like Oasis (per `05-diagnostic.md:312-326`).
+    let chunk_count_u64 = (size.x as u64) * (size.y as u64) * (size.z as u64);
     let blocks_alloc_len = if gpu_producer_enabled {
         // 64 = GPU `block_voxel_count[1]` cursor seed (`chunkCalc.fx`).
         // Still apply the W2 headroom on top of the producer's cursor seed.
-        ((cpu_blocks_len + 64) as u64 * W2_BUFFER_HEADROOM_MUL).max(64) as usize
+        let from_cpu_with_headroom =
+            ((cpu_blocks_len + 64) as u64) * W2_BUFFER_HEADROOM_MUL;
+        // Upper bound on mixed-block count when no CPU mirror is available
+        // (W5 .vox install path) — assume worst case `chunk_count * 64`
+        // mixed blocks. Take the larger of (CPU-derived headroom) and
+        // (chunks-derived upper bound) so the legacy non-empty-CPU path
+        // still gets its 2× headroom while the W5 empty-CPU path is sized
+        // to absorb the GPU producer's full cumulative cursor output.
+        let from_chunks = chunk_count_u64.saturating_mul(64);
+        from_chunks.max(from_cpu_with_headroom).max(64) as usize
     } else {
         blocks_with_headroom.max(1) as usize
     };
     let voxels_alloc_len = if gpu_producer_enabled {
         // 32 = GPU `block_voxel_count[0]` cursor seed.
-        ((cpu_voxels_len + 32) as u64 * W2_BUFFER_HEADROOM_MUL).max(32) as usize
+        let from_cpu_with_headroom =
+            ((cpu_voxels_len + 32) as u64) * W2_BUFFER_HEADROOM_MUL;
+        // Realistic cap for the W5 empty-CPU path — see comment above.
+        let from_chunks = chunk_count_u64.saturating_mul(128);
+        from_chunks.max(from_cpu_with_headroom).max(32) as usize
     } else {
         voxels_with_headroom.max(1) as usize
     };
@@ -342,6 +387,22 @@ pub fn prepare_world_gpu(
             .collect()
     };
 
+    info!(
+        "vox-gpu-rewrite W5.3-fix Stage 1 — prepare_world_gpu allocating \
+         buffers: chunks={} u32-pairs ({} MiB), blocks={} u32s ({} MiB), \
+         voxels={} u32s ({} MiB) (gpu_producer_enabled={}, \
+         cpu_blocks_len={}, cpu_voxels_len={}, chunk_count={}).",
+        chunk_count,
+        (chunk_count as u64 * 8) / (1024 * 1024),
+        blocks_alloc_len,
+        (blocks_alloc_len as u64 * 4) / (1024 * 1024),
+        voxels_alloc_len,
+        (voxels_alloc_len as u64 * 4) / (1024 * 1024),
+        gpu_producer_enabled,
+        cpu_blocks_len,
+        cpu_voxels_len,
+        chunk_count_u64,
+    );
     let mut blocks = GrowableBuffer::<u32>::new(&render_device, "naadf_blocks", blocks_alloc_len as u64);
     let mut voxels = GrowableBuffer::<u32>::new(&render_device, "naadf_voxels", voxels_alloc_len as u64);
     let mut voxel_types = GrowableBuffer::<GpuVoxelType>::new(
