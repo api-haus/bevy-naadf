@@ -28,6 +28,13 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
+  // Don't intercept non-http(s) requests (e.g. `chrome-extension://...` from
+  // a browser extension's content script). The Cache API rejects such
+  // schemes with `TypeError: Request scheme '...' is unsupported`, and we
+  // have nothing useful to proxy. Skipping `respondWith` lets the browser
+  // handle the request natively.
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+
   // Network-first for index.html (always get the latest deploy).
   if (url.pathname === '/' || url.pathname === '/index.html') {
     event.respondWith(networkFirst(event.request));
@@ -55,7 +62,7 @@ async function networkFirst(request) {
     const response = await fetch(request);
     if (response.ok) {
       const cache = await caches.open(CACHE_NAME);
-      cache.put(request, response.clone());
+      cache.put(request, response.clone()).catch(() => {});
     }
     return response;
   } catch {
@@ -72,7 +79,7 @@ async function cacheFirst(request) {
   const response = await fetch(request, { cache: 'no-store' });
   if (response.ok) {
     const cache = await caches.open(CACHE_NAME);
-    cache.put(request, response.clone());
+    cache.put(request, response.clone()).catch(() => {});
   }
   return response;
 }
