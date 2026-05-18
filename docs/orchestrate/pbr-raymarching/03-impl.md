@@ -598,3 +598,40 @@ root-cause analysis + final fix diff + regression sweep.
 
 SUCCESS — `--pbr-hard-edge` gate from 79–80 hard jumps to **2 (ceiling 5)**;
 all 10 other gates + `just bake-texarrays` green.
+
+
+## Shadow-only residual splotch fix (2026-05-19)
+
+See `05-diagnostic.md` § "Shadow-only residual splotch fix —
+facing-voxel pose + retuned detector (2026-05-19, post-`163cbac`)"
+for the full log.
+
+### Files changed
+
+- `crates/bevy_naadf/src/e2e/pbr_hard_edge.rs`:
+  - **Pose rebuilt** — camera at small-rel `(10.8, 6.5, 18.5)` looking
+    `+X` at red cobblestone voxel `(2028, 6, 2034)` west face centre,
+    1.2 m distance, 768×768, voxel face fills the frame (matches user's
+    desired pose in image #22).
+  - **Detector rebuilt** — stone-interior masked hard-jump count on
+    HSV-V channel with 3×3 median pre-filter:
+    - Crop rect → HSV-V image (`max(R, G, B)`).
+    - 3×3 median pre-filter (`imageproc::filter::median_filter`).
+    - Per-rect median V → stone-interior floor `V_med - 35`.
+    - Run hard-jump predicate at `T_HARD = 10`, `T_SMOOTH = 5`, ONLY
+      count pixels where BOTH sides of the jump are above the floor.
+    - Assert count <= `MAX_HARD_JUMPS = 80`.
+  - **Synthetic unit tests** — 7 tests (4 retained from prior gate +
+    3 new: low-contrast coherent bump detection, moss-gap rejection,
+    Gaussian-noise rejection). All PASS.
+
+### Verdict
+
+PARTIAL — the new `--pbr-hard-edge` gate reliably FAILS at baseline
+(2200+ hard-jumps > 80 ceiling) on the user-requested facing-voxel
+pose; two candidate shader fixes tried (Iter 1 + Iter 2) did NOT
+materially reduce the metric within the ±100 run-to-run variance.
+Root cause of the residual shadow-only GI splotch requires deeper
+investigation than fits the 6-iteration budget. Shaders restored to
+`163cbac` baseline; gate code is the only delta. Sister gates green
+(11/11 except the intended `--pbr-hard-edge` FAIL).
