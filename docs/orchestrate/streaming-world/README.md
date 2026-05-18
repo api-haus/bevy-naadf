@@ -41,19 +41,55 @@ consolidated mode disqualified.
 - [x] Step 2.5 — Mode selection (distributed)
 - [x] Step 4 — Architectural Q&A
 - [x] Step 5 — Shared-context files (`README.md`, `01-context.md`)
-- [x] 02 — Architecture design (`delegate-architect` → `02-design.md`)
-- [ ] **Hard gate** — submit design to user, wait for confirmation
-- [ ] 03 — Implementation (`general-purpose` → code + `03-impl.md`)
-- [ ] **Hard gate** — submit impl to user, wait for confirmation
+- [x] 02 — Architecture design v1 (`delegate-architect` → `02-design.md`, Plan A — CPU noise)
+- [x] **Hard gate v1** — user redirected: Plan B (WGSL noise via GLSL port, W5 gate inverted)
+- [ ] 02b — Architecture design v2 (`delegate-architect` → `02b-design-plan-b.md`)
+- [ ] **Hard gate v2** — submit revised design to user
+- [ ] 03a — Phase-1 impl: WGSL FastNoiseLite port (`general-purpose` → code + `03a-impl-wgsl-noise.md`)
+- [ ] **Hard gate** — noise port + CPU↔GPU oracle test passes
+- [ ] 03b — Phase-2 impl: residency layer + W5 gate inversion (`general-purpose` → code + `03b-impl-residency.md`)
+- [ ] **Hard gate** — submit impl to user
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user
 
-## Q&A decisions (from Step 4)
+## Q&A decisions
+
+### Step 4 (initial)
 
 | Question | Choice |
 |---|---|
 | Coordinate widening | Residency-only `i32` widening — GPU bind layout stays `(cx:11,cy:10,cz:11)` window-local |
 | Residency unit | Per-segment (16×16×16 chunks) |
 | Block dedup | Per-resident-chunk-local |
-| Noise backend | `voxel_noise` (cross-platform: native + web-workers via existing JS bridge) |
+| Noise backend | ~~`voxel_noise` CPU~~ → **WGSL FastNoiseLite port (Plan B)** — see addendum below |
+
+### Plan-B addendum (post-design redirect)
+
+User redirected at the design hard gate after seeing the architect's CPU-noise
+choice (D.2). Throughput analysis showed GPU noise is ~30–100× faster per
+segment, which directly addresses the "empty patches under fast traversal"
+failure mode (D.7) the architect named as Plan A's cost. The brief explicitly
+prioritises fast traversal of large worlds.
+
+**New plan:**
+- **Noise:** port `FastNoiseLite.glsl`
+  (https://github.com/Auburn/FastNoiseLite/blob/master/GLSL/FastNoiseLite.glsl)
+  to WGSL. GLSL chosen over HLSL because built-in name parity (`mix` / `fract`
+  / `inverseSqrt`) and the absence of HLSL preprocessor / `static` / `cbuffer`
+  / `register` baggage cuts the porting diff by half.
+- **GPU producer:** noise WGSL feeds the existing W5 GPU pipeline
+  (`ModelData → chunks/blocks/voxels`). W5 stops being dead code in the
+  streaming preset — it becomes the primary consumer.
+- **Driver:** the W5 once-at-startup gate is **inverted to per-frame**
+  (newly-resident segments dispatch generator+chunk_calc on demand) — NOT
+  disabled as in Plan A's D.10.
+- **Order of work:** **WGSL noise port goes first** (user directive). It is a
+  self-contained, independently verifiable deliverable (CPU↔GPU oracle test).
+  The residency layer comes after, consuming it.
+
+Impl scope estimate revised: ~1500–2000 new LOC (most of it shader). The
+`voxel_noise` crate stays in the workspace as the CPU oracle source but is
+**not** wired into `bevy_naadf` as a runtime dep for the streaming preset.
+
+The Q1/Q2/Q3 choices above are unchanged.
