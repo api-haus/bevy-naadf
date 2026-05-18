@@ -24,8 +24,8 @@ Async `.vox` loading on web + native, with closed-loop e2e gates (Playwright hea
 - [x] Step 3 — Method preview to user
 - [x] Step 4 — Architectural Q&A (answers folded into `01-context.md`)
 - [x] Step 5 — Write `01-context.md` + `05-review.md` + this `README.md`
-- [ ] Step 6a — Checkpoint commit (sonnet) + architect dispatch
-- [ ] Step 7a — **HARD GATE**: synthesize architecture, submit to user, wait
+- [x] Step 6a — Checkpoint commit (sonnet) + architect dispatch (commit `1ac6f0b6`; design at `03-architecture.md`)
+- [ ] Step 7a — **HARD GATE**: synthesize architecture, submit to user, wait *(awaiting user confirmation)*
 - [ ] Step 6b — Checkpoint commit + implementer dispatch
 - [ ] Step 7b — **HARD GATE**: synthesize implementation + verification log, submit to user, wait
 - [ ] Step 6c — Reviewer dispatch (reads ONLY `05-review.md`)
