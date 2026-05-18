@@ -75,7 +75,17 @@
          which has no web build) and `--features webgpu` (selects the WebGPU
          wgpu backend over Bevy's default webgl2). `data-wasm-opt="0"` keeps
          `trunk serve` fast; the deploy CI flips it to `"s"` for the release
-         artifact (see `.github/workflows/deploy-cloudflare.yml`). -->
+         artifact (see `.github/workflows/deploy-cloudflare.yml`).
+
+         `data-initializer` points at `init-wasm-rayon.mjs` — a custom dev-
+         side loader that awaits `init()` then calls
+         `bindings.initThreadPool(navigator.hardwareConcurrency)` to spawn
+         the `wasm-bindgen-rayon` worker pool (used by
+         `voxel::web_vox::spawn_wasm_vox_parse` for off-main-thread `.vox`
+         parsing — see
+         `docs/orchestrate/web-vox-async-loading/03-architecture.md` Q1).
+         The production `init.js.template` (patched in by the CI) does the
+         same; this dev-side initializer mirrors it. -->
     <link
       data-trunk
       rel="rust"
@@ -83,7 +93,13 @@
       data-cargo-no-default-features
       data-cargo-features="webgpu"
       data-wasm-opt="0"
+      data-initializer="init-wasm-rayon.mjs"
     />
+    <!-- Copy the custom dev initializer into dist/ alongside the wasm-bindgen
+         JS so Trunk's loader can fetch it. The file is a small ES module
+         that exports a default async function returning the same shape
+         Trunk's built-in loader expects. -->
+    <link data-trunk rel="copy-file" href="init-wasm-rayon.mjs" />
 
     <!-- The NAADF WGSL shaders / fonts / textures are loaded at runtime by the
          Bevy asset server from `src/assets/` (AssetPlugin.file_path). Copy

@@ -225,6 +225,30 @@ pub struct ConstructionGpu {
     /// per segment in the W5.3 segment loop via `RenderQueue::write_buffer`.
     /// (See `02-design.md` Decision: "one params buffer vs 512 buffers".)
     pub model_data_params_buffer: Option<Buffer>,
+
+    // === web-vox-async-loading Q4 (2026-05-18) — label stash for the Q4
+    //     confirmation assertion ============================================
+    //
+    // wgpu 27's `Buffer::label()` accessor isn't re-exported through Bevy
+    // 0.19's `render_resource::Buffer` wrapper, so we stash the label
+    // strings here at allocation time. Used by the debug-only assertion in
+    // `populate_cpu_mirror_from_gpu_producer` that catches a regression to
+    // the gate at `mod.rs:1184-1186` routing a `.vox` run through the W2
+    // placeholder block instead of the `naadf_*_gpu_producer` block.
+    //
+    // Per Decision 1 of `01-context.md` the three flagless W2 placeholders
+    // are dead code on the `.vox` production path; this label-stash +
+    // assertion defends the property explicitly. Release builds skip the
+    // assertion via `#[cfg(debug_assertions)]`.
+    /// Label of the buffer assigned to `block_voxel_count` (set at
+    /// allocation time). Used by the debug-only Q4 assertion only.
+    pub block_voxel_count_label: Option<&'static str>,
+    /// Label of the buffer assigned to `segment_voxel_buffer`.
+    pub segment_voxel_buffer_label: Option<&'static str>,
+    /// Label of the buffer assigned to `hash_map`.
+    pub hash_map_label: Option<&'static str>,
+    /// Label of the buffer assigned to `hash_coefficients`.
+    pub hash_coefficients_label: Option<&'static str>,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -923,6 +947,62 @@ pub fn populate_cpu_mirror_from_gpu_producer(
         return;
     }
 
+    // web-vox-async-loading Q4 (2026-05-18) — confirmation assertion per
+    // Decision 1 of `docs/orchestrate/web-vox-async-loading/01-context.md`:
+    // the three flagless W2 placeholders (`hash_map_w2_placeholder`,
+    // `segment_voxel_buffer_w2_placeholder`, `hash_coefficients_w2_placeholder`)
+    // MUST be dead code on the `.vox` production path. The gate at
+    // `mod.rs:1184-1186` widens `want_gpu_producer` to include
+    // `model_data.is_some()`, so the production `naadf_*_gpu_producer`
+    // allocations fire BEFORE the W2 placeholder block — every
+    // `is_none()` guard in the placeholder block then returns `false`.
+    //
+    // The audit (`00-reuse-audit.md` § Q4) confirmed three of the four
+    // W2 placeholders lack `COPY_SRC` and would panic the readback if
+    // they were ever wired in on a `.vox` run. This debug-only assertion
+    // defends the property — if a future regression to the gate logic
+    // routes a `.vox` run through the placeholder block, the buffer
+    // labels carry `_w2_placeholder` and this assertion fires
+    // immediately rather than producing a silent readback corruption.
+    //
+    // Release builds skip the check entirely. The label-stash fields
+    // are stamped at the allocation sites in `prepare_construction`
+    // (`mod.rs:~1190-1320` for production / `~1916-1960` for W2
+    // placeholders).
+    #[cfg(debug_assertions)]
+    {
+        if let Some(label) = gpu.block_voxel_count_label {
+            assert!(
+                !label.contains("w2_placeholder"),
+                "vox-gpu-rewrite Q4 regression: block_voxel_count is the W2 \
+                 placeholder on a .vox run — gate logic regression at \
+                 mod.rs:1184-1186 routed past the gpu_producer allocation. \
+                 Label was: {label}"
+            );
+        }
+        if let Some(label) = gpu.hash_map_label {
+            assert!(
+                !label.contains("w2_placeholder"),
+                "vox-gpu-rewrite Q4 regression: hash_map is the W2 placeholder \
+                 on a .vox run. Label was: {label}"
+            );
+        }
+        if let Some(label) = gpu.segment_voxel_buffer_label {
+            assert!(
+                !label.contains("w2_placeholder"),
+                "vox-gpu-rewrite Q4 regression: segment_voxel_buffer is the W2 \
+                 placeholder on a .vox run. Label was: {label}"
+            );
+        }
+        if let Some(label) = gpu.hash_coefficients_label {
+            assert!(
+                !label.contains("w2_placeholder"),
+                "vox-gpu-rewrite Q4 regression: hash_coefficients is the W2 \
+                 placeholder on a .vox run. Label was: {label}"
+            );
+        }
+    }
+
     // WebGPU divergence: wgpu's `Device::poll(wait_indefinitely)` is a no-op
     // on the WebGPU backend — the main thread can't synchronously block
     // waiting for the `mapAsync` JS promise to resolve, so when
@@ -1203,6 +1283,9 @@ pub fn prepare_construction(
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
+            // web-vox-async-loading Q4 — stash label for debug-only assertion
+            // in `populate_cpu_mirror_from_gpu_producer`.
+            gpu.hash_map_label = Some("naadf_hash_map_gpu_producer");
             // wgpu storage buffers with `mapped_at_creation: false` have
             // implementation-defined contents (uninitialised on some
             // backends). The open-addressing CAS loop in `chunk_calc.wgsl`
@@ -1238,6 +1321,7 @@ pub fn prepare_construction(
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&coeffs));
             gpu.hash_coefficients = Some(buf);
+            gpu.hash_coefficients_label = Some("naadf_hash_coefficients_gpu_producer");
             bind_groups.construction_world = None;
         }
         // block_voxel_count: 2 u32 cursors, seeded at `[32, 64]` per
@@ -1265,6 +1349,7 @@ pub fn prepare_construction(
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&[64u32, 64u32]));
             gpu.block_voxel_count = Some(buf);
+            gpu.block_voxel_count_label = Some("naadf_block_voxel_count_gpu_producer");
             bind_groups.construction_world = None;
         }
         // segment_voxel_buffer: built CPU-side from `dense_voxel_types`. For
@@ -1317,6 +1402,7 @@ pub fn prepare_construction(
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&segment_data));
             gpu.segment_voxel_buffer = Some(buf);
+            gpu.segment_voxel_buffer_label = Some("naadf_segment_voxel_buffer_gpu_producer");
             bind_groups.construction_world = None;
         }
         let _ = world_chunk_count; // referenced for future segment-iteration sizing.
@@ -1575,6 +1661,7 @@ pub fn prepare_construction(
                 mapped_at_creation: false,
             });
             gpu.segment_voxel_buffer = Some(buf);
+            gpu.segment_voxel_buffer_label = Some("naadf_segment_voxel_buffer_w5");
             // Force rebuild of every bind group that binds this buffer.
             bind_groups.construction_world = None;
             bind_groups.construction_generator_model = None;
@@ -1930,6 +2017,7 @@ pub fn prepare_construction(
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&[64u32, 64u32]));
             gpu.block_voxel_count = Some(buf);
+            gpu.block_voxel_count_label = Some("naadf_block_voxel_count_w2_placeholder");
         }
         if gpu.segment_voxel_buffer.is_none() {
             let buf = render_device.create_buffer(&BufferDescriptor {
@@ -1939,6 +2027,7 @@ pub fn prepare_construction(
                 mapped_at_creation: false,
             });
             gpu.segment_voxel_buffer = Some(buf);
+            gpu.segment_voxel_buffer_label = Some("naadf_segment_voxel_buffer_w2_placeholder");
         }
         if gpu.hash_map.is_none() {
             let buf = render_device.create_buffer(&BufferDescriptor {
@@ -1948,6 +2037,7 @@ pub fn prepare_construction(
                 mapped_at_creation: false,
             });
             gpu.hash_map = Some(buf);
+            gpu.hash_map_label = Some("naadf_hash_map_w2_placeholder");
         }
         if gpu.hash_coefficients.is_none() {
             let buf = render_device.create_buffer(&BufferDescriptor {
@@ -1957,6 +2047,7 @@ pub fn prepare_construction(
                 mapped_at_creation: false,
             });
             gpu.hash_coefficients = Some(buf);
+            gpu.hash_coefficients_label = Some("naadf_hash_coefficients_w2_placeholder");
         }
 
         if let (Some(params), Some(bvc), Some(segv), Some(hmap), Some(coeffs)) = (

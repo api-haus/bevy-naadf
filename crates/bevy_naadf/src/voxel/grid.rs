@@ -322,35 +322,82 @@ fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
 ///
 /// `source_label` is the human-readable origin used in log messages — a
 /// filesystem path, a URL, or "<dropped file>".
+///
+/// **Split (web-vox-async-loading Step 3, 2026-05-18):** this function is
+/// the synchronous-convenience wrapper that combines
+/// [`parse_to_imported_vox`] (pure CPU, `Send`-able output — runs in the
+/// async parse task on both web/native) with [`install_imported_vox`] (the
+/// Bevy-resource install pass — must run on the main thread). Callers that
+/// still want a one-shot sync API (e.g. the `--vox-gpu-oracle` and
+/// `--vox-e2e` startup-time installers that tolerate a blocking parse)
+/// keep using this entry point. Async callers
+/// (`voxel::web_vox::apply_pending_vox` + `native_vox_drop_listener` +
+/// `setup_test_grid`'s `GridPreset::Vox` arm) drive
+/// `parse_to_imported_vox` off-thread and call `install_imported_vox` from
+/// the polling system once the parse completes.
 pub fn install_vox_bytes_in_fixed_world(
     commands: &mut Commands,
     bytes: &[u8],
     source_label: &str,
 ) {
-    // W5.1 — parse as a single-tile sparse import (no CPU tiling).
-    let data = match dot_vox::load_bytes(bytes) {
-        Ok(d) => d,
-        Err(e) => {
-            error!(
-                ".vox load failed (parse error: {e}); falling back to embedded \
-                 default in fixed world (source: {source_label})"
-            );
-            install_default_embedded_in_fixed_world(commands);
-            return;
-        }
-    };
-    let imp = match vox_import::parse_dot_vox_data(&data) {
-        Ok(i) => i,
+    match parse_to_imported_vox(bytes) {
+        Ok(imp) => install_imported_vox(commands, imp, source_label),
         Err(e) => {
             error!(
                 ".vox load failed ({e}); falling back to embedded default in \
                  fixed world (source: {source_label})"
             );
             install_default_embedded_in_fixed_world(commands);
-            return;
         }
-    };
+    }
+}
 
+/// Pure-CPU bytes → [`vox_import::ImportedVox`] parse. **`Send`-able output**
+/// — designed to be called from an off-main-thread context
+/// (`bevy::tasks::AsyncComputeTaskPool::spawn` on native, `rayon::spawn` on
+/// web via the `wasm-bindgen-rayon` worker pool).
+///
+/// Wraps `dot_vox::load_bytes` + `vox_import::parse_dot_vox_data` into a
+/// single error-mapped entry point: any failure (malformed bytes, oversize
+/// world, empty model) becomes a `String` so the caller doesn't need to
+/// import the upstream error type. The returned `ImportedVox` owns its
+/// `chunks` / `blocks` / `voxels` `Vec<u32>` buffers and `Vec<VoxelType>`
+/// palette — all are `Send + Sync`, no Bevy or wgpu references.
+///
+/// **Web async path:** the rayon worker reads `&[u8]` (a slice into the
+/// caller-owned `Vec<u8>` of the fetched bytes) and returns the parsed
+/// `ImportedVox` via a `crossbeam_channel::Sender`. The Bevy `Update`
+/// system on the main thread `try_recv()`s the result and invokes
+/// [`install_imported_vox`].
+///
+/// **Native async path:** the `AsyncComputeTaskPool` task reads bytes from
+/// disk + parses, owning the entire chain off-thread. Same hand-off shape
+/// to `install_imported_vox` via a Bevy `Task<...>` polled in an `Update`
+/// system.
+pub fn parse_to_imported_vox(bytes: &[u8]) -> Result<vox_import::ImportedVox, String> {
+    let data = dot_vox::load_bytes(bytes).map_err(|e| format!("parse error: {e}"))?;
+    vox_import::parse_dot_vox_data(&data).map_err(|e| e.to_string())
+}
+
+/// Install a parsed [`vox_import::ImportedVox`] into the live Bevy `World`
+/// via `commands.insert_resource(...)` calls. **Main-thread only** — this
+/// is the post-parse half of the original `install_vox_bytes_in_fixed_world`.
+///
+/// Inserts:
+/// - [`crate::camera::InitialCameraPose`] — proportionally-scaled C#
+///   `(500, 200, 40)`-voxel spawn pose in the fixed world.
+/// - [`crate::aadf::generator::ModelData`] — the `.vox`-derived chunks /
+///   blocks / voxels buffers that the W5 GPU producer chain consumes.
+/// - [`crate::world::data::WorldData`] — empty at the fixed world size;
+///   the W5 dispatch populates the GPU buffers, then
+///   `populate_cpu_mirror_from_gpu_producer` reads them back into the CPU
+///   mirror.
+/// - [`crate::world::data::VoxelTypes`] — the parsed palette.
+pub fn install_imported_vox(
+    commands: &mut Commands,
+    imp: vox_import::ImportedVox,
+    source_label: &str,
+) {
     let model_size_in_chunks = imp.world.size_in_chunks;
     info!(
         "NAADF .vox loaded from {} → ModelData ({}×{}×{} chunks; \
@@ -503,25 +550,22 @@ pub fn native_vox_drop_listener(
                     );
                     continue;
                 }
-                let bytes = match std::fs::read(path_buf) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(
-                            "drag-drop: failed to read .vox ({e}); keeping current scene (path: {})",
-                            path_buf.display()
-                        );
-                        continue;
-                    }
-                };
+                // web-vox-async-loading Step 4 (2026-05-18): drop the
+                // sync `std::fs::read` + parse + install chain in favour
+                // of [`crate::voxel::async_vox::spawn_native_vox_parse`]
+                // which offloads BOTH the disk read AND the multi-second
+                // `parse_vox_bytes` call onto `AsyncComputeTaskPool` — the
+                // drop handler returns immediately and the renderer
+                // continues to paint frames. The completion is consumed
+                // by [`crate::voxel::async_vox::poll_pending_vox_parse`]
+                // each `Update` tick.
                 info!(
-                    "drag-drop: loading .vox ({} bytes) from {}",
-                    bytes.len(),
+                    "drag-drop: dispatching async .vox parse from {}",
                     path_buf.display()
                 );
-                install_vox_bytes_in_fixed_world(
+                crate::voxel::async_vox::spawn_native_vox_parse(
                     &mut commands,
-                    &bytes,
-                    &path_buf.display().to_string(),
+                    path_buf.clone(),
                 );
             }
         }

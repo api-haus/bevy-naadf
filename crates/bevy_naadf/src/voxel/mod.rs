@@ -9,6 +9,7 @@
 //! the C# traversal shader uses (`02-research.md` §1.1.2, divergence #3) so the
 //! eventual WGSL traversal port bit-matches the algorithm.
 
+pub mod async_vox;
 pub mod grid;
 pub mod vox_import;
 

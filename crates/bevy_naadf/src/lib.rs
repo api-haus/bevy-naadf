@@ -708,14 +708,34 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // (`crate::e2e::add_e2e_systems`).
     app.add_systems(Startup, voxel::grid::setup_test_grid);
 
+    // web-vox-async-loading Step 4 (2026-05-18) — async `.vox` parse pump.
+    // The polling system drains the `PendingVoxParse` hand-off resource
+    // produced by the target-specific async parse spawn (native:
+    // `AsyncComputeTaskPool::spawn` from `native_vox_drop_listener`; web:
+    // `rayon::spawn` from `web_vox::apply_pending_vox`). Resource +
+    // system registered on BOTH targets so the cfg-gated internals share
+    // one main-thread driver. The system is wired even when no drop has
+    // landed yet — it short-circuits when `pending.inner.is_none()`.
+    app.init_resource::<voxel::async_vox::PendingVoxParse>()
+        .add_systems(Update, voxel::async_vox::poll_pending_vox_parse);
+
     // Web-only .vox streaming: kick off the default-model HTTP fetch on
     // `Startup`, and run the consumer system on `Update` so both the fetch
     // and any drag-dropped `.vox` files swap the active scene the moment
     // their bytes are ready. The default scene from `setup_test_grid` stays
     // visible until then.
+    //
+    // Order: `apply_pending_vox` runs `.after(poll_pending_vox_parse)` so
+    // its overlay-hide branch sees `pending.inner.is_none()` the same
+    // frame the polling system clears the slot post-install. Otherwise
+    // the overlay would linger an extra frame.
     #[cfg(target_arch = "wasm32")]
     app.add_systems(Startup, voxel::web_vox::startup_fetch_default_vox)
-        .add_systems(Update, voxel::web_vox::apply_pending_vox);
+        .add_systems(
+            Update,
+            voxel::web_vox::apply_pending_vox
+                .after(voxel::async_vox::poll_pending_vox_parse),
+        );
 
     // Native drag-and-drop: drop a `.vox` file onto the window to replace the
     // active scene. Gated off the e2e harness — winit emits the event in both

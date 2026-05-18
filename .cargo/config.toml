@@ -8,12 +8,57 @@
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
-# wasm32-unknown-unknown has no OS RNG, so getrandom ≥0.3 refuses to compile
-# unless we explicitly pick a backend. `wasm_js` routes `getrandom_uninit`
-# through the browser's `crypto.getRandomValues`, which is what Trunk's
-# `just web` target needs. The cfg flag pairs with the matching `wasm_js`
-# feature on the direct `getrandom` dep in `crates/bevy_naadf/Cargo.toml`
-# (both are required — the feature alone is insufficient, per the upstream
-# error message).
+# wasm32-unknown-unknown — WebGPU build configuration with atomics +
+# SharedArrayBuffer threading support for `wasm-bindgen-rayon`. Mirrors
+# `/mnt/archive4/DEV/bevy_pixel_world/.cargo/config.toml` verbatim where it
+# overlaps; bevy-naadf historically only had the `getrandom_backend="wasm_js"`
+# cfg flag (without the atomics + shared-memory linker args, since the sync
+# `.vox` load path didn't need a worker pool).
+#
+# - `getrandom_backend="wasm_js"` — wasm32-unknown-unknown has no OS RNG, so
+#   getrandom ≥0.3 refuses to compile unless we explicitly pick a backend.
+#   `wasm_js` routes `getrandom_uninit` through `crypto.getRandomValues`.
+#   Paired with the matching `wasm_js` feature on the direct `getrandom` dep
+#   in `crates/bevy_naadf/Cargo.toml` (both are required — feature alone is
+#   insufficient).
+# - `target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals` — atomics
+#   + bulk-memory are required by `wasm-bindgen-rayon` so Rust's `std::sync`
+#   primitives compile to real `wasm-atomics` instructions; +simd128 is
+#   carried over from bevy_pixel_world (cheap if unused).
+# - `link-arg=--shared-memory` + `--max-memory=1073741824` + `--import-memory`
+#   — required for SharedArrayBuffer (which Web Workers spawned by
+#   `wasm-bindgen-rayon` use to communicate). 1 GiB max memory matches
+#   bevy_pixel_world.
+# - `link-arg=--export=__wasm_init_tls` / `__tls_size` / `__tls_align` /
+#   `__tls_base` — TLS init symbols required by wasm-bindgen-rayon's worker
+#   pool spawn (each worker thread needs to initialise its own thread-local
+#   storage; the JS shim calls these exported symbols).
+#
+# The cost: `build-std = ["std", "panic_abort"]` (see `[unstable]` below)
+# rebuilds the standard library with the atomics target-feature so
+# `std::sync` works on wasm. Adds ~10s to a cold build (cached afterwards)
+# and ~10 MB to the wasm bundle. One-time per nightly bump.
 [target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+rustflags = [
+    "--cfg", "getrandom_backend=\"wasm_js\"",
+    "-C", "target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals",
+    # Required for SharedArrayBuffer (wasm-bindgen-rayon)
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--max-memory=1073741824",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+    # wasm-bindgen-0.2.121's threading prep requires `__heap_base` to be
+    # exported by LLD so it can inject the thread-id helpers. Newer LLD
+    # default-strips it; add the explicit `--export` to keep it.
+    "-C", "link-arg=--export=__heap_base",
+]
+
+# Rebuild std with atomics support — required by the atomics target-feature
+# above. Only applies when the wasm32 target is being built; native targets
+# are unaffected (Cargo only consults `build-std` when an `--unstable` flag
+# requests it via the nightly toolchain).
+[unstable]
+build-std = ["std", "panic_abort"]

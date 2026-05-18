@@ -24,6 +24,20 @@ use bevy::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
+// Re-export `wasm_bindgen_rayon::init_thread_pool` so the wasm-bindgen JS
+// bindings expose it as `wasmBindings.initThreadPool(n)`. The JS bootstrap
+// (`init.js.template` in production, `index.html` in dev) awaits this call
+// after the regular `init({...})` and before dispatching
+// `TrunkApplicationStarted` — without this re-export the JS-side
+// `initThreadPool(...)` is undefined and Rayon's `spawn` lands on a pool
+// that has zero worker threads (every `rayon::spawn` panics with "no thread
+// pool installed").
+//
+// See `docs/orchestrate/web-vox-async-loading/03-architecture.md` Q1 for
+// the full design + `/tmp/wasm-bindgen-rayon-1.3.0/README.md:44-80` for the
+// upstream documented setup.
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 /// R2 key + URL for the default `.vox` model fetched on startup. The R2 proxy
 /// worker (`workers/r2-proxy/src/index.js`) serves any key under the
 /// `bevy-naadf-assets` bucket with `Cross-Origin-Resource-Policy: cross-origin`
@@ -293,46 +307,133 @@ pub fn startup_fetch_default_vox() {
 }
 
 /// `Update` system — runs every frame. Implements a two-stage deferred parse
-/// so the "Parsing…" overlay paints before the synchronous (and currently
-/// quite slow — see followup `02b-async-vox-load.md`) parse blocks the main
-/// thread for several seconds:
+/// so the "Parsing…" overlay paints before the parse dispatch sends the
+/// bytes onto a rayon worker pool:
 ///
-/// * **Stage 2 first** — if a previous frame queued bytes for install, do the
-///   install now. Then hide the overlay. (Stage 2 is checked first so the
-///   browser's compositor gets to paint the overlay set up in stage 1 between
-///   the two frames.)
+/// * **Stage 2 first** — if a previous frame queued bytes for install,
+///   dispatch the parse via `spawn_wasm_vox_parse` (which uses
+///   `rayon::spawn` against the `wasm-bindgen-rayon` worker pool spawned
+///   by `bindings.initThreadPool` in `init-wasm-rayon.mjs`). The parse
+///   runs off the main thread; the result is delivered through a
+///   `crossbeam_channel::Receiver<...>` consumed by
+///   [`crate::voxel::async_vox::poll_pending_vox_parse`].
 /// * **Stage 1** — if new bytes have just landed (from the HTTP fetch or a
 ///   drag-drop), surface a "Parsing…" overlay and move the bytes into the
 ///   second-stage slot. The next frame will pick them up.
-pub fn apply_pending_vox(mut commands: Commands) {
-    // Stage 2: drain the queued-for-install slot first. The overlay set up
-    // last frame has now been painted; the upcoming sync install can block
-    // for several seconds and the user will see "Parsing…" the whole time.
+///
+/// **web-vox-async-loading Step 5 (2026-05-18):** the previous body of
+/// stage 2 ran the parse + install synchronously on the wasm main thread
+/// (multi-second UI freeze). Replaced with `spawn_wasm_vox_parse`. The
+/// overlay's `.indeterminate` class continues to animate during the
+/// parse since the main thread is now responsive.
+pub fn apply_pending_vox(
+    mut commands: Commands,
+    pending: Res<crate::voxel::async_vox::PendingVoxParse>,
+    mut overlay_state: Local<OverlayState>,
+) {
+    // Stage 2: drain the queued-for-install slot first. Dispatch the parse
+    // onto a rayon worker. If a previous parse is still in flight we
+    // overwrite it (last-writer-wins matches the inbox semantic at
+    // line ~63 below).
     if let Some((bytes, source_label)) = QUEUED_FOR_INSTALL.with(|c| c.borrow_mut().take()) {
+        if pending.inner.is_some() {
+            warn!(
+                "web_vox: a previous .vox parse was still in flight; replacing \
+                 it with the new payload (source: {source_label})"
+            );
+        }
         info!(
-            "web_vox: installing .vox ({} bytes) from {source_label} — \
-             expect a few seconds of UI freeze (sync parse, see followup)",
+            "web_vox: dispatching async parse ({} bytes from {source_label}) \
+             onto the wasm-bindgen-rayon worker pool",
             bytes.len()
         );
-        crate::voxel::grid::install_vox_bytes_in_fixed_world(
-            &mut commands,
-            &bytes,
-            &source_label,
-        );
-        hide_loading_overlay();
+        // We re-show the overlay in indeterminate mode for the parse
+        // duration — it stays visible until the install lands.
+        show_loading_overlay("Parsing model…");
+        overlay_state.parse_in_flight = true;
+        spawn_wasm_vox_parse(&mut commands, bytes, source_label);
         return;
     }
 
     // Stage 1: pick up freshly delivered bytes, surface the "Parsing…"
-    // overlay, and defer the actual install to the next frame so the
+    // overlay, and defer the actual dispatch to the next frame so the
     // browser can paint the overlay between the two frames.
     if let Some((bytes, source_label)) = take_pending_bytes() {
         info!(
             "web_vox: bytes ready ({} bytes from {source_label}); deferring \
-             install one frame so the loading overlay paints first",
+             parse-dispatch one frame so the loading overlay paints first",
             bytes.len()
         );
         show_loading_overlay("Parsing model…");
+        overlay_state.parse_in_flight = true;
         QUEUED_FOR_INSTALL.with(|c| *c.borrow_mut() = Some((bytes, source_label)));
+        return;
     }
+
+    // Overlay hide: the parse was in flight and the polling system has
+    // cleared `pending.inner` (install done OR parse failed). Hide the
+    // overlay so the user sees the rendered scene.
+    if overlay_state.parse_in_flight && pending.inner.is_none() {
+        info!("web_vox: async parse + install complete — hiding loading overlay");
+        hide_loading_overlay();
+        overlay_state.parse_in_flight = false;
+    }
+}
+
+/// Per-run overlay state owned by `apply_pending_vox` as `Local<...>`.
+/// Tracks whether a parse is currently in flight so the overlay hides on
+/// the frame the polling system clears `PendingVoxParse.inner`.
+#[derive(Default)]
+pub struct OverlayState {
+    pub parse_in_flight: bool,
+}
+
+/// Spawn a `.vox` parse off the wasm main thread via `rayon::spawn`. The
+/// rayon worker is one of the `navigator.hardwareConcurrency` Web Workers
+/// spawned by `bindings.initThreadPool` (called from `init-wasm-rayon.mjs`
+/// in dev / `init.js.template` in production); when this function returns
+/// the parse is already running concurrently with the main-thread render
+/// loop.
+///
+/// Result is delivered through a `crossbeam_channel::bounded(1)` pair;
+/// receiver lives in the [`crate::voxel::async_vox::PendingVoxParse`]
+/// resource consumed by `poll_pending_vox_parse`.
+///
+/// `commands.insert_resource(PendingVoxParse { inner: Some(...) })`
+/// overwrites any in-flight parse, matching the inbox's last-writer-wins
+/// semantic.
+fn spawn_wasm_vox_parse(commands: &mut Commands, bytes: Vec<u8>, source_label: String) {
+    let (tx, rx) = crossbeam_channel::bounded::<crate::voxel::async_vox::ParseResult>(1);
+    let label_for_task = source_label.clone();
+    rayon::spawn(move || {
+        let result = match crate::voxel::grid::parse_to_imported_vox(&bytes) {
+            Ok(imp) => Ok((imp, label_for_task)),
+            Err(e) => Err(e),
+        };
+        // Best-effort send — if the receiver was dropped (replaced by a
+        // newer parse) the result is discarded silently.
+        let _ = tx.send(result);
+    });
+    commands.insert_resource(crate::voxel::async_vox::PendingVoxParse {
+        inner: Some(crate::voxel::async_vox::PendingVoxParseInner {
+            rx,
+            source_label,
+        }),
+    });
+}
+
+/// Hide the loading overlay once the async parse + install completes. The
+/// `poll_pending_vox_parse` system runs `install_imported_vox` on the
+/// main thread; this helper is wired as an observer so the overlay
+/// hides the same frame the install lands.
+///
+/// Currently not wired — the architect's design called for the polling
+/// system itself to call `hide_loading_overlay()` post-install, but
+/// `poll_pending_vox_parse` lives in `voxel::async_vox` which is
+/// platform-agnostic. The overlay-hide is left for a follow-up; the
+/// existing `Update` system in this module will hide the overlay when
+/// the inbox + queue are both empty (handled in the next iteration).
+#[allow(dead_code)]
+pub(crate) fn hide_overlay_if_install_done() {
+    hide_loading_overlay();
 }

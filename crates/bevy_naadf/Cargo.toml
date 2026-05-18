@@ -115,6 +115,25 @@ basis-universal = "0.3"
 # behind `cfg(target_arch = "wasm32")`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
+# Web async `.vox` parse — `wasm-bindgen-rayon` spawns a worker pool of
+# `navigator.hardwareConcurrency` Web Workers backed by `SharedArrayBuffer`
+# (enabled by the COOP/COEP `same-origin` / `require-corp` headers in
+# `_headers` + `e2e/serve.mjs`). `rayon::spawn` then schedules the
+# multi-second `parse_vox_bytes` call onto a real worker thread instead of
+# the wasm main thread — unblocks the renderer + the loading-overlay
+# animation during the parse. The receiver lives in a Bevy Update system
+# (`apply_pending_vox` in `voxel/web_vox.rs`) that reads from a
+# `crossbeam_channel::Receiver<ImportedVox>` populated from the rayon
+# worker. See `docs/orchestrate/web-vox-async-loading/03-architecture.md`
+# Q1 for the full design.
+#
+# Build configuration is in `.cargo/config.toml`'s
+# `[target.wasm32-unknown-unknown]` block (atomics + shared-memory rustflags
+# + TLS link-args + `build-std`). The toolchain pin in `rust-toolchain.toml`
+# guarantees `rust-src` for `build-std`.
+wasm-bindgen-rayon = "1.3"
+rayon = "1.11.0"
+crossbeam-channel = "0.5"
 # Web .vox loading — HTTP fetch + drag-and-drop. The web build streams the
 # default model from R2 (`crates/bevy_naadf/src/voxel/web_vox.rs`) and accepts
 # `.vox` files dropped onto the `<canvas>` element via a JS shim that calls
