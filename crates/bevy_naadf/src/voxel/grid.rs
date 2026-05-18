@@ -61,85 +61,50 @@ const TY_EMISSIVE_MAGENTA: VoxelTypeId = VoxelTypeId(12);
 /// (`03-design.md` §6.1 step 1).
 const GRID_SIZE_IN_CHUNKS: [u32; 3] = [4, 2, 4];
 
+/// Public alias for [`GRID_SIZE_IN_CHUNKS`] — the small Default test-scene
+/// footprint, used by [`crate::e2e::gates::demo_origin_v`] to compute the
+/// XZ centring offset for the demo inside the fixed world.
+pub const DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS: [u32; 3] = GRID_SIZE_IN_CHUNKS;
+
 /// Startup system: build the hard-coded Phase-A voxel test grid (D2).
 ///
 /// Replaces `main::setup_scene_placeholder`. Inserts the `WorldData` and
 /// `VoxelTypes` resources.
 ///
-/// **Two paths**:
-/// - `GridPreset::Default` (test grid, Δ-DenseFallback) — builds a
-///   `DenseVolume`, runs `construct()`, installs with a populated
-///   `dense_voxel_types` (so the runtime GPU producer chain can rebuild
-///   `segment_voxel_buffer` per Phase-C followup #1).
-/// - `GridPreset::Vox` (sparse, Track A v2 —
-///   `docs/orchestrate/feature-completeness/02a-v2-sparse-vox-ingestion.md`) —
-///   the sparse walk in `vox_import::parse_vox_bytes` produces a
-///   `ConstructedWorld` directly. We install it via `build_world_from_vox`,
-///   which sets `dense_voxel_types: Vec::new()` (Δ-GPUProducer); the GPU
-///   producer's data-driven gate at `render/construction/mod.rs:833-835`
-///   then skips the dispatch chain and the renderer reads the pre-built CPU
-///   buffers via the existing extract/prepare upload path.
+/// **vox-gpu-rewrite Stage 2 consolidation (2026-05-18):** the dispatch
+/// ladder is gone. Every binary (production + every e2e gate) routes
+/// through the C#-faithful fixed-world install path:
+/// - [`GridPreset::Default`] → [`install_default_embedded_in_fixed_world`]
+///   embeds the small primitive scene at the world centre inside the
+///   `(4096, 512, 4096)`-voxel container; CPU upload path (W5.6 documented
+///   divergence — the synthesised scene stays on the CPU producer because
+///   composing it as `ModelData` would force unwanted XZ tiling of the demo).
+/// - [`GridPreset::Vox`] → [`install_vox_in_fixed_world`] uploads the model
+///   as a [`crate::aadf::generator::ModelData`] resource and the W5 GPU
+///   producer chain runs `generator_model` + `chunk_calc` per segment to
+///   build the world directly on the device.
+///
+/// **`--vox-gpu-oracle` CPU phase exception:** when
+/// `AppArgs.vox_gpu_oracle_cpu_phase == true` the loader instead calls
+/// [`install_vox_sized_to_model`] directly — this is the CPU oracle the
+/// gate compares the W5 GPU output against. Test-only escape hatch; NOT a
+/// runtime configuration knob.
 pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
     match &args.grid_preset {
         GridPreset::Default => {
-            if args.fixed_world_size {
-                install_default_embedded_in_fixed_world(&mut commands);
-            } else {
-                install_default_small_world(&mut commands);
-            }
+            install_default_embedded_in_fixed_world(&mut commands);
         }
-        GridPreset::Vox { path, tiles } => {
-            if args.fixed_world_size {
-                install_vox_in_fixed_world(&mut commands, path);
+        GridPreset::Vox { path } => {
+            if args.vox_gpu_oracle_cpu_phase {
+                // Test-only CPU oracle phase for `--vox-gpu-oracle`. The
+                // gate's compare phase pairs this CPU render against the GPU
+                // render of the same fixture through the production W5 path.
+                install_vox_sized_to_model(&mut commands, path);
             } else {
-                install_vox_sized_to_model(&mut commands, path, *tiles);
+                install_vox_in_fixed_world(&mut commands, path);
             }
         }
     }
-}
-
-/// Legacy small-world default — used by e2e gates whose luminance assertions
-/// are tuned to the 64×32×64-voxel grid. **DO NOT** change the chunks/blocks/
-/// voxels output here; the e2e baseline framebuffer is bit-sensitive.
-fn install_default_small_world(commands: &mut Commands) {
-    let palette = build_palette();
-    let volume = build_default_volume();
-    let world = construct(&volume);
-    let size = volume.size_in_voxels();
-
-    info!(
-        "NAADF test grid (Default, small): {} chunks, {} blocks, {} voxel-u32s ({}x{}x{} voxels)",
-        world.chunks.len(),
-        world.blocks.len(),
-        world.voxels.len(),
-        size[0],
-        size[1],
-        size[2],
-    );
-
-    // Phase-C followup #1 — preserve the dense voxel-type stream so the
-    // runtime GPU construction dispatch can rebuild `segment_voxel_buffer`
-    // without re-running CPU `construct()`. Only the small-world Default
-    // path keeps this populated; the fixed-world path skips it (the
-    // 4096×512×4096 dense buffer would be ~17 GiB).
-    let dense_voxel_types: Vec<u16> = volume.voxels.iter().map(|t| t.0).collect();
-
-    let mut world_data = WorldData {
-        chunks_cpu: world.chunks,
-        blocks_cpu: world.blocks,
-        voxels_cpu: world.voxels,
-        size_in_chunks: UVec3::from_array(world.size_in_chunks),
-        bounding_box: IAabb3 {
-            min: IVec3::ZERO,
-            max: IVec3::new(size[0] as i32 - 1, size[1] as i32 - 1, size[2] as i32 - 1),
-        },
-        pending_edits: Default::default(),
-        dense_voxel_types,
-        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
-    };
-    world_data.seed_block_hashing();
-    commands.insert_resource(world_data);
-    commands.insert_resource(VoxelTypes { types: palette });
 }
 
 /// C#-faithful default — build the same primitive scene the small-world path
@@ -248,20 +213,20 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
     commands.insert_resource(VoxelTypes { types: palette });
 }
 
-/// Legacy `.vox` loader — sizes the world to `tiles × tiles` copies of the
-/// model. Used by e2e gates (`--vox-e2e`, `--oasis-edit-visual`,
-/// `--small-edit-repro`) whose camera framing depends on the model bounds.
-fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path, tiles: u32) {
-    match vox_import::load_vox_tiled(path, tiles) {
+/// Legacy `.vox` loader — sizes the world to the model's natural bounds.
+///
+/// **vox-gpu-rewrite Stage 2 (2026-05-18):** retained as the CPU oracle the
+/// `--vox-gpu-oracle` gate compares the W5 GPU output against. NOT reachable
+/// from the production install path — only the test-only
+/// `AppArgs.vox_gpu_oracle_cpu_phase` branch in [`setup_test_grid`] dispatches
+/// here. The XZ-tiling parameter is gone (the GPU producer handles tiling
+/// via `voxelPos % modelSize` on device).
+fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path) {
+    match vox_import::load_vox_tiled(path, 1) {
         Ok(imp) => {
             let size_in_chunks = imp.world.size_in_chunks;
-            let tile_note = if tiles > 1 {
-                format!(" (tiled {0}×{0} in XZ)", tiles)
-            } else {
-                String::new()
-            };
             info!(
-                "NAADF .vox loaded from {}: {} palette entries, world bounds {}×{}×{} chunks ({}×{}×{} voxels), {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s (sparse path, GPU producer skipped){}",
+                "NAADF .vox loaded from {} (CPU oracle, sized-to-model): {} palette entries, world bounds {}×{}×{} chunks ({}×{}×{} voxels), {} chunks total, blocks_cpu {} u32s, voxels_cpu {} u32s",
                 path.display(),
                 imp.palette.len(),
                 size_in_chunks[0],
@@ -273,7 +238,6 @@ fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path, t
                 imp.world.chunks.len(),
                 imp.world.blocks.len(),
                 imp.world.voxels.len(),
-                tile_note,
             );
             let world_voxels = [
                 size_in_chunks[0] * 16,
@@ -289,10 +253,10 @@ fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path, t
         }
         Err(e) => {
             error!(
-                ".vox load failed ({e}); falling back to default test grid (path: {})",
+                ".vox load failed ({e}); falling back to embedded default in fixed world (path: {})",
                 path.display()
             );
-            install_default_small_world(commands);
+            install_default_embedded_in_fixed_world(commands);
         }
     }
 }

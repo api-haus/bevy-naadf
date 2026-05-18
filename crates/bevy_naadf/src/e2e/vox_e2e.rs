@@ -350,8 +350,16 @@ pub fn run_vox_e2e() -> AppExit {
     //       for `assert_vox_geometry_visible` (driver branch on
     //       `args.vox_e2e_mode`).
     let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path, tiles: 1 };
+    // vox-gpu-rewrite Stage 2 (2026-05-18): the production install path is
+    // the only install path — the synthesised fixture flows through
+    // `install_vox_in_fixed_world` + the W5 GPU producer chain just like the
+    // production binary's `--vox` flag.
+    app_args.grid_preset = crate::GridPreset::Vox { path };
     app_args.vox_e2e_mode = true;
+    // The W5 GPU producer chain runs `generator_model` + `chunk_calc` per
+    // segment to populate the fixed `(4096, 512, 4096)`-voxel world from
+    // the model's `ModelData`; gpu_construction_enabled is on by default
+    // (`ConstructionConfig::default`), no override needed.
 
     // 3) Run the harness the same way `--entities` does (Phase-C wave-3 —
     //    surface `AppArgs` overrides to the e2e binary). The standard

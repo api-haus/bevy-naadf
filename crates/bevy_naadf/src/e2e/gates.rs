@@ -20,6 +20,25 @@ use bevy::prelude::*;
 
 use super::framebuffer::{Framebuffer, Rect};
 
+/// vox-gpu-rewrite Stage 2 (2026-05-18) — the small Default test-scene used
+/// to live at world origin `(0..64, 0..32, 0..64)`. After consolidation,
+/// `setup_test_grid` always uses the fixed `(4096, 512, 4096)`-voxel world
+/// and embeds the small primitive scene at the world centre — the demo
+/// origin shifts from `(0, 0, 0)` to this voxel offset
+/// (`((4096-64)/2, 0, (4096-64)/2) = (2016, 0, 2016)`). Every e2e camera
+/// pose / look target / entity position const in this module is expressed
+/// in small-world-relative voxels and translated through [`demo_origin_v`]
+/// at point-of-use so the framing of the small primitive scene stays
+/// pixel-identical regardless of where the world container places it.
+pub fn demo_origin_v() -> Vec3 {
+    use crate::{WORLD_SIZE_IN_CHUNKS, voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS};
+    let small_in_voxels_x = DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[0] * 16;
+    let small_in_voxels_z = DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[2] * 16;
+    let off_x = (WORLD_SIZE_IN_CHUNKS.x * 16 - small_in_voxels_x) / 2;
+    let off_z = (WORLD_SIZE_IN_CHUNKS.z * 16 - small_in_voxels_z) / 2;
+    Vec3::new(off_x as f32, 0.0, off_z as f32)
+}
+
 /// The fixed E2E camera pose (`e2e-render-test.md` §4.2, R5).
 ///
 /// A **test-specific pose** — the design explicitly allows one (§4.2,
@@ -46,13 +65,22 @@ use super::framebuffer::{Framebuffer, Rect};
 /// across the top. Gate rects below were re-derived from a fresh `save_to_disk`
 /// dump at this pose.
 pub fn e2e_camera_transform() -> Transform {
-    Transform::from_xyz(86.0, 42.0, 90.0).looking_at(Vec3::new(32.0, 16.0, 32.0), Vec3::Y)
+    let off = demo_origin_v();
+    Transform::from_translation(off + Vec3::new(86.0, 42.0, 90.0))
+        .looking_at(off + Vec3::new(32.0, 16.0, 32.0), Vec3::Y)
 }
 
 /// The point the e2e camera always looks at — the `GridPreset::Default` scene
-/// centre. Shared by [`e2e_camera_transform`] and [`e2e_orbit_camera_transform`]
-/// so the motion path keeps the same framing target as the static pose.
+/// centre, in small-world-relative voxel coords. Callers translate by
+/// [`demo_origin_v`] when constructing a world-space transform.
 pub const E2E_LOOK_TARGET: Vec3 = Vec3::new(32.0, 16.0, 32.0);
+
+/// World-space look target — [`E2E_LOOK_TARGET`] translated by
+/// [`demo_origin_v`]. Use this in place of [`E2E_LOOK_TARGET`] anywhere a
+/// transform-space coord is required.
+pub fn e2e_look_target_world() -> Vec3 {
+    demo_origin_v() + E2E_LOOK_TARGET
+}
 
 /// A deterministic camera pose along the moving-camera e2e motion path
 /// (`10-impl-b.md` — TAA camera-motion reprojection coverage).
@@ -92,9 +120,11 @@ pub fn e2e_orbit_camera_transform(t: f32) -> Transform {
     // zero end-velocity would mask the decay).
     let s = t;
 
-    // Both endpoints expressed relative to the shared look target.
-    let end = e2e_camera_transform().translation - E2E_LOOK_TARGET;
-    let start = e2e_motion_start_transform().translation - E2E_LOOK_TARGET;
+    // Both endpoints expressed relative to the shared look target (in
+    // world space — the look-target shift cancels in the subtraction).
+    let look_world = e2e_look_target_world();
+    let end = e2e_camera_transform().translation - look_world;
+    let start = e2e_motion_start_transform().translation - look_world;
     let end_radius = end.length();
     let start_radius = start.length();
     let end_yaw = end.x.atan2(end.z);
@@ -108,7 +138,7 @@ pub fn e2e_orbit_camera_transform(t: f32) -> Transform {
     // Horizontal radius from the (radius, height) on the sphere of this yaw.
     let horizontal = (radius * radius - height * height).max(0.0).sqrt();
     let offset = Vec3::new(yaw.sin() * horizontal, height, yaw.cos() * horizontal);
-    Transform::from_translation(E2E_LOOK_TARGET + offset).looking_at(E2E_LOOK_TARGET, Vec3::Y)
+    Transform::from_translation(look_world + offset).looking_at(look_world, Vec3::Y)
 }
 
 /// The pose the moving-camera e2e [`WARMUP` phase](crate::e2e::E2E_WARMUP_FRAMES)
@@ -125,7 +155,9 @@ pub fn e2e_orbit_camera_transform(t: f32) -> Transform {
 /// geometry and (b) be far enough from the readback pose that the motion is a
 /// genuine reprojection workload.
 pub fn e2e_motion_start_transform() -> Transform {
-    Transform::from_xyz(-28.0, 70.0, 96.0).looking_at(E2E_LOOK_TARGET, Vec3::Y)
+    let off = demo_origin_v();
+    Transform::from_translation(off + Vec3::new(-28.0, 70.0, 96.0))
+        .looking_at(off + E2E_LOOK_TARGET, Vec3::Y)
 }
 
 /// Camera pose for the **resize-blackness reproduction test**
@@ -173,7 +205,9 @@ pub fn e2e_motion_start_transform() -> Transform {
 /// per-phase changes — so any luma collapse between the three captures is
 /// attributable to the resize-induced ring drain, not to camera motion.
 pub fn e2e_resize_test_camera_transform() -> Transform {
-    Transform::from_xyz(20.0, 12.0, 50.0).looking_at(Vec3::new(58.0, 18.0, 30.0), Vec3::Y)
+    let off = demo_origin_v();
+    Transform::from_translation(off + Vec3::new(20.0, 12.0, 50.0))
+        .looking_at(off + Vec3::new(58.0, 18.0, 30.0), Vec3::Y)
 }
 
 /// The highest batch currently implemented — the `ASSERT` step runs this

@@ -1711,8 +1711,19 @@ fn run_assertions(
                     Err(msg) => failures.push(format!("screenshot save:\n  {msg}")),
                 }
                 // (2) Degenerate-frame floor.
-                if let Err(msg) = fb.check_not_degenerate() {
-                    failures.push(format!("degenerate-frame floor:\n  {msg}"));
+                //
+                // vox-gpu-rewrite Stage 2 (2026-05-18): skipped in vox-e2e
+                // mode. The W5 GPU producer chain tiles the synthesised
+                // fixture across the entire fixed `(4096, 512, 4096)`-voxel
+                // world via `voxelPos % modelSize`, so the camera sees
+                // tiled geometry at every horizon — no dark "sky vs
+                // geometry" contrast. The dedicated vox_e2e geometry gate
+                // (`assert_vox_geometry_visible`) is the load-bearing
+                // check for this mode.
+                if !vox_e2e_mode {
+                    if let Err(msg) = fb.check_not_degenerate() {
+                        failures.push(format!("degenerate-frame floor:\n  {msg}"));
+                    }
                 }
                 // (3) Global luminance liveness gate — a large fraction of the
                 // frame must not be pitch black. Batch-aware threshold: 50%

@@ -53,6 +53,15 @@ use bevy::anti_alias::dlss::DlssProjectId;
 /// synchronously at `Startup` via [`voxel::vox_import::load_vox`]. `PathBuf` is
 /// not `Copy`, so this enum is now `Clone` only (the
 /// [`AppArgs`] / [`build_app_with_args`] surfaces propagate the move).
+///
+/// **vox-gpu-rewrite Stage 2 consolidation (2026-05-18):** both variants now
+/// always route through the C#-faithful fixed-world install path
+/// (`install_default_embedded_in_fixed_world` / `install_vox_in_fixed_world`).
+/// The old `tiles` field on `Vox` (driving CPU XZ-replication via
+/// `install_vox_sized_to_model`) is gone — the W5 GPU producer chain handles
+/// `voxelPos % modelSize` tiling on the device. The legacy sized-to-model
+/// install function is preserved only as a test-only oracle reachable from
+/// the `--vox-gpu-oracle` CPU-phase branch.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub enum GridPreset {
     /// The default scene: ground slab + axis-aligned boxes + a sphere + one
@@ -63,18 +72,8 @@ pub enum GridPreset {
     /// absolute). The file is read once at `Startup`; failure logs an error
     /// and falls back to [`GridPreset::Default`] so the e2e harness still has
     /// a renderable world. See `voxel/vox_import.rs`.
-    ///
-    /// `tiles`: N×N tiling factor in the XZ plane (default 1 = single load).
-    /// When `tiles > 1`, the parsed `.vox` content is replicated `tiles²`
-    /// times across the XZ plane, expanding the world to
-    /// `(tiles × tile_w, tile_h, tiles × tile_d)` chunks. This mirrors the C#
-    /// startup behaviour that loads multiple `Oasis_Hard_Cover.vox` instances
-    /// in a 4×4 grid; surfaced as a CLI affordance (`--vox-grid N`) rather
-    /// than the C# menu-driven multi-load. **Faithful in effect, divergent in
-    /// interface** — C# has no `--vox-grid` flag.
     Vox {
         path: std::path::PathBuf,
-        tiles: u32,
     },
 }
 
@@ -356,8 +355,9 @@ pub struct AppArgs {
     /// `vox-gpu-rewrite W5.3-fix Stage 1` — when `true`, the e2e driver runs
     /// the **vox-gpu-construction production-path gate**: load the Oasis VOX
     /// fixture through `install_vox_in_fixed_world`'s W5 GPU producer chain
-    /// (`fixed_world_size = true`, `gpu_construction_enabled = true`), pin
-    /// the camera to C#'s literal `(500, 200, 40)` voxel spawn
+    /// (Stage 2 consolidation 2026-05-18: the production install path is now
+    /// the ONLY install path; `gpu_construction_enabled = true` is the only
+    /// remaining knob), pin the camera to C#'s literal `(500, 200, 40)` voxel spawn
     /// (`WorldRender.cs:48-49`), capture frame A, dispatch a sphere brush
     /// directly in front of the camera, wait ~5 s for W2 / GI / TAA to
     /// converge, capture frame B, assert the per-pixel RGB Δ over a central
@@ -392,25 +392,6 @@ pub struct AppArgs {
     /// capture a single screenshot to `oracle_gpu.png`, then exit. See
     /// [`crate::e2e::vox_gpu_oracle`].
     pub vox_gpu_oracle_gpu_phase: bool,
-    /// `2026-05-17` — C#-faithful world initialisation. When `true`,
-    /// [`crate::voxel::grid::setup_test_grid`] always allocates the fixed
-    /// [`WORLD_SIZE_IN_CHUNKS`] world (`256×32×256` chunks = `4096×512×4096`
-    /// voxels) regardless of grid preset:
-    ///
-    /// - [`GridPreset::Default`] embeds the small primitive scene at the
-    ///   `(0, 0, 0)` corner of the full-size world — the rest is empty but
-    ///   editable (matches C#'s "world container is built, then `oasis.cvox`
-    ///   either loads or doesn't" behaviour at `WorldHandler.cs:29-35`).
-    /// - [`GridPreset::Vox`] auto-tiles the model in XZ using `voxelPos %
-    ///   modelSize` and leaves all `Y > 0` tiles empty — exactly what
-    ///   `generatorModel.fx:16-52` does on the GPU in C#. The `tiles` field
-    ///   of [`GridPreset::Vox`] is ignored in this mode.
-    ///
-    /// `false` (the default) preserves the legacy scene-sized behaviour the
-    /// e2e gates depend on (`crate::e2e::gates` derives its rectangles from
-    /// the small 64×32×64 voxel layout). `bevy-naadf::main` sets this `true`
-    /// always; e2e binaries leave it `false`.
-    pub fixed_world_size: bool,
 }
 
 impl Default for AppArgs {
@@ -430,9 +411,6 @@ impl Default for AppArgs {
             vox_gpu_construction_mode: false,
             vox_gpu_oracle_cpu_phase: false,
             vox_gpu_oracle_gpu_phase: false,
-            // Off by default — the e2e gates depend on the legacy small-world
-            // layout. `bevy-naadf::main` flips it on for the production binary.
-            fixed_world_size: false,
         }
     }
 }
@@ -893,10 +871,15 @@ fn spawn_phase_c_test_entity(
     entities.voxel_data = voxel_data;
     entities.voxel_data_generation = entities.voxel_data_generation.wrapping_add(1);
 
-    // Place at (30, 24, 30) — chunk (1,1,1) corner area, well above the
-    // ground slab + existing emissive blocks. Identity quaternion.
+    // Place at (30, 24, 30) RELATIVE TO THE SMALL DEFAULT-SCENE DEMO
+    // ORIGIN. vox-gpu-rewrite Stage 2 (2026-05-18): the demo now lives
+    // centered in the fixed `(4096, 512, 4096)`-voxel world, so the entity
+    // position must translate through `demo_origin_v` to land in the same
+    // relative spot the e2e camera frames.
+    let demo_off = crate::e2e::gates::demo_origin_v();
+    let entity_pos = demo_off + bevy::math::Vec3::new(30.0, 24.0, 30.0);
     entities.instances = vec![EntityInstance {
-        position: bevy::math::Vec3::new(30.0, 24.0, 30.0),
+        position: entity_pos,
         quaternion: [0.0, 0.0, 0.0, 1.0],
         voxel_start: 0,
         entity: 0,
@@ -904,8 +887,10 @@ fn spawn_phase_c_test_entity(
     }];
 
     info!(
-        "phase-c wave-3 — spawned fixture entity: 4×4×4 green-emissive @ (30, 24, 30); \
-         voxel_data {} u32s",
+        "phase-c wave-3 — spawned fixture entity: 4×4×4 green-emissive @ {:?} \
+         (demo-relative (30, 24, 30) + demo origin {:?}); voxel_data {} u32s",
+        entity_pos,
+        demo_off,
         entities.voxel_data.len()
     );
 }

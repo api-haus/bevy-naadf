@@ -91,19 +91,29 @@ pub const SMALL_EDIT_DRAIN_FRAMES: u32 = 16;
 /// `crate::editor::tools::tests`).
 pub const SMALL_EDIT_RADIUS: f32 = 1.0;
 
-/// World-space click position — voxel `(32, 29, 32)` centre at world
-/// coords `(32.5, 29.5, 32.5)`. This is **directly above the world XZ
-/// centre** so it projects to the framebuffer centre under the
-/// birdseye camera (simplifying the rect-placement math). y=29 sits
-/// above every fixture in the default grid: ground slab tops at y=2,
-/// tallest tower y=26, BOX_A y=20, BOX_B y=16, tallest emissive y=28
-/// (warm cube ymax=28), spheres top at y~19. The sphere at (30,11,30)
-/// r=8 has distance √(4+324+4)≈18.2 from (32,29,32) → outside. World
-/// ceiling y=31. The position is empty pre-edit and surrounded by
-/// empty cells in every direction.
+/// World-space click position — small-world-relative voxel `(32, 29, 32)`.
+/// The default-scene demo's local centre at y=29 sits above every fixture
+/// (ground slab tops at y=2, tallest tower y=26, BOX_A y=20, BOX_B y=16,
+/// tallest emissive y=28 — warm cube ymax=28). The sphere at (30,11,30)
+/// r=8 has distance √(4+324+4)≈18.2 from (32,29,32) → outside. Demo
+/// ceiling y=31. The position is empty pre-edit and surrounded by empty
+/// cells in every direction.
+///
+/// **vox-gpu-rewrite Stage 2 (2026-05-18):** the demo is now embedded at
+/// the centre of the fixed `(4096, 512, 4096)`-voxel world; callers
+/// translate this small-world-local coord through
+/// [`crate::e2e::gates::demo_origin_v`] to get the world-space click voxel.
 ///
 /// See `voxel/grid.rs::build_default_volume`.
 pub const SMALL_EDIT_CLICK_VOXEL: IVec3 = IVec3::new(32, 29, 32);
+
+/// World-space click voxel — [`SMALL_EDIT_CLICK_VOXEL`] translated by the
+/// demo origin offset.
+pub fn small_edit_click_voxel_world() -> IVec3 {
+    use crate::e2e::gates::demo_origin_v;
+    let off = demo_origin_v();
+    SMALL_EDIT_CLICK_VOXEL + IVec3::new(off.x as i32, off.y as i32, off.z as i32)
+}
 
 /// The non-empty type id painted at the click voxel. Matches
 /// `TY_EMISSIVE_MAGENTA = VoxelTypeId(12)` — a bright magenta emissive
@@ -212,17 +222,30 @@ pub fn run_small_edit_visual() -> AppExit {
 // ---------------------------------------------------------------------------
 
 /// Birdseye over the test grid centered on the click voxel.
-/// Default grid is 64×32×64 voxels. Camera at `(click.x, ceiling+50,
-/// click.z)` looking straight down at the click voxel centre. With +X
-/// as the up-reference vector, screen-space +Y maps to world +X and
-/// screen-space +X maps to world +Z (the standard look_at with `up=+X`
-/// pinning). The click voxel projects to the framebuffer centre.
-pub fn birdseye_pose(world_size_voxels: [u32; 3]) -> Transform {
-    let click = SMALL_EDIT_CLICK_VOXEL;
-    let cx = click.x as f32 + 0.5;
-    let cz = click.z as f32 + 0.5;
-    let cy = click.y as f32 + 0.5;
-    let cam_y = world_size_voxels[1] as f32 + 50.0;
+///
+/// **vox-gpu-rewrite Stage 2 (2026-05-18):** the camera is pinned to the
+/// **demo's top + 50** rather than the full fixed-world top + 50 — the
+/// demo is 64×32×64 voxels embedded in the centre of the
+/// `(4096, 512, 4096)`-voxel container; framing the projected 1-voxel
+/// edit against the full-world top would put the camera ~530 voxels above
+/// the click and dilute the projection to sub-pixel. The demo-relative
+/// altitude keeps the projection at the same screen size as the legacy
+/// small-world layout.
+///
+/// Camera at `(click.x, demo_top+50, click.z)` looking straight down at
+/// the click voxel centre. With +X as the up-reference vector,
+/// screen-space +Y maps to world +X and screen-space +X maps to world +Z
+/// (the standard look_at with `up=+X` pinning). The click voxel projects
+/// to the framebuffer centre.
+pub fn birdseye_pose() -> Transform {
+    let click_world = small_edit_click_voxel_world();
+    let cx = click_world.x as f32 + 0.5;
+    let cz = click_world.z as f32 + 0.5;
+    let cy = click_world.y as f32 + 0.5;
+    // Demo Y extent is `crate::voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[1] * 16`
+    // = 32 voxels; the demo embed sits at Y=0..32 inside the fixed world.
+    let demo_top_y = crate::voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[1] as f32 * 16.0;
+    let cam_y = demo_top_y + 50.0;
     Transform::from_xyz(cx, cam_y, cz).looking_at(Vec3::new(cx, cy, cz), Vec3::X)
 }
 
@@ -243,7 +266,7 @@ pub fn pin_small_edit_camera(
     if size_v.x == 0 || size_v.y == 0 || size_v.z == 0 {
         return;
     }
-    let pose = birdseye_pose([size_v.x, size_v.y, size_v.z]);
+    let pose = birdseye_pose();
     let (transform, position_split) = &mut *camera;
     **transform = pose;
     **position_split = PositionSplit::from_world(pose.translation);
@@ -253,23 +276,32 @@ pub fn pin_small_edit_camera(
 // CPU snapshot helper
 // ---------------------------------------------------------------------------
 
-/// Count non-empty voxels in `WorldData` by walking the chunks/blocks/
-/// voxels CPU mirror. Avoids touching the GPU side. O(voxels). For the
-/// default 64×32×64 grid, ~131k iterations — sub-millisecond.
+/// Count non-empty voxels in the demo embed region of `WorldData` by
+/// walking the chunks/blocks/voxels CPU mirror. Avoids touching the GPU
+/// side. O(demo voxels) — fixed cost regardless of world container size.
+///
+/// **vox-gpu-rewrite Stage 2 (2026-05-18):** scoped to the demo embed
+/// (~131k iterations) rather than the full fixed `(4096, 512, 4096)`-voxel
+/// world (~8.5G iterations — multi-second per call). The +1 edit lands
+/// inside the demo embed so the scoped count is the load-bearing signal.
 ///
 /// **Mode 2 detection mechanism**: A correct single-voxel edit increments
 /// this count by exactly 1; a phantom-emitting encoder would increment it
 /// by 3 (the user's report) or some other off-by-N value.
 pub fn count_non_empty_voxels(world_data: &WorldData) -> u64 {
-    let size_v = world_data.size_in_chunks * (CELL_DIM as u32 * CELL_DIM as u32);
-    let sx = size_v.x as i32;
-    let sy = size_v.y as i32;
-    let sz = size_v.z as i32;
+    use crate::e2e::gates::demo_origin_v;
+    use crate::voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS;
+    let off = demo_origin_v();
+    let off_x = off.x as i32;
+    let off_z = off.z as i32;
+    let demo_sx = (DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[0] * 16) as i32;
+    let demo_sy = (DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[1] * 16) as i32;
+    let demo_sz = (DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[2] * 16) as i32;
     let mut count = 0u64;
-    for z in 0..sz {
-        for y in 0..sy {
-            for x in 0..sx {
-                let p = IVec3::new(x, y, z);
+    for z in 0..demo_sz {
+        for y in 0..demo_sy {
+            for x in 0..demo_sx {
+                let p = IVec3::new(off_x + x, y, off_z + z);
                 if let Some(t) = world_data.get_voxel_type(p) {
                     if t != VoxelTypeId::EMPTY {
                         count += 1;
@@ -298,7 +330,9 @@ pub fn apply_small_cube_edit(
     let count_before = count_non_empty_voxels(world_data);
     state.voxel_count_before = Some(count_before);
 
-    let click = SMALL_EDIT_CLICK_VOXEL;
+    // vox-gpu-rewrite Stage 2: click voxel is the demo-relative coord
+    // translated through `demo_origin_v` to its world-space location.
+    let click = small_edit_click_voxel_world();
     let pre_type = world_data.get_voxel_type(click);
     println!(
         "e2e_render --small-edit-visual: pre-edit voxel at {:?} has type {:?}, \
@@ -484,9 +518,9 @@ pub fn assert_small_edit_landed(
     if voxel_count_after != voxel_count_before + 1 {
         return Err(format!(
             "small-edit-visual gate FAIL — Mode 2 detected (phantom voxels). \
-             Single-voxel cube_brush (radius=1.0) at {:?} should produce +1 \
-             non-empty voxel; CPU snapshot shows count {voxel_count_before} → \
-             {voxel_count_after} (Δ={}). \
+             Single-voxel cube_brush (radius=1.0) at {:?} (demo-relative \
+             {:?}) should produce +1 non-empty voxel; CPU snapshot shows count \
+             {voxel_count_before} → {voxel_count_after} (Δ={}). \
              Most likely sites: \
              - `aadf::cell::pack_voxels` / `unpack_voxel` (the 2-voxels-per-u32 \
              packing logic), \
@@ -495,6 +529,7 @@ pub fn assert_small_edit_landed(
              - `aadf::edit::process_edit_batch` (the block-uniformity check \
              might be mis-classifying empty-with-flag voxels). \
              See `03g-impl-small-edit-fix.md` `## Root cause(s)` for diagnosis.",
+            small_edit_click_voxel_world(),
             SMALL_EDIT_CLICK_VOXEL,
             (voxel_count_after as i64 - voxel_count_before as i64),
         ));
@@ -510,8 +545,12 @@ pub fn assert_small_edit_landed(
             after.height(),
         ));
     }
-    let (click_rect, neg_x, pos_x, neg_z, pos_z) =
-        click_voxel_rects(before.width(), before.height(), world_size_voxels, SMALL_EDIT_CLICK_VOXEL);
+    let (click_rect, neg_x, pos_x, neg_z, pos_z) = click_voxel_rects(
+        before.width(),
+        before.height(),
+        world_size_voxels,
+        small_edit_click_voxel_world(),
+    );
 
     // Max delta in the click rect — catches "the voxel landed" with
     // single-pixel resolution (cleaner than mean for small projections).

@@ -27,12 +27,11 @@ use bevy::prelude::AppExit;
 use bevy_naadf::{build_app_with_args, AppArgs, AppConfig, GridPreset};
 
 fn main() -> AppExit {
+    // vox-gpu-rewrite Stage 2 consolidation (2026-05-18): the production
+    // binary and every e2e gate route through the SAME C#-faithful fixed-
+    // size world install path. `AppArgs::fixed_world_size` is gone; there's
+    // no per-binary divergence to configure.
     let mut args = AppArgs::default();
-    // Production binary is always C#-faithful — fixed-size world container,
-    // model auto-tiling, identical to `WorldHandler.cs:29-35`. The e2e harness
-    // leaves this `false` because its luminance gates are tuned to the legacy
-    // small-world layout.
-    args.fixed_world_size = true;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
@@ -40,10 +39,6 @@ fn main() -> AppExit {
         if let Some(path) = argv.get(idx + 1) {
             args.grid_preset = GridPreset::Vox {
                 path: std::path::PathBuf::from(path),
-                // `tiles` is ignored when `fixed_world_size = true` — the
-                // loader fills the fixed-size world via `voxelPos %
-                // modelSize` instead. Set to 1 for the resource shape.
-                tiles: 1,
             };
         } else {
             eprintln!("error: --vox flag requires a path argument");

@@ -26,19 +26,21 @@
 //! `e2e_render` binary:
 //!
 //! 1. **CPU oracle phase** (`--vox-gpu-oracle-cpu`): boots the e2e harness
-//!    with `GridPreset::Vox { path: oasis, tiles: 1 }` + `fixed_world_size =
-//!    false`, which triggers `install_vox_sized_to_model` — the world is
-//!    sized to the model's natural `93×34×84` chunks (`1488×544×1344`
-//!    voxels). Camera is pinned to a fixed pose **inside the world at Y <
-//!    512** so the CPU and GPU phases sample the same voxel volume. A single
-//!    screenshot is saved to `target/e2e-screenshots/oracle_cpu.png`.
+//!    with `GridPreset::Vox { path: oasis }` + `vox_gpu_oracle_cpu_phase =
+//!    true`, the SOLE test-only escape hatch in `setup_test_grid` that
+//!    routes to the legacy `install_vox_sized_to_model` CPU loader — the
+//!    world is sized to the model's natural `93×34×84` chunks
+//!    (`1488×544×1344` voxels). Camera is pinned to a fixed pose **inside
+//!    the world at Y < 512** so the CPU and GPU phases sample the same
+//!    voxel volume. A single screenshot is saved to
+//!    `target/e2e-screenshots/oracle_cpu.png`.
 //!
 //! 2. **GPU phase** (`--vox-gpu-oracle-gpu`): boots the e2e harness with
-//!    `GridPreset::Vox { path: oasis, tiles: 1 }` + `fixed_world_size = true`
-//!    + `gpu_construction_enabled = true`, which triggers
-//!    `install_vox_in_fixed_world` — the world is the fixed `256×32×256`
-//!    chunks (`4096×512×4096` voxels); the W5 GPU producer chain tiles Oasis
-//!    in XZ with `voxelPos % modelSize` and clamps Y > 0 tiles to empty.
+//!    `GridPreset::Vox { path: oasis }` (no oracle-CPU-phase flag) — the
+//!    production install path `install_vox_in_fixed_world`. The world is
+//!    the fixed `256×32×256` chunks (`4096×512×4096` voxels); the W5 GPU
+//!    producer chain tiles Oasis in XZ with `voxelPos % modelSize` and
+//!    clamps Y > 0 tiles to empty.
 //!    Camera is pinned to **the exact same world voxel coordinates** as the
 //!    CPU phase. Because the chosen camera coords sit inside the **first XZ
 //!    tile** (`x ∈ [0, 1488)`, `z ∈ [0, 1344)`) and **at Y < 512**, the
@@ -272,13 +274,13 @@ pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
     );
 
     let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path, tiles: 1 };
-    // The legacy CPU path: `fixed_world_size = false` triggers
-    // `install_vox_sized_to_model` which sizes the world to the model. GPU
-    // construction is irrelevant on this path (the world is built from CPU
-    // `chunks_cpu/blocks_cpu/voxels_cpu` data the parser produces); leave it
-    // at its default `true` so neither phase deviates from default config.
-    app_args.fixed_world_size = false;
+    app_args.grid_preset = crate::GridPreset::Vox { path };
+    // vox-gpu-rewrite Stage 2 (2026-05-18): `fixed_world_size` is gone;
+    // `setup_test_grid`'s only test-only escape hatch is
+    // `vox_gpu_oracle_cpu_phase`, which routes to the legacy
+    // `install_vox_sized_to_model` CPU oracle. This is the SOLE remaining
+    // call site of the sized-to-model path and exists specifically so the
+    // oracle gate can compare CPU vs W5 GPU output.
     app_args.vox_gpu_oracle_cpu_phase = true;
     crate::run_e2e_render_with_args(app_args)
 }
@@ -315,8 +317,11 @@ pub fn run_vox_gpu_oracle_gpu_phase() -> AppExit {
     );
 
     let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path, tiles: 1 };
-    app_args.fixed_world_size = true;
+    app_args.grid_preset = crate::GridPreset::Vox { path };
+    // vox-gpu-rewrite Stage 2 (2026-05-18): the production install path
+    // (no oracle-CPU-phase flag) — `install_vox_in_fixed_world` + W5 GPU
+    // producer chain. GPU construction default-on; explicit assignment
+    // for belt-and-braces.
     app_args.construction_config.gpu_construction_enabled = true;
     app_args.vox_gpu_oracle_gpu_phase = true;
     crate::run_e2e_render_with_args(app_args)

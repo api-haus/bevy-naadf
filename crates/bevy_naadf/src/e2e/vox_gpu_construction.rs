@@ -221,13 +221,16 @@ pub fn run_vox_gpu_construction() -> AppExit {
     );
 
     let mut app_args = crate::AppArgs::default();
-    // Production W5 path: fixed-size world + GPU construction default-on
-    // (= the `bevy-naadf::main` shape, per `lib.rs:393` + `:143`).
+    // Production W5 path: the only install path. vox-gpu-rewrite Stage 2
+    // (2026-05-18) destroyed `fixed_world_size` — `setup_test_grid` always
+    // routes `GridPreset::Vox` through `install_vox_in_fixed_world`. The
+    // GPU construction default-on (`ConstructionConfig::default()` →
+    // `gpu_construction_enabled = true`) keeps the W5 producer chain
+    // active; the explicit assignment below is a belt-and-braces guard
+    // against a future default flip.
     app_args.grid_preset = crate::GridPreset::Vox {
         path: PathBuf::from(&app_path_for_args(&path)),
-        tiles: 1,
     };
-    app_args.fixed_world_size = true;
     app_args.construction_config.gpu_construction_enabled = true;
     // Route through the Oasis brush-edit driver flow. The driver's
     // `OasisWarmup` fast-path triggers when EITHER `oasis_edit_visual_mode`

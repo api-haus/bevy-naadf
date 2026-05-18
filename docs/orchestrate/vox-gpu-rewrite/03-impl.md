@@ -3215,3 +3215,271 @@ speckle-class residual (per `--vox-gpu-oracle` per-pixel ceiling) is a
 separate diagnostic surface and does NOT block Stage 2 on the
 Stage-10-scope success criterion, though the user may want to clear it
 before legacy removal.
+
+## impl Stage 2 — single-pathway consolidation (2026-05-18)
+
+Per user directive (verbatim): "cpu path shant be removed - useful as
+oracle and the test that compares cpu-gpu must live ... however ability to
+configure CPU path when running e2e tests - should not ... e2e test should
+ALWAYS go the same route as main - to the point that even an option of
+not going there must be destroyed". Stage 2 deletes the configurable
+runtime knobs that previously let e2e gates pick a different install
+path than the production binary; the CPU oracle helpers stay reachable
+only via the dedicated `--vox-gpu-oracle` test (test-only escape hatch).
+
+### Files touched
+
+**Production scope**:
+
+- `crates/bevy_naadf/src/lib.rs`
+  - `AppArgs::fixed_world_size` field + default removed.
+  - `GridPreset::Vox::tiles` field removed.
+  - `GridPreset` enum docstring updated.
+  - `spawn_phase_c_test_entity` entity position now translated through
+    `e2e::gates::demo_origin_v` so the entity lands in the centered demo
+    embed (was small-world-relative `(30, 24, 30)`; now world-space
+    `(2046, 24, 2046)`).
+- `crates/bevy_naadf/src/main.rs`
+  - `args.fixed_world_size = true` line deleted (the field no longer
+    exists; the install path is now unconditional).
+  - `--vox` flag's `GridPreset::Vox { tiles: 1 }` simplified to
+    `{ path }`. (No `--vox-grid N` CLI flag was ever parsed; only the
+    docstrings + struct field referenced it.)
+- `crates/bevy_naadf/src/voxel/grid.rs`
+  - `setup_test_grid` dispatch ladder removed; always routes
+    `Default → install_default_embedded_in_fixed_world`,
+    `Vox → install_vox_in_fixed_world`, with a SOLE test-only escape
+    hatch: when `args.vox_gpu_oracle_cpu_phase == true`, route
+    `Vox → install_vox_sized_to_model` instead (the CPU oracle).
+  - `install_default_small_world` deleted (the only legacy caller was
+    the dispatch ladder; the small world is no longer reachable as a
+    runtime path).
+  - `install_vox_sized_to_model` lost its `tiles: u32` parameter (always
+    1 now; the CPU oracle helper isn't a tiling configuration knob),
+    docstring updated to "CPU oracle only".
+  - `DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS` const exposed as `pub` so the
+    e2e gates module can compute the demo embed offset.
+- `crates/bevy_naadf/src/voxel/vox_import.rs`
+  - Deleted: `load_vox_into_world`, `parse_dot_vox_data_into_world`,
+    `tile_buckets_into_world` (W5.4 deletion list per
+    `00-reuse-audit.md` §W5.4).
+  - Deleted: tests `into_world_tiles_xz_and_leaves_y_above_tile_empty`,
+    `into_world_with_target_smaller_than_tile_clips`.
+  - Retained: `load_vox_tiled`, `parse_dot_vox_data_tiled`,
+    `replicate_buckets_xz`, `build_world_from_vox` (CPU oracle path).
+    Docstrings updated to flag oracle-only status.
+
+**E2e gate scope** (every gate routes through the production W5 install
+path now; the configurable-CPU branch is gone):
+
+- `crates/bevy_naadf/src/e2e/gates.rs`
+  - Added `demo_origin_v()` helper computing the demo embed XZ offset
+    `((WORLD-DEMO)/2, 0, (WORLD-DEMO)/2) = (2016, 0, 2016)`.
+  - Added `e2e_look_target_world()` helper for the world-space look
+    target.
+  - `e2e_camera_transform` / `e2e_motion_start_transform` /
+    `e2e_orbit_camera_transform` / `e2e_resize_test_camera_transform`
+    all retranslated to frame the demo at its world-space embed offset.
+    The relative-to-target framing is preserved bit-identically; gate
+    fractional rects auto-adjust.
+- `crates/bevy_naadf/src/e2e/driver.rs`
+  - `check_not_degenerate` skipped in `vox_e2e_mode`. The W5 GPU
+    producer tiles the synthesised fixture across the entire fixed
+    world via `voxelPos % modelSize`, so every horizon pixel sees tiled
+    geometry (no sky vs geometry contrast). The dedicated
+    `assert_vox_geometry_visible` gate is the load-bearing check for
+    that mode.
+- `crates/bevy_naadf/src/e2e/vox_e2e.rs`
+  - `app_args.fixed_world_size = false` removed; gate routes through
+    `install_vox_in_fixed_world` (the production W5 path).
+  - `GridPreset::Vox { tiles }` field removed in call site.
+- `crates/bevy_naadf/src/e2e/oasis_edit_visual.rs`
+  - `GridPreset::Vox { tiles }` field removed; runs the production W5
+    path. Camera birdseye + brush position untouched — both are computed
+    from `WorldData.size_in_chunks` which is now the fixed
+    `(256, 32, 256)` chunks (= `(4096, 512, 4096)` voxels). Centre voxel
+    `(2048, 256, 2048)` is comfortably inside the W5-tiled Oasis volume.
+- `crates/bevy_naadf/src/e2e/small_edit_visual.rs`
+  - `SMALL_EDIT_CLICK_VOXEL` kept as small-world-relative `(32, 29, 32)`;
+    new helper `small_edit_click_voxel_world()` translates through
+    `demo_origin_v` to world-space `(2048, 29, 2048)`.
+  - `birdseye_pose` rewritten to compute the camera Y as
+    `demo_top_y + 50 = 82` instead of `world_top_y + 50 = 562` — pinning
+    the camera at the legacy "50 voxels above the demo" altitude so the
+    single-voxel projection has the same screen footprint.
+  - `count_non_empty_voxels` scoped to the demo embed bounds (the +1
+    edit lands inside the demo). Avoids the ~8.5G iterations the
+    naive full-fixed-world walk would cost per snapshot.
+- `crates/bevy_naadf/src/e2e/small_edit_repro.rs`
+  - `GridPreset::Vox { tiles }` field removed; gate routes through W5
+    (user-captured camera + brush coords are absolute world voxels and
+    fall within the first XZ tile so the W5 tiling collapses to
+    identity at that position).
+- `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs`
+  - `app_args.fixed_world_size = true` line removed (field is gone;
+    install path is unconditional). `GridPreset::Vox { tiles }` field
+    removed.
+- `crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs`
+  - CPU phase: `app_args.fixed_world_size = false` replaced by
+    `app_args.vox_gpu_oracle_cpu_phase = true` (the new SOLE escape
+    hatch in `setup_test_grid` routes to `install_vox_sized_to_model`
+    when this flag is set). The flag is a phase marker, not a path
+    configuration knob.
+  - GPU phase: `app_args.fixed_world_size = true` removed (default is
+    now the only install path). `GridPreset::Vox { tiles }` field
+    removed.
+  - Module docstring updated to reflect the new escape-hatch shape.
+
+### Deletions confirmed
+
+- `AppArgs::fixed_world_size` — destroyed (field + default + all
+  references — verified `grep -r "fixed_world_size" crates/bevy_naadf`
+  returns nothing in source code).
+- `--vox-grid N` CLI flag — destroyed. (No CLI parser ever read it; the
+  flag was only ever a comment + `GridPreset::Vox::tiles` field. The
+  field is destroyed below.)
+- `GridPreset::Vox::tiles: u32` — destroyed.
+- `setup_test_grid` dispatch ladder on `fixed_world_size` — destroyed
+  (now a single branch on `vox_gpu_oracle_cpu_phase` for the test-only
+  CPU oracle escape).
+- `vox_import::load_vox_into_world` — destroyed.
+- `vox_import::parse_dot_vox_data_into_world` — destroyed.
+- `vox_import::tile_buckets_into_world` — destroyed.
+- Tests `into_world_tiles_xz_and_leaves_y_above_tile_empty` +
+  `into_world_with_target_smaller_than_tile_clips` — destroyed.
+- `voxel::grid::install_default_small_world` — destroyed (unreachable
+  after the dispatch ladder removal; baseline gates now route through
+  `install_default_embedded_in_fixed_world` with the demo embedded at
+  the fixed-world centre).
+
+### E2e gate retargeting — camera / assertion adjustments
+
+| Gate | Retargeting required | What changed |
+|---|---|---|
+| `--baseline` / `--edit-mode` / `--entities` / `--runtime-edit-mode` | Camera poses retranslated by `demo_origin_v` | `gates::e2e_camera_transform` + 3 friends now `demo_origin_v + (legacy_offset)`; fractional rects unchanged. |
+| `--validate-gpu-construction[-scaled\|-production]` | None | Already self-contained — boots its own render world with a deterministic small fixture. |
+| `--vox-e2e` | Slot 1 kept emissive (gate's `assert_vox_geometry_visible` still expects > 160 luminance — passes at 250); `check_not_degenerate` skipped in vox_e2e mode (W5 tiling fills the whole frame so the dark-vs-bright contrast check would trip on legitimate tiled geometry). | Fixture unchanged. Driver bypasses degenerate-frame check when `vox_e2e_mode`. |
+| `--oasis-edit-visual` | None (the gate already used WorldData.size_in_chunks for world bounds; centre voxel (2048, 256, 2048) sits in the W5-tiled Oasis volume — brush erases at world centre and the rect Δ floor is met). | Just dropped the `fixed_world_size = false` line. |
+| `--small-edit-visual` | Click voxel translated to world-space via `small_edit_click_voxel_world()`; camera pinned at `demo_top + 50` not `world_top + 50` so projection scale matches legacy; `count_non_empty_voxels` scoped to demo embed. | See `e2e/small_edit_visual.rs` for the three helpers' shape changes. |
+| `--small-edit-repro` | Just dropped the `GridPreset::Vox { tiles }` field; camera + brush coords are absolute world voxels untouched. | See FLAGGED gate below. |
+| `--vox-gpu-construction` | Just dropped `fixed_world_size = true`; install path is unconditional. | Camera + sweep + assertion unchanged. |
+| `--vox-gpu-oracle` | CPU phase routed through new `vox_gpu_oracle_cpu_phase` escape hatch (the only test-only branch in `setup_test_grid`). GPU phase is the production install path. | See FLAGGED gate below. |
+
+### Verification — full e2e suite
+
+- `cargo build --workspace` — PASS
+- `cargo test --workspace --lib` — PASS (196 passed, 1 ignored;
+  baseline was 198 — the two deleted tiling tests account for the −2).
+- `--baseline`: PASS (region luminance emissive 247.6, solid 243.7, sky
+  202.9 — same shape as pre-Stage-2; per-batch region gate green
+  through camera motion).
+- `--validate-gpu-construction`: PASS (388 bytes byte-equal to CPU
+  oracle).
+- `--validate-gpu-construction-scaled`: PASS (every fixture
+  byte-equal).
+- `--validate-gpu-construction-production`: PASS (25/25 byte-correct
+  voxels[] readback post-producer + post-bounds).
+- `--vox-e2e`: PASS (region luminance 250.5; degenerate-frame check
+  skipped per vox_e2e_mode branch).
+- `--vox-gpu-construction`: PASS (camera-sweep rect Δ = 87.58 over 8.0
+  floor; frame-A near-black count = 0 under 1% ceiling).
+- `--oasis-edit-visual`: PASS (rect Δ = 19.85 over 8.0 floor; full-frame
+  mean Δ = 4.44 — same shape as pre-Stage-2).
+- `--small-edit-visual`: PASS (CPU Δ = +1; click rect max-Δ = 18 over
+  15 floor; adj rects below 50 ceiling).
+- `--small-edit-repro`: **FAIL** — 411196 anomalously dark pixels
+  (19.8% of frame) added by the brush edit. See FLAG below.
+- `--vox-gpu-oracle`: **FAIL** — 4100 pixels with per-channel Δ > 16
+  (6.26%) over 1% ceiling. See FLAG below.
+- `--edit-mode`: PASS (1 set_voxel → 1 changed_chunks).
+- `--entities`: PASS (fixture entity at world (2046, 24, 2046) — demo-
+  centred, frame A 8 chunk_updates).
+- `--runtime-edit-mode`: PASS.
+
+### FLAGGED gates (pre-existing W5 residual; NOT caused by Stage 2)
+
+#### `--vox-gpu-oracle` — failing pre-Stage-2 at exactly the same metric
+
+Pre-Stage-2 run (verified by stashing Stage 2 changes + re-running):
+3971 pixels with Δ > 16 (6.06% of frame); mean Δ 3.249 well under 8.0
+floor.
+
+Post-Stage-2 run: 4100 pixels (6.26%); mean Δ 3.279 well under floor.
+
+This is the residual ~6% speckle the Stage 11 fix flagged as a
+followup ("Per-pixel CEILING ... still exceeded at 3906 (5.96%) —
+secondary smaller-class bug remains" per orchestration README's
+Stage 11 line). The user explicitly accepted this residual when
+dispatching Stage 2 ("if visually clean, dispatch Stage 2
+consolidation + file residual speckle as followup"). The gate's
+intent is preserved post-consolidation — the CPU-vs-GPU comparison
+still works exactly as before.
+
+**Proposal**: keep the gate; the residual speckle is the documented
+followup tracker.
+
+#### `--small-edit-repro` — REGRESSED post-Stage-2 (legacy CPU → W5 path)
+
+Pre-Stage-2 (route through legacy `install_vox_sized_to_model` CPU
+path): PASS (dark-after = 0, no inversion).
+
+Post-Stage-2 (route through W5 GPU `install_vox_in_fixed_world` path):
+FAIL (411196 anomalously dark pixels = 19.8% of frame).
+
+The gate's *intent* is preserved on the W5 path: "single-voxel edits
+must not render as inverted dark shapes". The W5 path exhibits the
+inversion bug for the user-captured edit parameters. CPU verification
+(8/8 affected voxels correctly encoded) confirms the bug is renderer-
+side, not edit-side — the same shape as the `--vox-gpu-oracle`
+residual.
+
+**Hypothesis**: same residual ~6% speckle class as `--vox-gpu-oracle`,
+but spatially-concentrated around the brush edit instead of scattered
+because the edit invalidates a localised W3 AADF region that
+re-converges with the residual bug present. NOT a Stage 2 regression
+— it surfaces a pre-existing W5 path bug the legacy CPU path
+sidestepped.
+
+**Proposal**: keep the gate as-is. It correctly catches the inversion
+on the W5 path (the production path the user actually runs). The
+fix is the same as `--vox-gpu-oracle` residual fix — a Stage 12+
+followup. If the user wants `--small-edit-repro` to pass before the
+followup lands, the option is to skip it explicitly with a comment
+pointing at the followup. **I recommend keeping it failing** so the
+followup work has a hard gate to land against.
+
+### Surprises
+
+1. **`spawn_phase_c_test_entity` needed retranslation too.** Entity
+   position was hardcoded at small-world-relative `(30, 24, 30)` — the
+   `--entities` gate's `entity_pixel_rect` is calibrated to where this
+   projects under the small-world e2e camera. After demo embed
+   centring, the entity needed to translate to `demo_origin_v +
+   (30, 24, 30) = (2046, 24, 2046)` so the camera (also retranslated)
+   still frames it at the same screen rect.
+2. **`check_not_degenerate` needed to gate on `vox_e2e_mode`.** The
+   synthesised vox-e2e fixture tiles across the entire fixed world
+   under W5's `voxelPos % modelSize`, so every horizon pixel sees
+   geometry — no dark sky for the contrast check. The dedicated
+   `assert_vox_geometry_visible` gate is the load-bearing intent for
+   that mode; skipping the generic degenerate-frame check in vox_e2e
+   mode is the right call.
+3. **`install_default_small_world` was entirely dead after the dispatch
+   ladder removal.** No e2e gate had a config knob to reach it — every
+   `fixed_world_size = false` call site was either:
+   (a) the production binary (was overriding to `true`), or
+   (b) an e2e gate (was leaving the default `false`).
+   With the field gone, both routes are unified at
+   `install_default_embedded_in_fixed_world`. The dead function +
+   ~50 LOC has been deleted.
+
+### Stage 2 consolidation summary
+
+The dispatch ladder is destroyed. The production binary and every e2e
+gate route through the SAME C#-faithful fixed-world install path; the
+sole remaining branch is a test-only escape hatch in `setup_test_grid`
+for the `--vox-gpu-oracle` CPU phase, which exists specifically so the
+CPU-vs-GPU comparison gate can invoke both paths within its harness
+(per user directive: "test that compares cpu-gpu must live"). 11 / 13
+e2e gates PASS; 2 FAIL on residual W5 issues that pre-date Stage 2 +
+are tracked as Stage 12+ followups.

@@ -175,28 +175,15 @@ pub fn load_vox(path: impl AsRef<Path>) -> Result<ImportedVox, VoxImportError> {
 
 /// Convenience: load a `.vox` file from disk via `std::fs::read` + parse with
 /// `tiles × tiles` XZ tiling applied. `tiles == 1` is equivalent to
-/// [`load_vox`]. Mirrors C#'s startup behaviour that loads multiple
-/// `Oasis_Hard_Cover.vox` instances in a 4×4 grid; surfaced as a CLI
-/// affordance (`--vox-grid N`) rather than the C# menu-driven multi-load.
+/// [`load_vox`].
+///
+/// **vox-gpu-rewrite Stage 2 (2026-05-18):** retained as the CPU oracle
+/// helper for `--vox-gpu-oracle` only. The production install path uses the
+/// W5 GPU producer chain which tiles via `voxelPos % modelSize` on device;
+/// CPU XZ replication is no longer a runtime option.
 pub fn load_vox_tiled(path: impl AsRef<Path>, tiles: u32) -> Result<ImportedVox, VoxImportError> {
     let bytes = std::fs::read(path.as_ref())?;
     parse_vox_bytes_tiled(&bytes, tiles)
-}
-
-/// Load a `.vox` file and tile it into a fixed-size world of
-/// `target_world_chunks` chunks per axis.
-///
-/// C#-faithful production path (matches `WorldHandler.cs:29-35` +
-/// `generatorModel.fx:16-52`): the model auto-tiles in XZ via `voxelPos %
-/// modelSize`, and `Y > 0` tiles stay empty. Used by `bevy-naadf::main` when
-/// `AppArgs.fixed_world_size = true`.
-pub fn load_vox_into_world(
-    path: impl AsRef<Path>,
-    target_world_chunks: [u32; 3],
-) -> Result<ImportedVox, VoxImportError> {
-    let bytes = std::fs::read(path.as_ref())?;
-    let data = dot_vox::load_bytes(&bytes).map_err(VoxImportError::Parse)?;
-    parse_dot_vox_data_into_world(&data, target_world_chunks)
 }
 
 /// Convert a parsed `DotVoxData` into [`ImportedVox`].
@@ -208,18 +195,15 @@ pub fn parse_dot_vox_data(data: &dot_vox::DotVoxData) -> Result<ImportedVox, Vox
 }
 
 /// Convert a parsed `DotVoxData` into [`ImportedVox`] with `tiles × tiles`
-/// XZ tiling applied. `tiles == 1` is the canonical single-tile path. Higher
-/// values replicate the parsed content `tiles²` times across the XZ plane,
-/// expanding the world bounds to `(tiles × tile_w, tile_h, tiles × tile_d)`
-/// chunks. The C# reference (`Oasis_Hard_Cover.vox` at boot) loads a 4×4
-/// grid; the port surfaces this via `--vox-grid N`.
+/// XZ tiling applied. `tiles == 1` is the canonical single-tile path.
 ///
-/// **Faithful in effect, divergent in interface:** C# has no `--vox-grid`
-/// flag; it's a port-side CLI affordance equivalent to the C# startup-time
-/// multiple-load behaviour. The block-dedup HashMap naturally collapses
-/// every tile's identical-content blocks to the same `VoxelPtr` slot, so
-/// `voxels_cpu` grows by ~0× with tile count (only `chunks_cpu` and
-/// `blocks_cpu` scale, both `O(tiles²)`).
+/// **vox-gpu-rewrite Stage 2 (2026-05-18):** the production runtime path no
+/// longer exposes the tile count — `setup_test_grid` always passes 1 (the W5
+/// GPU producer chain handles the C#-faithful `voxelPos % modelSize` tiling
+/// across the fixed 256-chunk world). The `tiles > 1` branch is retained for
+/// the test corpus + the CPU oracle helpers and exercises the block-dedup
+/// HashMap (identical content across tiles collapses to the same `VoxelPtr`
+/// slot, so `voxels_cpu` grows by ~0× with tile count).
 pub fn parse_dot_vox_data_tiled(
     data: &dot_vox::DotVoxData,
     tiles: u32,
@@ -238,90 +222,6 @@ pub fn parse_dot_vox_data_tiled(
     let world = build_constructed_world_sparse(buckets)?;
     let palette = vox_palette_to_voxel_types(&data.palette, &data.materials);
     Ok(ImportedVox { world, palette })
-}
-
-/// Convert a parsed `DotVoxData` into [`ImportedVox`], tiling the model into
-/// a fixed-size world of `target_world_chunks` chunks per axis.
-///
-/// **C#-faithful production path** (`WorldHandler.cs:29-35` +
-/// `generatorModel.fx:16-52`): the world container is built at a fixed size
-/// independent of the model, and the model auto-tiles via `voxelPos %
-/// modelSize` in X and Z. `Y > 0` model-tiles are forced empty (matches the
-/// `if (modelIndexY > 0) type = 0;` guard at `generatorModel.fx:48-49`), so
-/// only the bottom Y-stripe of the fixed-size world is populated — the rest
-/// stays editable airspace.
-///
-/// Tile-count per axis: implicit, `target_world_chunks / tile_chunks` (integer
-/// division + one extra wrap to cover the world ceiling if it isn't an exact
-/// multiple). Block dedup downstream collapses every tile's identical-content
-/// blocks to the same `VoxelPtr` slot, so `voxels_cpu` grows by ~0× with tile
-/// count (only `chunks_cpu` and `blocks_cpu` scale).
-pub fn parse_dot_vox_data_into_world(
-    data: &dot_vox::DotVoxData,
-    target_world_chunks: [u32; 3],
-) -> Result<ImportedVox, VoxImportError> {
-    if data.models.is_empty() {
-        return Err(VoxImportError::Empty);
-    }
-    validate_caps(target_world_chunks)?;
-
-    let (tile_buckets, tile_size_in_chunks) = compose_to_sparse_world(data)?;
-    let buckets = tile_buckets_into_world(&tile_buckets, tile_size_in_chunks, target_world_chunks);
-    let world = build_constructed_world_sparse(buckets)?;
-    let palette = vox_palette_to_voxel_types(&data.palette, &data.materials);
-    Ok(ImportedVox { world, palette })
-}
-
-/// Tile `tile_buckets` (one tile's worth of sparse voxel data) into a
-/// fixed-size world of `target_world_chunks`. Mirrors C# `generatorModel.fx`:
-/// XZ auto-tile, `Y > 0` tiles forced empty.
-///
-/// **TODO (Phase-C W5):** the C# tiling runs on the GPU as
-/// `Content/shaders/world/generator/generatorModel.fx` (HLSL `cs_5_0`),
-/// dispatched per WorldGenSegment inside `WorldData.GenerateWorld`. This CPU
-/// loop is the stop-gap until W5 ports that shader to
-/// `generator_model.wgsl` + wires the per-segment dispatch chain through
-/// `ConstructionPlugin`. When W5 lands, the call site in `setup_test_grid`
-/// flips back to a `dense_voxel_types`-feeding install + a GPU dispatch, and
-/// this helper can be deleted.
-fn tile_buckets_into_world(
-    tile_buckets: &ChunkBuckets,
-    tile_size_in_chunks: [u32; 3],
-    target_world_chunks: [u32; 3],
-) -> ChunkBuckets {
-    let [tw, th, td] = tile_size_in_chunks;
-    let [ww, _wh, wd] = target_world_chunks;
-
-    let mut out = ChunkBuckets::new(target_world_chunks);
-    let tile_sx = tw as usize;
-    let tile_sy = th as usize;
-    let new_sx = ww as usize;
-    let new_sy = target_world_chunks[1] as usize;
-
-    // Y-stripe height capped at the tile's Y extent (`modelIndexY > 0` zeroed
-    // in C# `generatorModel.fx:48-49`). For Y >= th, the C# shader writes 0
-    // — we leave those buckets `None`, which yields all-empty chunks
-    // downstream.
-    let y_lim = th.min(target_world_chunks[1]);
-
-    for wcz in 0..wd {
-        let src_cz = (wcz % td) as usize;
-        for wcy in 0..y_lim {
-            let src_cy = wcy as usize;
-            for wcx in 0..ww {
-                let src_cx = (wcx % tw) as usize;
-                let src_idx = src_cx + src_cy * tile_sx + src_cz * tile_sx * tile_sy;
-                let Some(bucket) = tile_buckets.chunks[src_idx].as_ref() else {
-                    continue;
-                };
-                let dst_idx = (wcx as usize)
-                    + (wcy as usize) * new_sx
-                    + (wcz as usize) * new_sx * new_sy;
-                out.chunks[dst_idx] = Some(bucket.clone());
-            }
-        }
-    }
-    out
 }
 
 /// Replicate `tile_buckets` (a single `.vox` tile's worth of sparse voxel
@@ -1766,7 +1666,11 @@ mod tests {
         );
     }
 
-    // -- Test (v2 — tile feature) — `--vox-grid N` expands the world by N×N --
+    // -- Test (sparse XZ-tile feature) — replicate one tile N×N in XZ.
+    //
+    // vox-gpu-rewrite Stage 2 (2026-05-18): the runtime path no longer
+    // exposes a tile-count knob, but the helper is still reachable via the
+    // CPU oracle paths; this test pins block-dedup correctness across tiles.
 
     #[test]
     fn tiled_load_expands_world_xz_and_dedups_blocks() {
@@ -1826,65 +1730,4 @@ mod tests {
         );
     }
 
-    // -- Test (fixed-size world tiling — C#-faithful production path) ------
-
-    #[test]
-    fn into_world_tiles_xz_and_leaves_y_above_tile_empty() {
-        // Drive the small-cube fixture through the fixed-size-world path.
-        // The fixture is 8×8×8 voxels = 1×1×1 chunks after Z↔Y swap; tiling
-        // it into a 3×3×3-chunk target world should:
-        //   - fill every chunk at Y=0 with a copy of the tile,
-        //   - leave Y=1 and Y=2 chunks empty (C# `modelIndexY > 0 → 0`).
-        let data = build_small_cube();
-        let single = parse_dot_vox_data(&data).unwrap();
-        let target = [3u32, 3, 3];
-        let world = parse_dot_vox_data_into_world(&data, target).unwrap();
-
-        assert_eq!(world.world.size_in_chunks, target);
-
-        // Distinguished emissive voxel sits at NAADF (3,3,3) in the single
-        // tile. Check it shows up at the same offset within every X/Z tile
-        // at Y=0, and is absent at Y >= tile_chunks_y.
-        let tile_chunks_y = single.world.size_in_chunks[1];
-        let tile_w_voxels = single.world.size_in_chunks[0] * 16;
-        let tile_d_voxels = single.world.size_in_chunks[2] * 16;
-        let probe = decoded_voxel_at(&single.world, [3, 3, 3]);
-        assert_ne!(probe, VoxelTypeId::EMPTY, "fixture sanity");
-
-        // Bottom Y-stripe — tile repeats in X and Z.
-        for tz in 0..3u32 {
-            for tx in 0..3u32 {
-                let px = tx * tile_w_voxels + 3;
-                let pz = tz * tile_d_voxels + 3;
-                assert_eq!(
-                    decoded_voxel_at(&world.world, [px, 3, pz]),
-                    probe,
-                    "Y=0 tile ({tx},{tz}) should contain the emissive voxel"
-                );
-            }
-        }
-
-        // Above the tile's Y extent → empty (C# `modelIndexY > 0 → 0`).
-        let above_y = tile_chunks_y * 16 + 3;
-        assert_eq!(
-            decoded_voxel_at(&world.world, [3, above_y, 3]),
-            VoxelTypeId::EMPTY,
-            "Y-tiles above the model must be empty"
-        );
-    }
-
-    #[test]
-    fn into_world_with_target_smaller_than_tile_clips() {
-        // Sanity: a target world smaller than the tile should still parse,
-        // populating only the chunks that fit (the `wcx % tw` walk just
-        // accesses the first slice of the tile).
-        let data = build_small_cube();
-        let target = [1u32, 1, 1];
-        let world = parse_dot_vox_data_into_world(&data, target).unwrap();
-        assert_eq!(world.world.size_in_chunks, target);
-        assert_eq!(
-            decoded_voxel_at(&world.world, [3, 3, 3]),
-            decoded_voxel_at(&parse_dot_vox_data(&data).unwrap().world, [3, 3, 3]),
-        );
-    }
 }
