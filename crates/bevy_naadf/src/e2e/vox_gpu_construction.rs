@@ -88,43 +88,41 @@ use crate::e2e::oasis_edit_visual::{oasis_vox_fixture_path, OASIS_VOX_FIXTURE_PA
 // Camera poses — C#-faithful literal voxel coordinates
 // ---------------------------------------------------------------------------
 
-/// C# `WorldRender.cs:48-49` literal camera spawn scaled to the
-/// 4096×512×4096 fixed world (`camera/mod.rs::from_world_voxels`'s formula:
-/// `pos = (W * 500/1024, H * 200/128, D * 40/1024)`). For the 4096×512×4096
-/// world this evaluates to `(2000, 800, 160)` — Y=800 > ceiling 512 (above
-/// the world); the camera looks +Z down onto Oasis architecture, which is
-/// the SAME pose the production binary `bevy-naadf -- --vox <path>` uses
-/// (see `camera/mod.rs:101` runtime log "framing loaded world —
-/// pos=(2000.00, 800.00, 160.00)"). This is the view that REVEALS the
-/// inversion class of regression as scattered dark "hole" pixels through
-/// otherwise-intact Oasis architecture; the un-scaled literal
-/// `(500, 200, 40)` puts the camera INSIDE the world where the inversion
-/// is masked by uniform-block geometry (the W5.3-fix Stage 1 e2e pose;
-/// `06-diagnostic-inversion.md` thought camera A would reveal the
-/// inversion but empirically the inside-the-world pose does not — fixed
-/// at Stage 1.5).
-pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_A: Vec3 = Vec3::new(2000.0, 800.0, 160.0);
+/// C# `WorldRender.cs:48-49` literal camera spawn (`(500, 200, 40)` voxels).
+///
+/// vox-gpu-rewrite W5.3-fix Stage 1.5 (round-2 revert, 2026-05-18) —
+/// reverted from the scaled production-faithful `(2000, 800, 160)` Stage 1.5
+/// pose back to the LITERAL C# spawn at the user's explicit request. The
+/// Stage 1.5 move to `(2000, 800, 160)` was a goalpost-shift: the user
+/// reported that the production binary's rendering at the scaled pose
+/// still shows scattered missing voxels POST-FIX, and the prior agent's
+/// own measurement at the LITERAL C# pose `(500, 200, 40)` confirmed the
+/// near-black count did NOT change between pre-fix (35.25%) and post-fix
+/// (35.24%) — only 8 pixels of pure noise. The Stage 1.5 fix landed but
+/// did not actually fix the user-visible inversion. The gate's
+/// measurement MUST reflect what the user sees from the inside-world
+/// spawn, not a moved-goalpost camera above the world that hides the
+/// failure pattern. See
+/// `docs/orchestrate/vox-gpu-rewrite/07-diagnostic-inversion-round-2.md`.
+pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_A: Vec3 = Vec3::new(500.0, 200.0, 40.0);
 
-/// Camera A look-at target: framing forward (+Z) and tilting DOWN onto
-/// Oasis architecture (instead of the production binary's horizontal +Z).
-/// The downward tilt puts Oasis geometry into the central rect (where the
-/// per-pixel Δ assertion samples), making the Δ-vs-empty discriminator
-/// load-bearing for the gate.
+/// Camera A look-at target: forward `+Z` (same convention as
+/// `from_world_voxels`: identity rotation → look-at `pos + Vec3::Z`). The
+/// C# spawn looks straight forward (no downward tilt) — see
+/// `camera/mod.rs:62`.
 pub const VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A: Vec3 =
-    Vec3::new(2000.0, 200.0, 1160.0);
+    Vec3::new(500.0, 200.0, 41.0);
 
-/// Camera B — translated 800 voxels in the `+X` direction from camera A;
-/// still framing the Oasis fixture from above (Oasis's first XZ tile spans
-/// `0..1488 × 0..544 × 0..1344` voxels; both A and B Y=800 sit above the
-/// world's 512-voxel ceiling). The lateral translation sweeps architecture
-/// laterally through the frustum, producing a per-pixel Δ well above the
-/// TAA noise floor in a populated world; in an empty world both poses
-/// render uniform sky and the Δ collapses to near-zero.
-pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_B: Vec3 = Vec3::new(2800.0, 800.0, 160.0);
+/// Camera B — translated +Z deeper into the world from camera A (Oasis's
+/// stamped XZ tiling at the chunk-Y=0 layer means moving forward sweeps
+/// architecture through the frustum). +Z chosen instead of lateral +X so
+/// camera B also stays inside the world's 4096×512×4096 voxel extent at
+/// the C# spawn Y=200.
+pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_B: Vec3 = Vec3::new(500.0, 200.0, 200.0);
 
-/// Camera B look-at target: matched downward tilt with B's lateral offset.
+/// Camera B look-at target: matched forward `+Z` (identity rotation).
 pub const VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B: Vec3 =
-    Vec3::new(2800.0, 200.0, 1160.0);
+    Vec3::new(500.0, 200.0, 201.0);
 
 // ---------------------------------------------------------------------------
 // Diff threshold + bounding box fractions
