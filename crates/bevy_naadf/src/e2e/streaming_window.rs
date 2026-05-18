@@ -134,23 +134,65 @@ pub fn streaming_window_pose(walked: bool) -> Transform {
     Transform::from_translation(cam_pos).looking_at(look, Vec3::Y)
 }
 
+/// Translate an absolute-world Transform into the residency window-local frame
+/// by subtracting `origin * SEGMENT_VOXELS`. Returns the absolute Transform
+/// unchanged when `residency` is `None` (non-streaming presets).
+///
+/// Phase 2.5 follow-up to `03b-impl-residency.md`'s "Camera-to-window-coords
+/// translation" hand-off: the renderer treats the camera Transform as if it
+/// were already in window-local coords (it derives `chunks_buffer` indices via
+/// `camera_voxel / 16` against the *window-local* `(0..4096, 0..512, 0..4096)`
+/// AABB). The residency driver however maintains `origin` in absolute world
+/// segments — so without this translation, a residency shift breaks visible
+/// streaming (the renderer reads the wrong chunk slot).
+///
+/// Per Q1 of `01-context.md` ("Chunks are re-indexed into the resident window
+/// before upload. Camera uses the existing PositionSplit. No shader-side
+/// packing changes."), the fix is host-side: pre-translate the camera each
+/// frame so what the renderer sees is already window-local.
+///
+/// The translation is **stateless** — it reads `origin` from the live
+/// [`crate::streaming::Residency`] and re-derives the world-local Transform
+/// from the absolute pose every tick. No floating-point drift can accumulate
+/// across frames.
+pub(crate) fn translate_world_to_window_local(
+    world_pose: Transform,
+    residency: Option<&crate::streaming::Residency>,
+) -> Transform {
+    let Some(residency) = residency else {
+        return world_pose;
+    };
+    let origin_voxels = (residency.origin * crate::streaming::SEGMENT_VOXELS).as_vec3();
+    let mut local = world_pose;
+    local.translation -= origin_voxels;
+    local
+}
+
 /// `Update` system: pin the camera at Pose A or Pose B (selected via the
 /// `CAMERA_WALKED` latch). Wired only when
 /// `AppArgs.streaming_window_mode == true`. Runs `.after(e2e_driver)` so the
 /// pose write lands AFTER the driver's pose write but BEFORE
 /// `sync_position_split` consumes the transform.
+///
+/// Phase 2.5: applies the [`translate_world_to_window_local`] translation
+/// (gated on the presence of the `Residency` resource, which only exists for
+/// the streaming preset) so the renderer reads the correct
+/// `chunks_buffer[…]` slot after a residency-origin shift.
 pub fn pin_streaming_window_camera(
     args: Option<Res<crate::AppArgs>>,
+    residency: Option<Res<crate::streaming::Residency>>,
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
 ) {
     let Some(args) = args else { return; };
     if !args.streaming_window_mode {
         return;
     }
-    let pose = streaming_window_pose(camera_has_walked());
+    let world_pose = streaming_window_pose(camera_has_walked());
+    let local_pose =
+        translate_world_to_window_local(world_pose, residency.as_deref());
     let (transform, position_split) = &mut *camera;
-    **transform = pose;
-    **position_split = PositionSplit::from_world(pose.translation);
+    **transform = local_pose;
+    **position_split = PositionSplit::from_world(local_pose.translation);
 }
 
 // ---------------------------------------------------------------------------
@@ -328,5 +370,70 @@ mod tests {
         assert!((pose_b.translation.x - pose_a.translation.x - STREAMING_WALK_DISTANCE_VOXELS).abs() < 0.01);
         assert!((pose_b.translation.y - pose_a.translation.y).abs() < 0.01);
         assert!((pose_b.translation.z - pose_a.translation.z).abs() < 0.01);
+    }
+
+    #[test]
+    fn pin_translates_world_to_window_local_origin_zero() {
+        // With origin = (0, 0, 0) — the initial state before the camera moves —
+        // the translation is a no-op: world Transform == local Transform.
+        let mut res = crate::streaming::Residency::empty(4);
+        res.origin = IVec3::ZERO;
+        let world = streaming_window_pose(false);
+        let local = translate_world_to_window_local(world, Some(&res));
+        assert!((local.translation - world.translation).length() < 1e-4);
+    }
+
+    #[test]
+    fn pin_translates_world_to_window_local_origin_shifted() {
+        // After a +4-segment X walk, the residency origin lands at (4, 0, 0).
+        // The translation should subtract `(4*256, 0, 0) = (1024, 0, 0)` from
+        // the post-walk world pose — landing the camera at the SAME window-local
+        // X as the pre-walk pose (which had origin (0, 0, 0)).
+        let mut res = crate::streaming::Residency::empty(4);
+        res.origin = IVec3::new(4, 0, 0);
+
+        let pose_a_world = streaming_window_pose(false);
+        let pose_b_world = streaming_window_pose(true);
+        // Pre-condition: in world coords, B is +1024 X past A.
+        assert!((pose_b_world.translation.x - pose_a_world.translation.x
+            - STREAMING_WALK_DISTANCE_VOXELS).abs() < 1e-4);
+
+        // After origin-shift translation, pose_b_world maps to the same X as
+        // pose_a_world at origin (0, 0, 0).
+        let mut res_zero = crate::streaming::Residency::empty(4);
+        res_zero.origin = IVec3::ZERO;
+        let pose_a_local = translate_world_to_window_local(pose_a_world, Some(&res_zero));
+        let pose_b_local = translate_world_to_window_local(pose_b_world, Some(&res));
+        assert!((pose_b_local.translation - pose_a_local.translation).length() < 1e-4,
+            "post-translation local poses should coincide (pose_a_local={:?}, \
+             pose_b_local={:?})", pose_a_local.translation, pose_b_local.translation);
+        // And the local X must stay inside the renderable window AABB.
+        assert!(pose_b_local.translation.x >= 0.0
+            && pose_b_local.translation.x < crate::WORLD_SIZE_IN_VOXELS.x as f32);
+        assert!(pose_b_local.translation.z >= 0.0
+            && pose_b_local.translation.z < crate::WORLD_SIZE_IN_VOXELS.z as f32);
+    }
+
+    #[test]
+    fn pin_translation_no_residency_is_identity() {
+        // With no Residency resource (non-streaming presets), the translation
+        // helper returns the input Transform unchanged.
+        let world = streaming_window_pose(false);
+        let local = translate_world_to_window_local(world, None);
+        assert!((local.translation - world.translation).length() < 1e-7);
+    }
+
+    #[test]
+    fn pin_translation_is_idempotent_under_re_derivation() {
+        // The translation is stateless — re-running it with the same origin
+        // produces the same result (no drift across repeated invocations).
+        let mut res = crate::streaming::Residency::empty(4);
+        res.origin = IVec3::new(4, 0, 2);
+        let world = streaming_window_pose(true);
+        let once = translate_world_to_window_local(world, Some(&res));
+        let twice = translate_world_to_window_local(world, Some(&res));
+        let thrice = translate_world_to_window_local(world, Some(&res));
+        assert_eq!(once.translation, twice.translation);
+        assert_eq!(twice.translation, thrice.translation);
     }
 }

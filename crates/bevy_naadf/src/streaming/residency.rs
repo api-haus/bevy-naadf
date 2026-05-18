@@ -242,11 +242,25 @@ pub fn compute_slab_total_mib() -> u64 {
         + bounds_mib + misc_mib
 }
 
-/// Camera segment for the current frame, in `WorldSegmentPos` units. Reads
-/// the camera's `PositionSplit::pos_int` (world-voxel coord) and divides by
-/// `SEGMENT_VOXELS`.
-fn camera_segment_pos(camera_pos_int: IVec3) -> WorldSegmentPos {
-    world_voxel_to_segment(camera_pos_int)
+/// Camera segment for the current frame, in `WorldSegmentPos` units.
+///
+/// The camera Transform / `PositionSplit::pos_int` is **window-local** (Phase
+/// 2.5 — `pin_streaming_window_camera` pre-translates the world Transform by
+/// `-origin * SEGMENT_VOXELS` each frame so the renderer reads correct
+/// `chunks_buffer[…]` slots). To recover the absolute world voxel coord — the
+/// quantity that determines which world-segment the camera is in — we add the
+/// current `origin * SEGMENT_VOXELS` back.
+///
+/// Self-consistency: this driver runs in `PreUpdate`, before the Update-stage
+/// pin recomputes the local Transform with the latest `origin`. So when this
+/// reads `pos_int`, it sees the result of frame N-1's pin (which used frame
+/// N-1's `origin` — equal to the `residency.origin` we read here, because no
+/// system between then and now mutates `origin`). The reconstruction therefore
+/// recovers the world camera pose at frame N-1's end, which is what we want
+/// for "which segment is the camera in right now?".
+fn camera_segment_pos(camera_pos_int: IVec3, residency_origin: IVec3) -> WorldSegmentPos {
+    let world_voxel = camera_pos_int + residency_origin * SEGMENT_VOXELS;
+    world_voxel_to_segment(world_voxel)
 }
 
 /// `PreUpdate` system — detect camera-segment crossings, recompute the target
@@ -274,7 +288,7 @@ pub fn residency_driver(
         // this. Defer until camera exists.
         return;
     };
-    let cam_seg_world = camera_segment_pos(camera.pos_int);
+    let cam_seg_world = camera_segment_pos(camera.pos_int, residency.origin);
 
     // First-tick init: place the origin so the camera is centered.
     let do_shift = match residency.last_camera_seg {

@@ -49,8 +49,12 @@ consolidated mode disqualified.
 - [x] **Hard gate (Phase 1)** — user confirmed, Phase 2 OQ.1/OQ.3 + composition scope resolved
 - [x] 03b — Phase-2 impl: residency + noise_terrain.wgsl + W5 gate inversion + --streaming-window gate (`general-purpose` → code + `03b-impl-residency.md`)
 - [ ] **Hard gate (Phase 2)** — submit impl to user; one camera-translation gap surfaced
-- [ ] 03c — Phase-2.5 fix: camera-Transform → window-local translation + tighten `--streaming-window` pixel-Δ threshold
-- [ ] **Hard gate (Phase 2.5)** — confirm visible streaming + tightened gate passes
+- [x] 03c — Diagnostic: read-only investigation of skybox-only false-pass + minutes-long hang
+- [x] **Hard gate (diagnostic)** — user directive: verify noise→visible-terrain in a static scene FIRST, then sliding window
+- [ ] 03d — Phase-2.4: static-scene noise verification — one-shot noise_terrain dispatch over full world + strict `--noise-static-world` gate (no residency)
+- [ ] **Hard gate (Phase 2.4)** — if static-scene gate green → proceed to 2.5; if red → diagnose noise/encoding before residency
+- [ ] 03e — Phase-2.5 fix (contingent on 2.4 passing): `Generating → Resident` transition + sliding-window gate threshold tightening + wall-clock budget
+- [ ] **Hard gate (Phase 2.5)** — confirm visible sliding-window streaming + strict gate passes
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user
