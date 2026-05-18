@@ -23,6 +23,7 @@
 //! lives in `render/construction/mod.rs`'s `naadf_gpu_producer_node` (a third
 //! arm of the existing `model_data.is_some()` ladder at `:2384-2566`).
 
+pub mod camera;
 pub mod chunk_source;
 pub mod noise_dispatch;
 pub mod noise_fastnoiselite;
@@ -33,6 +34,9 @@ pub mod windowed_slot_map;
 use bevy::prelude::*;
 use bevy::render::{ExtractSchedule, Render, RenderApp, RenderSystems};
 
+pub use camera::{
+    install_streaming_camera_position, track_and_pin_camera, CameraAbsolutePosition,
+};
 pub use chunk_source::{
     ChunkSource, NoiseChunkSource, ProceduralStaticActive, SegmentSourceKind,
 };
@@ -71,6 +75,30 @@ impl Plugin for StreamingPlugin {
         // Main-world residency driver. `PreUpdate` so the per-frame
         // admissions/evictions are visible to the render extract that follows.
         app.add_systems(PreUpdate, residency_driver);
+        // Production-side camera-position tracker (`03j` Phase 2.9 fix):
+        // re-derives `Transform.translation` to window-local each tick from
+        // a separately-tracked absolute world position, so the additive
+        // `FreeCamera` controller can't drive the residency driver into an
+        // endless reposition loop. Runs `.before(sync_position_split)` so
+        // the consumer's `PositionSplit::pos_int` lands in window-local
+        // coords. Early-returns when the `Residency` /
+        // `CameraAbsolutePosition` resources are absent (non-streaming
+        // presets keep the original Transform-is-absolute behaviour).
+        app.add_systems(
+            Update,
+            track_and_pin_camera
+                .before(crate::camera::sync_position_split)
+                // Run AFTER the e2e camera-pin systems (when present) so any
+                // gate-driven Transform writes are folded into
+                // `CameraAbsolutePosition` before re-pin. The e2e streaming
+                // gate's `pin_streaming_window_camera` is the load-bearing
+                // upstream — it applies per-tick additive Transform writes
+                // during the walk phase, and `track_and_pin_camera` must
+                // observe those deltas before re-pinning to window-local.
+                // `ambiguous_with` over the other gates' pin systems is
+                // safe — only one gate runs per harness invocation.
+                .after(crate::e2e::streaming_window::pin_streaming_window_camera),
+        );
         // Phase 2.6 (`02c-design-windowed-slot-map.md` § G.4 + D4): the
         // explicit `Generating → Resident` `Last`-stage system from Phase 2.5
         // is GONE — slot lifecycle is now implicit (bound ∩

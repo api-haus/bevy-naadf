@@ -63,6 +63,8 @@ consolidated mode disqualified.
 - [x] **Hard gate (Phase 2.7)** — GREEN: all 5 priority gates pass; 3 interactive presets launch; 253 tests pass; 2 HIGH-RISK escalations noted (vox-gpu-oracle subprocess respawn, oasis-edit-visual / vox-gpu-construction default-fidelity)
 - [x] 03i — Phase-2.8: deferred-idle-flush for bounds-chain dispatch — cold-start dropped ~40 s → 1.02 s (vs static baseline 5.14 s). No shader changes, ~75 LOC.
 - [x] **Hard gate (Phase 2.8)** — GREEN: all 8 gates pass; cold-start now FASTER than static baseline; streaming preset visibly populates within ~1 s
+- [x] 03j/03k — Phase-2.9: diagnostic + fix for camera-nudge endless-reposition loop — new `CameraAbsolutePosition` resource + production pin (FreeCamera writes absolute coords; pin derives Transform); `--gate streaming-window` refactored to drive `AppConfig::windowed()` + simulated additive Transform input (catches divergent-App-construction regressions per the e2e-must-drive-actual-main memory)
+- [x] **Hard gate (Phase 2.9)** — GREEN: all 7 gates pass; production camera path now exercised by `--gate streaming-window` at pixel-Δ 82.11 / variance 2346.83 / origin-shift 4; interactive boot smoke confirms no endless reposition loop
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user

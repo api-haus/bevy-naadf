@@ -120,6 +120,25 @@ static CAMERA_WALKED: AtomicBool = AtomicBool::new(false);
 /// compute the shift when the assertion fires).
 static RESIDENCY_ORIGIN_X_AT_POSE_A: AtomicI32 = AtomicI32::new(i32::MIN);
 
+/// Phase 2.9 — the walk is now an additive sequence of Transform deltas, not
+/// a single Pose-A→Pose-B teleport. After [`promote_camera_to_walk`] fires
+/// the gate runs [`STREAMING_WALK_TICKS`] ticks, each adding
+/// [`STREAMING_WALK_VOXELS_PER_TICK`] voxels in `+X` to the camera's absolute
+/// world position via [`track_and_pin_camera`]. Mirrors the
+/// `FreeCamera` controller's additive-Transform write pattern — exactly the
+/// production path the `03j` diagnosis identified as broken pre-fix.
+///
+/// Total walk distance = `STREAMING_WALK_TICKS *
+/// STREAMING_WALK_VOXELS_PER_TICK` voxels, calibrated to match
+/// `STREAMING_WALK_DISTANCE_VOXELS` (= 1024).
+pub const STREAMING_WALK_TICKS: i32 = 256;
+/// Per-tick `+X` Transform delta in voxels. `256 * 4 = 1024` voxels total.
+pub const STREAMING_WALK_VOXELS_PER_TICK: f32 = 4.0;
+/// Counter for the remaining walk ticks. Set to `STREAMING_WALK_TICKS` on
+/// [`promote_camera_to_walk`]; decremented by [`pin_streaming_window_camera`]
+/// per tick.
+static WALK_TICKS_REMAINING: AtomicI32 = AtomicI32::new(0);
+
 // ---------------------------------------------------------------------------
 // Wall-clock budget enforcement (Phase 2.5 — `03c-diagnosis.md` § Punch-list
 // item 4). Same shape as `noise_static_world.rs`'s gate-start latch.
@@ -185,23 +204,37 @@ pub fn origin_x_at_pose_a() -> i32 {
     RESIDENCY_ORIGIN_X_AT_POSE_A.load(Ordering::SeqCst)
 }
 
-/// Promote the streaming-window camera to "Pose B" (the post-walk position).
-/// Called by the e2e driver at `OasisApplyEdit` when `streaming_window_mode`
-/// is active. The [`pin_streaming_window_camera`] Update system reads the
-/// latch each tick and pins the camera to either Pose A (pre-walk) or Pose B
-/// (post-walk) accordingly.
+/// Promote the streaming-window camera into "walk mode". Called by the e2e
+/// driver at `OasisApplyEdit` when `streaming_window_mode` is active.
+///
+/// Phase 2.9 — instead of a single Pose-A→Pose-B teleport, this kicks off a
+/// `STREAMING_WALK_TICKS`-tick additive walk. The [`pin_streaming_window_camera`]
+/// Update system reads the latch + counter each tick and writes
+/// `Transform.translation += (STREAMING_WALK_VOXELS_PER_TICK, 0, 0)` while
+/// the counter is non-zero, mirroring the production `FreeCamera`'s additive
+/// write pattern (the `03j` diagnosis identified this as the load-bearing
+/// shape — the bug fires under additive writes, NOT teleports). After the
+/// counter drains to zero, the pin is a no-op (the camera holds its
+/// post-walk pose for the framebuffer capture).
 pub fn promote_camera_to_walk() {
     CAMERA_WALKED.store(true, Ordering::SeqCst);
+    WALK_TICKS_REMAINING.store(STREAMING_WALK_TICKS, Ordering::SeqCst);
 }
 
 /// Reset the camera-walked latch — used by tests.
 pub fn reset_camera_walked_latch() {
     CAMERA_WALKED.store(false, Ordering::SeqCst);
+    WALK_TICKS_REMAINING.store(0, Ordering::SeqCst);
 }
 
 /// Read the current state of the camera-walked latch.
 pub fn camera_has_walked() -> bool {
     CAMERA_WALKED.load(Ordering::SeqCst)
+}
+
+/// Read the remaining walk ticks (test helper).
+pub fn walk_ticks_remaining() -> i32 {
+    WALK_TICKS_REMAINING.load(Ordering::SeqCst)
 }
 
 // ---------------------------------------------------------------------------
@@ -257,16 +290,39 @@ pub(crate) fn translate_world_to_window_local(
     local
 }
 
-/// `Update` system: pin the camera at Pose A or Pose B (selected via the
-/// `CAMERA_WALKED` latch). Wired only when
+/// `Update` system: pin the camera at the streaming spawn pose (Pose A) before
+/// the walk, then apply an additive `+X` Transform write per tick during the
+/// walk phase, then no-op once the walk completes. Wired only when
 /// `AppArgs.streaming_window_mode == true`. Runs `.after(e2e_driver)` so the
-/// pose write lands AFTER the driver's pose write but BEFORE
-/// `sync_position_split` consumes the transform.
+/// pose write lands AFTER the driver's pose write.
 ///
-/// Phase 2.5: applies the [`translate_world_to_window_local`] translation
-/// (gated on the presence of the `Residency` resource, which only exists for
-/// the streaming preset) so the renderer reads the correct
-/// `chunks_buffer[…]` slot after a residency-origin shift.
+/// Phase 2.9 — REPLACES the previous Pose-A/B teleport pin (which bypassed
+/// the production camera path entirely). The new shape:
+///
+/// 1. While walk has NOT been promoted (`!camera_has_walked()`): pin
+///    Transform + PositionSplit to the streaming-preset spawn pose in
+///    **window-local** coords. This handles the e2e camera spawn (which
+///    starts at the harness's `e2e_motion_start_transform` pose, not the
+///    streaming-preset world centre) and gives the residency manager a
+///    stable spawn frame to cold-start populate.
+/// 2. Once the walk is promoted AND `walk_ticks_remaining > 0`: apply
+///    `transform.translation += (STREAMING_WALK_VOXELS_PER_TICK, 0, 0)`,
+///    decrement the counter. The production-side `track_and_pin_camera`
+///    system (registered by `StreamingPlugin::build` in `Update`,
+///    `.before(sync_position_split)`) sees this delta the same way it
+///    sees a `FreeCamera` controller delta, folds it into
+///    `CameraAbsolutePosition`, and re-pins Transform to window-local for
+///    the current `Residency::origin`. `residency_driver` then reads
+///    `CameraAbsolutePosition` and shifts origin correctly.
+/// 3. Once the walk completes (`walk_ticks_remaining == 0`): no-op. Hold
+///    Transform — `track_and_pin_camera` keeps it window-local under the
+///    final origin so the after-frame capture is correct.
+///
+/// This shape **exercises the production camera path**: the bug diagnosed
+/// in `03j` is exactly the additive-Transform write pattern + missing
+/// production-side window-local re-pin. If `track_and_pin_camera` is broken
+/// or absent, the additive writes drive `residency_driver` into an endless
+/// reposition loop (wall-clock budget exceeded → gate panics).
 pub fn pin_streaming_window_camera(
     args: Option<Res<crate::AppArgs>>,
     residency: Option<Res<crate::streaming::Residency>>,
@@ -337,12 +393,39 @@ pub fn pin_streaming_window_camera(
             elapsed_since_start(),
         );
     }
-    let world_pose = streaming_window_pose(camera_has_walked());
-    let local_pose =
-        translate_world_to_window_local(world_pose, residency.as_deref());
     let (transform, position_split) = &mut *camera;
-    **transform = local_pose;
-    **position_split = PositionSplit::from_world(local_pose.translation);
+
+    if !camera_has_walked() {
+        // Pre-walk — pin to the streaming-preset spawn pose. Production
+        // `install_procedural_streaming_world` writes the same pose to
+        // `InitialCameraPose` + seeds `CameraAbsolutePosition` from it; in
+        // the e2e harness the camera is spawned via `setup_e2e_camera`
+        // (which ignores `InitialCameraPose`), so we re-anchor it here on
+        // every pre-walk tick. `track_and_pin_camera` then sees a stable
+        // window-local pose (delta == 0 once anchored) and the residency
+        // driver cold-starts the segment window around the camera centre.
+        let world_pose = streaming_window_pose(false);
+        let local_pose =
+            translate_world_to_window_local(world_pose, residency.as_deref());
+        **transform = local_pose;
+        **position_split = PositionSplit::from_world(local_pose.translation);
+        return;
+    }
+
+    // Walk in progress — apply an additive `+X` Transform write per tick,
+    // exactly like the production `FreeCamera` controller does. The
+    // production `track_and_pin_camera` system (Phase 2.9) folds the delta
+    // into `CameraAbsolutePosition` and re-pins the Transform to
+    // window-local for the current `Residency::origin`. PositionSplit will
+    // be re-derived by `sync_position_split` later in the same Update
+    // schedule.
+    let remaining = WALK_TICKS_REMAINING.load(Ordering::SeqCst);
+    if remaining > 0 {
+        transform.translation.x += STREAMING_WALK_VOXELS_PER_TICK;
+        WALK_TICKS_REMAINING.store(remaining - 1, Ordering::SeqCst);
+    }
+    // Post-walk (remaining == 0) — do nothing. Hold the Transform;
+    // `track_and_pin_camera` keeps it window-local under the final origin.
 }
 
 // ---------------------------------------------------------------------------

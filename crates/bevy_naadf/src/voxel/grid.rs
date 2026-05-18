@@ -221,6 +221,14 @@ fn install_procedural_streaming_world(
         Transform::from_translation(cam_pos).looking_at(cam_look, Vec3::Y),
     ));
 
+    // Phase 2.9 fix (`03j-diagnosis-camera-nudge-loop.md`) — seed the
+    // production-side absolute camera position tracker so
+    // `track_and_pin_camera` can re-pin Transform to window-local each tick
+    // (otherwise FreeCamera's additive Transform writes drift the residency
+    // origin into an endless reposition loop on the first interactive
+    // segment crossing).
+    crate::streaming::install_streaming_camera_position(commands, cam_pos);
+
     info!(
         "streaming-world: ProceduralStreaming preset installed — \
          noise_preset={noise_preset}, seed={seed}, sea_level={:.1}, \

@@ -323,6 +323,21 @@ pub fn pin_oasis_camera(
     if !args.oasis_edit_visual_mode {
         return;
     }
+    // Phase 2.9 (`03j-diagnosis-camera-nudge-loop.md`) — the streaming-window
+    // gate routes through `oasis_edit_visual_mode` for the OasisXxx state
+    // machine but owns its own camera pose (the streaming-preset spawn /
+    // additive walk). Skip the birdseye write here so
+    // `pin_streaming_window_camera` is the sole authority over Transform —
+    // otherwise the birdseye pose's Y (~world_top + 250 ≈ 762) places the
+    // camera in segment row Y=2, outside the residency window (which pins
+    // Y to 0..1). Mirrors the same skip the vox-gpu-construction /
+    // vox-gpu-oracle gates already perform via `.after(pin_oasis_camera)`
+    // overwrites — but for streaming we need the skip up front because
+    // the streaming pin only overwrites Transform pre-walk, leaving the
+    // birdseye Y in place during the walk phase otherwise.
+    if args.streaming_window_mode {
+        return;
+    }
     let Some(world_data) = world_data else { return; };
     let size_v = world_data.size_in_chunks
         * (crate::voxel::CELL_DIM as u32 * crate::voxel::CELL_DIM as u32);

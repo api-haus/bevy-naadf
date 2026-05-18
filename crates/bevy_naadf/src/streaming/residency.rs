@@ -240,6 +240,16 @@ fn camera_segment_pos(camera_pos_int: IVec3, residency_origin: IVec3) -> WorldSe
     world_voxel_to_segment(world_voxel)
 }
 
+/// Phase 2.9 (`03j-diagnosis-camera-nudge-loop.md`) — camera segment derived
+/// directly from the production-side `CameraAbsolutePosition` resource. The
+/// preferred path: bypasses the window-local→absolute round-trip that
+/// `camera_segment_pos` does, so a hypothetical out-of-sync Transform (e.g.
+/// during the same frame `track_and_pin_camera` has yet to re-pin) cannot
+/// drive the driver into an endless reposition loop.
+fn camera_segment_pos_from_abs(abs_pos_int: IVec3) -> WorldSegmentPos {
+    world_voxel_to_segment(abs_pos_int)
+}
+
 /// `PreUpdate` system — detect camera-segment crossings, recompute the target
 /// resident set, populate `admissions_this_frame` + `evictions_this_frame`,
 /// honour the `--max-segments-per-frame` budget.
@@ -258,6 +268,7 @@ pub fn residency_driver(
     camera: Option<
         Single<&crate::camera::position_split::PositionSplit, With<bevy::prelude::Camera3d>>,
     >,
+    abs_pos: Option<Res<super::CameraAbsolutePosition>>,
 ) {
     let Some(mut residency) = residency else {
         return;
@@ -266,12 +277,21 @@ pub fn residency_driver(
     residency.admissions_this_frame.clear();
     residency.evictions_this_frame.clear();
 
-    let Some(camera) = camera else {
-        // No camera yet — the very first frame of the e2e harness can hit
-        // this. Defer until camera exists.
-        return;
+    // Phase 2.9 fix — prefer the production-side absolute position tracker
+    // when available (the streaming preset's main camera path). Falls back
+    // to the window-local→absolute round-trip on `PositionSplit` only when
+    // the resource is absent (e2e gate before Phase 2.9 refactor, or any
+    // future entry point that bypasses the production camera install).
+    let cam_seg_world = if let Some(abs) = abs_pos.as_deref() {
+        camera_segment_pos_from_abs(abs.pos_int)
+    } else {
+        let Some(camera) = camera else {
+            // No camera yet — the very first frame of the e2e harness can hit
+            // this. Defer until camera exists.
+            return;
+        };
+        camera_segment_pos(camera.pos_int, residency.origin())
     };
-    let cam_seg_world = camera_segment_pos(camera.pos_int, residency.origin());
 
     // First-tick init: place the origin so the camera is centered.
     let do_shift = match residency.last_camera_seg {
@@ -495,6 +515,66 @@ mod tests {
     #[should_panic(expected = "VRAM budget pre-flight FAILED")]
     fn vram_budget_panics_below_floor() {
         super::assert_vram_budget_sufficient(0);
+    }
+
+    /// Phase 2.9 (`03j-diagnosis-camera-nudge-loop.md`) regression catcher
+    /// — under the absolute-position tracker the segment computation must
+    /// NOT depend on the residency origin. Past bug: `camera_segment_pos`
+    /// added `origin * SEGMENT_VOXELS` to the (already-absolute) Transform
+    /// position, double-counting the origin and driving an endless
+    /// reposition loop the moment the camera crossed a segment boundary.
+    ///
+    /// This test simulates the post-shift bug pattern: a camera holding
+    /// world position `(2304, 288, 2048)` (one segment past the centre)
+    /// with `origin = (1, 0, 0)` (the shift the driver applied last
+    /// frame). The correct camera segment is `(9, 1, 8)` (= `2304/256`).
+    /// `camera_segment_pos_from_abs` returns this directly; the legacy
+    /// `camera_segment_pos` formula would have returned `(10, 1, 8)`
+    /// (= `(2304-256)/256 + origin = 8 + 1` only IF `pos_int` is window-
+    /// local — but under the bug `pos_int` is absolute, so the formula
+    /// over-counts to `(10, 1, 8)` and the cam_seg drifts).
+    #[test]
+    fn camera_segment_pos_from_abs_is_origin_independent() {
+        // Camera at absolute world position 1 segment +X of centre.
+        let abs_pos_int = IVec3::new(2304, 288, 2048);
+        let cam_seg_abs = camera_segment_pos_from_abs(abs_pos_int);
+        assert_eq!(cam_seg_abs.0, IVec3::new(9, 1, 8));
+
+        // Repeat at a shifted origin — the result must NOT change.
+        let _origin_shifted = IVec3::new(1, 0, 0);
+        // `camera_segment_pos_from_abs` takes only the abs pos — verify it
+        // doesn't expose any origin parameter (compile-time test, ish).
+        let cam_seg_abs_again = camera_segment_pos_from_abs(abs_pos_int);
+        assert_eq!(cam_seg_abs.0, cam_seg_abs_again.0);
+    }
+
+    /// Phase 2.9 — under the pre-fix `camera_segment_pos(pos_int, origin)`
+    /// formula, an absolute Transform + a shifted origin double-counted
+    /// the origin (driving the reposition loop). Pin the bug-and-fix
+    /// distinction in the unit suite so a future refactor that
+    /// resurrects the formula has a clear regression signal.
+    #[test]
+    fn legacy_camera_segment_pos_double_counts_under_absolute_pos_int() {
+        // Camera at absolute world (2304, 288, 2048), origin shifted to (1,0,0).
+        // With pos_int treated as window-local (the C# / e2e contract):
+        //   pos_int_local = abs - origin*SEG = (2304 - 256, 288, 2048) = (2048, 288, 2048)
+        //   world_voxel = pos_int_local + origin*SEG = (2304, 288, 2048) ✓ correct
+        let pos_int_window_local = IVec3::new(2048, 288, 2048);
+        let origin = IVec3::new(1, 0, 0);
+        let seg = camera_segment_pos(pos_int_window_local, origin);
+        assert_eq!(seg.0, IVec3::new(9, 1, 8));
+
+        // The bug: when `pos_int` is ABSOLUTE (no window-local pre-translation),
+        // the formula adds `origin*SEG` ON TOP, producing an over-shifted
+        // segment that drives the endless reposition loop.
+        let pos_int_absolute = IVec3::new(2304, 288, 2048); // not window-local!
+        let buggy_seg = camera_segment_pos(pos_int_absolute, origin);
+        assert_eq!(
+            buggy_seg.0,
+            IVec3::new(10, 1, 8),
+            "the legacy formula over-counts origin when pos_int is already absolute — \
+             Phase 2.9 fix routes through camera_segment_pos_from_abs to bypass this"
+        );
     }
 
     /// Phase 2.6 — migrated regression catcher (Phase 2.5's
