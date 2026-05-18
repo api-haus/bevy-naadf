@@ -79,8 +79,10 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Stage 8 — type-decode diagnostic; Q4 max_storage_buffer_binding_size hypothesis (MEDIUM-HIGH confidence)
 - [x] Q4 verification — REFUTED (Bevy auto-uses adapter max 2047 MiB; bindings fit)
 - [x] Stage 9 — production-scale voxels[] readback at 25 Oasis-populated positions, post-producer AND post-bounds-calc. **25/25 BYTE-MATCH at both checkpoints.** voxels[] IS byte-correct end-to-end at production scale.
-- [x] **Bug now PROVEN to be in renderer/wiring path, NOT producer chain.** Candidates: (1) `prepare.rs:184-450` buffer-handle binding mismatch, (2) `prepare.rs:418-432` `chunks.upload_all(&[0u32], …)` ordering racing producer writes, (3) `world_data_meta.size_in_chunks` mismatch at bind-group construction, (4) `naadf_first_hit.wgsl:227-228` `decompress_voxel_type` / `voxel_types` palette wiring.
-- [ ] Hard gate — submit Stage 9: bug localized to renderer/wiring; 4 specific candidates  ← CURRENT
+- [x] Stage 9 — bug PROVEN to be downstream of producer
+- [x] Stage 10 — renderer/wiring diagnostic. **BUG FOUND (HIGH confidence).** All 4 prior candidates REFUTED. Concrete root cause at `crates/bevy_naadf/src/voxel/grid.rs:393-398`: `install_vox_in_fixed_world` builds `ModelData` from `build_constructed_world_sparse` output which **encodes empty voxels with 12-bit AADF distance bits in the low half-word**. Generator shader `& 0x7FFF` + `\|= (1<<15) if > 0` falsely promotes AADF-bearing empty voxels to "full type=AADF". Concrete example: voxel(186,189,252) → `data_voxel[32515] = 0x08830886` (empty+AADF=0x886) → renderer reads hit_type=0x886=2182 → OOB palette → BLACK surface. **Matches symptom exactly.** Legacy path works because it never goes through ModelData (reads voxels_cpu directly + checks bit 15 in `ray_tracing.wgsl:339-341`). C# `ModelData.cs::ImportFromVox:442-446` emits literal 0 for empty voxels — Rust port unified model encoder with renderer encoder, breaking the convention.
+- [x] Recommended fix: at `grid.rs:393-398` post-process `imp.world.voxels` to zero out half-words where bit 15 is clear (~10 lines, C#-faithful)
+- [ ] Hard gate — submit Stage 10: HIGH-confidence concrete bug + fix proposal  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.4 (delete CPU stop-gap)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.6 (document default-scene divergence)
