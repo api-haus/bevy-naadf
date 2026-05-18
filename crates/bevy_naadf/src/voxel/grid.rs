@@ -203,6 +203,27 @@ pub fn install_empty_world(commands: &mut Commands) {
         block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
     };
     commands.insert_resource(world_data);
+    // web-vox-color-divergence diagnose-first (2026-05-18) — pairs with the
+    // [palette-install] log in the .vox + default-scene install sites. The
+    // skybox-only path also installs a default palette; logging it lets us
+    // confirm whether the build-once gate sees the skybox palette in the
+    // `--vox-web-parity-skybox` subprocess. Diagnostic instrumentation; to be
+    // demoted to `debug!` per
+    // `docs/orchestrate/web-vox-color-divergence/01-context.md` forbidden
+    // move 11.
+    {
+        let preview: Vec<(f32, f32, f32)> = palette
+            .iter()
+            .take(5)
+            .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
+            .collect();
+        info!(
+            "[palette-install] install_empty_world label=\"skybox-only\" \
+             palette_len={} first_5_color_base={:?}",
+            palette.len(),
+            preview,
+        );
+    }
     commands.insert_resource(VoxelTypes { types: palette });
 }
 
@@ -309,6 +330,26 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
     };
     world_data.seed_block_hashing();
     commands.insert_resource(world_data);
+    // web-vox-color-divergence diagnose-first (2026-05-18) — pairs with the
+    // [palette-install] log in `install_imported_vox` so we can tell the
+    // default-scene install (Startup, before any async .vox lands) from the
+    // .vox install (post-rayon-parse). Diagnostic instrumentation; to be
+    // demoted to `debug!` per
+    // `docs/orchestrate/web-vox-color-divergence/01-context.md` forbidden
+    // move 11. DO NOT REMOVE without that demotion.
+    {
+        let preview: Vec<(f32, f32, f32)> = palette
+            .iter()
+            .take(5)
+            .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
+            .collect();
+        info!(
+            "[palette-install] install_default_embedded_in_fixed_world \
+             label=\"default-scene\" palette_len={} first_5_color_base={:?}",
+            palette.len(),
+            preview,
+        );
+    }
     commands.insert_resource(VoxelTypes { types: palette });
 }
 
@@ -577,6 +618,30 @@ pub fn install_imported_vox(
     };
     world_data.seed_block_hashing();
     commands.insert_resource(world_data);
+    // web-vox-color-divergence diagnose-first (2026-05-18) — one-shot palette
+    // install trace. Logs the main-world palette insertion with the source
+    // label so we can distinguish the .vox install path from
+    // `install_default_embedded_in_fixed_world`. Pair with the
+    // `[palette-upload]` log in `render/prepare.rs` to verify whether the
+    // build-once gate uploaded the .vox palette or the default-scene palette.
+    // To be demoted to `debug!` once the divergence is fixed (per
+    // `docs/orchestrate/web-vox-color-divergence/01-context.md` forbidden
+    // move 11). DO NOT REMOVE without that demotion.
+    {
+        let preview: Vec<(f32, f32, f32)> = imp
+            .palette
+            .iter()
+            .take(5)
+            .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
+            .collect();
+        info!(
+            "[palette-install] install_imported_vox label={:?} palette_len={} \
+             first_5_color_base={:?}",
+            source_label,
+            imp.palette.len(),
+            preview,
+        );
+    }
     commands.insert_resource(VoxelTypes { types: imp.palette });
 }
 

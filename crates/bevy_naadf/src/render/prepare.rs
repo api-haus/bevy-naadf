@@ -484,6 +484,27 @@ pub fn prepare_world_gpu(
         blocks.upload_all(&blocks_data, &render_device, &render_queue);
         voxels.upload_all(&voxels_data, &render_device, &render_queue);
     }
+    // web-vox-color-divergence diagnose-first (2026-05-18) — one-shot palette
+    // upload trace. Logs the GPU upload event with palette length + first
+    // 5 packed entries so we can compare native vs web ordering against the
+    // [palette-install] log at `voxel/grid.rs`. This is diagnostic
+    // instrumentation; the architect/implementer will demote it to `debug!`
+    // once the divergence is fixed (per
+    // `docs/orchestrate/web-vox-color-divergence/01-context.md` forbidden
+    // move 11). DO NOT REMOVE without that demotion.
+    {
+        let preview: Vec<[u32; 4]> = voxel_types_data
+            .iter()
+            .take(5)
+            .map(|e| e.data)
+            .collect();
+        info!(
+            "[palette-upload] prepare_world_gpu uploading voxel_types to GPU \
+             (palette_len={}, first_5_raw={:?})",
+            voxel_types_data.len(),
+            preview,
+        );
+    }
     voxel_types.upload_all(&voxel_types_data, &render_device, &render_queue);
 
     // --- world_meta uniform -------------------------------------------------

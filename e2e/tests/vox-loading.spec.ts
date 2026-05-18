@@ -156,6 +156,19 @@ test.describe.serial("Web .vox loading", () => {
     const collector = new ConsoleCollector();
     collector.attach(page);
 
+    // web-vox-color-divergence diagnose-first (2026-05-18) — forward the
+    // one-shot palette-trace lines to Node stdout for the diagnose phase.
+    page.on("console", (msg: ConsoleMessage) => {
+      const text = msg.text();
+      if (
+        text.includes("[palette-upload]") ||
+        text.includes("[palette-install]")
+      ) {
+        // eslint-disable-next-line no-console
+        console.log(`[wasm-console] ${text}`);
+      }
+    });
+
     // Boot the page with `?skybox=1`. The wasm bootstrap reads the param
     // via `voxel::web_vox::resolve_skybox_only_param`, inserts a
     // `WebSkyboxOverride` resource, and `setup_test_grid` installs an
@@ -204,8 +217,17 @@ test.describe.serial("Web .vox loading", () => {
     // literal message text is present.
     let voxInstallSeen = false;
     page.on("console", (msg: ConsoleMessage) => {
-      if (msg.text().includes("NAADF .vox loaded from")) {
+      const text = msg.text();
+      if (text.includes("NAADF .vox loaded from")) {
         voxInstallSeen = true;
+      }
+      // web-vox-color-divergence diagnose-first (2026-05-18) — forward the
+      // one-shot [palette-upload] / [palette-install] diagnostic lines from
+      // the wasm tracing bridge to Node stdout so `just test-wasm 2>&1 | tee`
+      // captures them. Remove (or scope) once the diagnose phase concludes.
+      if (text.includes("[palette-upload]") || text.includes("[palette-install]")) {
+        // eslint-disable-next-line no-console
+        console.log(`[wasm-console] ${text}`);
       }
     });
 

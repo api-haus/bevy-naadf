@@ -42,8 +42,8 @@ design; render-world gating fix is moderate blast radius rather than low.
 - [x] Step 3 — Method preview
 - [x] Step 4 — Q&A (4 decisions captured in `01-context.md`)
 - [x] Step 5 — Shared-context files written
-- [ ] Step 6a — Diagnose-first research dispatch (`02-research.md`)
-- [ ] Step 6a hard gate — user confirms root cause from observation
+- [x] Step 6a — Diagnose-first research dispatch (`02-research.md`)
+- [ ] Step 6a hard gate — user confirms root cause from observation ← **here**
 - [ ] Step 6b — Architecture dispatch (`03-design.md`)
 - [ ] Step 6b hard gate — user approves fix shape
 - [ ] Step 6c — Implementation dispatch (`04-impl.md`)
