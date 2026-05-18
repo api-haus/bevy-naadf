@@ -60,12 +60,22 @@
 #import "shaders/common.wgsl"::PI
 #import "shaders/pbr_sampling.wgsl"::{
     triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
+    triplanar_sample_pom, triplanar_sample_normal_pom, pom_compute,
     select_layer_variant, eval_pbr, PbrEval,
     ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
 // `triplanar_sample_normal` is imported above and called below to sample the
 // perturbed (normal-mapped) surface normal so the BRDF sees the bump detail
 // instead of the axis-aligned geometric face normal.
+//
+// The first-hit surface re-sample (`:250-280`) uses the POM-displaced UV
+// (via `pom_compute` + `_pom` sample variants) to stay consistent with the
+// first-hit pass's POM-shaded direct contribution. WITHOUT this match the
+// final pixel composites un-POM shading from the GI pass on top of POM
+// shading from the first-hit pass → visible moiré / "double-surface"
+// artifact (`05-diagnostic.md` § "POM seam-artifact diagnose+fix"). The
+// secondary GI bounce samples STAY un-POM — POM is first-hit-surface only
+// per design § F.4 + cost budget.
 
 // --- @group(1) — the GI-specific bindings -----------------------------------
 
@@ -247,15 +257,32 @@ fn calc_global_ilum(
         first_hit_type.variant_span,
         vec3<i32>(floor(first_hit_world_pos)),
     );
-    let first_hit_mrh = triplanar_sample(
+    // POM-displaced UV on the dominant plane. MUST be computed via the
+    // canonical `pom_compute` with the same inputs the first-hit pass used
+    // (`naadf_first_hit.wgsl:290-294`): same `world_pos`, same `ray_dir`
+    // (the first-hit pass's `ray_dir` post any mirror reflections matches
+    // `first_hit_result.ray_dir` here), same `blend_weights`, same
+    // `layer`. Without this match the GI sun-direct shading below would
+    // sample the texture at the geometric UV while the first-hit pass
+    // shaded it at the POM-displaced UV → moiré
+    // (`05-diagnostic.md` H2 root cause).
+    let first_hit_pom = pom_compute(
+        pbr_mrh, pbr_sampler,
+        first_hit_world_pos, first_hit_result.ray_dir, first_hit_blend, first_hit_layer,
+    );
+    let first_hit_displaced_uv  = first_hit_pom.displaced_uv;
+    let first_hit_dominant_axis = first_hit_pom.dominant_axis;
+    let first_hit_mrh = triplanar_sample_pom(
         pbr_mrh, pbr_sampler,
         first_hit_world_pos, first_hit_blend, first_hit_layer,
+        first_hit_dominant_axis, first_hit_displaced_uv,
     );
     let first_hit_metallic = first_hit_mrh.r;
     let first_hit_roughness_sampled = first_hit_mrh.g;
-    let first_hit_diffuse_ao = triplanar_sample(
+    let first_hit_diffuse_ao = triplanar_sample_pom(
         pbr_diffuse_ao, pbr_sampler,
         first_hit_world_pos, first_hit_blend, first_hit_layer,
+        first_hit_dominant_axis, first_hit_displaced_uv,
     );
     let first_hit_albedo = first_hit_diffuse_ao.rgb
         * first_hit_type.albedo_tint * first_hit_diffuse_ao.a;
@@ -263,10 +290,10 @@ fn calc_global_ilum(
     // hit. Replaces `first_hit_result.normal` in every BRDF call below
     // (initial bounce VNDF, throughput eval_pbr). The geometric normal stays
     // in use only for geometric tests (ray offset, ≤0 cos cull).
-    let first_hit_perturbed_normal = triplanar_sample_normal(
+    let first_hit_perturbed_normal = triplanar_sample_normal_pom(
         pbr_normal, pbr_sampler,
         first_hit_world_pos, first_hit_blend, first_hit_result.normal,
-        first_hit_layer,
+        first_hit_layer, first_hit_dominant_axis, first_hit_displaced_uv,
     );
 
     // A primary-ray miss (voxelTypeRaw == 0) is never queued by `rayQueueCalc`,

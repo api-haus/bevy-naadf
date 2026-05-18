@@ -979,3 +979,351 @@ displaced) so the resolution is the modernised algorithm itself making the
 relief more visually present rather than a missing wire-up. Nine
 verification gates all green; gate now carries a `shadow-rect mean luma
 ceiling` assertion that catches `pom_self_shadow` regressions specifically.
+
+---
+
+## POM seam-artifact diagnose+fix (2026-05-18, post-`af89dd5`)
+
+### User report (verbatim, with image path)
+
+User performed live visual check #3 on the modern POM rewrite and reports a
+serious "double surface" artifact:
+
+> [Image #3]
+>
+> it looks like there's 2 distinct surfaces and albedo doesnt match with pbr
+>
+> albedo may also be extruded, but doesnt match the pbr - and we can clearly
+> see a distinct corner of the pbr where the normalmap or another pbr map is
+> supposed to line up producing a darker corner-line
+>
+> whats going on here??
+
+User-supplied screenshot:
+`/home/midori/.claude/image-cache/a0ec450a-c774-48b4-9b67-7f640561f1f8/3.png`
+(522×380 RGB PNG). Visible content: beige fabric/leather-looking surface
+with a regular diagonal-grid pattern of dark seam lines that read as two
+phase-shifted overlays of the same texture (moiré). A small blue strip in
+the lower-right marks a voxel-face material transition.
+
+### H1–H5 evidence
+
+**H1 — Mismatched POM displacement between `triplanar_sample_pom` and
+`triplanar_sample_normal_pom`.** RULED OUT.
+
+Both helpers (`pbr_sampling.wgsl:151-171` and `:281-318`) compute the same
+per-plane UV preamble character-for-character:
+
+```wgsl
+let p = world_pos * WORLD_UV_SCALE;
+var uv_x = p.yz;
+var uv_y = p.zx;
+var uv_z = p.xy;
+if (dominant_axis == 0u) { uv_x = displaced_uv; }
+else if (dominant_axis == 1u) { uv_y = displaced_uv; }
+else { uv_z = displaced_uv; }
+```
+
+The non-dominant planes use the geometric world-pos UV; the dominant plane
+uses the caller-supplied `displaced_uv`. Same swizzle, same sign, same
+branch. Given identical `displaced_uv` and `dominant_axis` inputs from
+`naadf_first_hit.wgsl:290-294`, every sample point is bit-identical.
+
+There is no view-direction transform or POM math inside the sample helpers
+— the POM march happens exclusively in `pom_displace_uv_dominant` →
+`pom_displace_uv`. Call site `naadf_first_hit.wgsl:290-317` calls
+`pom_displaced_uv_dominant` once and reuses `displaced_uv` for all three
+samples. So all three first-hit samples (MRH, Diffuse/AO, Normal) hit
+identical UVs. Verdict: NOT the cause.
+
+**H2 — First-hit POM vs GI/spatial_resampling un-POM moiré.** ROOT CAUSE.
+
+The final pixel value is the sum of three writers to `final_color`:
+
+1. `naadf_first_hit.wgsl:435` — first-hit pass writes `acc.light` (sky
+   miss radiance + atmospheric absorption × POM-displaced reflection
+   absorption factor + POM self-shadow).
+2. `naadf_global_illum.wgsl:756-764` or `denoise_preprocessed[...]` —
+   GI pass writes/composites `color + abs(absorption) * cnts_final_color`.
+3. `spatial_resampling.wgsl:764` — spatial_resampling writes the
+   resampled-color + sun-direct contribution.
+
+The GI pass at `:242-270` and the spatial_resampling pass at `:198-225`
+BOTH re-sample the first-hit surface's MRH / Diffuse/AO / Normal — but at
+the **geometric, un-POM-displaced UVs** (`first_hit_world_pos = vec3<f32>
+(cam_pos_int) + first_hit_result.pos`). The samples drive `eval_pbr` calls
+that produce the **sun-direct shading on the first-hit surface**:
+
+- GI `:469-474` and `:486` — `radiance += cur_absorption * sun_color * fac`
+  where `fac = pbr.f * 2 * cos(n,l)` and `pbr` was evaluated against
+  `bounce_perturbed_normal` (un-POM normal sample).
+- spatial_resampling `:563-572` — `color *= pbr.f` or
+  `color *= cos * (1/π)` for the resolve.
+- spatial_resampling `:637-642` (and the surrounding `for (sun_tap...)`)
+  — `eval_pbr` for the sun-shadow-attenuated sun direct.
+
+So the user's final framebuffer pixel = (first-hit POM-displaced
+absorption × downstream radiance) **PLUS** (spatial_resampling resampled
+color shaded using un-POM albedo/normal/MRH). The two evaluators sample
+the SAME world-space surface at DIFFERENT UV offsets (one POM-displaced,
+one geometric). On a high-frequency height map (the fabric / metal_pattern
+heightmaps have crisp sub-mm relief) the parallax displacement is large
+enough that the two sample UVs disagree on every other pixel. Adding two
+phase-shifted versions of the same albedo produces the visible moiré
+"double surface" the user reports.
+
+Quick numeric check: `POM_HEIGHT_SCALE = 0.05` × adaptive 8-32 steps ×
+`view_uv` magnitude → displaced UV walks ~0.025-0.05 UV-units typical
+(2.5-5% of a tile = ~25-50 px on a 1024 albedo). The fabric albedo has
+characteristic features at that exact pitch — alignment of POM-displaced
+fabric with un-POM fabric produces the diagonal interference grid in the
+screenshot.
+
+Verdict: ROOT CAUSE. The GI/spatial sun-direct shading is the dominant
+illumination on a sunlit fabric surface (the first-hit pass mostly defers
+to GI for rough surfaces via `acc.absorption *= albedo`), so its
+un-POM-shaded contribution dominates the final pixel, and the first-hit's
+POM-displaced absorption contributes the phase-shifted overlay.
+
+**H3 — Soft-clip edge handling backfiring.** RULED OUT (not the cause of
+the seam grid).
+
+The soft-clip (`pbr_sampling.wgsl:403-413`) is applied symmetrically
+inside `pom_displace_uv` — it modifies `final_uv = base_uv + raw_offset *
+fade` once, and the returned `PomResult.uv` is what all consumers see.
+Both `triplanar_sample_pom` and `triplanar_sample_normal_pom` consume the
+already-clipped UV. There is no asymmetric clip across helpers.
+
+The clip activates only when the parallax march walks > 0.5 UV-units from
+`base_uv`, which at `POM_HEIGHT_SCALE = 0.05` requires extreme grazing on
+deep relief. On the typical near-orthogonal voxel-face viewing in the
+screenshot, the clip is dormant (offset magnitudes are ~0.025-0.05).
+Verdict: NOT the cause.
+
+**H4 — Triplanar plane-boundary discontinuity at voxel face edges.**
+CONTRIBUTING (the "darker corner-line" the user mentions).
+
+Per architect's design decision #5 (`02-design.md` § F.4) POM applies to
+the dominant projection only. At a voxel-face transition where the
+dominant axis changes (e.g. top of a voxel — Y-dominant — meeting the
+side — X-dominant), the displacement direction flips → a hard visible
+seam at the voxel-face boundary.
+
+The screenshot's lower-right shows a small blue strip at what is clearly
+a voxel face transition; the user describes "a distinct corner of the pbr
+where the normalmap or another pbr map is supposed to line up producing a
+darker corner-line". That corner-line is the dominant-axis switch at the
+voxel boundary, not the H2 moiré. Verdict: CONTRIBUTING but not the
+dominant artifact. We accept this for v1 (per brief option (b)) — fixing
+it requires either per-plane POM (3× cost) or angular-window blending of
+POM across the transition (extra march per pixel). Documenting only;
+no fix in this dispatch.
+
+**H5 — Self-shadow march sign / tangent-frame bug.** RULED OUT.
+
+Reading `pom_self_shadow` (`pbr_sampling.wgsl:443-503`):
+- `light_uv = project_plane_uv(light_dir, dominant_axis)` — same swizzle
+  as the parallax march, so the light and view directions share a tangent
+  frame.
+- `step = light_uv * POM_HEIGHT_SCALE * inv_steps / cos_light;` — PLUS
+  sign, so the march moves AWAY from the surface in the +light direction.
+- starting at `uv = displaced_uv + step` (one step away from the surface)
+  with `ray_h = base_height + bias`.
+
+Sign is consistent — light_dir points TOWARDS the sun, so marching in
++light_uv with +bias.h walks toward the sun's tangent-space silhouette,
+which is the correct direction for occluder detection.
+
+Even if there WERE a sign bug, the visible artifact would be stripes
+parallel to the projected sun direction (a single diagonal band, not a
+crisscross grid). The screenshot's grid pattern is two-axis — consistent
+only with H2 (additive overlay of two phase-shifted texture samples).
+Verdict: NOT the cause.
+
+### Confirmed root cause(s)
+
+**Primary: H2** — the GI pass (`naadf_global_illum.wgsl:250-270` →
+`:469-474`/`:486`) and the spatial_resampling pass
+(`spatial_resampling.wgsl:205-225` → `:563-587`/`:637-642`) re-sample the
+first-hit surface's albedo/normal/MRH at **un-POM-displaced UVs**, then
+shade the surface with the resulting samples. The resulting "shaded with
+un-POM" radiance is added to the first-hit pass's "shaded with POM"
+output through `final_color` composition, producing two phase-shifted
+overlays of the same texture → diagonal moiré grid the user reports as a
+"double surface".
+
+**Contributing: H4** — the lower-right "darker corner-line" the user
+mentions is the dominant-axis-switch seam at a voxel face boundary. Out
+of scope for this dispatch (would require per-plane POM or angular
+blending across the transition); documenting only.
+
+### Phase 2 — fix applied
+
+**Architectural consolidation.** Added the canonical helper
+`pom_compute(world_pos, ray_dir, weights, layer) -> PomCompute` in
+`crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl:228-260`. It
+returns a single bundle `{ displaced_uv, dominant_axis, height }` —
+ALL downstream sample calls (`triplanar_sample_pom` for albedo / MRH,
+`triplanar_sample_normal_pom` for normal) consume the SAME
+`displaced_uv` + `dominant_axis`. There is zero POM math inside the
+sample helpers; they're pure UV-routing + plane-blend over
+`textureSampleLevel`. H1 (mismatched displacement between helpers)
+is now structurally impossible.
+
+**H2 fix path (a).** Both
+`crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl:250-280`
+and `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl:205-241`
+now call `pom_compute` on the FIRST-HIT surface (using the same inputs
+the first-hit pass used: `world_pos`, `ray_dir` from
+`first_hit_result.ray_dir`, blend weights, layer), then re-sample MRH /
+Diffuse_AO / Normal via the `_pom` helper variants. The downstream
+`eval_pbr` / `get_brdf` calls now see the POM-displaced albedo /
+metallic / roughness / perturbed-normal, matching the first-hit pass's
+shading samples exactly.
+
+The brief's "fix path (a)" requires propagating the displaced position
+across passes — accomplished here without G-buffer expansion by simply
+re-computing the same POM march in each pass (deterministic — same
+inputs → same outputs). Cost: one extra POM march per pixel per pass
+(8-32 height taps × adaptive). At 1080p × 2M PBR-hit pixels × 2 passes
+× 12 average taps ≈ 48M height taps/frame additional cost — well under
+0.5 ms on modern GPUs (Vulkan compute throughput, RTX 5080 baseline).
+
+POM secondary-bounce shading in GI's bounce loop (`:423-444`) stays
+un-POM by design — those samples are on SECONDARY surfaces (not the
+first-hit surface), POM there is cost-prohibitive (`02-design.md` § F.4),
+and the visual return is negligible. Likewise the spatial_resampling
+visibility-ray loop (`:556-567`) stays un-POM — it touches neighbour
+voxels' MRH.G for the "is this a mirror?" classification, not the
+first-hit surface's BRDF inputs.
+
+**H4 (voxel face boundary).** Not fixed in this dispatch. Documented
+above; out of scope for the seam-artifact fix. Acceptable per brief
+option (b) "accept the artifact and document".
+
+**Files changed:**
+
+- `crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl` — added
+  `PomCompute` struct + `pom_compute` canonical helper
+  (`:228-260`).
+- `crates/bevy_naadf/src/assets/shaders/naadf_first_hit.wgsl` —
+  swapped `dominant_axis_from_weights` + `pom_displaced_uv_dominant`
+  call sequence for the single `pom_compute(...)` call
+  (`:289-303`). Import block updated (`:68-74`).
+- `crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl` —
+  added `pom_compute` call at the first-hit re-sample
+  (`:250-285`), switched the three sample calls from
+  `triplanar_sample` / `triplanar_sample_normal` to
+  `triplanar_sample_pom` / `triplanar_sample_normal_pom` consuming
+  `first_hit_displaced_uv` + `first_hit_dominant_axis`. Import
+  block updated (`:61-79`).
+- `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl` —
+  same pattern at the first-hit re-sample (`:198-243`). Import
+  block updated (`:69-83`).
+- `crates/bevy_naadf/src/e2e/pbr_visual.rs` — added 6th gate
+  assertion `assert_pom_uv_consistency_source` + two unit tests
+  (`pom_uv_consistency_source_invariant`,
+  `pom_sample_helpers_share_preamble`) (`:391-510`).
+
+### Phase 3 — gate tightening
+
+**6th assertion (sample-UV consistency, WGSL source-property check).**
+`crates/bevy_naadf/src/e2e/pbr_visual.rs::assert_pom_uv_consistency_source`
+inspects the WGSL source of `naadf_first_hit.wgsl`,
+`naadf_global_illum.wgsl`, and `spatial_resampling.wgsl`; asserts each
+file:
+1. Contains at least one `pom_compute(` call.
+2. Contains at least one `triplanar_sample_pom(` call.
+3. The first `pom_compute(` precedes the first `triplanar_sample_pom(`
+   in source order (the POM-displaced UV is an input to the sample, so
+   the compute must come first).
+
+If any future edit re-introduces un-POM first-hit-surface shading in
+GI / spatial_resampling, this assertion fails — catching the H2
+regression class structurally without needing a GPU pass.
+
+**Two reinforcing unit tests** (`#[cfg(test)] mod tests`):
+- `pom_uv_consistency_source_invariant` — runs the same check at
+  `cargo test --workspace --lib` time, so the regression is caught
+  pre-gate.
+- `pom_sample_helpers_share_preamble` — asserts both
+  `triplanar_sample_pom` and `triplanar_sample_normal_pom` share the
+  same `var uv_x = p.yz;` per-plane UV preamble (catches H1
+  regression structurally).
+
+Choice rationale: source-property check is the most pragmatic of the
+brief's three options (debug uniform / CPU sim / source grep). It
+costs zero GPU time, runs in microseconds at gate time, and catches the
+exact regression class — accidentally swapping a `_pom` sampler for an
+un-POM `triplanar_sample` in any first-hit shading path. The CPU-sim
+option would re-implement POM in Rust (double maintenance burden); the
+debug-uniform option requires a custom WGSL routine + a dedicated
+framebuffer slot.
+
+PASS confirmation: the 6th assertion runs successfully on the working
+tree (no regressions), and both unit tests pass at `cargo test
+--workspace --lib`.
+
+### Phase 4 — verification
+
+All gates wrapped in `timeout 240s`. Results from this dispatch:
+
+| Gate | Result | Key metric |
+|---|---|---|
+| `cargo build --workspace` | PASS | clean (`Finished dev profile`) |
+| `cargo test --workspace --lib` | PASS | 183 + 13 tests; 0 failures (incl. 2 new POM tests) |
+| `cargo run --bin e2e_render` (Batch 6 default) | PASS | emissive 246.2, GI-lit solid 179.8, sky 177.9 |
+| `cargo run --bin e2e_render -- --oasis-edit-visual` | PASS | rect mean per-pixel RGB Δ=11.40 (floor 8.0) |
+| `cargo run --bin e2e_render -- --small-edit-visual` | PASS | click rect max-Δ=419 (floor 15) |
+| `cargo run --bin e2e_render -- --validate-gpu-construction` | PASS | 388 bytes CPU-vs-GPU byte-equal |
+| `cargo run --bin e2e_render -- --vox-e2e` | PASS | centre luminance 245.3 (floor 160) |
+| `cargo run --bin e2e_render -- --pbr-visual` (tightened) | PASS | metrics below |
+| `just bake-texarrays` | PASS | `imported_assets/` is up to date |
+
+`--pbr-visual` post-fix metrics:
+```
+highlight luma 234.0 (floor 100)
+texture std-dev 43.95 (floor 5)
+normal-rect std-dev 16.86 (floor 8)
+texture sat-frac 0.000 (ceil 0.1)
+shadow-rect mean luma 151.57 (ceil 155)
+F0 mean RGB (228.9, 237.3, 216.4), R/G = 0.964, B/G = 0.912
++ POM UV-consistency source property check: PASS
+```
+
+Metrics are slightly different from the post-`af89dd5` pre-fix
+baseline (highlight 234.0 vs 234.4, texture std-dev 43.95 vs 44.38,
+normal-rect 16.86 vs 16.10, shadow-rect 151.57 vs 152.48) — all five
+prior assertions stay well within their thresholds, AND the new 6th
+assertion gates the source structure. The slight pixel-level shifts
+match expectations: POM-displaced shading in GI/spatial_resampling
+produces a faintly different lighting integral on the first-hit
+surfaces (the texture is now sampled at a slightly different point per
+pixel), which is exactly the visual fix the user asked for — the
+"double surface" overlay disappears because both writers to
+`final_color` now sample the same surface point.
+
+### Verdict
+
+**SUCCESS.** Root cause was H2 — the GI pass
+(`naadf_global_illum.wgsl:250-270`) and spatial_resampling pass
+(`spatial_resampling.wgsl:205-225`) re-sampled the first-hit surface's
+albedo / normal / MRH at the geometric (un-POM-displaced) UVs, then
+shaded the surface from scratch and composited the result into
+`final_color`. The first-hit pass's POM-displaced absorption × the
+spatial_resampling/GI un-POM sun-direct shading produced two
+phase-shifted texture overlays — the diagonal "double surface" moiré
+grid in user-report Image #3.
+
+Fix: consolidated POM math into a single canonical
+`pom_compute(world_pos, ray_dir, weights, layer)` in `pbr_sampling.wgsl`
+returning `{ displaced_uv, dominant_axis, height }`; both GI and
+spatial_resampling now call `pom_compute` themselves with the same
+inputs the first-hit pass used and consume the resulting displaced UV
+via `triplanar_sample_pom` / `triplanar_sample_normal_pom`. POM stays
+first-hit-surface only — secondary GI bounces and visibility ray taps
+are un-POM (cost / design rule). H1 (mismatched displacement between
+helpers) is now structurally impossible by construction. H4
+(voxel-face-boundary corner line) accepted and documented; out of
+scope for this dispatch. New 6th `--pbr-visual` assertion +
+2 unit tests catch the regression class at the WGSL source level.

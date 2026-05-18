@@ -421,3 +421,42 @@ consume the shared displaced UV; user's "only albedo is pom-offsetted"
 report is a visual-subtlety perception (normals/MRH POM produces less
 obvious visual signature than albedo POM) rather than a missing-wire-up
 bug. Nine verification gates green.
+
+---
+
+## pom seam-artifact diagnose+fix (2026-05-18)
+
+See `05-diagnostic.md` § "POM seam-artifact diagnose+fix (2026-05-18,
+post-`af89dd5`)" for the full root-cause + fix log.
+
+### Files changed
+
+- `crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl` — added
+  `PomCompute` struct + canonical `pom_compute` helper. ALL downstream
+  passes that re-shade the first-hit surface now consume the SAME
+  `displaced_uv` + `dominant_axis` via the shared helper.
+- `crates/bevy_naadf/src/assets/shaders/naadf_first_hit.wgsl` — swapped
+  `dominant_axis_from_weights` + `pom_displaced_uv_dominant` for the
+  single `pom_compute` call.
+- `crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl` —
+  added `pom_compute` call at the first-hit re-sample; the three
+  first-hit material samples (MRH, Diffuse/AO, Normal) now use the
+  `_pom` variants and consume the POM-displaced UV. (Secondary bounce
+  samples remain un-POM.)
+- `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl` —
+  same pattern at the first-hit re-sample.
+- `crates/bevy_naadf/src/e2e/pbr_visual.rs` — 6th gate assertion
+  (`assert_pom_uv_consistency_source`) + two unit tests
+  (`pom_uv_consistency_source_invariant`,
+  `pom_sample_helpers_share_preamble`) that catch the regression
+  class structurally.
+
+### Verdict
+
+SUCCESS — root cause was H2 (GI / spatial_resampling re-sampled the
+first-hit surface at un-POM-displaced UVs, producing two phase-shifted
+texture overlays = the "double surface" moiré). Fix consolidates POM
+math into `pom_compute` and propagates the displaced UV across all
+three passes that re-shade the first-hit surface. Nine verification
+gates green, including the tightened `--pbr-visual` with the new POM
+UV-consistency source-property check.

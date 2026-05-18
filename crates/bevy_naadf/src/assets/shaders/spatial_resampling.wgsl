@@ -68,9 +68,20 @@
 #import "shaders/common.wgsl"::PI
 #import "shaders/pbr_sampling.wgsl"::{
     triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
+    triplanar_sample_pom, triplanar_sample_normal_pom, pom_compute,
     select_layer_variant,
     eval_pbr, PbrEval, MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
+
+// The first-hit surface re-sample (`:205-225`) uses the POM-displaced UV
+// (via `pom_compute` + `_pom` sample variants) to stay consistent with the
+// first-hit pass's POM-shaded direct contribution. WITHOUT this match the
+// final pixel composites un-POM shading from this pass on top of POM
+// shading from the first-hit pass → visible moiré / "double-surface"
+// artifact (`05-diagnostic.md` § "POM seam-artifact diagnose+fix"). The
+// visibility-ray and reservoir-merge loops STAY un-POM — they touch
+// neighbour buckets at geometric face coordinates, not the first-hit
+// surface itself.
 
 // --- @group(1) — the spatial-resampling-specific bindings -------------------
 
@@ -202,13 +213,28 @@ fn sample_neighbors(
         first_hit_type.variant_span,
         vec3<i32>(floor(fh_world_pos)),
     );
-    let fh_mrh = triplanar_sample(
+    // POM-displaced UV on the dominant plane. MUST be computed via the
+    // canonical `pom_compute` with the same inputs the first-hit pass used
+    // (`naadf_first_hit.wgsl:290-294`): same `world_pos`, same `ray_dir`,
+    // same `blend_weights`, same `layer`. Without this match the
+    // resolved-color and sun-direct shading below would sample the texture
+    // at the geometric UV while the first-hit pass shaded it at the
+    // POM-displaced UV → moiré (`05-diagnostic.md` H2 root cause).
+    let fh_pom = pom_compute(
+        pbr_mrh, pbr_sampler,
+        fh_world_pos, first_hit.ray_dir, fh_blend, fh_layer,
+    );
+    let fh_displaced_uv  = fh_pom.displaced_uv;
+    let fh_dominant_axis = fh_pom.dominant_axis;
+    let fh_mrh = triplanar_sample_pom(
         pbr_mrh, pbr_sampler, fh_world_pos, fh_blend, fh_layer,
+        fh_dominant_axis, fh_displaced_uv,
     );
     let first_hit_metallic = fh_mrh.r;
     let first_hit_roughness = fh_mrh.g;
-    let fh_diffuse_ao = triplanar_sample(
+    let fh_diffuse_ao = triplanar_sample_pom(
         pbr_diffuse_ao, pbr_sampler, fh_world_pos, fh_blend, fh_layer,
+        fh_dominant_axis, fh_displaced_uv,
     );
     let first_hit_albedo = fh_diffuse_ao.rgb
         * first_hit_type.albedo_tint * fh_diffuse_ao.a;
@@ -219,9 +245,10 @@ fn sample_neighbors(
     // Geometric tests (visibility ray origin, sun-shadow ray origin,
     // bucket-classification) keep using `first_hit.normal` — they are
     // geometric face-orientation lookups, not BRDF inputs.
-    let first_hit_perturbed_normal = triplanar_sample_normal(
+    let first_hit_perturbed_normal = triplanar_sample_normal_pom(
         pbr_normal, pbr_sampler,
         fh_world_pos, fh_blend, first_hit.normal, fh_layer,
+        fh_dominant_axis, fh_displaced_uv,
     );
 
     // `is_diffuse` split mirrors the first-hit pass's gate

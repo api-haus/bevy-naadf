@@ -68,7 +68,7 @@
 #import "shaders/pbr_sampling.wgsl"::{
     triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
     triplanar_sample_pom, triplanar_sample_normal_pom,
-    dominant_axis_from_weights, pom_displaced_uv_dominant, pom_self_shadow,
+    pom_compute, pom_self_shadow,
     select_layer_variant,
     MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
@@ -286,12 +286,22 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // dependent), linear-interpolation refine, soft-clip
             // displacement, plus a secondary `pom_self_shadow` march toward
             // the sun in the dominant plane's tangent space.
-            let dominant_axis = dominant_axis_from_weights(blend_weights);
-            let pom = pom_displaced_uv_dominant(
+            //
+            // ALL POM math lives in `pom_compute` — the helper returns a
+            // single canonical `PomCompute { displaced_uv, dominant_axis,
+            // height }`. Every downstream sample call MUST consume the
+            // SAME `displaced_uv` + `dominant_axis` to keep the
+            // first-hit-pass texture sampling consistent. GI /
+            // spatial_resampling MUST call `pom_compute` themselves with
+            // the same inputs when re-shading the first-hit surface
+            // (see `05-diagnostic.md` § "POM seam-artifact diagnose+fix"
+            // for the seam-moiré root cause this consolidation closes).
+            let pom = pom_compute(
                 pbr_mrh, pbr_sampler,
-                hit_world_pos, ray_dir, layer, dominant_axis,
+                hit_world_pos, ray_dir, blend_weights, layer,
             );
-            let displaced_uv = pom.uv;
+            let displaced_uv  = pom.displaced_uv;
+            let dominant_axis = pom.dominant_axis;
             let mrh = triplanar_sample_pom(
                 pbr_mrh, pbr_sampler,
                 hit_world_pos, blend_weights, layer, dominant_axis, displaced_uv,

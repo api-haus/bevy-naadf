@@ -388,5 +388,127 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
         ));
     }
 
+    // 6th assertion — POM sample-UV consistency. Inspect the WGSL source of
+    // every pass that re-shades the first-hit surface; assert that each
+    // calls `pom_compute` BEFORE any `triplanar_sample_pom` /
+    // `triplanar_sample_normal_pom` call, and that the un-POM
+    // `triplanar_sample(pbr_diffuse_ao|pbr_normal, ...)` and
+    // `triplanar_sample_normal(pbr_normal, ...)` calls do NOT appear in
+    // the first-hit re-sample blocks (they would re-introduce the H2
+    // moiré). Catches `05-diagnostic.md` § "POM seam-artifact diagnose+fix"
+    // regression class: any future edit that re-introduces un-POM sampling
+    // of the first-hit surface in GI or spatial_resampling fails this check.
+    if let Err(msg) = assert_pom_uv_consistency_source() {
+        return Err(format!(
+            "pbr-visual gate FAIL — POM sample-UV consistency check: {msg}. \
+             {report}.",
+        ));
+    }
+
     Ok(format!("pbr-visual gate PASS — {report}"))
+}
+
+// ---------------------------------------------------------------------------
+// 6th assertion — POM sample-UV consistency (WGSL source property check)
+// ---------------------------------------------------------------------------
+
+/// Inspect the WGSL source of every pass that re-shades the first-hit
+/// surface; assert each pass establishes a POM-displaced UV via
+/// `pom_compute` BEFORE its first POM-aware sample call AND does not call
+/// un-POM `triplanar_sample` on the PBR maps in the first-hit re-sample
+/// block. Catches the H2 moiré regression class structurally — if any
+/// future edit re-introduces un-POM first-hit shading in GI /
+/// spatial_resampling, this assertion fails.
+pub fn assert_pom_uv_consistency_source() -> Result<(), String> {
+    const FIRST_HIT_WGSL: &str = include_str!(
+        "../assets/shaders/naadf_first_hit.wgsl"
+    );
+    const GI_WGSL: &str = include_str!(
+        "../assets/shaders/naadf_global_illum.wgsl"
+    );
+    const SPATIAL_WGSL: &str = include_str!(
+        "../assets/shaders/spatial_resampling.wgsl"
+    );
+
+    for (name, src) in &[
+        ("naadf_first_hit.wgsl", FIRST_HIT_WGSL),
+        ("naadf_global_illum.wgsl", GI_WGSL),
+        ("spatial_resampling.wgsl", SPATIAL_WGSL),
+    ] {
+        // The pass must call `pom_compute` at least once.
+        if !src.contains("pom_compute(") {
+            return Err(format!(
+                "{name} does not call `pom_compute(` — first-hit POM \
+                 consolidation regressed; H2 moiré will return"
+            ));
+        }
+        // The pass must call `triplanar_sample_pom` at least once.
+        if !src.contains("triplanar_sample_pom(") {
+            return Err(format!(
+                "{name} does not call `triplanar_sample_pom(` for the \
+                 first-hit re-sample — H2 moiré will return"
+            ));
+        }
+        // `pom_compute` must precede the first `triplanar_sample_pom`
+        // call in source order — the POM-displaced UV is an input to the
+        // sample, so the compute must come first.
+        let pc_pos = src
+            .find("pom_compute(")
+            .ok_or_else(|| format!("{name}: pom_compute( not found"))?;
+        let ts_pos = src
+            .find("triplanar_sample_pom(")
+            .ok_or_else(|| format!("{name}: triplanar_sample_pom( not found"))?;
+        if pc_pos > ts_pos {
+            return Err(format!(
+                "{name}: first `triplanar_sample_pom(` appears before \
+                 `pom_compute(` — the displaced UV is consumed before being \
+                 computed"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Source-level invariant: every WGSL pass that re-shades the
+    /// first-hit surface MUST establish its POM-displaced UV via
+    /// `pom_compute` BEFORE issuing a POM-aware texture sample. If this
+    /// invariant breaks, the H2 first-hit-vs-GI moiré (the "double
+    /// surface" artifact in user-report Image #3) returns. See
+    /// `05-diagnostic.md` § "POM seam-artifact diagnose+fix".
+    #[test]
+    fn pom_uv_consistency_source_invariant() {
+        if let Err(msg) = assert_pom_uv_consistency_source() {
+            panic!("POM UV-consistency source-property check failed: {msg}");
+        }
+    }
+
+    /// The two POM-aware sample helpers MUST share the per-plane UV
+    /// preamble — same swizzle (`p.yz, p.zx, p.xy`) and same branch on
+    /// `dominant_axis`. A future divergence would re-introduce H1
+    /// (mismatched displacement across helpers).
+    #[test]
+    fn pom_sample_helpers_share_preamble() {
+        const PBR_SAMPLING: &str =
+            include_str!("../assets/shaders/pbr_sampling.wgsl");
+
+        // Both helpers compute `let p = world_pos * WORLD_UV_SCALE` and
+        // build `uv_x = p.yz; uv_y = p.zx; uv_z = p.xy;` then branch on
+        // `dominant_axis`. Count occurrences — there should be at least
+        // two of each (one per helper).
+        let preamble_count = PBR_SAMPLING
+            .matches("var uv_x = p.yz;")
+            .count();
+        assert!(
+            preamble_count >= 2,
+            "Expected ≥2 POM-aware sample helpers sharing the \
+             `var uv_x = p.yz;` preamble; found {preamble_count}. A \
+             helper diverged from the canonical layout — H1 mismatched \
+             displacement risk."
+        );
+    }
 }

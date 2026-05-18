@@ -226,6 +226,55 @@ fn pom_displaced_uv_dominant(
     return pom_displace_uv(mrh_tex, smp, base_uv, view_uv, view_n, layer);
 }
 
+// `PomCompute` — the canonical POM input bundle every pass MUST consume.
+//
+// Phase 3 of `05-diagnostic.md` § "POM seam-artifact diagnose+fix" (post-
+// `af89dd5`) consolidated all POM math into this one helper to eliminate
+// the H2 first-hit-vs-GI moiré class. The contract:
+//
+//   * Compute the dominant-plane displaced UV exactly ONCE per first-hit
+//     surface pixel, in one canonical place (this function).
+//   * Every downstream sample call (albedo, normal, MRH) consumes the
+//     SAME `displaced_uv` + `dominant_axis` via `triplanar_sample_pom` /
+//     `triplanar_sample_normal_pom`.
+//   * Every pass that re-evaluates the first-hit surface's BRDF (GI's
+//     `:250-270` first-hit re-sample, spatial_resampling's `:205-225`
+//     first-hit re-sample) MUST call this helper instead of bare
+//     `triplanar_sample`/`triplanar_sample_normal`. Re-sampling the
+//     first-hit surface at the un-POM-displaced UV produced the
+//     "double-surface" moiré the user reported on Image #3.
+//
+// The function returns the displaced UV, the dominant-axis index, and the
+// intersection-point height. POM self-shadow is *NOT* re-evaluated here —
+// it stays first-hit only (folded into `first_hit_absorption`), so GI /
+// spatial_resampling consume only the displaced UV + dominant axis.
+struct PomCompute {
+    displaced_uv:  vec2<f32>,
+    dominant_axis: u32,
+    height:        f32,
+}
+
+fn pom_compute(
+    mrh_tex:    texture_2d_array<f32>,
+    smp:        sampler,
+    world_pos:  vec3<f32>,
+    view_dir:   vec3<f32>,
+    weights:    vec3<f32>,
+    layer:      u32,
+) -> PomCompute {
+    let dominant_axis = dominant_axis_from_weights(weights);
+    let p = world_pos * WORLD_UV_SCALE;
+    let base_uv = project_plane_uv(p, dominant_axis);
+    let view_uv = project_plane_uv(view_dir, dominant_axis);
+    let view_n  = project_plane_n(view_dir, dominant_axis);
+    let r = pom_displace_uv(mrh_tex, smp, base_uv, view_uv, view_n, layer);
+    var out: PomCompute;
+    out.displaced_uv  = r.uv;
+    out.dominant_axis = dominant_axis;
+    out.height        = r.height;
+    return out;
+}
+
 // --- triplanar normal-map sample (RNM blend) -------------------------------
 
 // Decode a tangent-space normal byte triplet (R,G,B in [0,1]) to a
