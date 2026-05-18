@@ -103,18 +103,36 @@ noise-clean:
     cd crates/voxel_noise && make clean
 
 # ── e2e (Playwright smoke test against the web build) ───────────────────────
+#
+# ALWAYS run the Playwright e2e suite headful.
+#
+# The NAADF render path is WebGPU-only and uses a heavy compute pipeline that
+# overruns headless Chromium's `chrome-headless-shell` WebGPU stack (SwiftShader
+# fallback only) — the device times out and panics mid-render with
+# `Caught DeviceLost error: Destroyed Device was destroyed.` before the .vox
+# install can even complete. That noise hides the *real* failures we want the
+# suite to surface (wgpu validation, buffer-flag mismatches, wasm panics, ...).
+#
+# Headed Chrome routes through the same Dawn + GPU-process pipeline as a
+# normal browser session, picks the host adapter, and reaches the same
+# render state a user does — so the suite catches the bugs a user would.
+#
+# `test-wasm` and `test-wasm-full` therefore both run in headed mode by
+# default. A separate `test-wasm-headless` recipe stays for the rare case
+# where someone wants to triage the headless-only failure modes.
 
 # Install the Playwright test dependencies + the chromium browser.
 install-e2e:
     cd e2e && npm install && npx playwright install chromium
 
-# Run the WASM e2e smoke test (requires a prior `just web-build-release`).
+# Run the WASM e2e suite (requires a prior `just web-build-release`).
+# Headed by default — see the block comment above for why.
 test-wasm:
-    cd e2e && npx playwright test
-
-# Run the WASM e2e smoke test with a visible browser (for debugging).
-test-wasm-headed:
     cd e2e && npx playwright test --headed
 
-# Build the release web artifact, then run the e2e smoke test against it.
+# Diagnostic-only — expected to fail with WebGPU `DeviceLost` (see block comment).
+test-wasm-headless:
+    cd e2e && npx playwright test
+
+# Build the release web artifact, then run the e2e suite (headed) against it.
 test-wasm-full: web-build-release test-wasm

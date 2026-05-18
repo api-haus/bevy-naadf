@@ -922,6 +922,40 @@ pub fn populate_cpu_mirror_from_gpu_producer(
         gpu.cpu_mirror_populated = true;
         return;
     }
+
+    // WebGPU divergence: wgpu's `Device::poll(wait_indefinitely)` is a no-op
+    // on the WebGPU backend — the main thread can't synchronously block
+    // waiting for the `mapAsync` JS promise to resolve, so when
+    // `get_mapped_range` runs below the buffer isn't yet mapped and wgpu
+    // panics with `OperationError: Failed to execute 'getMappedRange' on
+    // 'GPUBuffer'`. The synchronous map/poll/read pattern is fundamentally
+    // unportable to WebGPU.
+    //
+    // The CPU mirror is only consumed by the EDITOR (hash-keyed edit path,
+    // CPU pick ray). The renderer reads `WorldGpu` storage buffers
+    // (populated in-place by the W5 GPU producer chain) and is unaffected
+    // by an empty CPU mirror — so on web we skip the readback entirely.
+    // Editor operations are deferred to a followup that implements a proper
+    // async readback path (Bevy `Task` + cross-frame `mapAsync.await`).
+    //
+    // Mark the mirror as "populated" so this system stops checking; the
+    // editor's hash-table lookups will return empty on web until the async
+    // path lands. See `e2e/tests/vox-loading.spec.ts` for the gate.
+    #[cfg(target_arch = "wasm32")]
+    {
+        bevy::log::info!(
+            "vox-gpu-rewrite D1 readback: skipping CPU-mirror population on \
+             wasm32 — synchronous map/poll/read is incompatible with WebGPU's \
+             async `mapAsync`. Renderer is unaffected (reads from WorldGpu); \
+             editor operations are deferred to async-readback followup."
+        );
+        gpu.cpu_mirror_populated = true;
+        // Silence "unused" warnings for the parameters the native path
+        // would consume below.
+        let _ = (&world_gpu, &render_device, &render_queue, &main_world);
+        return;
+    }
+
     let Some(world_gpu) = world_gpu else { return; };
     let Some(block_voxel_count_buf) = gpu.block_voxel_count.as_ref() else {
         return;
@@ -1883,7 +1917,15 @@ pub fn prepare_construction(
             let buf = render_device.create_buffer(&BufferDescriptor {
                 label: Some("naadf_block_voxel_count_w2_placeholder"),
                 size: 8, // 2 × u32 — `block_voxel_count[0..2]`
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                // COPY_SRC is required for `populate_cpu_mirror_from_gpu_producer`
+                // to copy the W5 atomic cursors out via `CopyBufferToBuffer`.
+                // Native wgpu validation was lenient with the flag missing;
+                // WebGPU's stricter validation rejects the encode and the
+                // follow-up `get_mapped_range` panics. See e2e/tests/
+                // vox-loading.spec.ts.
+                usage: BufferUsages::STORAGE
+                    | BufferUsages::COPY_DST
+                    | BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&[64u32, 64u32]));

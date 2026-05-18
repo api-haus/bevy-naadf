@@ -295,7 +295,6 @@ fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path) {
 /// (same as the pre-W5.1 behaviour, so the world is still fixed-size and
 /// editable — matches C#'s missing-`oasis.cvox` path).
 fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
-    // W5.1 — parse as a single-tile sparse import (no CPU tiling).
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -308,13 +307,33 @@ fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
             return;
         }
     };
-    let data = match dot_vox::load_bytes(&bytes) {
+    install_vox_bytes_in_fixed_world(commands, &bytes, &path.display().to_string());
+}
+
+/// Bytes-based variant of [`install_vox_in_fixed_world`]. Used by:
+/// - the native path entry point (above), which reads from disk first;
+/// - the wasm HTTP-fetch path (`voxel::web_vox::apply_pending_vox`), which
+///   receives bytes fetched over HTTP;
+/// - drag-and-drop on both platforms.
+///
+/// All `commands.insert_resource(...)` calls below overwrite existing
+/// resources cleanly, so this function is safe to invoke post-`Startup`
+/// (e.g. from an `Update` system) to *replace* the active scene.
+///
+/// `source_label` is the human-readable origin used in log messages — a
+/// filesystem path, a URL, or "<dropped file>".
+pub fn install_vox_bytes_in_fixed_world(
+    commands: &mut Commands,
+    bytes: &[u8],
+    source_label: &str,
+) {
+    // W5.1 — parse as a single-tile sparse import (no CPU tiling).
+    let data = match dot_vox::load_bytes(bytes) {
         Ok(d) => d,
         Err(e) => {
             error!(
                 ".vox load failed (parse error: {e}); falling back to embedded \
-                 default in fixed world (path: {})",
-                path.display()
+                 default in fixed world (source: {source_label})"
             );
             install_default_embedded_in_fixed_world(commands);
             return;
@@ -325,8 +344,7 @@ fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
         Err(e) => {
             error!(
                 ".vox load failed ({e}); falling back to embedded default in \
-                 fixed world (path: {})",
-                path.display()
+                 fixed world (source: {source_label})"
             );
             install_default_embedded_in_fixed_world(commands);
             return;
@@ -339,7 +357,7 @@ fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
          data_chunk={} u32s, data_block={} u32s, data_voxel={} u32s, \
          {} palette entries). Fixed world {}×{}×{} chunks; GPU producer \
          chain runs per WORLD_SIZE_IN_SEGMENTS = ({}, {}, {}).",
-        path.display(),
+        source_label,
         model_size_in_chunks[0],
         model_size_in_chunks[1],
         model_size_in_chunks[2],
@@ -429,6 +447,98 @@ fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
     world_data.seed_block_hashing();
     commands.insert_resource(world_data);
     commands.insert_resource(VoxelTypes { types: imp.palette });
+}
+
+/// Native (desktop) drag-and-drop entry point. Winit emits
+/// [`bevy::window::FileDragAndDrop::DroppedFile`] with a `PathBuf` whenever the
+/// user drops a file onto a window; this system filters to `.vox` files, reads
+/// the bytes via `std::fs::read`, and feeds them into
+/// [`install_vox_bytes_in_fixed_world`] — the same install path used by the
+/// startup loader and (on web) the HTTP-fetch / browser-DnD paths.
+///
+/// Non-`.vox` drops are ignored with an info log; `.vox` drops with a read
+/// error are logged as `error!` but the current scene is left intact (the
+/// install function's own fall-back-to-default behaviour only kicks in for
+/// successful reads that fail to *parse*).
+///
+/// **Diagnostics:** every received `FileDragAndDrop` variant is logged
+/// (`HoveredFile` / `DroppedFile` / `HoveredFileCanceled`) so that if drag-drop
+/// appears to "not work", the logs tell us whether winit is emitting any
+/// events at all on this platform / windowing system (Wayland in particular
+/// has historically had patchy drag-drop support; on Wayland the compositor
+/// has to forward the data offer to the toplevel surface, and not every
+/// compositor does for floating drops onto a regular window).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn native_vox_drop_listener(
+    mut commands: Commands,
+    mut events: MessageReader<bevy::window::FileDragAndDrop>,
+) {
+    for ev in events.read() {
+        match ev {
+            bevy::window::FileDragAndDrop::HoveredFile { path_buf, window } => {
+                info!(
+                    "drag-drop: HoveredFile event — path={} window={:?}",
+                    path_buf.display(),
+                    window
+                );
+            }
+            bevy::window::FileDragAndDrop::HoveredFileCanceled { window } => {
+                info!("drag-drop: HoveredFileCanceled event — window={:?}", window);
+            }
+            bevy::window::FileDragAndDrop::DroppedFile { path_buf, window } => {
+                info!(
+                    "drag-drop: DroppedFile event — path={} window={:?}",
+                    path_buf.display(),
+                    window
+                );
+                let is_vox = path_buf
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("vox"))
+                    .unwrap_or(false);
+                if !is_vox {
+                    info!(
+                        "drag-drop: ignoring non-.vox file ({})",
+                        path_buf.display()
+                    );
+                    continue;
+                }
+                let bytes = match std::fs::read(path_buf) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!(
+                            "drag-drop: failed to read .vox ({e}); keeping current scene (path: {})",
+                            path_buf.display()
+                        );
+                        continue;
+                    }
+                };
+                info!(
+                    "drag-drop: loading .vox ({} bytes) from {}",
+                    bytes.len(),
+                    path_buf.display()
+                );
+                install_vox_bytes_in_fixed_world(
+                    &mut commands,
+                    &bytes,
+                    &path_buf.display().to_string(),
+                );
+            }
+        }
+    }
+}
+
+/// One-shot startup logger — confirms `native_vox_drop_listener` is wired up
+/// and visible in the startup logs. If a user reports "drag-drop doesn't
+/// work", the absence of this log line tells us the system was never
+/// registered (e.g. `cfg.add_e2e_systems` was unexpectedly true).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn log_native_dnd_registered() {
+    info!(
+        "drag-drop: native_vox_drop_listener registered — drop a .vox file \
+         onto the window to load it (any FileDragAndDrop event reaching the \
+         window will be logged at INFO level)"
+    );
 }
 
 /// A `1×1×1`-chunk [`DenseVolume`] containing the standard 3-voxel ground

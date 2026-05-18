@@ -12,6 +12,16 @@ const DIST_DIR = resolve(
   new URL(".", import.meta.url).pathname,
   "../crates/bevy_naadf/dist"
 );
+// Test fixtures (e.g. the Oasis .vox checked in at
+// `crates/bevy_naadf/assets/test/`) served at `/test-fixtures/<name>` so
+// the Playwright `.vox`-loading test can point `web_vox` at a same-origin
+// file via the `?vox=<url>` query-string override — no dependency on the
+// live R2 bucket having the right key.
+const TEST_FIXTURES_DIR = resolve(
+  new URL(".", import.meta.url).pathname,
+  "../crates/bevy_naadf/assets/test"
+);
+const TEST_FIXTURES_PREFIX = "/test-fixtures/";
 
 const MIME_TYPES = {
   ".html": "text/html",
@@ -29,6 +39,7 @@ const MIME_TYPES = {
   ".txt": "text/plain",
   ".toml": "text/plain",
   ".meta": "text/plain",
+  ".vox": "application/octet-stream",
 };
 
 const server = createServer((req, res) => {
@@ -39,9 +50,22 @@ const server = createServer((req, res) => {
   let urlPath = new URL(req.url, `http://localhost:${PORT}`).pathname;
   if (urlPath === "/") urlPath = "/index.html";
 
+  // Resolve under either the dist tree or the test-fixtures tree, depending
+  // on the URL prefix. Test fixtures live outside dist/ so we don't bloat
+  // the deploy bundle with the 85 MB Oasis .vox.
+  let baseDir;
+  let relPath;
+  if (urlPath.startsWith(TEST_FIXTURES_PREFIX)) {
+    baseDir = TEST_FIXTURES_DIR;
+    relPath = urlPath.slice(TEST_FIXTURES_PREFIX.length);
+  } else {
+    baseDir = DIST_DIR;
+    relPath = urlPath;
+  }
+
   // Directory traversal protection
-  const filePath = normalize(join(DIST_DIR, urlPath));
-  if (!filePath.startsWith(DIST_DIR)) {
+  const filePath = normalize(join(baseDir, relPath));
+  if (!filePath.startsWith(baseDir)) {
     res.writeHead(403);
     res.end("Forbidden");
     return;

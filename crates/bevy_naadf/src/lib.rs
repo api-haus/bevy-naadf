@@ -708,6 +708,24 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // (`crate::e2e::add_e2e_systems`).
     app.add_systems(Startup, voxel::grid::setup_test_grid);
 
+    // Web-only .vox streaming: kick off the default-model HTTP fetch on
+    // `Startup`, and run the consumer system on `Update` so both the fetch
+    // and any drag-dropped `.vox` files swap the active scene the moment
+    // their bytes are ready. The default scene from `setup_test_grid` stays
+    // visible until then.
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Startup, voxel::web_vox::startup_fetch_default_vox)
+        .add_systems(Update, voxel::web_vox::apply_pending_vox);
+
+    // Native drag-and-drop: drop a `.vox` file onto the window to replace the
+    // active scene. Gated off the e2e harness — winit emits the event in both
+    // modes but the e2e harness should never see foreign input.
+    #[cfg(not(target_arch = "wasm32"))]
+    if !cfg.add_e2e_systems {
+        app.add_systems(Startup, voxel::grid::log_native_dnd_registered)
+            .add_systems(Update, voxel::grid::native_vox_drop_listener);
+    }
+
     // Phase-C wave-3 — spawn the W4 fixture entity (gated on
     // `args.spawn_test_entity`). Runs after `setup_test_grid` so the world
     // dimensions are known; populates `MainWorldEntities` with one entity at

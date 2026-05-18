@@ -12,6 +12,9 @@
 pub mod grid;
 pub mod vox_import;
 
+#[cfg(target_arch = "wasm32")]
+pub mod web_vox;
+
 use bevy::prelude::Vec3;
 
 // ---------------------------------------------------------------------------

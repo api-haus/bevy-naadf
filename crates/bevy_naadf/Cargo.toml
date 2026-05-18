@@ -115,6 +115,33 @@ basis-universal = "0.3"
 # behind `cfg(target_arch = "wasm32")`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
+# Web .vox loading — HTTP fetch + drag-and-drop. The web build streams the
+# default model from R2 (`crates/bevy_naadf/src/voxel/web_vox.rs`) and accepts
+# `.vox` files dropped onto the `<canvas>` element via a JS shim that calls
+# back into wasm. `console_error_panic_hook` surfaces wasm panics to the JS
+# console so the failures don't disappear into the void.
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "Response",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "EventTarget",
+    "Event",
+    "DragEvent",
+    "DataTransfer",
+    "File",
+    "FileList",
+    "Blob",
+    "Node",
+    "DomTokenList",
+] }
 
 [features]
 default = []

@@ -50,7 +50,13 @@ export class ConsoleCollector {
   attach(page: Page): void {
     page.on("console", (msg: ConsoleMessage) => {
       const text = msg.text();
-      if (this.isIgnored(text)) return;
+      // Chromium reports failed resource loads (e.g. the favicon.ico the
+      // browser fetches itself with no element in the HTML) as a generic
+      // `console.error` whose text is "Failed to load resource: …" — the
+      // URL is only in `msg.location().url`. We have to inspect both
+      // sources to filter that noise.
+      const locUrl = msg.location()?.url ?? "";
+      if (this.isIgnored(text) || this.isIgnored(locUrl)) return;
       const isBevyError =
         msg.type() === "log" && text.includes(BEVY_ERROR_MARKER);
       if (msg.type() !== "error" && !isBevyError) return;

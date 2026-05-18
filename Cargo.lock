@@ -391,13 +391,18 @@ dependencies = [
  "basis-universal",
  "bevy",
  "bytemuck",
+ "console_error_panic_hook",
  "dot_vox",
  "getrandom 0.3.4",
  "image",
  "image-compare",
+ "js-sys",
  "ron",
  "serde",
  "thiserror 2.0.18",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
