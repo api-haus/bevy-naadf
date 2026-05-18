@@ -81,11 +81,6 @@ the cross-origin-isolated page needs).
 The on-screen overlay shows FPS, the active renderer, and per-pass NAADF render-node
 GPU timings (`first-hit`, `final-blit`).
 
-## Known caveats
-
-- **Solari is experimental.** Some artifacts are expected — e.g. shimmer at world-cache LOD
-  transitions, imperfect denoising on curved mirrors.
-
 ## Project layout
 
 This is a Cargo workspace. `crates/bevy_naadf` is the renderer; `crates/voxel_noise` is a

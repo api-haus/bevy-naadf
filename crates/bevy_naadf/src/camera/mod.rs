@@ -12,7 +12,8 @@ pub mod position_split;
 use bevy::{
     camera::Hdr,
     camera_controller::free_camera::FreeCamera,
-    core_pipeline::tonemapping::Tonemapping, prelude::*,
+    core_pipeline::tonemapping::Tonemapping,
+    prelude::*,
 };
 
 pub use position_split::{sync_position_split, PositionSplit};
@@ -128,11 +129,7 @@ pub fn setup_camera(
         // Bevy's built-in tonemapper — `TonyMcMapface` (Bevy's default, the
         // idiomatic 0.19 choice). Replaces NAADF's custom Reinhard-ish tonemap.
         Tonemapping::default(),
-        FreeCamera {
-            walk_speed: 4.0,
-            run_speed: 14.0,
-            ..default()
-        },
+        default_free_camera(),
         start,
         // NAADF's int+frac camera-relative position (D1). Seeded from the
         // spawn `Transform`; `sync_position_split` keeps it in step each frame.
@@ -141,6 +138,23 @@ pub fn setup_camera(
         // rasterised — keep MSAA off.
         Msaa::Off,
     ));
+}
+
+/// The canonical `FreeCamera` config for the production camera. Used at
+/// spawn time and again by `crate::app_mode::restore_camera_input` when the
+/// Escape overlay closes (which re-inserts the component).
+///
+/// Note: NOT using `bevy_state::DisableOnEnter`/`EnableOnExit` for this —
+/// `Disabled` on a `Camera3d` entity makes Bevy's render-extraction queries
+/// skip it, which blanks the entire screen (the UI also renders through the
+/// camera). Toggling just the `FreeCamera` component keeps the camera
+/// rendering while making `FreeCameraPlugin`'s input queries skip it.
+pub fn default_free_camera() -> FreeCamera {
+    FreeCamera {
+        walk_speed: 4.0,
+        run_speed: 14.0,
+        ..default()
+    }
 }
 
 /// `D` toggles DLSS Ray Reconstruction on/off. Dormant in Phase A — the NAADF

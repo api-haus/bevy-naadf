@@ -11,12 +11,13 @@
 //! e2e-render-test.md`).
 
 pub mod aadf;
+pub mod app_mode;
 pub mod camera;
 pub mod e2e;
 pub mod editor;
 pub mod hud;
-pub mod panel;
 pub mod render;
+pub mod settings;
 pub mod texture_array;
 pub mod voxel;
 pub mod world;
@@ -27,7 +28,8 @@ static ROBOTO_REGULAR_BYTES: &[u8] =
     include_bytes!("assets/fonts/Roboto-Regular.ttf");
 
 /// Main-world resource — the `FontSource` for the embedded Roboto Regular
-/// font. Both `hud` and `panel` query this resource to set `TextFont.font`.
+/// font. `hud`, `editor::hud`, and `settings` all query this resource to set
+/// `TextFont.font`.
 ///
 /// To add a second font in future: add another `&[u8]` static + another field
 /// here, load it in `load_dev_font`, and store its `FontSource` alongside this one.
@@ -740,36 +742,63 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     );
 
     if cfg.add_hud {
+        use crate::app_mode::AppMode;
+        use bevy::state::condition::in_state;
+        use bevy::state::state::{OnEnter, OnExit};
+
         app.add_systems(Startup, hud::setup_hud.after(load_dev_font))
             .add_systems(Update, hud::update_hud);
-        // Quality panel (`21-design-quality-panel.md` + mouse extension
-        // `25-design-panel-mouse.md`) — gated on the same `add_hud` flag as
-        // the HUD itself. The e2e harness (`AppConfig::e2e`) sets
-        // `add_hud = false`, so the panel never spawns in the bounded harness
-        // — luminance gates are unaffected. The mouse system slots in
-        // between `adjust_panel` and `update_panel_text` so per-frame mouse
-        // mutations are reflected in the same frame's text refresh
-        // (`25-design-panel-mouse.md` §6.1).
-        app.init_resource::<panel::PanelState>()
-            .init_resource::<panel::PanelDrag>()
-            // Track-B editor — `02b-design-editor.md`. Shares the same
-            // `add_hud` gate as panel + HUD so the e2e harness never sees
-            // the editor either (luminance gates unaffected).
+
+        // Settings overlay + editor HUD — share the `add_hud` gate so the e2e
+        // harness (`AppConfig::e2e`) never sees them. Visibility is driven by
+        // the global `AppMode` state: `Playing` ↔ `Settings` flips on Escape
+        // (`app_mode::toggle_settings_on_escape`). While `Settings` is
+        // active the camera entity carries `Disabled` (markers attached in
+        // `camera::setup_camera`) so `FreeCameraPlugin`'s queries skip it, and
+        // `editor::apply_edit_tool` is gated by `in_state(Playing)`.
+        app.init_state::<AppMode>()
+            .init_resource::<settings::SettingsState>()
+            .init_resource::<settings::SettingsDrag>()
             .init_resource::<editor::EditorState>()
-            .add_systems(Startup, panel::setup_panel.after(load_dev_font))
             .add_systems(Startup, editor::hud::setup_editor_hud.after(load_dev_font))
+            // Settings spawns AFTER the editor HUD so it ends up later in the
+            // UI document order (a belt-and-suspenders safety net on top of
+            // the GlobalZIndex(1000/1001) markers on the backdrop + root).
+            .add_systems(
+                Startup,
+                settings::setup_settings
+                    .after(load_dev_font)
+                    .after(editor::hud::setup_editor_hud),
+            )
+            .add_systems(
+                OnEnter(AppMode::Settings),
+                (settings::show_settings, app_mode::suspend_camera_input),
+            )
+            .add_systems(
+                OnExit(AppMode::Settings),
+                (settings::hide_settings, app_mode::restore_camera_input),
+            )
             .add_systems(
                 Update,
                 (
-                    panel::toggle_panel,
-                    panel::adjust_panel,
-                    panel::mouse_interact_panel,
-                    panel::update_panel_text,
-                    // apply_edit_tool runs AFTER mouse_interact_panel so the
-                    // panel-press bail-out reads up-to-date Interaction state
-                    // (a panel row LMB-click owns the click).
-                    editor::apply_edit_tool,
+                    // Esc toggle runs first so the OnEnter/OnExit transition
+                    // is observed in the same frame.
+                    app_mode::toggle_settings_on_escape,
+                    // Editor HUD UI lives always-on (visible behind the
+                    // overlay too — purely visual). Clicks mutate
+                    // EditorState; brush dispatch is gated by AppMode.
+                    editor::hud::refresh_palette_swatches,
+                    editor::hud::handle_hud_clicks,
+                    editor::hud::scroll_palette_with_wheel,
+                    editor::hud::drag_palette_scrollbar,
+                    editor::hud::update_palette_scrollbar,
                     editor::hud::update_editor_hud,
+                    // Brush input — only active while playing.
+                    editor::apply_edit_tool.run_if(in_state(AppMode::Playing)),
+                    // Settings overlay input — only active while in settings.
+                    settings::adjust_settings.run_if(in_state(AppMode::Settings)),
+                    settings::mouse_interact_settings.run_if(in_state(AppMode::Settings)),
+                    settings::update_settings_text.run_if(in_state(AppMode::Settings)),
                 )
                     .chain(),
             );
