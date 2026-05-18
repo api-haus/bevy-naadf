@@ -374,6 +374,24 @@ pub struct AppArgs {
     /// deviation — the production-path-faithful gate is more valuable than
     /// preserving Q3.
     pub vox_gpu_construction_mode: bool,
+    /// `vox-gpu-rewrite W5.3-fix Stage 4` — when `true`, the e2e driver runs a
+    /// **CPU oracle render phase** for the `--vox-gpu-oracle` gate: load Oasis
+    /// via the legacy `install_vox_sized_to_model` path (the known-good CPU
+    /// renderer used by `--oasis-edit-visual`), pin a shared in-world camera
+    /// pose, warm up, capture a single screenshot to `oracle_cpu.png`, then
+    /// exit. The oracle gate's compare phase reads this PNG and the matching
+    /// `oracle_gpu.png` from disk and asserts per-pixel diff < small floor.
+    /// See [`crate::e2e::vox_gpu_oracle`].
+    pub vox_gpu_oracle_cpu_phase: bool,
+    /// `vox-gpu-rewrite W5.3-fix Stage 4` — when `true`, the e2e driver runs a
+    /// **GPU producer render phase** for the `--vox-gpu-oracle` gate: load
+    /// Oasis via `install_vox_in_fixed_world` (the W5 GPU producer chain), pin
+    /// the SAME camera pose as the CPU oracle phase (in world voxel coords;
+    /// the camera position must hit the first XZ tile of Oasis so the GPU
+    /// tiling collapses to the same voxel data the CPU oracle holds), warm up,
+    /// capture a single screenshot to `oracle_gpu.png`, then exit. See
+    /// [`crate::e2e::vox_gpu_oracle`].
+    pub vox_gpu_oracle_gpu_phase: bool,
     /// `2026-05-17` — C#-faithful world initialisation. When `true`,
     /// [`crate::voxel::grid::setup_test_grid`] always allocates the fixed
     /// [`WORLD_SIZE_IN_CHUNKS`] world (`256×32×256` chunks = `4096×512×4096`
@@ -410,6 +428,8 @@ impl Default for AppArgs {
             small_edit_visual_mode: false,
             small_edit_repro_mode: false,
             vox_gpu_construction_mode: false,
+            vox_gpu_oracle_cpu_phase: false,
+            vox_gpu_oracle_gpu_phase: false,
             // Off by default — the e2e gates depend on the legacy small-world
             // layout. `bevy-naadf::main` flips it on for the production binary.
             fixed_world_size: false,

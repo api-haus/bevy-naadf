@@ -198,6 +198,25 @@ impl Framebuffer {
         })
     }
 
+    /// Build a `Framebuffer` directly from a row-major `RGBA u8` byte
+    /// vector. Used by oracle / regression gates that load a previously-saved
+    /// PNG back from disk for comparison (the standard
+    /// [`Framebuffer::from_image`] path expects a Bevy `Image` carrying a
+    /// reported texture format, which is overkill when we already have RGBA
+    /// bytes in hand).
+    pub fn from_raw_rgba(data: Vec<[u8; 4]>, width: u32, height: u32) -> Self {
+        debug_assert_eq!(
+            data.len(),
+            (width as usize) * (height as usize),
+            "from_raw_rgba: data length must equal width*height",
+        );
+        Self {
+            data,
+            width,
+            height,
+        }
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }

@@ -64,8 +64,11 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Diagnostic dispatch — `06-diagnostic-inversion.md` identified hash_map placeholder hypothesis (LANDED Stage 1.5; did NOT fix the user-visible bug)
 - [x] Stage 1.5 landed (commit `9964105`) — gate widened, bound_group_queue_max_size fixed; user re-tested, same broken rendering
 - [x] Diagnostic round 2 — `07-diagnostic-inversion-round-2.md` proposed initial_hash_map_size bump (1<<18 → 1<<20) — MEDIUM confidence
-- [x] Compound dispatch (Stage 2) — applied hash_map_size bump (LANDED, harmless, C#-faithful) + 4 iterative experiments. Hash_map saturation REFUTED at 8M slots. Disabling chunk_calc dedup-hit branch dropped near-black 23092→20875 (~10%). NEW root-cause hypothesis (MEDIUM-HIGH confidence): WGSL dedup-hit memory-ordering race on non-atomic `voxels[]` reads after atomic spin-wait.
-- [ ] Hard gate — submit Stage 2 + round-3 diagnostic, two open items: (a) replace gate metric (C# pose has 35% legitimate-dark baseline — three alternatives proposed); (b) land atomic `voxels[]` + `atomicLoad` fix per `08-diagnostic-inversion-round-3.md`  ← CURRENT
+- [x] Compound dispatch (Stage 2) — applied hash_map_size bump (LANDED, harmless, C#-faithful) + 4 iterative experiments. Hash_map saturation REFUTED at 8M slots.
+- [x] Stage 3 — top-down birdseye camera (per user directive); agent gamed lum<10 metric (bug at top-down is bright sky-bleed not dark pixels)
+- [x] Stage 4 — CPU-vs-GPU per-pixel oracle gate built (`crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs`). Gate WORKS, ungameable: 127.84 mean diff vs 8.0 floor at broken state, 97.8% pixels over per-pixel threshold. CPU oracle sanity guards pass.
+- [x] Stage 4 fix iteration — 8 attempts, ALL FAILED: voxels[] atomic, hash_map atomic, single-submit (broke), warmup 480, device.poll-per-segment, skip bounds, hash_map 8M, disable dedup (broke). Root cause STILL unidentified. Round-4 diagnostic recommends GPU readback byte-diff.
+- [ ] Hard gate — submit Stage 4: WORKING ungameable gate + 8 failed fix attempts + unidentified root cause  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.4 (delete CPU stop-gap)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.6 (document default-scene divergence)

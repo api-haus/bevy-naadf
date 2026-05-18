@@ -89,6 +89,17 @@ fn main() -> ExitCode {
     let small_edit_repro_mode = args.iter().any(|a| a == "--small-edit-repro");
     let vox_gpu_construction_mode =
         args.iter().any(|a| a == "--vox-gpu-construction");
+    // vox-gpu-rewrite W5.3-fix Stage 4 — three-flag oracle gate:
+    //   --vox-gpu-oracle           = the top-level mode: spawn the CPU + GPU
+    //                                phases as subprocesses, then compare the
+    //                                two PNGs per-pixel.
+    //   --vox-gpu-oracle-cpu       = single-phase CPU oracle render (called
+    //                                by the top-level mode via subprocess).
+    //   --vox-gpu-oracle-gpu       = single-phase GPU producer render.
+    // See `bevy_naadf::e2e::vox_gpu_oracle` for the gate design + camera pose.
+    let vox_gpu_oracle_mode = args.iter().any(|a| a == "--vox-gpu-oracle");
+    let vox_gpu_oracle_cpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-cpu");
+    let vox_gpu_oracle_gpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-gpu");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -109,6 +120,16 @@ fn main() -> ExitCode {
     // capping `padded_*_group_count` at 32 768 in `sample_refine.wgsl`.
     // See `docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
     // `## GI-bounce-on-resize fix (2026-05-16)`.
+    // vox-gpu-rewrite W5.3-fix Stage 4 — top-level oracle gate. Returns its
+    // own exit code WITHOUT booting a bevy app (the compare phase spawns the
+    // two render phases as subprocesses of THIS binary). Handled at the very
+    // top of the dispatch so the standard `e2e_render` flow doesn't fight
+    // over `app_exit`.
+    if vox_gpu_oracle_mode {
+        let code = bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_compare();
+        return ExitCode::from(code);
+    }
+
     let app_exit = if resize_test {
         // resize-blackness: pre-launch — install a Hyprland windowrule so
         // the e2e_render window starts ALREADY-FLOATING (no togglefloating
@@ -209,6 +230,18 @@ fn main() -> ExitCode {
         // standard `--small-edit-visual` gate misses. See
         // [`bevy_naadf::e2e::small_edit_repro`].
         bevy_naadf::e2e::small_edit_repro::run_small_edit_repro()
+    } else if vox_gpu_oracle_cpu_mode {
+        // vox-gpu-rewrite W5.3-fix Stage 4 — CPU oracle phase. Loads Oasis
+        // via the legacy `install_vox_sized_to_model` path, pins the shared
+        // oracle camera pose, captures `target/e2e-screenshots/oracle_cpu.png`,
+        // and exits. The top-level `--vox-gpu-oracle` mode spawns this as a
+        // subprocess and pairs the output with the GPU phase.
+        bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_cpu_phase()
+    } else if vox_gpu_oracle_gpu_mode {
+        // vox-gpu-rewrite W5.3-fix Stage 4 — GPU phase. Loads Oasis via
+        // `install_vox_in_fixed_world` (W5 GPU producer chain), pins the
+        // shared oracle camera pose, captures `oracle_gpu.png`, exits.
+        bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_gpu_phase()
     } else if vox_gpu_construction_mode {
         // `--vox-gpu-construction` — load the Oasis fixture through the
         // production W5 GPU producer chain (vox-gpu-rewrite W5.5). Loads

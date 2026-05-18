@@ -197,6 +197,20 @@ pub enum E2ePhase {
     SmallEditReproDrainAfter,
     /// Run `assert_no_pitch_black_pixels`, save PNGs, write the verdict.
     SmallEditReproAssert,
+    // --- vox-gpu-oracle phases (Stage 4 — per-pixel CPU oracle vs GPU gate) ---
+    //
+    // Selected when `AppArgs.vox_gpu_oracle_cpu_phase == true` OR
+    // `AppArgs.vox_gpu_oracle_gpu_phase == true`. Single-screenshot fast-path:
+    // warmup → shoot → drain → save → exit. No edit phase, no Δ assertion —
+    // the compare happens out-of-process in `vox_gpu_oracle::run_vox_gpu_oracle_compare`.
+    /// Warmup at the shared oracle pose — TAA + GI convergence.
+    VoxGpuOracleWarmup,
+    /// Spawn `Screenshot::primary_window()`.
+    VoxGpuOracleShoot,
+    /// Drain the async capture, decode to a [`Framebuffer`], save the PNG to
+    /// disk (`oracle_cpu.png` for the CPU phase, `oracle_gpu.png` for the GPU
+    /// phase), then write `AppExit::Success`.
+    VoxGpuOracleDrain,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -411,6 +425,7 @@ pub fn e2e_driver(
     mut oasis: ResMut<super::oasis_edit_visual::OasisEditVisualState>,
     mut small_edit: ResMut<super::small_edit_visual::SmallEditVisualState>,
     mut small_edit_repro: ResMut<super::small_edit_repro::SmallEditReproState>,
+    mut vox_gpu_oracle: ResMut<super::vox_gpu_oracle::VoxGpuOracleState>,
     world_data: Option<ResMut<crate::world::data::WorldData>>,
     diagnostics: Res<DiagnosticsStore>,
     pipeline_scan: Res<PipelineScanResult>,
@@ -490,6 +505,18 @@ pub fn e2e_driver(
         .is_some_and(|a| a.small_edit_repro_mode);
     if small_edit_repro_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::SmallEditReproWarmup;
+        state.phase_ticks = 0;
+    }
+
+    // vox-gpu-rewrite W5.3-fix Stage 4 — vox-gpu-oracle fast-path. Routes
+    // into VoxGpuOracleWarmup on tick 0 when either oracle phase flag is set.
+    // Camera pose is owned by
+    // `super::vox_gpu_oracle::pin_vox_gpu_oracle_camera`.
+    let vox_gpu_oracle_mode = app_args.as_deref().is_some_and(|a| {
+        a.vox_gpu_oracle_cpu_phase || a.vox_gpu_oracle_gpu_phase
+    });
+    if vox_gpu_oracle_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+        state.phase = E2ePhase::VoxGpuOracleWarmup;
         state.phase_ticks = 0;
     }
 
@@ -1407,6 +1434,82 @@ pub fn e2e_driver(
             }
             outcome.gate_result = Some(result);
             state.phase = E2ePhase::Done;
+        }
+        // ---- vox-gpu-oracle phases (Stage 4 — single-screenshot save) ----
+        //
+        // Camera pose is owned by `pin_vox_gpu_oracle_camera` (Update system,
+        // `.after(driver::e2e_driver)`), so any pose write here would be
+        // overridden anyway. Skip touching `camera`.
+        E2ePhase::VoxGpuOracleWarmup => {
+            let _ = &mut camera;
+            state.phase_ticks += 1;
+            if state.phase_ticks >= super::vox_gpu_oracle::ORACLE_WARMUP_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::VoxGpuOracleShoot;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::VoxGpuOracleShoot => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::VoxGpuOracleDrain;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::VoxGpuOracleDrain => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        let is_cpu = app_args
+                            .as_deref()
+                            .is_some_and(|a| a.vox_gpu_oracle_cpu_phase);
+                        let is_gpu = app_args
+                            .as_deref()
+                            .is_some_and(|a| a.vox_gpu_oracle_gpu_phase);
+                        let filename = if is_cpu {
+                            super::vox_gpu_oracle::ORACLE_CPU_PNG
+                        } else if is_gpu {
+                            super::vox_gpu_oracle::ORACLE_GPU_PNG
+                        } else {
+                            // Unreachable in practice: routed in only when one
+                            // of the two flags is set.
+                            super::vox_gpu_oracle::ORACLE_CPU_PNG
+                        };
+                        println!(
+                            "e2e_render --vox-gpu-oracle: capture {}x{}; saving \
+                             to {}",
+                            fb.width(),
+                            fb.height(),
+                            filename
+                        );
+                        super::vox_gpu_oracle::save_oracle_screenshot(&fb, filename);
+                        vox_gpu_oracle.captured = Some(fb);
+                        vox_gpu_oracle.saved = true;
+                        outcome.gate_result = Some(Ok(()));
+                        exit.write(AppExit::Success);
+                        state.phase = E2ePhase::Done;
+                    }
+                    Err(msg) => {
+                        let err = format!(
+                            "vox-gpu-oracle: capture decode failed: {msg}"
+                        );
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::vox_gpu_oracle::ORACLE_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "vox-gpu-oracle: capture never delivered within {} drain frames",
+                    super::vox_gpu_oracle::ORACLE_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
         }
         E2ePhase::Done => {
             // `AppExit` is written; the winit runner sees `should_exit()` and

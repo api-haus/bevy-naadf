@@ -31,6 +31,7 @@ pub mod small_edit_repro;
 pub mod small_edit_visual;
 pub mod vox_e2e;
 pub mod vox_gpu_construction;
+pub mod vox_gpu_oracle;
 
 use bevy::camera::Hdr;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -224,6 +225,7 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<oasis_edit_visual::OasisEditVisualState>()
         .init_resource::<small_edit_visual::SmallEditVisualState>()
         .init_resource::<small_edit_repro::SmallEditReproState>()
+        .init_resource::<vox_gpu_oracle::VoxGpuOracleState>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
         // camera `Transform` + `PositionSplit` during the `MOTION` / `SETTLE`
@@ -249,6 +251,13 @@ pub fn add_e2e_systems(app: &mut App) {
                 // `pin_oasis_camera` writes (the vox-gpu-construction gate
                 // shares the Oasis driver flow but needs a different camera).
                 vox_gpu_construction::pin_vox_gpu_construction_camera
+                    .after(oasis_edit_visual::pin_oasis_camera),
+                // vox-gpu-rewrite W5.3-fix Stage 4 — oracle gate's shared
+                // camera pin. Runs `.after(pin_oasis_camera)` for the same
+                // reason `pin_vox_gpu_construction_camera` does (overrides
+                // the birdseye write the Oasis pin emits when oasis-mode
+                // fast-path triggers).
+                vox_gpu_oracle::pin_vox_gpu_oracle_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
                 .before(crate::camera::sync_position_split),

@@ -2171,3 +2171,275 @@ NVIDIA Vulkan 595.71.05).
   preserved.
 - The gate's diff-rect-fractions and assertion structure are unchanged
   from Stage 1.5 — only the camera coordinates moved.
+
+## impl W5.3-fix Stage 4 (oracle gate + iterative inversion fix) findings (2026-05-18)
+
+### Summary
+
+Two-stage compound dispatch per the brief: (Stage A) build a new
+per-pixel CPU-oracle-vs-GPU oracle gate that cannot be gamed by camera
+pose / threshold moves (the user's repeated complaint), and verify it
+FAILS at the current broken state. (Stage B) iterate fix attempts
+against the visible inversion bug until the gate passes; ceiling of 8
+iteration attempts.
+
+**Stage A delivered.** New `--vox-gpu-oracle` gate at
+`crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs` (~500 LOC). Three-flag
+shape:
+- `--vox-gpu-oracle` (top-level): spawns the CPU + GPU phases as
+  `e2e_render` subprocesses, then per-pixel-diff compares.
+- `--vox-gpu-oracle-cpu`: single-phase CPU oracle render via
+  `install_vox_sized_to_model` (the legacy known-good path
+  `--oasis-edit-visual` exercises) → `oracle_cpu.png`.
+- `--vox-gpu-oracle-gpu`: single-phase GPU producer render via
+  `install_vox_in_fixed_world` (W5 chain) → `oracle_gpu.png`.
+
+Camera pose: `(744, 800, 672)` looking down at `(744, 100, 672)` with
+`Vec3::X` up. ABOVE the world ceiling, steep top-down view of Oasis's
+first XZ tile interior. The chosen pose is `oasis-edit-visual`'s
+`birdseye_pose`-style framing applied at the first-tile-centre voxel
+coords; both CPU and GPU phases sample voxel positions within
+`(x < 1488, y < 512, z < 1344)` which the W5 generator's `voxelPos %
+modelSize` tiling collapses to identity (the W5 GPU world should hold
+byte-identical voxel data to the CPU oracle in this region, IFF the W5
+producer is correct).
+
+Diff metric + floor:
+- Mean per-pixel RGB Δ < 8.0 (Rec.709 absolute delta averaged over RGB
+  channels × all pixels; 0..=255 scale). Catches whole-frame
+  brightness/material divergence.
+- ALSO: ≤ 1 % of pixels with per-channel Δ > 16.0. Catches scattered
+  speckles even when their per-pixel-mean would dilute.
+
+Sanity guards on the CPU oracle frame (prevent the gate falsely
+passing on degenerate captures):
+- ≥ 1 % of pixels with `lum > 50` (camera frames actual geometry, not
+  pure dark void).
+- ≥ 1 % of pixels with `lum < 200` (not saturated sky/emissive only).
+- Frame dimensions match between CPU and GPU.
+
+**Stage A verified the gate FAILS at the current broken state.** Mean
+per-pixel RGB Δ = 127.741 (16× the 8.0 floor); 97.98 % of pixels
+exceed the per-pixel threshold; CPU oracle passes both sanity guards
+(96.3 % bright, 48.7 % dark). The CPU oracle PNG shows fully-lit Oasis
+architecture (bright sand walls, green palm trees, dark courtyards
+viewed top-down). The GPU PNG shows the SAME architecture layout
+(windows + walls visible at correct positions) but DRAMATICALLY DARKER
+with scattered bright pixels at correct emissive positions AND
+scattered GREEN specks through dark walls — exactly the user's
+screenshot #3 / #4 bug pattern (a stone wall block dedup-hits a
+palm-tree-foliage block, silently inheriting the foliage voxel
+pointer).
+
+**Stage B exhausted the 8-iteration ceiling without producing a
+passing fix.** Per the brief, wrote
+`09-diagnostic-inversion-round-4.md` with the per-iteration log + the
+remaining candidate hypotheses for the next dispatch. The final
+landed code state is **identical to Stage 3 final landed** — all 8
+attempted fix changes were reverted per the iteration rule (diff
+unchanged or worse → REVERT).
+
+### Gate design (canonical reference)
+
+| Aspect | Value / location |
+|---|---|
+| Module | `crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs` (~500 LOC, new) |
+| Flag set | `--vox-gpu-oracle`, `--vox-gpu-oracle-cpu`, `--vox-gpu-oracle-gpu` |
+| Camera position (both phases) | `Vec3(744, 800, 672)` (ABOVE world ceiling) |
+| Camera look-at (both phases) | `Vec3(744, 100, 672)` (steep top-down) |
+| Camera up reference | `Vec3::X` (matches `oasis_edit_visual::birdseye_pose`) |
+| Window size | 256×256 (standard `AppConfig::e2e()` window) |
+| Warmup frames | 120 (matches `OASIS_WARMUP_FRAMES`) |
+| Mean diff floor | 8.0 per-pixel RGB Δ (Rec.709 absolute, 0..=255 scale) |
+| Per-pixel diff threshold | 16.0 per channel; ceiling = 1.0 % of frame pixels |
+| CPU oracle sanity guards | ≥ 1 % pixels `lum > 50` AND ≥ 1 % `lum < 200` |
+| Saved PNGs | `target/e2e-screenshots/oracle_cpu.png` + `oracle_gpu.png` |
+
+### Pre-fix gate measurement (the broken-state baseline)
+
+```
+256×256 frame, 65536 pixels
+mean per-pixel RGB Δ = 127.741 (floor 8.00) → FAIL by 16×
+pixels with per-channel Δ > 16.0 = 64213 (97.98 % of frame; ceiling 1.0 %) → FAIL by 100×
+sanity guards: bright (lum>50) = 63091 (96.3 % ≥ 1.0 % floor) PASS
+              dark (lum<200) = 31941 (48.7 % ≥ 1.0 % floor) PASS
+```
+
+(Earlier baseline at a prior camera pose `(744, 400, 672)` measured
+mean Δ = 142.491 — the new above-world pose better matches the user's
+visible-bug screenshots and produces a more discriminating signal.)
+
+### Per-iteration log
+
+| # | Hypothesis | Change | Mean Δ | Outcome |
+|---|---|---|---|---|
+| 0 | baseline broken state (no change) | — | 127.741 | gate FAIL, image visibly wrong |
+| 1 | H11 voxels[] atomic | `chunk_calc.wgsl`: `voxels: array<atomic<u32>>`, 4 sites use `atomicLoad`/`atomicStore` | 142.491 (prior pose) | UNCHANGED; REVERT |
+| 2 | H11 hash_map.hash_raw atomic | `hash_raw: u32` → `atomic<u32>`; writes / reads promoted | 142.454 (prior pose) | UNCHANGED; REVERT |
+| 3 | (DIAGNOSTIC) collapse to 1 submit | reverted per-segment-submit; ONE shared encoder + ONE submit | 139.835; image pure sky | per-segment-submit IS load-bearing (confirms iter 0's GPU IS writing data); REVERT |
+| 4 | extended warmup | `ORACLE_WARMUP_FRAMES`: 120 → 480 | 142.535 | UNCHANGED; REVERT |
+| 5 | explicit GPU sync between per-segment submits | `device.poll(PollType::wait_indefinitely())` after each submit | 142.577 | UNCHANGED; cross-submit ordering isn't the race; REVERT |
+| 6 | (DIAGNOSTIC) skip bounds chain | commented out `compute_voxel_bounds` + `compute_block_bounds` | 142.483 | UNCHANGED; bounds chain isn't corrupting; REVERT |
+| 7 | bump hash_map to 8 M slots | `initial_hash_map_size`: `1 << 20` → `1 << 23` (128 MiB GPU buffer) | 127.818 | UNCHANGED at new pose; REVERT |
+| 8 | disable dedup-hit path | commented out `if (hash_raw == hash) { ... voxel_pointer = voxel_pointer_cur; }` branch | 123.063 (metric BETTER) but image PURE SKY (every contender probe-cap-exhausts → sentinel 2 → empty) | metric-better-but-image-worse; REVERT |
+
+Iterations 1, 2, 4, 5, 7 produced effectively zero measurable change
+(within TAA noise of ±0.2). Iterations 3, 6 were diagnostic-only (not
+fix candidates); reverted. Iteration 8 improved the metric numerically
+but degraded the image visually (so improvement is false).
+
+### Final root cause + fix
+
+**The actual root cause remains UNIDENTIFIED.** The user-visible
+inversion symptom (dark Oasis with scattered colour specks) IS
+reproducible at the oracle gate's chosen camera pose; the gate
+discriminates the broken vs would-be-fixed state with comfortable
+headroom (mean Δ at broken = 128, would-need-to-drop-to < 8). But the
+8 fix-candidate hypotheses tested produced no fix.
+
+`09-diagnostic-inversion-round-4.md` lists the next dispatch's
+candidate hypotheses to investigate:
+
+1. **GI bounce environment differs** between CPU oracle (small world,
+   sky beyond model) and GPU phase (tiled Oasis surrounding the
+   visible region). May not be a producer bug but a fundamental
+   world-setup incompatibility for the multi-bounce GI path. Next
+   dispatch should re-run with much longer warmup.
+2. **The GPU producer outputs may differ byte-for-byte** from the CPU
+   oracle's chunks/blocks/voxels even in the overlap region. Add a
+   GPU-readback diagnostic to compare first-tile-overlap byte-level
+   data between the two paths.
+3. **Memory-ordering on slot-claim state machine** — the round-3 H11
+   was tested both ways (just voxels, voxels + hash_raw) with zero
+   effect; maybe naga emits adequate barriers and the bug is in the
+   slot-claim transition itself (atomicCompareExchangeWeak +
+   atomicStore + non-atomic writes' ordering). Manual unroll +
+   `atomicFence` insertion is the next escalation.
+
+### Files touched
+
+- `crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs:1-500` — NEW module.
+  Oracle gate design + camera pose constants + screenshot save +
+  PNG-loading-from-disk Framebuffer reconstruction + sanity guards +
+  per-pixel diff compare.
+- `crates/bevy_naadf/src/lib.rs:376-396` — added 2 new `AppArgs`
+  fields (`vox_gpu_oracle_cpu_phase`, `vox_gpu_oracle_gpu_phase`).
+- `crates/bevy_naadf/src/lib.rs:412-414` — added defaults to
+  `impl Default for AppArgs`.
+- `crates/bevy_naadf/src/bin/e2e_render.rs:90-104` — added 3 new flag
+  parsings (`--vox-gpu-oracle`, `--vox-gpu-oracle-cpu`,
+  `--vox-gpu-oracle-gpu`).
+- `crates/bevy_naadf/src/bin/e2e_render.rs:112-120` — top-level
+  `--vox-gpu-oracle` orchestrator branch (early return with subprocess
+  spawn + compare).
+- `crates/bevy_naadf/src/bin/e2e_render.rs:222-235` — per-phase
+  dispatch branches.
+- `crates/bevy_naadf/src/e2e/mod.rs:33` — module export.
+- `crates/bevy_naadf/src/e2e/mod.rs:227` — `VoxGpuOracleState`
+  resource init.
+- `crates/bevy_naadf/src/e2e/mod.rs:247-254` — `pin_vox_gpu_oracle_camera`
+  system wiring (`.after(pin_oasis_camera)`,
+  `.before(sync_position_split)`).
+- `crates/bevy_naadf/src/e2e/driver.rs:200-211` — 3 new `E2ePhase`
+  variants (`VoxGpuOracleWarmup`, `VoxGpuOracleShoot`,
+  `VoxGpuOracleDrain`).
+- `crates/bevy_naadf/src/e2e/driver.rs:413` — added `vox_gpu_oracle`
+  `ResMut` to the system signature.
+- `crates/bevy_naadf/src/e2e/driver.rs:495-507` — fast-path routing
+  on tick 0 when either oracle phase flag is set.
+- `crates/bevy_naadf/src/e2e/driver.rs:1436-1517` — handlers for the
+  3 new oracle phases.
+- `crates/bevy_naadf/src/e2e/framebuffer.rs:200-218` — added
+  `Framebuffer::from_raw_rgba()` helper for the PNG-loading path.
+- `docs/orchestrate/vox-gpu-rewrite/09-diagnostic-inversion-round-4.md`
+  — NEW round-4 diagnostic doc.
+
+### Stage C verification — all gates after Stage 4 land
+
+- `cargo build --workspace`: **PASS** (clean, no new warnings, ~19 s
+  warm tree).
+- `cargo test --workspace --lib`: **PASS** — 198 passed, 1 ignored
+  (baseline preserved).
+- `--baseline`: **PASS** (emissive 247.1, solid 242.1, sky 145.9 —
+  identical to Stage 3 baseline).
+- `--vox-e2e`: **PASS**.
+- `--oasis-edit-visual`: **PASS** (rect Δ=9.47 above 8.00 floor;
+  rect mean before luminance 169.3).
+- `--small-edit-visual`: **PASS** (click rect max-Δ=18 above 15
+  floor; outside-click 1.3 % under 15 % ceiling).
+- `--small-edit-repro`: **PASS** (0 dark pixels in 1920×1080 frame).
+- `--validate-gpu-construction`: **PASS** (388 bytes byte-equal).
+- `--edit-mode`: **PASS** (1 set_voxel → 1+1+2 records).
+- `--entities`: **PASS** (8 chunk_updates, 1 entity_chunk).
+- `--runtime-edit-mode`: **PASS** (1 batch, 2+2+2 records).
+- `--vox-gpu-construction`: **PASS** (rect Δ=16.47 above 8.00; near-
+  black 0/65536 — pre-Stage 4 metric/pose preserved).
+- `--vox-gpu-oracle`: **FAIL** — mean Δ = 127.840 above 8.00 floor;
+  97.80 % of pixels exceed 16.0 per-channel Δ. **EXPECTED** — the new
+  gate is the discriminator for the next dispatch; the underlying bug
+  is unfixed.
+
+**Zero regressions on pre-Stage-4 GREEN gates.** The only RED gate is
+`--vox-gpu-oracle`, which is RED by design (it's the new tripwire for
+the unfixed bug).
+
+### Surprises
+
+1. **The "above-world top-down" camera pose dramatically helped the
+   gate's signal-to-noise.** The original inside-world pose `(744, 400,
+   672)` produced mean Δ = 142 with mostly-uniform-dark GPU output;
+   the new above-world pose `(744, 800, 672)` produces mean Δ = 128
+   with VISIBLY identifiable Oasis architecture in both phases. The
+   discriminator improvement comes from framing the topmost geometry
+   directly (where both worlds hold identical voxel data; bouncing
+   matters less for primary-hit) rather than framing the interior
+   (where multi-bounce GI from surrounding context dominates).
+2. **Iteration 3 (collapse to 1 submit) produced pure-sky output**,
+   proving the per-segment-submit fix from Stage 1 IS doing essential
+   work. Reverting per-segment-submit dropped image content to
+   essentially zero. The bug is NOT "per-segment-submit is broken";
+   per-segment-submit successfully populates the WHOLE world. The
+   visible darkness is downstream.
+3. **The atomic-voxels conversion is pixel-perfect identical to the
+   baseline** at this pose, just like at the round-3 top-down pose.
+   Two separate dispatches now confirm naga's `atomicLoad`/`atomicStore`
+   emit barriers no stricter than the non-atomic baseline — meaning
+   either (a) the WGSL spec's looser memory model isn't the source of
+   the bug, OR (b) the WGSL→Vulkan translator on NVIDIA already inserts
+   STORAGE→STORAGE barriers without the explicit `atomic<>` typing.
+4. **Iteration 8 (disable dedup) gave PURE SKY** at the new pose,
+   contradicting the round-3 report that dedup-disable IMPROVED the
+   count. The round-3 measurement was at a pose where the test metric
+   (lum<10 pixel count) couldn't discriminate empty-world-failure
+   (sky-bleed) from incorrect-render-failure (scattered specks); the
+   "improvement" was an artifact of the wrong metric. With this round's
+   per-pixel-diff metric, "everything became empty" yields mean Δ
+   numerically near "everything was wrong-coloured" because both produce
+   large absolute differences from the bright CPU oracle.
+
+### What's NOT yet done
+
+1. **The actual fix for the user-visible inversion.** 8 iterations
+   exhausted; the bug remains. The next dispatch's candidate
+   hypotheses are in `09-diagnostic-inversion-round-4.md`. Likeliest
+   next direction: extended-warmup test (1000+ frames) to rule out GI
+   convergence + GPU-readback byte-level diff between CPU oracle and
+   W5 producer outputs.
+2. **Gate-level enhancements**: the per-pixel-diff metric is robust
+   but coarse; a byte-level GPU-buffer-diff would be tighter. Out of
+   scope for this dispatch.
+3. **Stage 2-real (legacy-path deletion + single-pathway
+   consolidation)** remains a SEPARATE dispatch — orthogonal to the
+   inversion fix.
+
+### What's left in place
+
+- All Stage 1, 1.5, 2, 3 prior fixes preserved unchanged.
+- The new Stage 4 gate module + per-phase entry points + driver
+  routing + framebuffer helper are LANDED and load-bearing for the
+  next dispatch.
+- No `chunk_calc.wgsl` shader changes survived this dispatch (all
+  iter 1, 2, 8 attempts reverted).
+- No `mod.rs` runtime changes survived this dispatch (all iter 3, 5,
+  6 attempts reverted).
+- No config / sizing changes survived this dispatch (iter 7 reverted).
