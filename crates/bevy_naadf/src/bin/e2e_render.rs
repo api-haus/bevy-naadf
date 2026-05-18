@@ -122,6 +122,11 @@ fn main() -> ExitCode {
     // `bevy_naadf::e2e::wgsl_noise_oracle` +
     // `docs/orchestrate/streaming-world/02b-design-plan-b.md` § C.
     let wgsl_noise_oracle_mode = args.iter().any(|a| a == "--wgsl-noise-oracle");
+    // streaming-world Phase 2 — walks a procedural-streaming-world camera
+    // across ≥2 segment boundaries; asserts the residency window followed
+    // and terrain re-populated. See `bevy_naadf::e2e::streaming_window` +
+    // `docs/orchestrate/streaming-world/02b-design-plan-b.md` § J.
+    let streaming_window_mode = args.iter().any(|a| a == "--streaming-window");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -312,6 +317,11 @@ fn main() -> ExitCode {
         // `bevy_naadf::e2e::vox_gpu_construction` (+ the orchestration
         // bundle at `docs/orchestrate/vox-gpu-rewrite/`).
         bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction()
+    } else if streaming_window_mode {
+        // streaming-world Phase 2 — boot the e2e harness with the
+        // `ProceduralStreaming` preset + the `--streaming-window` driver
+        // branch enabled. See `bevy_naadf::e2e::streaming_window`.
+        bevy_naadf::e2e::streaming_window::run_streaming_window()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then

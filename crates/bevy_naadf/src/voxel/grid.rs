@@ -119,7 +119,135 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                 install_vox_in_fixed_world(&mut commands, path);
             }
         }
+        GridPreset::ProceduralStreaming { noise_preset, seed } => {
+            install_procedural_streaming_world(&mut commands, &args, *noise_preset, *seed);
+        }
     }
+}
+
+/// streaming-world Phase 2 — install a procedural-streaming world. The
+/// `WorldData` resource is inserted **empty** at the fixed
+/// `WORLD_SIZE_IN_CHUNKS` extent (same shape as `install_vox_in_fixed_world`)
+/// — the streaming residency driver + the per-frame W5 dispatch chain
+/// populate `WorldGpu::{chunks,blocks,voxels}` lazily on GPU; the CPU mirror
+/// stays empty.
+///
+/// Per `02b-design-plan-b.md` § L Phase 2: also inserts:
+/// - `Residency` (the sliding-window slot table).
+/// - `NoiseChunkSource` (the noise state uniform + classification params).
+/// - `InitialCameraPose` at the world's central segment (per v1 assumption #9).
+///
+/// The VRAM budget pre-flight (`assert_vram_budget_sufficient`) fires here —
+/// panics with a clear message if `--vram-budget-mib` is below the slab total.
+fn install_procedural_streaming_world(
+    commands: &mut Commands,
+    args: &AppArgs,
+    noise_preset: u32,
+    seed: i32,
+) {
+    use crate::streaming::{
+        assert_vram_budget_sufficient, chunk_source::NoiseChunkSource, Residency,
+    };
+
+    // Pre-flight VRAM budget check (panics on under-budget).
+    assert_vram_budget_sufficient(args.vram_budget_mib);
+
+    // Build the palette — Phase 2 ships a single-entry "ground" palette beyond
+    // the empty placeholder; Phase 3 / future presets will extend this.
+    let palette = build_streaming_palette();
+
+    // Empty WorldData at the fixed-world extent (mirrors install_vox_in_fixed_world's
+    // shape; the streaming driver populates the GPU buffers from noise lazily).
+    let mut world_data = WorldData {
+        chunks_cpu: Vec::new(),
+        blocks_cpu: Vec::new(),
+        voxels_cpu: Vec::new(),
+        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
+        bounding_box: IAabb3 {
+            min: IVec3::ZERO,
+            max: IVec3::new(
+                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
+            ),
+        },
+        pending_edits: Default::default(),
+        dense_voxel_types: Vec::new(),
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+    };
+    world_data.seed_block_hashing();
+    commands.insert_resource(world_data);
+    commands.insert_resource(VoxelTypes { types: palette });
+
+    // Phase 2 ships one noise preset only — `0 = SimpleTerrain` per
+    // `chunk_source::default_simple_terrain_state`.
+    let chunk_source = match noise_preset {
+        0 => {
+            let mut cs = NoiseChunkSource::from_seed(seed);
+            cs.sea_level = args.sea_level;
+            cs.terrain_amplitude = args.terrain_amplitude;
+            cs
+        }
+        n => {
+            error!(
+                "streaming-world: unknown noise_preset={n}; falling back to \
+                 SimpleTerrain (preset 0)",
+            );
+            NoiseChunkSource::from_seed(seed)
+        }
+    };
+    commands.insert_resource(chunk_source);
+
+    // Residency manager — fresh-empty; the per-frame driver populates
+    // `admissions_this_frame` on the first tick after the camera spawns.
+    commands.insert_resource(Residency::empty(args.max_segments_per_frame));
+
+    // Camera spawn at the centre of the X/Z window per v1 assumption #9. The
+    // world is `WORLD_SIZE_IN_VOXELS = (4096, 512, 4096)` voxels; centre is
+    // (2048, sea_level + 32, 2048). Look slightly down at the centre.
+    let cx = (WORLD_SIZE_IN_VOXELS.x as f32) * 0.5;
+    let cz = (WORLD_SIZE_IN_VOXELS.z as f32) * 0.5;
+    // Spawn ~32 voxels above sea_level so the camera sits above the terrain
+    // surface (terrain hovers around sea_level by construction).
+    let cam_y = args.sea_level + 32.0;
+    let cam_pos = Vec3::new(cx, cam_y, cz);
+    // Look forward in +X direction (also looking slightly down so terrain
+    // is in view).
+    let cam_look = Vec3::new(cx + 100.0, args.sea_level - 16.0, cz);
+    commands.insert_resource(crate::camera::InitialCameraPose(
+        Transform::from_translation(cam_pos).looking_at(cam_look, Vec3::Y),
+    ));
+
+    info!(
+        "streaming-world: ProceduralStreaming preset installed — \
+         noise_preset={noise_preset}, seed={seed}, sea_level={:.1}, \
+         terrain_amplitude={:.1}, vram_budget_mib={}, \
+         max_segments_per_frame={}; camera spawn at {:?} looking at {:?}",
+        args.sea_level,
+        args.terrain_amplitude,
+        args.vram_budget_mib,
+        args.max_segments_per_frame,
+        cam_pos,
+        cam_look,
+    );
+}
+
+/// Phase 2 default palette — index 0 reserved empty + a single "ground" type
+/// at index 1. The streaming preset's noise classification emits index 1 for
+/// every solid voxel.
+fn build_streaming_palette() -> Vec<VoxelType> {
+    vec![
+        // 0 — reserved empty placeholder.
+        VoxelType::default(),
+        // 1 — generic terrain ground: warm-grey diffuse.
+        VoxelType {
+            material_base: MaterialBase::Diffuse,
+            material_layer: MaterialLayer::None,
+            roughness: 0.85,
+            color_base: Vec3::new(0.50, 0.48, 0.42),
+            color_layered: Vec3::ZERO,
+        },
+    ]
 }
 
 /// C#-faithful default — build the same primitive scene the small-world path

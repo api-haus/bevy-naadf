@@ -30,6 +30,7 @@ pub mod readback;
 pub mod small_edit_repro;
 pub mod small_edit_visual;
 pub mod vox_e2e;
+pub mod streaming_window;
 pub mod vox_gpu_construction;
 pub mod vox_gpu_oracle;
 pub mod wgsl_noise_oracle;
@@ -259,6 +260,13 @@ pub fn add_e2e_systems(app: &mut App) {
                 // the birdseye write the Oasis pin emits when oasis-mode
                 // fast-path triggers).
                 vox_gpu_oracle::pin_vox_gpu_oracle_camera
+                    .after(oasis_edit_visual::pin_oasis_camera),
+                // streaming-world Phase 2 — pin the camera at Pose A or
+                // Pose B based on the `CAMERA_WALKED` latch. Runs `.after`
+                // pin_oasis_camera for the same reason (overrides the
+                // birdseye pose when oasis-mode fast-path triggers; the
+                // streaming gate routes via oasis_edit_visual_mode = true).
+                streaming_window::pin_streaming_window_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
                 .before(crate::camera::sync_position_split),

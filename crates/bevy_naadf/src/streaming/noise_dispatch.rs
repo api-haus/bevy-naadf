@@ -1,0 +1,368 @@
+//! `streaming::noise_dispatch` — per-frame GPU dispatch wiring for the
+//! streaming preset.
+//!
+//! Per `docs/orchestrate/streaming-world/02b-design-plan-b.md` §§ E + G:
+//! Phase 2 routes the W5 stage-1 producer through a NEW shader
+//! `noise_terrain.wgsl` instead of `generator_model.wgsl`. The output buffer
+//! (`segment_voxel_buffer`) is byte-identical between the two shaders, so the
+//! existing chunk_calc + bounds_calc chain runs over it unchanged.
+//!
+//! What this module owns:
+//! - The Rust mirror of `NoiseTerrainParams` (the WGSL uniform block consumed
+//!   by `noise_terrain.wgsl`), with static-asserted offsets so the WGSL
+//!   `params.state` layout aligns with the Phase-1 `FnlState`.
+//! - The shader-source helpers + bind-group layout descriptor + pipeline
+//!   queue (mirrors `generator_model::*`).
+//! - The combined-shader inliner (`build_noise_terrain_shader_src`), which
+//!   concatenates `noise_fastnoiselite.wgsl` and `noise_terrain.wgsl` per the
+//!   Phase-1 `build_oracle_dispatch_shader_src` precedent.
+//!
+//! The per-segment dispatch loop itself lives in
+//! `render/construction/mod.rs`'s `naadf_gpu_producer_node` (a new
+//! `streaming_mode_active` branch alongside the existing W5 + dense paths).
+//! Reason: that node already has the right encoder + bind-group plumbing in
+//! scope. Re-deriving it here would duplicate the W5 per-segment-submit
+//! ordering fix (`mod.rs:2427-2453`).
+//!
+//! ## Extract-resource pattern
+//!
+//! The main-world `Residency` carries `admissions_this_frame` /
+//! `evictions_this_frame`. The render-world mirrors these into a
+//! [`StreamingExtractRender`] resource each frame via Bevy's `ExtractResource`.
+
+use std::borrow::Cow;
+use std::num::NonZeroU64;
+
+use bevy::prelude::*;
+use bevy::render::render_resource::{
+    binding_types::{storage_buffer_sized, uniform_buffer_sized},
+    BindGroupLayoutDescriptor, BindGroupLayoutEntries, BufferDescriptor, BufferUsages,
+    CachedComputePipelineId, ComputePipelineDescriptor, PipelineCache, ShaderStages,
+};
+use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::shader::Shader;
+use bytemuck::{Pod, Zeroable};
+
+use super::noise_fastnoiselite::NOISE_FASTNOISELITE_SHADER_SRC;
+use super::noise_fastnoiselite_cpu_oracle::FnlState;
+use super::residency::{Residency, SlotIndex, WorldSegmentPos};
+
+/// Inlined WGSL noise-terrain source — `include_str!` of
+/// `assets/shaders/noise_terrain.wgsl`. Relative to this `.rs` file.
+pub const NOISE_TERRAIN_SHADER_SRC: &str =
+    include_str!("../assets/shaders/noise_terrain.wgsl");
+
+/// Asset path of the WGSL noise-terrain shader (for the `AssetServer.load`
+/// production path; Phase 2 may use either the inlined-string or the asset-
+/// loader path).
+pub const NOISE_TERRAIN_SHADER_PATH: &str = "shaders/noise_terrain.wgsl";
+
+/// `@workgroup_size(4, 4, 4)` per `noise_terrain.wgsl`.
+pub const NOISE_TERRAIN_WORKGROUP_SIZE: u32 = 4;
+
+/// Build the combined shader source by inlining `noise_fastnoiselite.wgsl`
+/// ABOVE the `noise_terrain.wgsl` body. Same pattern as
+/// [`super::noise_fastnoiselite::build_oracle_dispatch_shader_src`].
+pub fn build_noise_terrain_shader_src() -> String {
+    let mut combined = String::with_capacity(
+        NOISE_FASTNOISELITE_SHADER_SRC.len() + NOISE_TERRAIN_SHADER_SRC.len() + 256,
+    );
+    // Strip `#define_import_path` from the noise module so the combined
+    // single-translation-unit doesn't carry the directive.
+    for line in NOISE_FASTNOISELITE_SHADER_SRC.lines() {
+        if line.trim_start().starts_with("#define_import_path") {
+            combined.push_str("// (stripped #define_import_path for inlined compilation)\n");
+            continue;
+        }
+        combined.push_str(line);
+        combined.push('\n');
+    }
+    combined.push('\n');
+    // Append everything after the `// @begin` marker in the terrain shader.
+    let mut past_marker = false;
+    for line in NOISE_TERRAIN_SHADER_SRC.lines() {
+        if !past_marker {
+            if line.trim_start().starts_with("// @begin") {
+                past_marker = true;
+            }
+            continue;
+        }
+        combined.push_str(line);
+        combined.push('\n');
+    }
+    if !past_marker {
+        // Fallback — marker missing, concatenate the whole file.
+        combined.push_str(NOISE_TERRAIN_SHADER_SRC);
+    }
+    combined
+}
+
+/// Rust mirror of `NoiseTerrainParams` in `noise_terrain.wgsl`.
+///
+/// Layout (std140-compatible uniform — `align = 16` because the embedded
+/// `FnlState` host-shareable struct is 16-aligned in WGSL std140; even though
+/// its scalar members are only 4-aligned, top-level host-shared structs round
+/// up to 16):
+/// - Row 0 (offset 0, 16 B): `seg_origin_in_voxels_{xyz}` (i32) +
+///   `terrain_voxel_type_id` (u32).
+/// - Row 1 (offset 16, 16 B): `group_size_in_chunks_x/y` (u32) +
+///   `sea_level` (f32) + `terrain_amplitude` (f32).
+/// - Rows 2..6 (offset 32, 80 B): `FnlState`.
+///
+/// Total size = 112 B (Rust + WGSL agree because `FnlState` contains only
+/// scalars; no internal padding diff).
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct NoiseTerrainParams {
+    // Row 0
+    pub seg_origin_in_voxels_x: i32,
+    pub seg_origin_in_voxels_y: i32,
+    pub seg_origin_in_voxels_z: i32,
+    pub terrain_voxel_type_id: u32,
+    // Row 1
+    pub group_size_in_chunks_x: u32,
+    pub group_size_in_chunks_y: u32,
+    pub sea_level: f32,
+    pub terrain_amplitude: f32,
+    // Rows 2..6 — FnlState (80 B).
+    pub state: FnlState,
+}
+
+// Compile-time layout pins. Total size = 32 B header + 80 B FnlState = 112 B.
+const _: () = assert!(std::mem::size_of::<NoiseTerrainParams>() == 112);
+const _: () = assert!(std::mem::align_of::<NoiseTerrainParams>() == 16);
+const _: () = assert!(std::mem::offset_of!(NoiseTerrainParams, seg_origin_in_voxels_x) == 0);
+const _: () = assert!(std::mem::offset_of!(NoiseTerrainParams, group_size_in_chunks_x) == 16);
+const _: () = assert!(std::mem::offset_of!(NoiseTerrainParams, state) == 32);
+
+/// Build the `noise_terrain_layout` bind-group-layout descriptor.
+///
+/// Bindings (`@group(0)`):
+/// - 0: `chunk_data_rw` — `segment_voxel_buffer` (same buffer chunk_calc
+///   consumes as read-only on its side).
+/// - 1: `params` — [`NoiseTerrainParams`] uniform.
+pub fn noise_terrain_layout_descriptor() -> BindGroupLayoutDescriptor {
+    let params_size =
+        NonZeroU64::new(std::mem::size_of::<NoiseTerrainParams>() as u64).unwrap();
+    BindGroupLayoutDescriptor::new(
+        "naadf_streaming_noise_terrain_bind_group_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_sized(false, None),
+                uniform_buffer_sized(false, Some(params_size)),
+            ),
+        ),
+    )
+}
+
+/// Queue the `noise_terrain` pipeline against the given layout.
+pub fn queue_noise_terrain_pipeline(
+    asset_server: &AssetServer,
+    pipeline_cache: &PipelineCache,
+    layout: BindGroupLayoutDescriptor,
+) -> CachedComputePipelineId {
+    let shader = asset_server.load(NOISE_TERRAIN_SHADER_PATH);
+    queue_noise_terrain_pipeline_with_handle(pipeline_cache, layout, shader)
+}
+
+/// Queue the `noise_terrain` pipeline against an already-resolved shader
+/// handle. Used by the unit tests + the streaming pipeline init path that
+/// builds the inlined shader source.
+pub fn queue_noise_terrain_pipeline_with_handle(
+    pipeline_cache: &PipelineCache,
+    layout: BindGroupLayoutDescriptor,
+    shader: Handle<Shader>,
+) -> CachedComputePipelineId {
+    pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("naadf_streaming_noise_terrain_pipeline".into()),
+        layout: vec![layout],
+        shader,
+        entry_point: Some(Cow::from("fill_chunk_data_with_noise")),
+        ..default()
+    })
+}
+
+/// Allocate the `noise_terrain_params_buffer` (96 B uniform, rewritten in
+/// place per admitted segment).
+pub fn create_noise_terrain_params_buffer(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+) -> bevy::render::render_resource::Buffer {
+    let buf = device.create_buffer(&BufferDescriptor {
+        label: Some("naadf_streaming_noise_terrain_params"),
+        size: std::mem::size_of::<NoiseTerrainParams>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let zeroed: NoiseTerrainParams = Zeroable::zeroed();
+    queue.write_buffer(&buf, 0, bytemuck::bytes_of(&zeroed));
+    buf
+}
+
+// -----------------------------------------------------------------------------
+// Render-world extract resource — per-frame mirror of `Residency`'s per-frame
+// admissions/evictions.
+// -----------------------------------------------------------------------------
+
+/// Main-world `Resource` holding the long-lived strong handle to the
+/// inlined-source `noise_terrain` shader. Seeded once at startup by
+/// [`seed_noise_terrain_shader`]; the render-world `ExtractSchedule` mirrors
+/// the handle into [`StreamingExtractRender::noise_terrain_shader`] so
+/// `prepare_construction` can pick it up and queue the pipeline lazily.
+///
+/// **Why on the main world?** `Assets<Shader>` lives in the main world; the
+/// render-world `PipelineCache` reads it via the standard asset-server
+/// extraction. Registering the inlined-source shader once at main-world
+/// startup is the simplest path to a stable handle (Bevy's render-world
+/// `Assets<Shader>` isn't reliably reachable from `init_gpu_resource`
+/// callbacks).
+#[derive(Resource, Clone)]
+pub struct StreamingShaderHandle(pub Handle<Shader>);
+
+/// `Startup` system — register the inlined-source `noise_terrain` shader
+/// (`build_noise_terrain_shader_src`) as an `Assets<Shader>` asset and stash
+/// the strong handle in [`StreamingShaderHandle`]. Wired by
+/// [`super::StreamingPlugin::build`].
+pub fn seed_noise_terrain_shader(
+    mut commands: Commands,
+    mut shaders: ResMut<bevy::asset::Assets<bevy::shader::Shader>>,
+) {
+    let combined = build_noise_terrain_shader_src();
+    let shader = bevy::shader::Shader::from_wgsl(
+        combined,
+        "shaders/noise_terrain_combined.wgsl",
+    );
+    let handle = shaders.add(shader);
+    commands.insert_resource(StreamingShaderHandle(handle));
+}
+
+/// Render-world mirror of the main-world [`Residency`] per-frame deltas.
+///
+/// `ExtractSchedule` writes this from the main-world residency resource each
+/// frame; the streaming-mode branch of `naadf_gpu_producer_node` consumes it.
+#[derive(Resource, Clone, Debug)]
+pub struct StreamingExtractRender {
+    /// `true` when the main world is running the `ProceduralStreaming` preset.
+    /// Off otherwise.
+    pub streaming_mode_active: bool,
+    /// Per-frame admissions (camera-distance-sorted, capped at
+    /// `--max-segments-per-frame`).
+    pub admissions_this_frame: Vec<(WorldSegmentPos, SlotIndex)>,
+    /// Per-frame evictions.
+    pub evictions_this_frame: Vec<SlotIndex>,
+    /// Camera-anchored sea level + amplitude + noise state — copied from the
+    /// main-world [`super::chunk_source::NoiseChunkSource`].
+    pub noise_state: FnlState,
+    pub sea_level: f32,
+    pub terrain_amplitude: f32,
+    pub solid_voxel_type_id: u32,
+    /// Mirror of the main-world [`StreamingShaderHandle`] — the inlined-source
+    /// `noise_terrain` shader handle. `prepare_construction` queues the
+    /// pipeline lazily once this becomes `Some`.
+    pub noise_terrain_shader: Option<Handle<Shader>>,
+}
+
+impl Default for StreamingExtractRender {
+    fn default() -> Self {
+        // `FnlState` is `Pod + Zeroable` — a zeroed state is a valid empty
+        // configuration. The `streaming_mode_active = false` discriminator
+        // means consumers never read these defaults in practice.
+        Self {
+            streaming_mode_active: false,
+            admissions_this_frame: Vec::new(),
+            evictions_this_frame: Vec::new(),
+            noise_state: Zeroable::zeroed(),
+            sea_level: 0.0,
+            terrain_amplitude: 1.0,
+            solid_voxel_type_id: 1,
+            noise_terrain_shader: None,
+        }
+    }
+}
+
+/// `ExtractSchedule` system — mirror the main-world residency state into the
+/// render-world [`StreamingExtractRender`] resource. Wired by the
+/// [`super::StreamingPlugin`].
+pub fn extract_streaming_state(
+    mut commands: Commands,
+    residency: bevy::render::Extract<Option<Res<Residency>>>,
+    chunk_source: bevy::render::Extract<Option<Res<super::chunk_source::NoiseChunkSource>>>,
+    shader_handle: bevy::render::Extract<Option<Res<StreamingShaderHandle>>>,
+) {
+    let shader = shader_handle.as_deref().map(|s| s.0.clone());
+    let (Some(residency), Some(chunk_source)) =
+        (residency.as_deref(), chunk_source.as_deref())
+    else {
+        // Even when streaming isn't active, propagate the shader handle so
+        // the lazy queue path picks it up the moment streaming flips on.
+        let mut default_state = StreamingExtractRender::default();
+        default_state.noise_terrain_shader = shader;
+        commands.insert_resource(default_state);
+        return;
+    };
+    commands.insert_resource(StreamingExtractRender {
+        streaming_mode_active: true,
+        admissions_this_frame: residency.admissions_this_frame.clone(),
+        evictions_this_frame: residency.evictions_this_frame.clone(),
+        noise_state: chunk_source.state,
+        sea_level: chunk_source.sea_level,
+        terrain_amplitude: chunk_source.terrain_amplitude,
+        solid_voxel_type_id: chunk_source.solid_voxel_type_id,
+        noise_terrain_shader: shader,
+    });
+}
+
+/// Build the [`NoiseTerrainParams`] for one segment admission.
+pub fn build_noise_terrain_params(
+    seg_origin_in_voxels: IVec3,
+    state: &StreamingExtractRender,
+    segment_chunks: u32,
+) -> NoiseTerrainParams {
+    NoiseTerrainParams {
+        seg_origin_in_voxels_x: seg_origin_in_voxels.x,
+        seg_origin_in_voxels_y: seg_origin_in_voxels.y,
+        seg_origin_in_voxels_z: seg_origin_in_voxels.z,
+        terrain_voxel_type_id: state.solid_voxel_type_id,
+        group_size_in_chunks_x: segment_chunks,
+        group_size_in_chunks_y: segment_chunks,
+        sea_level: state.sea_level,
+        terrain_amplitude: state.terrain_amplitude,
+        state: state.noise_state,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noise_terrain_params_layout() {
+        assert_eq!(std::mem::size_of::<NoiseTerrainParams>(), 112);
+        assert_eq!(std::mem::align_of::<NoiseTerrainParams>(), 16);
+        // Sanity-check Row 0 fields:
+        assert_eq!(std::mem::offset_of!(NoiseTerrainParams, seg_origin_in_voxels_x), 0);
+        assert_eq!(std::mem::offset_of!(NoiseTerrainParams, terrain_voxel_type_id), 12);
+        // Row 1
+        assert_eq!(std::mem::offset_of!(NoiseTerrainParams, group_size_in_chunks_x), 16);
+        assert_eq!(std::mem::offset_of!(NoiseTerrainParams, sea_level), 24);
+        // FnlState starts at row 2.
+        assert_eq!(std::mem::offset_of!(NoiseTerrainParams, state), 32);
+    }
+
+    #[test]
+    fn shader_inliner_strips_directive_and_finds_marker() {
+        let src = build_noise_terrain_shader_src();
+        assert!(src.contains("fn fnl_get_noise_3d"), "noise module not inlined");
+        assert!(
+            src.contains("fn fill_chunk_data_with_noise"),
+            "noise_terrain entry point missing"
+        );
+        let has_directive = src
+            .lines()
+            .any(|line| line.trim_start().starts_with("#define_import_path"));
+        assert!(!has_directive, "#define_import_path leaked into combined");
+        let has_marker = src.lines().any(|line| line.trim_start().starts_with("// @begin"));
+        assert!(!has_marker, "// @begin marker leaked");
+    }
+}

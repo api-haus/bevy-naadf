@@ -447,6 +447,9 @@ pub fn e2e_driver(
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
     app_args: Option<Res<crate::AppArgs>>,
+    // streaming-world Phase 2 — read `Residency::origin` to assert the
+    // window shifted in X over Phase C.
+    residency: Option<Res<crate::streaming::Residency>>,
 ) {
     // Resize-test fast-path: at the very first Warmup tick, if --resize-test
     // is set, branch into the resize-test state machine entirely (skips the
@@ -492,7 +495,15 @@ pub fn e2e_driver(
     let vox_gpu_construction_mode = app_args
         .as_deref()
         .is_some_and(|a| a.vox_gpu_construction_mode);
-    if (oasis_mode || vox_gpu_construction_mode)
+    // streaming-world Phase 2 — `--streaming-window` reuses the OasisWarmup
+    // → ShootBefore → ApplyEdit → WaitPostEdit → ShootAfter → Assert state
+    // machine. The ApplyEdit branch promotes the camera instead of running a
+    // brush; the Assert branch dispatches to
+    // `streaming_window::assert_streaming_window_landed`.
+    let streaming_window_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.streaming_window_mode);
+    if (oasis_mode || vox_gpu_construction_mode || streaming_window_mode)
         && state.phase == E2ePhase::Warmup
         && state.phase_ticks == 0
     {
@@ -902,6 +913,11 @@ pub fn e2e_driver(
                                 &fb,
                                 super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_BEFORE_PNG,
                             );
+                        } else if streaming_window_mode {
+                            super::streaming_window::save_streaming_window_screenshot(
+                                &fb,
+                                super::streaming_window::STREAMING_BEFORE_PNG,
+                            );
                         } else {
                             super::oasis_edit_visual::save_oasis_screenshot(
                                 &fb,
@@ -961,6 +977,22 @@ pub fn e2e_driver(
                 if vox_gpu_construction_mode {
                     let _ = &mut wd;
                     super::vox_gpu_construction::promote_camera_to_pose_b();
+                } else if streaming_window_mode {
+                    // streaming-world Phase 2 — instead of applying a brush
+                    // edit (the procedural world doesn't have anything to
+                    // erase yet), walk the camera +X across ≥ 2 segment
+                    // boundaries. `pin_streaming_window_camera` reads the
+                    // latch each tick and pins the new pose.
+                    //
+                    // Snapshot the residency origin X NOW so we can assert
+                    // the shift after the WaitPostEdit phase.
+                    let origin_x = residency
+                        .as_deref()
+                        .map(|r| r.origin.x)
+                        .unwrap_or(i32::MIN);
+                    super::streaming_window::record_origin_x_at_pose_a(origin_x);
+                    let _ = &mut wd;
+                    super::streaming_window::promote_camera_to_walk();
                 } else {
                     super::oasis_edit_visual::apply_erase_brush(&mut wd);
                 }
@@ -1008,6 +1040,11 @@ pub fn e2e_driver(
                                 &fb,
                                 super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_AFTER_PNG,
                             );
+                        } else if streaming_window_mode {
+                            super::streaming_window::save_streaming_window_screenshot(
+                                &fb,
+                                super::streaming_window::STREAMING_AFTER_PNG,
+                            );
                         } else {
                             super::oasis_edit_visual::save_oasis_screenshot(
                                 &fb,
@@ -1054,6 +1091,28 @@ pub fn e2e_driver(
                         .map(|msg| {
                             println!("e2e_render --vox-gpu-construction: {msg}");
                         })
+                    } else if streaming_window_mode {
+                        // streaming-world Phase 2 — compute the residency-
+                        // origin shift in X (Pose A snapshot vs current).
+                        let origin_a =
+                            super::streaming_window::origin_x_at_pose_a();
+                        let origin_now = residency
+                            .as_deref()
+                            .map(|r| r.origin.x)
+                            .unwrap_or(i32::MAX);
+                        let shift = if origin_a == i32::MIN || origin_now == i32::MAX {
+                            // Never snapshotted / no current Residency — let
+                            // the assertion fail cleanly with shift = 0.
+                            0
+                        } else {
+                            origin_now - origin_a
+                        };
+                        super::streaming_window::assert_streaming_window_landed(
+                            &a, &b, shift,
+                        )
+                        .map(|msg| {
+                            println!("e2e_render --streaming-window: {msg}");
+                        })
                     } else {
                         super::oasis_edit_visual::assert_visual_edit_landed(&a, &b)
                             .map(|msg| {
@@ -1080,6 +1139,16 @@ pub fn e2e_driver(
                             super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
                             super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
                             super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
+                        );
+                    } else if streaming_window_mode {
+                        println!(
+                            "e2e_render: streaming-window PASS — \
+                             {} warmup + {} post-walk wait frames; camera \
+                             walked +{:.0} voxels in X; residency window \
+                             followed.",
+                            super::oasis_edit_visual::OASIS_WARMUP_FRAMES,
+                            super::oasis_edit_visual::OASIS_POST_EDIT_WAIT_FRAMES,
+                            super::streaming_window::STREAMING_WALK_DISTANCE_VOXELS,
                         );
                     } else {
                         println!(

@@ -225,6 +225,21 @@ pub struct ConstructionGpu {
     /// per segment in the W5.3 segment loop via `RenderQueue::write_buffer`.
     /// (See `02-design.md` Decision: "one params buffer vs 512 buffers".)
     pub model_data_params_buffer: Option<Buffer>,
+
+    // === streaming-world Phase 2 — noise_terrain dispatch (sibling of W5) ====
+    /// streaming-world Phase 2 — `NoiseTerrainParams` uniform (112 B,
+    /// `streaming/noise_dispatch.rs::NoiseTerrainParams`). One buffer,
+    /// rewritten per admitted segment via `RenderQueue::write_buffer` exactly
+    /// like the W5 `model_data_params_buffer`.
+    pub noise_terrain_params_buffer: Option<Buffer>,
+    /// streaming-world Phase 2 — lazily-queued compute pipeline id for the
+    /// noise terrain entry point. Queued on the first frame
+    /// `streaming_extract.streaming_mode_active = true` is observed (the
+    /// render-world `Assets<Shader>` is reachable from
+    /// `prepare_construction`; not from `ConstructionPipelines::from_world`
+    /// which runs at `RenderStartup` before any extract has fired).
+    /// `None` when streaming is not active.
+    pub noise_terrain_pipeline: Option<CachedComputePipelineId>,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -274,6 +289,13 @@ pub struct ConstructionBindGroups {
     /// 512 segments** (binding identities are stable; only the uniform
     /// contents rotate). vox-gpu-rewrite W5.2.
     pub construction_generator_model: Option<BindGroup>,
+    /// streaming-world Phase 2 — `@group(0)` bind group for
+    /// `noise_terrain.wgsl::fill_chunk_data_with_noise`. 2 bindings:
+    /// `chunk_data_rw` (the shared `segment_voxel_buffer`) + `params` (the
+    /// rewritten-per-segment `noise_terrain_params_buffer`). Built once in
+    /// `prepare_construction`, reused across every per-segment admission
+    /// dispatch (binding identities stable, only the uniform contents rotate).
+    pub construction_noise_terrain: Option<BindGroup>,
 }
 
 /// The sibling of `NaadfPipelines` (`render/pipelines.rs`) for Phase-C
@@ -378,6 +400,19 @@ pub struct ConstructionPipelines {
     pub world_change_pipeline_apply_block_change: CachedComputePipelineId,
     /// W2 — `world_change.wgsl::apply_voxel_change`.
     pub world_change_pipeline_apply_voxel_change: CachedComputePipelineId,
+
+    // === streaming-world Phase 2 — noise_terrain layout ======================
+    /// streaming-world Phase 2 — `@group(0)` layout for
+    /// `noise_terrain.wgsl::fill_chunk_data_with_noise`. 2 bindings.
+    ///
+    /// **NOTE:** the corresponding pipeline ID lives on `ConstructionGpu`
+    /// (`noise_terrain_pipeline`) because it's queued lazily in
+    /// `prepare_construction` — `ConstructionPipelines::from_world` runs in
+    /// the render-world `RenderStartup` schedule, and the inlined-source
+    /// shader registration via `Assets<Shader>` needs the main-world asset
+    /// store. The lazy queue path runs once `streaming_extract.streaming_mode_active`
+    /// is observed for the first time.
+    pub noise_terrain_layout: BindGroupLayoutDescriptor,
 }
 
 impl FromWorld for ConstructionPipelines {
@@ -515,6 +550,13 @@ impl FromWorld for ConstructionPipelines {
                 construction_bounds_layout.clone(),
             );
 
+        // === streaming-world Phase 2 — noise_terrain layout ==================
+        // (Pipeline queue is deferred to `prepare_construction` per the
+        // doc-comment on `noise_terrain_layout` above — needs Assets<Shader>
+        // access which isn't reliably reachable here from RenderStartup.)
+        let noise_terrain_layout =
+            crate::streaming::noise_dispatch::noise_terrain_layout_descriptor();
+
         Self {
             generator_model_layout,
             generator_model_pipeline,
@@ -541,6 +583,7 @@ impl FromWorld for ConstructionPipelines {
             world_change_pipeline_apply_chunk_change,
             world_change_pipeline_apply_block_change,
             world_change_pipeline_apply_voxel_change,
+            noise_terrain_layout,
         }
     }
 }
@@ -1088,6 +1131,10 @@ pub fn prepare_construction(
     // fires when the main-world install path inserts a `ModelData`); absent
     // on default-scene + entity-only / non-VOX runs.
     model_data: Option<Res<crate::render::extract::ModelDataRender>>,
+    // streaming-world Phase 2 — render-world mirror of the main-world
+    // `Residency` / `NoiseChunkSource` resources. `streaming_mode_active`
+    // is `true` only when the user is running `GridPreset::ProceduralStreaming`.
+    streaming_extract: Option<Res<crate::streaming::StreamingExtractRender>>,
 ) {
     // W0 seam: ensure-exists for both resources, then W1..W5 fill in their
     // family's allocations + bind groups on subsequent frames (when the
@@ -1620,6 +1667,105 @@ pub fn prepare_construction(
         }
     }
 
+    // === streaming-world Phase 2 — noise_terrain buffer + bind group ========
+    //
+    // Allocates the `segment_voxel_buffer` (when not already there — the W5
+    // block above allocates it whenever `model_data` is present, but the
+    // streaming preset has no ModelData) + the `noise_terrain_params_buffer`,
+    // then builds the `construction_noise_terrain` bind group.
+    //
+    // Slotted alongside the W5 block (same lifecycle pattern as the W5
+    // `model_data_*` allocations). `streaming_extract` is `Some` whenever the
+    // ExtractSchedule has run — its `streaming_mode_active` flag tells us
+    // whether to actually allocate the buffers. We DO allocate even on
+    // non-streaming frames if `streaming_mode_active = true`, gated by
+    // construction_config's gpu_construction_enabled (the noise dispatch is a
+    // GPU op).
+    let streaming_active = streaming_extract
+        .as_deref()
+        .map(|s| s.streaming_mode_active)
+        .unwrap_or(false);
+    if streaming_active && construction_config.gpu_construction_enabled {
+        // (0) Lazily queue the noise_terrain compute pipeline once the shader
+        // handle has been seeded into Assets<Shader> by the streaming plugin's
+        // startup system (see `crate::streaming::seed_noise_terrain_shader`).
+        // The handle is mirrored into the render world via the
+        // StreamingExtractRender extract. We pick it up the first time it's
+        // available and queue the pipeline; subsequent ticks reuse the cached
+        // ID.
+        if gpu.noise_terrain_pipeline.is_none() {
+            if let Some(handle) = streaming_extract
+                .as_deref()
+                .and_then(|s| s.noise_terrain_shader.clone())
+            {
+                let pid =
+                    crate::streaming::noise_dispatch::queue_noise_terrain_pipeline_with_handle(
+                        &pipeline_cache,
+                        construction_pipelines.noise_terrain_layout.clone(),
+                        handle,
+                    );
+                gpu.noise_terrain_pipeline = Some(pid);
+            }
+        }
+
+        // (1) `segment_voxel_buffer` — allocate at per-segment cubic 128 MiB
+        // extent, same shape as the W5 block at `:1527-1547`. Streaming reuses
+        // this buffer across every per-segment dispatch (only one segment
+        // alive in the scratch at a time).
+        if gpu.segment_voxel_buffer.is_none() {
+            const SEGMENT_CHUNKS: u64 =
+                (crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS as u64) * 4;
+            let size = SEGMENT_CHUNKS
+                * SEGMENT_CHUNKS
+                * SEGMENT_CHUNKS
+                * (generator_model::CHUNK_DATA_U32S as u64)
+                * 4;
+            let buf = render_device.create_buffer(&BufferDescriptor {
+                label: Some("naadf_streaming_segment_voxel_buffer"),
+                size,
+                usage: BufferUsages::STORAGE
+                    | BufferUsages::COPY_DST
+                    | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            gpu.segment_voxel_buffer = Some(buf);
+            bind_groups.construction_world = None;
+            bind_groups.construction_noise_terrain = None;
+        }
+
+        // (2) `noise_terrain_params_buffer` — 96 B uniform, rewritten per
+        // admitted segment.
+        if gpu.noise_terrain_params_buffer.is_none() {
+            let buf = crate::streaming::noise_dispatch::create_noise_terrain_params_buffer(
+                &render_device,
+                &render_queue,
+            );
+            gpu.noise_terrain_params_buffer = Some(buf);
+            bind_groups.construction_noise_terrain = None;
+        }
+
+        // (3) Build the noise-terrain bind group when missing AND both
+        // bindings exist.
+        if bind_groups.construction_noise_terrain.is_none() {
+            if let (Some(segv), Some(params)) = (
+                gpu.segment_voxel_buffer.as_ref(),
+                gpu.noise_terrain_params_buffer.as_ref(),
+            ) {
+                let bgl = pipeline_cache
+                    .get_bind_group_layout(&construction_pipelines.noise_terrain_layout);
+                let bg = render_device.create_bind_group(
+                    "naadf_streaming_noise_terrain_bind_group",
+                    &bgl,
+                    &BindGroupEntries::sequential((
+                        segv.as_entire_buffer_binding(),
+                        params.as_entire_buffer_binding(),
+                    )),
+                );
+                bind_groups.construction_noise_terrain = Some(bg);
+            }
+        }
+    }
+
     // First-frame seed: when the bound-queue family has just been built AND
     // `WorldGpu`'s chunks texture is the CPU-built version, dispatch
     // `add_initial_groups_to_bound_queue` to seed the size-0 X/Y/Z queues +
@@ -1644,6 +1790,11 @@ pub fn prepare_construction(
         && bound_group_count > 0
         && !gpu.bounds_initialized
         && (!want_gpu_producer || gpu.gpu_producer_has_run)
+        // streaming-world Phase 2: skip the bounds-init seed when streaming
+        // is active — the streaming branch in naadf_gpu_producer_node runs
+        // the full bounds chain per frame, which subsumes the once-at-startup
+        // seed.
+        && !streaming_active
     {
         let Some(initial_pipeline) = pipeline_cache
             .get_compute_pipeline(construction_pipelines.bounds_calc_pipeline_add_initial)
@@ -2342,13 +2493,26 @@ pub fn naadf_gpu_producer_node(
     // `.vox` file was loaded into the fixed world via
     // `install_vox_in_fixed_world` (W5.1).
     model_data: Option<Res<crate::render::extract::ModelDataRender>>,
+    // streaming-world Phase 2 — when `streaming_mode_active = true`, branch
+    // into the per-frame admission-driven noise_terrain + chunk_calc
+    // dispatch loop. The non-streaming W5 + dense ladder below stays
+    // byte-identical for `GridPreset::Default` + `GridPreset::Vox`.
+    streaming_extract: Option<Res<crate::streaming::StreamingExtractRender>>,
 ) {
     let Some(config) = construction_config else { return; };
     if !config.gpu_construction_enabled {
         return;
     }
     let Some(mut gpu) = construction_gpu else { return; };
-    if gpu.gpu_producer_has_run {
+    let streaming_mode_active = streaming_extract
+        .as_deref()
+        .map(|s| s.streaming_mode_active)
+        .unwrap_or(false);
+    // Streaming preset bypasses the once-at-startup gate (the streaming
+    // dispatch runs every frame any admission/eviction happens). The two
+    // non-streaming branches preserve the once-at-startup gate exactly as
+    // before.
+    if !streaming_mode_active && gpu.gpu_producer_has_run {
         return;
     }
     let Some(construction_pipelines) = construction_pipelines else { return; };
@@ -2370,9 +2534,12 @@ pub fn naadf_gpu_producer_node(
         return;
     };
 
-    // vox-gpu-rewrite W5.3 — three-way producer gate ladder
-    // (`docs/orchestrate/vox-gpu-rewrite/02-design.md` § "Three-way producer
-    // gate ordering"):
+    // vox-gpu-rewrite W5.3 — three-way producer gate ladder, extended in
+    // streaming-world Phase 2 with a fourth branch (a0) before the W5 branch:
+    //   (a0) `streaming_mode_active = true` → per-frame admission-driven
+    //        noise_terrain + chunk_calc + bounds dispatch (per-frame, NOT
+    //        once-at-startup). Inverts the W5 gate per
+    //        `docs/orchestrate/streaming-world/02b-design-plan-b.md` § G.
     //   (a) `ModelDataRender` present + W5 deps ready → per-segment generator
     //       + chunk_calc dispatch chain (the C# `WorldData.GenerateWorld` loop
     //       at `WorldData.cs:120-156`).
@@ -2381,6 +2548,211 @@ pub fn naadf_gpu_producer_node(
     //       drives the chunk_calc chain; the default-scene path).
     //   (c) else → CPU upload fallback (early-return; the renderer reads the
     //       pre-built CPU mirror via `prepare_world_gpu`).
+    if streaming_mode_active {
+        // === (a0) streaming-world Phase 2 branch ============================
+        //
+        // Per-frame admission loop:
+        //   1. For each admission in `streaming_extract.admissions_this_frame`
+        //      (capped at `--max-segments-per-frame`):
+        //      - Rewrite the `noise_terrain_params_buffer` with the segment's
+        //        world origin + the FnlState + sea_level + amplitude.
+        //      - Rewrite the `bounds_params_buffer` with the segment's
+        //        chunk_offset (so chunk_calc writes to the right chunks).
+        //      - On a fresh per-segment encoder, dispatch noise_terrain then
+        //        chunk_calc.calc_block_from_raw_data. Submit (per
+        //        `02b-design-plan-b.md` § G.3 — inherits the W5 per-segment
+        //        submit constraint from `:2427-2453`).
+        //   2. After the per-segment loop, if any admissions OR evictions
+        //      happened, run the bounds chain (`compute_voxel_bounds` +
+        //      `compute_block_bounds`) once on the render-context encoder
+        //      (per `02b-design-plan-b.md` § G + D.B7).
+        let Some(streaming_extract) = streaming_extract else {
+            return;
+        };
+        let Some(p_noise_id) = gpu.noise_terrain_pipeline else {
+            return;
+        };
+        let Some(p_noise) = pipeline_cache.get_compute_pipeline(p_noise_id) else {
+            return;
+        };
+        let Some(noise_bg) =
+            construction_bind_groups.construction_noise_terrain.as_ref()
+        else {
+            return;
+        };
+        let Some(noise_params_buf) = gpu.noise_terrain_params_buffer.as_ref() else {
+            return;
+        };
+        let Some(bounds_params_buf) = gpu.bounds_params_buffer.as_ref() else {
+            return;
+        };
+
+        let admissions = &streaming_extract.admissions_this_frame;
+        let evictions = &streaming_extract.evictions_this_frame;
+        let any_admissions_or_evictions =
+            !admissions.is_empty() || !evictions.is_empty();
+
+        // Per-segment chunk extent — same shape as the W5 producer
+        // (`SEGMENT_CHUNKS = 16`).
+        let segment_chunks: u32 = crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4;
+        let group_size_in_chunks =
+            [segment_chunks, segment_chunks, segment_chunks];
+
+        let mut segments_dispatched: u32 = 0;
+        for (world_seg, slot) in admissions.iter() {
+            // World origin in voxels — `WorldSegmentPos.0 * SEGMENT_VOXELS`.
+            let seg_origin_v = world_seg.0
+                * (crate::streaming::SEGMENT_VOXELS);
+
+            // Slot → window-local segment coords → chunk offset (where in
+            // `WorldGpu.chunks_buffer` this segment's output lands). The
+            // chunk_calc dispatch writes into chunks at
+            // `chunk_offset + (gx, gy, gz)` per the construction_params
+            // uniform.
+            let [lx, ly, lz] = crate::streaming::Residency::local_of(slot.0);
+            let group_offset_in_chunks = [
+                lx * segment_chunks,
+                ly * segment_chunks,
+                lz * segment_chunks,
+            ];
+
+            // Build the noise_terrain params.
+            let noise_params = crate::streaming::build_noise_terrain_params(
+                seg_origin_v,
+                streaming_extract.as_ref(),
+                segment_chunks,
+            );
+            render_queue.write_buffer(
+                noise_params_buf,
+                0,
+                bytemuck::bytes_of(&noise_params),
+            );
+
+            // Build the construction_params uniform for the chunk_calc pass.
+            let bound_group_count = bounds_calc::bound_group_count_of([
+                crate::WORLD_SIZE_IN_CHUNKS.x,
+                crate::WORLD_SIZE_IN_CHUNKS.y,
+                crate::WORLD_SIZE_IN_CHUNKS.z,
+            ]);
+            let construction_params = crate::render::gpu_types::GpuConstructionParams {
+                size_in_chunks: [
+                    crate::WORLD_SIZE_IN_CHUNKS.x,
+                    crate::WORLD_SIZE_IN_CHUNKS.y,
+                    crate::WORLD_SIZE_IN_CHUNKS.z,
+                ],
+                _pad0: 0,
+                group_size_in_groups: bounds_calc::group_size_in_groups_of([
+                    crate::WORLD_SIZE_IN_CHUNKS.x,
+                    crate::WORLD_SIZE_IN_CHUNKS.y,
+                    crate::WORLD_SIZE_IN_CHUNKS.z,
+                ]),
+                _pad1: 0,
+                bound_group_queue_max_size: bound_group_count.max(1),
+                hash_map_size: config.initial_hash_map_size,
+                segment_size_in_chunks: segment_chunks,
+                max_group_bound_dispatch: config.max_group_bound_dispatch,
+                chunk_offset: group_offset_in_chunks,
+                _pad2: 0,
+                frame_index: 0,
+                changed_chunk_count: 0,
+                changed_block_count: 0,
+                changed_voxel_count: 0,
+            };
+            render_queue.write_buffer(
+                bounds_params_buf,
+                0,
+                bytemuck::bytes_of(&construction_params),
+            );
+
+            // Per-segment encoder + submit (inherits the W5 per-segment submit
+            // ordering fix at `:2427-2453`).
+            let mut seg_encoder = render_device.create_command_encoder(
+                &CommandEncoderDescriptor {
+                    label: Some("naadf_streaming_segment_encoder"),
+                },
+            );
+            // (a) Dispatch noise_terrain: writes `segment_voxel_buffer`.
+            {
+                let mut pass = seg_encoder.begin_compute_pass(
+                    &bevy::render::render_resource::ComputePassDescriptor {
+                        label: Some("naadf_streaming_noise_terrain_pass"),
+                        timestamp_writes: None,
+                    },
+                );
+                pass.set_pipeline(p_noise);
+                pass.set_bind_group(0, noise_bg, &[]);
+                pass.dispatch_workgroups(
+                    group_size_in_chunks[0],
+                    group_size_in_chunks[1],
+                    group_size_in_chunks[2],
+                );
+            }
+            // (b) Dispatch chunk_calc.calc_block_from_raw_data: writes
+            //     WorldGpu.{chunks,blocks,voxels}. Same encoder — wgpu auto-
+            //     inserts the STORAGE→STORAGE barrier between the two passes.
+            chunk_calc::dispatch_calc_block_from_raw_data_world_sized(
+                &mut seg_encoder,
+                p_calc,
+                world_bg,
+                group_size_in_chunks,
+            );
+            render_queue.submit([seg_encoder.finish()]);
+            segments_dispatched += 1;
+        }
+
+        // After the per-segment loop, run the bounds chain once if any
+        // admissions / evictions happened (per D.B7 — covers freshly-written
+        // chunks AND newly-emptied slots).
+        if any_admissions_or_evictions {
+            let encoder = render_context.command_encoder();
+
+            // Same bounds-chain dispatch shape as the W5 branch (full-world
+            // worst-case workgroup counts; extra workgroups are spec-safe
+            // no-ops per `chunk_calc::split_3d_dispatch` invariants).
+            let world_chunks = crate::WORLD_SIZE_IN_CHUNKS.x
+                * crate::WORLD_SIZE_IN_CHUNKS.y
+                * crate::WORLD_SIZE_IN_CHUNKS.z;
+            let max_blocks_u64 = (world_chunks as u64) * 64;
+            let max_voxels_u64 = max_blocks_u64 * 32;
+            let voxel_workgroups =
+                ((max_voxels_u64 / 32 + 1).max(1)).min(u32::MAX as u64) as u32;
+            let block_workgroups =
+                ((max_blocks_u64 / 64 + 1).max(1)).min(u32::MAX as u64) as u32;
+
+            chunk_calc::dispatch_compute_voxel_bounds(
+                encoder,
+                p_voxel,
+                world_bg,
+                voxel_workgroups,
+            );
+            chunk_calc::dispatch_compute_block_bounds(
+                encoder,
+                p_block,
+                world_bg,
+                block_workgroups,
+            );
+        }
+
+        // streaming-world: gpu_producer_has_run STAYS FALSE (the producer
+        // runs every frame any admission/eviction happens). Also flip
+        // bounds_initialized to true on the first dispatch so the bounds-init
+        // seed in prepare_construction doesn't re-fire (it would interleave
+        // with our own bounds chain).
+        if segments_dispatched > 0 && !gpu.bounds_initialized {
+            gpu.bounds_initialized = true;
+        }
+        if segments_dispatched > 0 {
+            bevy::log::info!(
+                "streaming-world: dispatched {} segment(s) this frame ({} evictions); \
+                 bounds chain {} run.",
+                segments_dispatched,
+                evictions.len(),
+                if any_admissions_or_evictions { "WAS" } else { "skipped" },
+            );
+        }
+        return;
+    }
+
     if let Some(model_data) = model_data.as_deref() {
         // === (a) W5 branch — per-segment generator + chunk_calc =============
         //

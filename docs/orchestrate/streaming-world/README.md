@@ -47,8 +47,10 @@ consolidated mode disqualified.
 - [ ] **Hard gate v2** — submit revised design to user, resolve OQ.2 before Phase 1
 - [x] 03a — Phase-1 impl: WGSL FastNoiseLite port (`general-purpose` → code + `03a-impl-wgsl-noise.md`)
 - [x] **Hard gate (Phase 1)** — user confirmed, Phase 2 OQ.1/OQ.3 + composition scope resolved
-- [ ] 03b — Phase-2 impl: residency + noise_terrain.wgsl + W5 gate inversion + --streaming-window gate (`general-purpose` → code + `03b-impl-residency.md`)
-- [ ] **Hard gate (Phase 2)** — submit impl to user
+- [x] 03b — Phase-2 impl: residency + noise_terrain.wgsl + W5 gate inversion + --streaming-window gate (`general-purpose` → code + `03b-impl-residency.md`)
+- [ ] **Hard gate (Phase 2)** — submit impl to user; one camera-translation gap surfaced
+- [ ] 03c — Phase-2.5 fix: camera-Transform → window-local translation + tighten `--streaming-window` pixel-Δ threshold
+- [ ] **Hard gate (Phase 2.5)** — confirm visible streaming + tightened gate passes
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user

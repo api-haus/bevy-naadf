@@ -76,6 +76,18 @@ pub enum GridPreset {
     Vox {
         path: std::path::PathBuf,
     },
+    /// Streaming-world preset (`docs/orchestrate/streaming-world`). The world
+    /// is procedurally generated on-the-fly by the residency manager driving
+    /// the WGSL FastNoiseLite noise → `segment_voxel_buffer` GPU dispatch
+    /// chain. `noise_preset` selects one of the built-in WGSL presets (Phase 2
+    /// ships exactly one: `0 = SimpleTerrain`); `seed` is the FNL hash seed.
+    ProceduralStreaming {
+        /// Index into the built-in WGSL noise preset table. Phase 2 supports
+        /// `0 = SimpleTerrain` only.
+        noise_preset: u32,
+        /// FNL seed (`FnlState::seed`).
+        seed: i32,
+    },
 }
 
 /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#
@@ -393,6 +405,33 @@ pub struct AppArgs {
     /// capture a single screenshot to `oracle_gpu.png`, then exit. See
     /// [`crate::e2e::vox_gpu_oracle`].
     pub vox_gpu_oracle_gpu_phase: bool,
+    /// streaming-world Phase 2 — runs the `--streaming-window` e2e gate. When
+    /// `true`, the e2e harness boots a `GridPreset::ProceduralStreaming` world
+    /// at the configured `vram_budget_mib` + `max_segments_per_frame` budget,
+    /// walks the camera across ≥2 segment boundaries in X, captures
+    /// framebuffers before/after, and asserts the residency window followed
+    /// the camera + terrain re-populated. See
+    /// `docs/orchestrate/streaming-world/02b-design-plan-b.md` § J +
+    /// `crate::e2e::streaming_window`.
+    pub streaming_window_mode: bool,
+    /// streaming-world Phase 2 — VRAM budget (in MiB) for the residency slab.
+    /// Default `1024`. Asserted at startup install time against the slab's
+    /// computed total per `02-design.md` § A.4; panic on under-budget.
+    pub vram_budget_mib: u32,
+    /// streaming-world Phase 2 — per-frame admission cap for the residency
+    /// driver. Default `4` per `02b-design-plan-b.md` § D.B6.
+    pub max_segments_per_frame: u32,
+    /// streaming-world Phase 2 — `world_y` value at which `noise == 0` flips
+    /// solid/empty. Default = half world height (`WORLD_SIZE_IN_VOXELS.y / 2 =
+    /// 256`).
+    pub sea_level: f32,
+    /// streaming-world Phase 2 — height span over which the noise transition
+    /// spreads. Default `64.0` (architect-picked; justified in
+    /// `03b-impl-residency.md` § CLI defaults justified).
+    pub terrain_amplitude: f32,
+    /// streaming-world Phase 2 — FNL seed for the streaming preset (default
+    /// `1337`).
+    pub noise_seed: i32,
 }
 
 impl Default for AppArgs {
@@ -412,6 +451,12 @@ impl Default for AppArgs {
             vox_gpu_construction_mode: false,
             vox_gpu_oracle_cpu_phase: false,
             vox_gpu_oracle_gpu_phase: false,
+            streaming_window_mode: false,
+            vram_budget_mib: 1024,
+            max_segments_per_frame: 4,
+            sea_level: (WORLD_SIZE_IN_VOXELS.y as f32) * 0.5,
+            terrain_amplitude: 64.0,
+            noise_seed: 1337,
         }
     }
 }
@@ -669,6 +714,11 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // succeeds (same ordering as `NaadfRenderPlugin`'s
             // `init_gpu_resource::<NaadfPipelines>()`).
             render::construction::ConstructionPlugin,
+            // streaming-world Phase 2 — registers the residency driver +
+            // the render-world extract. Unconditional registration: when no
+            // `Residency` / `NoiseChunkSource` resources exist (the
+            // non-streaming presets) the systems early-return.
+            streaming::StreamingPlugin,
             // `material.ron` loader — registers `MaterialRonLoader` so
             // `materials/<name>/material.ron` resolves to a `StandardMaterial`.
             // Infrastructure only: nothing in the scene consumes a baked
