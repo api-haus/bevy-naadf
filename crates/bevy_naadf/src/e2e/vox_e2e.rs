@@ -322,49 +322,43 @@ pub fn vox_e2e_fixture_path() -> PathBuf {
 ///
 /// Caller (`bin/e2e_render.rs` `--vox-e2e` branch) is responsible for
 /// folding this into the binary exit code.
+/// Apply the vox-e2e gate's default overlay onto `args` in place.
+///
+/// Synthesises a `.vox` fixture to a temp path, sets `vox_e2e_mode = true`,
+/// and (if the user didn't override the grid preset) installs the synthesised
+/// fixture as `GridPreset::Vox`. Returns `true` on success; `false` if the
+/// fixture write fails.
+pub fn apply_vox_e2e_defaults(args: &mut crate::AppArgs) -> bool {
+    args.vox_e2e_mode = true;
+
+    if matches!(args.grid_preset, crate::GridPreset::Default) {
+        let path = match write_vox_e2e_fixture_to_temp() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "e2e_render --gate vox-e2e: failed to write synthesised \
+                     .vox fixture: {e}"
+                );
+                return false;
+            }
+        };
+        println!(
+            "e2e_render --gate vox-e2e: synthesised .vox fixture written to \
+             {} ({} models, 2 nTRN translations)",
+            path.display(),
+            2
+        );
+        args.grid_preset = crate::GridPreset::Vox { path };
+    }
+    true
+}
+
+/// Thin Rust-API wrapper.
 pub fn run_vox_e2e() -> AppExit {
-    // 1) Serialise the fixture to a temp file so the production `--vox
-    //    <path>` ingestion path runs verbatim (load_vox → std::fs::read →
-    //    parse_vox_bytes → flatten_scene → build_world_from_vox).
-    let path = match write_vox_e2e_fixture_to_temp() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "e2e_render --vox-e2e: failed to write synthesised .vox \
-                 fixture: {e}"
-            );
-            return AppExit::error();
-        }
-    };
-    println!(
-        "e2e_render --vox-e2e: synthesised .vox fixture written to {} \
-         ({} models, 2 nTRN translations)",
-        path.display(),
-        2
-    );
-
-    // 2) Set up `AppArgs` so:
-    //     - `setup_test_grid` reads `GridPreset::Vox { path }` and calls
-    //       `vox_import::load_vox(&path)` (`voxel/grid.rs:75-83`).
-    //     - The driver's `ASSERT` step swaps the default-scene batch gate
-    //       for `assert_vox_geometry_visible` (driver branch on
-    //       `args.vox_e2e_mode`).
     let mut app_args = crate::AppArgs::default();
-    // vox-gpu-rewrite Stage 2 (2026-05-18): the production install path is
-    // the only install path — the synthesised fixture flows through
-    // `install_vox_in_fixed_world` + the W5 GPU producer chain just like the
-    // production binary's `--vox` flag.
-    app_args.grid_preset = crate::GridPreset::Vox { path };
-    app_args.vox_e2e_mode = true;
-    // The W5 GPU producer chain runs `generator_model` + `chunk_calc` per
-    // segment to populate the fixed `(4096, 512, 4096)`-voxel world from
-    // the model's `ModelData`; gpu_construction_enabled is on by default
-    // (`ConstructionConfig::default`), no override needed.
-
-    // 3) Run the harness the same way `--entities` does (Phase-C wave-3 —
-    //    surface `AppArgs` overrides to the e2e binary). The standard
-    //    `AppConfig::e2e()` window (256×256 non-resizable) is reused so
-    //    the gate rect fractions stay calibrated.
+    if !apply_vox_e2e_defaults(&mut app_args) {
+        return AppExit::error();
+    }
     crate::run_e2e_render_with_args(app_args)
 }
 

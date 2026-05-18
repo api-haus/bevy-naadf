@@ -73,6 +73,13 @@ image-compare = "0.5"
 # bevy-instamat = the `material.ron` + sibling PNG loader (yields
 # `StandardMaterial`). Small loader crate, local path dep.
 bevy-instamat = { path = "../bevy-instamat" }
+# clap = derive-based CLI parser. Both `bevy-naadf` (interactive) and
+# `e2e_render` use the same `bevy_naadf::cli::Cli` / `E2eCli` parsers so every
+# `AppArgs` field gets a clap-derived `--flag`, `--help` prints, and the e2e
+# binary composes user-supplied overrides with its per-gate defaults instead
+# of building a parallel `AppArgs::default()` per gate (the parallel-reality
+# fix in `docs/orchestrate/streaming-world/02d-design-cli-and-e2e-rearch.md`).
+clap = { version = "4", features = ["derive"] }
 # ron = the `*.texarray.ron` texture-array definition format
 # (`src/texture_array/def.rs`). Bevy already pulls `ron` transitively at this
 # minor version.

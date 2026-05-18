@@ -121,38 +121,45 @@ pub struct SmallEditReproState {
 // Entry point — invoked from `bin/e2e_render.rs`
 // ---------------------------------------------------------------------------
 
-pub fn run_small_edit_repro() -> AppExit {
-    let path = oasis_vox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --small-edit-repro: FIXTURE MISSING at {} (cwd = {:?}). \
-             Run `git lfs pull` or from the workspace root.",
+/// Apply the small-edit-repro gate's default overlay onto `args` in place.
+/// Returns `true` on success; `false` if the bundled fixture is missing.
+pub fn apply_small_edit_repro_defaults(args: &mut crate::AppArgs) -> bool {
+    args.small_edit_repro_mode = true;
+
+    if matches!(args.grid_preset, crate::GridPreset::Default) {
+        let path = oasis_vox_fixture_path();
+        if !path.exists() {
+            eprintln!(
+                "e2e_render --gate small-edit-repro: FIXTURE MISSING at {} \
+                 (cwd = {:?}). Run `git lfs pull` or from the workspace root.",
+                path.display(),
+                std::env::current_dir().ok()
+            );
+            return false;
+        }
+        println!(
+            "e2e_render --gate small-edit-repro: loading Oasis VOX from {} \
+             ({} bytes); camera pos={:?} quat={:?}; cube_brush pos={:?} \
+             radius={} ty={}",
             path.display(),
-            std::env::current_dir().ok()
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            SMALL_EDIT_REPRO_CAM_POS,
+            SMALL_EDIT_REPRO_CAM_QUAT,
+            SMALL_EDIT_REPRO_BRUSH_POS,
+            SMALL_EDIT_REPRO_RADIUS,
+            SMALL_EDIT_REPRO_TY,
         );
+        args.grid_preset = crate::GridPreset::Vox { path };
+    }
+    true
+}
+
+/// Thin Rust-API wrapper.
+pub fn run_small_edit_repro() -> AppExit {
+    let mut app_args = crate::AppArgs::default();
+    if !apply_small_edit_repro_defaults(&mut app_args) {
         return AppExit::error();
     }
-    println!(
-        "e2e_render --small-edit-repro: loading Oasis VOX from {} ({} bytes); \
-         camera pos={:?} quat={:?}; cube_brush pos={:?} radius={} ty={}",
-        path.display(),
-        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-        SMALL_EDIT_REPRO_CAM_POS,
-        SMALL_EDIT_REPRO_CAM_QUAT,
-        SMALL_EDIT_REPRO_BRUSH_POS,
-        SMALL_EDIT_REPRO_RADIUS,
-        SMALL_EDIT_REPRO_TY,
-    );
-
-    let mut app_args = crate::AppArgs::default();
-    // vox-gpu-rewrite Stage 2 (2026-05-18): always the W5 GPU producer
-    // chain (production path). The captured camera pose and brush position
-    // are absolute world-voxel coords; the W5 path tiles Oasis at
-    // `voxelPos % modelSize` starting from world origin, so the original
-    // user-captured coords fall inside the first XZ tile and frame the
-    // same architecture the user saw.
-    app_args.grid_preset = crate::GridPreset::Vox { path };
-    app_args.small_edit_repro_mode = true;
     crate::run_e2e_render_with_args(app_args)
 }
 

@@ -254,39 +254,45 @@ pub const ORACLE_DARK_THRESHOLD: f32 = 200.0;
 /// `vox_gpu_oracle_cpu_phase` in `setup_test_grid`. The CPU oracle is a
 /// known-good reference renderer the SSIM compare phase pairs against the
 /// GPU production W5 path.
-pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
-    let path = oasis_vox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --vox-gpu-oracle-cpu: FIXTURE MISSING at {} \
-             (cwd = {:?}). The fixture is Git LFS-tracked at \
-             {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull`, OR run from the \
-             workspace root.",
+/// Apply the vox-gpu-oracle-cpu phase's default overlay onto `args`.
+/// Returns `true` on success; `false` if the fixture is missing.
+pub fn apply_vox_gpu_oracle_cpu_defaults(args: &mut crate::AppArgs) -> bool {
+    args.vox_gpu_oracle_cpu_phase = true;
+
+    if matches!(args.grid_preset, crate::GridPreset::Default) {
+        let path = oasis_vox_fixture_path();
+        if !path.exists() {
+            eprintln!(
+                "e2e_render --gate vox-gpu-oracle-cpu: FIXTURE MISSING at {} \
+                 (cwd = {:?}). The fixture is Git LFS-tracked at \
+                 {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull`, OR run from the \
+                 workspace root.",
+                path.display(),
+                std::env::current_dir().ok()
+            );
+            return false;
+        }
+        println!(
+            "e2e_render --gate vox-gpu-oracle-cpu: loading Oasis VOX fixture \
+             from {} via the legacy CPU path (install_vox_sized_to_model) — \
+             world size = model's natural 1488×544×1344 voxels. Camera pinned \
+             to shared oracle pose pos={:?} look={:?}. Saving to {}.",
             path.display(),
-            std::env::current_dir().ok()
+            ORACLE_CAMERA_POS,
+            ORACLE_CAMERA_LOOK,
+            ORACLE_CPU_PNG,
         );
+        args.grid_preset = crate::GridPreset::Vox { path };
+    }
+    true
+}
+
+/// Thin Rust-API wrapper.
+pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
+    let mut app_args = crate::AppArgs::default();
+    if !apply_vox_gpu_oracle_cpu_defaults(&mut app_args) {
         return AppExit::error();
     }
-    println!(
-        "e2e_render --vox-gpu-oracle-cpu: loading Oasis VOX fixture from {} \
-         via the legacy CPU path (install_vox_sized_to_model) — \
-         world size = model's natural 1488×544×1344 voxels. Camera pinned to \
-         shared oracle pose pos={:?} look={:?}. Saving to {}.",
-        path.display(),
-        ORACLE_CAMERA_POS,
-        ORACLE_CAMERA_LOOK,
-        ORACLE_CPU_PNG,
-    );
-
-    let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path };
-    // vox-gpu-rewrite Stage 14 (2026-05-18): `vox_gpu_oracle_cpu_phase` is
-    // the SOLE test-only escape hatch in `setup_test_grid` that routes to
-    // the legacy `install_vox_sized_to_model` CPU oracle. This is the SOLE
-    // remaining call site of the sized-to-model path and exists
-    // specifically so the oracle gate can compare CPU vs W5 GPU output
-    // via SSIM.
-    app_args.vox_gpu_oracle_cpu_phase = true;
     crate::run_e2e_render_with_args(app_args)
 }
 
@@ -302,37 +308,47 @@ pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
 /// path (`install_vox_in_fixed_world`) — the same path the production
 /// binary uses for `--vox` loads. The SSIM compare phase pairs this
 /// against the CPU oracle render.
-pub fn run_vox_gpu_oracle_gpu_phase() -> AppExit {
-    let path = oasis_vox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --vox-gpu-oracle-gpu: FIXTURE MISSING at {} \
-             (cwd = {:?}). The fixture is Git LFS-tracked at \
-             {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull`, OR run from the \
-             workspace root.",
+/// Apply the vox-gpu-oracle-gpu phase's default overlay onto `args`.
+/// Returns `true` on success; `false` if the fixture is missing.
+pub fn apply_vox_gpu_oracle_gpu_defaults(args: &mut crate::AppArgs) -> bool {
+    args.vox_gpu_oracle_gpu_phase = true;
+    args.construction_config.gpu_construction_enabled = true;
+
+    if matches!(args.grid_preset, crate::GridPreset::Default) {
+        let path = oasis_vox_fixture_path();
+        if !path.exists() {
+            eprintln!(
+                "e2e_render --gate vox-gpu-oracle-gpu: FIXTURE MISSING at {} \
+                 (cwd = {:?}). The fixture is Git LFS-tracked at \
+                 {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull`, OR run from the \
+                 workspace root.",
+                path.display(),
+                std::env::current_dir().ok()
+            );
+            return false;
+        }
+        println!(
+            "e2e_render --gate vox-gpu-oracle-gpu: loading Oasis VOX fixture \
+             from {} via the W5 GPU producer chain (install_vox_in_fixed_world) \
+             — fixed world 4096×512×4096 voxels, GPU construction enabled. \
+             Camera pinned to shared oracle pose pos={:?} look={:?}. Saving to \
+             {}.",
             path.display(),
-            std::env::current_dir().ok()
+            ORACLE_CAMERA_POS,
+            ORACLE_CAMERA_LOOK,
+            ORACLE_GPU_PNG,
         );
+        args.grid_preset = crate::GridPreset::Vox { path };
+    }
+    true
+}
+
+/// Thin Rust-API wrapper.
+pub fn run_vox_gpu_oracle_gpu_phase() -> AppExit {
+    let mut app_args = crate::AppArgs::default();
+    if !apply_vox_gpu_oracle_gpu_defaults(&mut app_args) {
         return AppExit::error();
     }
-    println!(
-        "e2e_render --vox-gpu-oracle-gpu: loading Oasis VOX fixture from {} \
-         via the W5 GPU producer chain (install_vox_in_fixed_world) — \
-         fixed world 4096×512×4096 voxels, GPU construction enabled. Camera \
-         pinned to shared oracle pose pos={:?} look={:?}. Saving to {}.",
-        path.display(),
-        ORACLE_CAMERA_POS,
-        ORACLE_CAMERA_LOOK,
-        ORACLE_GPU_PNG,
-    );
-
-    let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path };
-    // The production install path (no oracle-CPU-phase flag) —
-    // `install_vox_in_fixed_world` + W5 GPU producer chain. GPU
-    // construction default-on; explicit assignment for belt-and-braces.
-    app_args.construction_config.gpu_construction_enabled = true;
-    app_args.vox_gpu_oracle_gpu_phase = true;
     crate::run_e2e_render_with_args(app_args)
 }
 
@@ -366,11 +382,12 @@ pub fn run_vox_gpu_oracle_compare() -> u8 {
     // Phase 1 — CPU oracle.
     println!(
         "e2e_render --vox-gpu-oracle: spawning CPU oracle phase \
-         (subprocess: {} --vox-gpu-oracle-cpu)",
+         (subprocess: {} --gate vox-gpu-oracle-cpu)",
         exe.display()
     );
     let cpu_status = Command::new(&exe)
-        .arg("--vox-gpu-oracle-cpu")
+        .arg("--gate")
+        .arg("vox-gpu-oracle-cpu")
         .current_dir(&cwd)
         .status();
     let cpu_ok = match cpu_status {
@@ -394,11 +411,12 @@ pub fn run_vox_gpu_oracle_compare() -> u8 {
     // Phase 2 — GPU.
     println!(
         "e2e_render --vox-gpu-oracle: spawning GPU phase \
-         (subprocess: {} --vox-gpu-oracle-gpu)",
+         (subprocess: {} --gate vox-gpu-oracle-gpu)",
         exe.display()
     );
     let gpu_status = Command::new(&exe)
-        .arg("--vox-gpu-oracle-gpu")
+        .arg("--gate")
+        .arg("vox-gpu-oracle-gpu")
         .current_dir(&cwd)
         .status();
     let gpu_ok = match gpu_status {

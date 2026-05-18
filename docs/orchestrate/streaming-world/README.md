@@ -59,6 +59,8 @@ consolidated mode disqualified.
 - [ ] **Hard gate (Phase 2.6 design)** — submit refined design to user before impl dispatch
 - [x] 03f — Phase-2.6 impl: `WindowedSlotMap` data structure + GPU indirection buffer + shader helper threading (per `02c` § G migration plan)
 - [x] **Hard gate (Phase 2.6 impl)** — GREEN: `--streaming-window` PASS at pixel-Δ 83 (floor 3) / variance 2326 (floor 800); all 7 gates green; visible sliding-window streaming verified for the first time
+- [x] 02d/03h — Phase-2.7 consolidated: CLI + e2e re-arch — `bevy-naadf` accepts every `AppArgs` flag via clap; `e2e_render` collapsed 425→215 LOC to drive the actual main; per-gate `apply_<gate>_defaults()` overlays; `--help` prints clap output
+- [x] **Hard gate (Phase 2.7)** — GREEN: all 5 priority gates pass; 3 interactive presets launch; 253 tests pass; 2 HIGH-RISK escalations noted (vox-gpu-oracle subprocess respawn, oasis-edit-visual / vox-gpu-construction default-fidelity)
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user

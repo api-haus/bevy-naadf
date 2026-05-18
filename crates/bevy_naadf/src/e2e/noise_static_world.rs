@@ -224,36 +224,50 @@ pub fn pin_noise_static_camera(
 /// Boot the e2e harness with the procedural-static world preset + the
 /// `--noise-static-world` driver branch enabled. Returns the harness's
 /// `AppExit`.
-pub fn run_noise_static_world() -> AppExit {
+/// Apply the noise-static-world gate's default overlay onto `args` in place.
+///
+/// Per `02d-design-cli-and-e2e-rearch.md` § D: mode flags are always set; the
+/// preset is only installed when the user didn't override `--grid-preset`.
+/// Resets the wall-clock budget latch.
+pub fn apply_noise_static_defaults(args: &mut crate::AppArgs) {
     reset_gate_start_latch();
 
-    let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::ProceduralStatic {
-        noise_preset: 0,
-        seed: app_args.noise_seed,
-    };
-    app_args.noise_static_mode = true;
+    args.noise_static_mode = true;
     // Reuse the OasisXxx state machine for the standard
     // Warmup→ShootBefore→ApplyEdit(no-op)→WaitPostEdit→ShootAfter→Assert
     // flow. The streaming gate uses the same pattern.
-    app_args.oasis_edit_visual_mode = true;
+    args.oasis_edit_visual_mode = true;
+
+    if matches!(args.grid_preset, crate::GridPreset::Default) {
+        args.grid_preset = crate::GridPreset::ProceduralStatic {
+            noise_preset: args.noise_preset,
+            seed: args.noise_seed,
+        };
+    }
 
     println!(
-        "e2e_render --noise-static-world: booting procedural-static world \
+        "e2e_render --gate noise-static-world: booting procedural-static world \
          (seed={}, sea_level={:.1}, terrain_amplitude={:.1}); strict \
          assertions: lum_var ≥ {:.0}, column_stddev ≥ {:.1}, wall_clock ≤ {}s",
-        app_args.noise_seed,
-        app_args.sea_level,
-        app_args.terrain_amplitude,
+        args.noise_seed,
+        args.sea_level,
+        args.terrain_amplitude,
         NOISE_STATIC_MIN_LUM_VARIANCE,
         NOISE_STATIC_MIN_COLUMN_STDDEV,
         NOISE_STATIC_TOTAL_TIMEOUT.as_secs(),
     );
+}
+
+/// Thin Rust-API wrapper — see [`apply_noise_static_defaults`] for the
+/// composable form used by the e2e binary.
+pub fn run_noise_static_world() -> AppExit {
+    let mut app_args = crate::AppArgs::default();
+    apply_noise_static_defaults(&mut app_args);
 
     let exit = crate::run_e2e_render_with_args(app_args);
     let elapsed = elapsed_since_start();
     println!(
-        "e2e_render --noise-static-world: gate run completed in {:?} \
+        "e2e_render --gate noise-static-world: gate run completed in {:?} \
          (budget = {}s).",
         elapsed,
         NOISE_STATIC_TOTAL_TIMEOUT.as_secs(),

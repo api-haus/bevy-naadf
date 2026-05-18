@@ -12,6 +12,7 @@
 
 pub mod aadf;
 pub mod camera;
+pub mod cli;
 pub mod e2e;
 pub mod editor;
 pub mod hud;
@@ -460,6 +461,15 @@ pub struct AppArgs {
     /// streaming-world Phase 2 — FNL seed for the streaming preset (default
     /// `1337`).
     pub noise_seed: i32,
+    /// streaming-world Phase 2 — WGSL noise preset index (flat CLI feed for
+    /// the `GridPreset::Procedural*` variant payloads). Default `0 =
+    /// SimpleTerrain`. [`crate::cli::Cli::into_app_args`] copies this into
+    /// the matching `GridPreset` variant's `noise_preset` field at parse
+    /// time so the install path
+    /// (`crate::voxel::grid::install_procedural_streaming_world`) reads it
+    /// off the variant; the flat field exists so a single `--noise-preset
+    /// N` CLI flag drives both presets uniformly.
+    pub noise_preset: u32,
 }
 
 impl Default for AppArgs {
@@ -486,6 +496,7 @@ impl Default for AppArgs {
             sea_level: (WORLD_SIZE_IN_VOXELS.y as f32) * 0.5,
             terrain_amplitude: 64.0,
             noise_seed: 1337,
+            noise_preset: 0,
         }
     }
 }

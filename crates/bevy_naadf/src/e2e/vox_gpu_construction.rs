@@ -190,58 +190,54 @@ pub const VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING: f32 = 0.01;
 /// runs `.after(pin_oasis_camera)` so it takes precedence over the
 /// birdseye); the brush is overridden by `apply_erase_brush`'s mode-aware
 /// branch to spawn at [`VOX_GPU_CONSTRUCTION_BRUSH_POS`].
-pub fn run_vox_gpu_construction() -> AppExit {
-    let path = oasis_vox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --vox-gpu-construction: FIXTURE MISSING at {} \
-             (cwd = {:?}). The fixture is Git LFS-tracked at \
-             {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull` to fetch the \
-             binary content, OR run the binary from the workspace root.",
+/// Apply the vox-gpu-construction gate's default overlay onto `args` in place.
+/// Returns `true` on success; `false` if the bundled fixture is missing.
+pub fn apply_vox_gpu_construction_defaults(args: &mut crate::AppArgs) -> bool {
+    args.vox_gpu_construction_mode = true;
+    args.construction_config.gpu_construction_enabled = true;
+
+    if matches!(args.grid_preset, crate::GridPreset::Default) {
+        let path = oasis_vox_fixture_path();
+        if !path.exists() {
+            eprintln!(
+                "e2e_render --gate vox-gpu-construction: FIXTURE MISSING at {} \
+                 (cwd = {:?}). The fixture is Git LFS-tracked at \
+                 {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull` to fetch the \
+                 binary content, OR run the binary from the workspace root.",
+                path.display(),
+                std::env::current_dir().ok()
+            );
+            return false;
+        }
+        println!(
+            "e2e_render --gate vox-gpu-construction: loading Oasis VOX fixture \
+             from {} ({} bytes) into the W5 GPU producer chain (production-path \
+             camera-sweep gate; camera A at {:?} look {:?} → camera B at {:?} \
+             look {:?}; expecting per-pixel RGB Δ ≥ {:.2} over central rect AND \
+             frame-A near-black (lum<{:.1}) count ≤ {:.1}% of frame pixels)",
             path.display(),
-            std::env::current_dir().ok()
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
+            VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A,
+            VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
+            VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B,
+            VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
+            VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD,
+            100.0 * VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING,
         );
+        args.grid_preset = crate::GridPreset::Vox {
+            path: PathBuf::from(&app_path_for_args(&path)),
+        };
+    }
+    true
+}
+
+/// Thin Rust-API wrapper.
+pub fn run_vox_gpu_construction() -> AppExit {
+    let mut app_args = crate::AppArgs::default();
+    if !apply_vox_gpu_construction_defaults(&mut app_args) {
         return AppExit::error();
     }
-    println!(
-        "e2e_render --vox-gpu-construction: loading Oasis VOX fixture from \
-         {} ({} bytes) into the W5 GPU producer chain (production-path \
-         camera-sweep gate; camera A at {:?} look {:?} → camera B at {:?} \
-         look {:?}; expecting per-pixel RGB Δ ≥ {:.2} over central rect AND \
-         frame-A near-black (lum<{:.1}) count ≤ {:.1}% of frame pixels)",
-        path.display(),
-        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-        VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
-        VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A,
-        VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
-        VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B,
-        VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
-        VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD,
-        100.0 * VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING,
-    );
-
-    let mut app_args = crate::AppArgs::default();
-    // Production W5 path: the only install path. vox-gpu-rewrite Stage 2
-    // (2026-05-18) destroyed `fixed_world_size` — `setup_test_grid` always
-    // routes `GridPreset::Vox` through `install_vox_in_fixed_world`. The
-    // GPU construction default-on (`ConstructionConfig::default()` →
-    // `gpu_construction_enabled = true`) keeps the W5 producer chain
-    // active; the explicit assignment below is a belt-and-braces guard
-    // against a future default flip.
-    app_args.grid_preset = crate::GridPreset::Vox {
-        path: PathBuf::from(&app_path_for_args(&path)),
-    };
-    app_args.construction_config.gpu_construction_enabled = true;
-    // Route through the Oasis brush-edit driver flow. The driver's
-    // `OasisWarmup` fast-path triggers when EITHER `oasis_edit_visual_mode`
-    // OR `vox_gpu_construction_mode` is set; the brush + assertion mechanics
-    // are identical, the camera + brush position are mode-specific.
-    // NOTE: we deliberately do NOT also set `oasis_edit_visual_mode = true`
-    // — `pin_oasis_camera` would write a birdseye pose every tick that
-    // `pin_vox_gpu_construction_camera` would then override; cleaner to
-    // skip the birdseye write entirely.
-    app_args.vox_gpu_construction_mode = true;
-
     crate::run_e2e_render_with_args(app_args)
 }
 

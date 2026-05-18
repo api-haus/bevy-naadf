@@ -205,15 +205,23 @@ pub struct SmallEditVisualState {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Boot the e2e harness with `--small-edit-visual` mode active.
-pub fn run_small_edit_visual() -> AppExit {
-    let mut app_args = crate::AppArgs::default();
-    app_args.small_edit_visual_mode = true;
+/// Apply the small-edit-visual gate's default overlay onto `args`.
+///
+/// Sets `small_edit_visual_mode = true`; no preset override (uses the
+/// default test grid).
+pub fn apply_small_edit_visual_defaults(args: &mut crate::AppArgs) {
+    args.small_edit_visual_mode = true;
     println!(
-        "e2e_render --small-edit-visual: target click voxel {:?}, brush radius {SMALL_EDIT_RADIUS}, \
-         paint type {:?}",
+        "e2e_render --gate small-edit-visual: target click voxel {:?}, brush \
+         radius {SMALL_EDIT_RADIUS}, paint type {:?}",
         SMALL_EDIT_CLICK_VOXEL, SMALL_EDIT_PAINT_TYPE
     );
+}
+
+/// Thin Rust-API wrapper.
+pub fn run_small_edit_visual() -> AppExit {
+    let mut app_args = crate::AppArgs::default();
+    apply_small_edit_visual_defaults(&mut app_args);
     crate::run_e2e_render_with_args(app_args)
 }
 

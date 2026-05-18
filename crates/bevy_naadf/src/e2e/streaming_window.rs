@@ -349,47 +349,71 @@ pub fn pin_streaming_window_camera(
 // Entry point — boot the e2e harness in streaming-window mode.
 // ---------------------------------------------------------------------------
 
-/// Boot the e2e harness with the procedural-streaming world preset + the
-/// `--streaming-window` driver branch enabled. Returns the harness's
-/// `AppExit`.
-pub fn run_streaming_window() -> AppExit {
-    // Reset the latch each invocation — the driver re-promotes the camera on
-    // its own schedule.
+/// Apply the streaming-window gate's default overlay onto `args` in place.
+///
+/// Per `02d-design-cli-and-e2e-rearch.md` § D: the gate's mode flag(s) are
+/// set unconditionally (observer attachment), but the grid preset is only
+/// installed when the user didn't pass `--grid-preset` (i.e. the args still
+/// carry `GridPreset::Default`). This composes user CLI overrides on top of
+/// the gate's defaults: `--gate streaming-window --vram-budget-mib 2048`
+/// keeps the user's budget but installs the streaming preset; `--gate
+/// streaming-window --grid-preset procedural-static` runs the
+/// streaming-window observer against the static preset (useful for
+/// debugging cross-preset behaviour).
+///
+/// Resets the per-run latches (camera walk + wall-clock budget start) so a
+/// second invocation in the same process gets a fresh budget.
+pub fn apply_streaming_window_defaults(args: &mut crate::AppArgs) {
+    // Reset latches first — the driver re-promotes the camera on its own
+    // schedule.
     reset_camera_walked_latch();
     reset_gate_start_latch();
     RESIDENCY_ORIGIN_X_AT_POSE_A.store(i32::MIN, Ordering::SeqCst);
 
-    let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::ProceduralStreaming {
-        noise_preset: 0,
-        seed: app_args.noise_seed,
-    };
-    app_args.streaming_window_mode = true;
+    // Observer attachment — always set.
+    args.streaming_window_mode = true;
     // Force `oasis_edit_visual_mode = true` so the driver routes into the
     // OasisWarmup state machine on tick 0. The OasisApplyEdit branch in
     // `driver.rs` detects `streaming_window_mode` and promotes the camera
     // instead of running a brush edit.
-    app_args.oasis_edit_visual_mode = true;
+    args.oasis_edit_visual_mode = true;
+
+    // Preset default — only install if the user didn't override.
+    if matches!(args.grid_preset, crate::GridPreset::Default) {
+        args.grid_preset = crate::GridPreset::ProceduralStreaming {
+            noise_preset: args.noise_preset,
+            seed: args.noise_seed,
+        };
+    }
 
     println!(
-        "e2e_render --streaming-window: booting procedural-streaming world \
+        "e2e_render --gate streaming-window: booting procedural-streaming world \
          (seed={}, sea_level={:.1}, terrain_amplitude={:.1}, \
          vram_budget_mib={}, max_segments_per_frame={}); strict floors: \
          pixel_delta ≥ {:.2}, after_lum_variance ≥ {:.1}, wall_clock ≤ {}s",
-        app_args.noise_seed,
-        app_args.sea_level,
-        app_args.terrain_amplitude,
-        app_args.vram_budget_mib,
-        app_args.max_segments_per_frame,
+        args.noise_seed,
+        args.sea_level,
+        args.terrain_amplitude,
+        args.vram_budget_mib,
+        args.max_segments_per_frame,
         STREAMING_MIN_PIXEL_DELTA,
         STREAMING_MIN_AFTER_LUM_VARIANCE,
         STREAMING_GATE_WALL_CLOCK_MAX_SECS,
     );
+}
+
+/// Thin wrapper retained for Rust-API callers (no clap). The e2e binary's
+/// `main` no longer calls this — it composes its own `AppArgs` through
+/// `cli::E2eCli::into_app_args_and_gate()` so user CLI overrides flow
+/// through. This function is the no-overrides equivalent.
+pub fn run_streaming_window() -> AppExit {
+    let mut app_args = crate::AppArgs::default();
+    apply_streaming_window_defaults(&mut app_args);
 
     let exit = crate::run_e2e_render_with_args(app_args);
     let elapsed = elapsed_since_start();
     println!(
-        "e2e_render --streaming-window: gate run completed in {:?} \
+        "e2e_render --gate streaming-window: gate run completed in {:?} \
          (budget = {}s).",
         elapsed,
         STREAMING_GATE_WALL_CLOCK_MAX_SECS,

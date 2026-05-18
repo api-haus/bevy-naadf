@@ -176,39 +176,50 @@ pub struct OasisEditVisualState {
 // Entry point — invoked from `bin/e2e_render.rs`
 // ---------------------------------------------------------------------------
 
-/// Boot the e2e harness with the Oasis VOX fixture + the
-/// `--oasis-edit-visual` driver branch enabled. Returns the harness's
-/// `AppExit`.
-pub fn run_oasis_edit_visual() -> AppExit {
-    let path = oasis_vox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --oasis-edit-visual: FIXTURE MISSING at {} \
-             (cwd = {:?}). The fixture is Git LFS-tracked at \
-             {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull` to fetch \
-             the binary content, OR run the binary from the workspace \
-             root.",
+/// Apply the oasis-edit-visual gate's default overlay onto `args` in place.
+///
+/// Sets `oasis_edit_visual_mode = true` (observer attachment) and installs
+/// the Oasis VOX fixture as the grid preset IF the user didn't pass an
+/// explicit `--vox` / `--grid-preset` override. Returns `true` on success;
+/// `false` if the bundled fixture is missing (caller should treat as gate
+/// error).
+///
+/// Per `02d-design-cli-and-e2e-rearch.md` § D.
+pub fn apply_oasis_edit_visual_defaults(args: &mut crate::AppArgs) -> bool {
+    args.oasis_edit_visual_mode = true;
+
+    if matches!(args.grid_preset, crate::GridPreset::Default) {
+        let path = oasis_vox_fixture_path();
+        if !path.exists() {
+            eprintln!(
+                "e2e_render --gate oasis-edit-visual: FIXTURE MISSING at {} \
+                 (cwd = {:?}). The fixture is Git LFS-tracked at \
+                 {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull` to fetch the \
+                 binary content, OR run the binary from the workspace root, \
+                 OR override the fixture via `--vox <path>`.",
+                path.display(),
+                std::env::current_dir().ok()
+            );
+            return false;
+        }
+        println!(
+            "e2e_render --gate oasis-edit-visual: loading Oasis VOX fixture \
+             from {} ({} bytes)",
             path.display(),
-            std::env::current_dir().ok()
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
         );
+        args.grid_preset = crate::GridPreset::Vox { path };
+    }
+    true
+}
+
+/// Thin Rust-API wrapper. Returns `AppExit::error()` if the fixture is
+/// missing; otherwise delegates to `run_e2e_render_with_args`.
+pub fn run_oasis_edit_visual() -> AppExit {
+    let mut app_args = crate::AppArgs::default();
+    if !apply_oasis_edit_visual_defaults(&mut app_args) {
         return AppExit::error();
     }
-    println!(
-        "e2e_render --oasis-edit-visual: loading Oasis VOX fixture from {} \
-         ({} bytes)",
-        path.display(),
-        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
-    );
-
-    let mut app_args = crate::AppArgs::default();
-    // vox-gpu-rewrite Stage 2 (2026-05-18): always the W5 GPU producer
-    // chain. The brush-edit assertion is on the framebuffer Δ from a
-    // birdseye-over-world-centre camera; the W5 path tiles Oasis to fill
-    // the fixed `(4096, 512, 4096)`-voxel world, so the birdseye sees the
-    // tiled architecture and the central edit at world centre still
-    // projects to the central screen rect — assertion semantics preserved.
-    app_args.grid_preset = crate::GridPreset::Vox { path };
-    app_args.oasis_edit_visual_mode = true;
     crate::run_e2e_render_with_args(app_args)
 }
 
