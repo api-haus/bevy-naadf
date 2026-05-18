@@ -60,6 +60,16 @@ image = { version = "=0.25.10", default-features = false, features = [
     "png",
     "jpeg",
 ] }
+# image-compare = SSIM (Structural Similarity Index) implementation, consumed by
+# the `--vox-gpu-oracle` gate (`src/e2e/vox_gpu_oracle.rs`, Stage 14 — see
+# `docs/orchestrate/vox-gpu-rewrite/03-impl.md`). The gate compares two REAL
+# framebuffer captures (CPU oracle vs production W5 GPU path); SSIM tolerates
+# the renderer's inherent ~1.5-6% per-pixel TAA/GI shimmer + GPU atomic-cursor
+# nondeterminism + the install-path world-shape divergence (natural-bound CPU
+# vs fixed-tiled GPU) while still cratering on gross renderer regressions
+# (sky-bleed, voxel-type corruption, palette OOB) that would drop SSIM far
+# below 1.0. Pure-Rust dep, no native compile.
+image-compare = "0.5"
 # bevy-instamat = the InstaMAT integration crate — DEFAULT FEATURES ONLY. The
 # `instamat` feature is NEVER enabled here: that is the structural hard gate.
 # `bevy-naadf` pulls in `bevy-instamat`'s feature-free surface (the `material.ron`

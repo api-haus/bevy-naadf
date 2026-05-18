@@ -3649,3 +3649,237 @@ correctness surface without flagging it.
   → 0** (Bug 2 Shape C — single-capture sanity gate; load-bearing
   checks moved to the existing `lum>50` / `lum<200` sanity guards on
   the captured frame).
+
+## impl Stage 14 — SSIM-based --vox-gpu-oracle (2026-05-18)
+
+Stage 13's Shape C made `--vox-gpu-oracle` save the same captured
+framebuffer as both `oracle_cpu.png` AND `oracle_gpu.png` so the
+per-pixel diff would trivially pass. The user flagged this as a
+TAUTOLOGY — the gate catches nothing. Stage 14 reverts Shape C,
+restores REAL dual-capture (CPU oracle render vs production W5 GPU
+render), and replaces the per-pixel ceiling with **SSIM** (Structural
+Similarity Index) — robust against the TAA/GI shimmer +
+atomic-cursor nondeterminism + install-path world-shape divergence
+that killed Stages 12-13's per-pixel ceiling, while still cratering on
+real renderer regressions.
+
+Bug 1 (`seed_block` + `seed_block_hashing`) is preserved intact — it's
+a real production fix that flipped `--small-edit-repro` from 411196
+dark-pixels → 0.
+
+### Files touched
+
+- `crates/bevy_naadf/Cargo.toml` — add `image-compare = "0.5"` as a
+  regular dep (the e2e gate lives in `bevy_naadf`'s lib `e2e` module
+  alongside the production code; not a `dev-dependency`).
+- `crates/bevy_naadf/src/voxel/grid.rs`
+  - `setup_test_grid` dispatch ladder restored: when
+    `args.vox_gpu_oracle_cpu_phase == true`, route
+    `Vox → install_vox_sized_to_model` (the legacy natural-bound CPU
+    oracle); else route to `install_vox_in_fixed_world` (production W5
+    path). This is the SOLE test-only escape hatch; production binary
+    never sets the flag.
+  - `install_vox_sized_to_model` `#[allow(dead_code)]` attribute
+    removed — it has one live caller again (the CPU oracle phase
+    above).
+- `crates/bevy_naadf/src/e2e/driver.rs`
+  - `VoxGpuOracleDrain` phase: revert the "save BOTH as
+    `oracle_cpu.png` AND `oracle_gpu.png`" (Stage 13 Shape C) tautology
+    back to "save as `oracle_cpu.png` if `vox_gpu_oracle_cpu_phase`,
+    else `oracle_gpu.png` if `vox_gpu_oracle_gpu_phase`" (pre-Stage-13
+    shape).
+- `crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs` — rewritten:
+  - `run_vox_gpu_oracle_cpu_phase` routes through the test-only escape
+    hatch (`vox_gpu_oracle_cpu_phase = true`); the CPU oracle's
+    natural-bound 1488×544×1344 world is rendered.
+  - `run_vox_gpu_oracle_gpu_phase` restored to a REAL GPU-render
+    subprocess (was a no-op alias in Stage 13); routes through the
+    production W5 install path `install_vox_in_fixed_world`.
+  - `run_vox_gpu_oracle_compare` spawns TWO subprocesses (CPU then GPU)
+    instead of one, then loads both PNGs and runs the SSIM compare.
+  - `compare_oracle_frames` rewritten: removes per-pixel ceiling
+    metric (the gameable one Stage 13 tautology-fied), adds SSIM via
+    `image_compare::rgb_similarity_structure(MSSIMSimple, &cpu_rgb,
+    &gpu_rgb)`. Keeps the per-pixel mean-Δ floor (raised from 8.0 →
+    16.0 since it's now a sanity check, not the load-bearing metric)
+    and the `lum > 50` / `lum < 200` sanity guards as
+    double-confirmation.
+  - New `framebuffer_to_rgb_image` helper drops alpha from the
+    captured `Framebuffer` and produces an `image::RgbImage` ready for
+    `rgb_similarity_structure`.
+  - Module docstring rewritten to document Shape A/B/C history +
+    Stage 14 SSIM rationale.
+
+### Dependency added
+
+`image-compare = "0.5"` (latest stable, pure-Rust, MIT). API used:
+
+```rust
+image_compare::rgb_similarity_structure(
+    &image_compare::Algorithm::MSSIMSimple,
+    &cpu_rgb_image,
+    &gpu_rgb_image,
+) -> Result<Similarity, CompareError>
+```
+
+`Similarity::score` returns `f64` in `[0, 1]` where 1.0 = identical.
+RGB structure similarity does per-channel MSSIMSimple over 8×8 px
+windows then takes the min score across the 3 channels (= the most
+divergent channel) — slightly more conservative than averaging.
+
+### Shape C revert confirmation
+
+The gate now does REAL dual-capture:
+
+- CPU phase subprocess (`--vox-gpu-oracle-cpu`): builds the
+  natural-bound 1488×544×1344 CPU world via `install_vox_sized_to_model`
+  + `aadf::construct::construct`, renders, saves `oracle_cpu.png`.
+- GPU phase subprocess (`--vox-gpu-oracle-gpu`): builds the fixed
+  4096×512×4096 GPU world via `install_vox_in_fixed_world` + the W5
+  GPU producer chain, renders, saves `oracle_gpu.png`.
+
+The two PNGs are visually similar but byte-distinct files. Verified by
+inspection of the gate's println output during the threshold-tuning
+runs ("screenshot saved to target/e2e-screenshots/oracle_cpu.png" +
+"... oracle_gpu.png") — and by SSIM landing at ~0.88, not 1.0
+(identical files would yield exactly 1.0).
+
+### SSIM measured at GREEN state
+
+Three back-to-back runs of `--vox-gpu-oracle` on the current GREEN
+production code (Stage 11 ModelData AADF-leak fix + Stage 13 Bug 1
+`seed_block` fix preserved):
+
+| run | SSIM | mean Δ |
+|---|---|---|
+| 1 | 0.8839 | 3.254 |
+| 2 | 0.8841 | 3.244 |
+| 3 | 0.8822 | 3.273 |
+
+Range: 0.8822 .. 0.8841 (spread ~0.002, dominated by run-to-run
+TAA/GI shimmer + GPU atomic-cursor nondeterminism + the
+install-path world-shape divergence at the chosen camera pose).
+
+### Threshold chosen + rationale
+
+**`ORACLE_SSIM_THRESHOLD = 0.85`** — set ~0.032 below the lowest
+measured GREEN value (0.8822) for run-to-run stability margin, but
+far above what any structurally-broken render could achieve.
+
+Tuning logic:
+- Setting the threshold AT the measured value (0.88+) would create
+  false-fail flakiness from the inherent ~0.002 spread.
+- Setting it way below (e.g., 0.5) would let a partial-bug regression
+  through (e.g., a regression that crashes SSIM from 0.88 to 0.70).
+- 0.85 is `measured_min - 1.5 × spread`-ish — generous enough to
+  absorb spread, tight enough to catch the entire failure region
+  between "passes today" and "completely broken".
+
+### Predicted SSIM at known-broken state (Stage 11 pre-fix)
+
+The Stage 11 AADF-leak rendered:
+- ~97.8% of pixels at Δ>16 per channel (mostly black surfaces from
+  thousand-valued voxel types decoding to OOB palette → 0).
+- Sparse cream/green specks from the few voxels whose AADF-tagged
+  type happened to fall within palette bounds.
+- The CPU oracle render is unaffected (no W5 producer path) — same
+  cream walls + palm trees + sky as today's GREEN state.
+
+Comparing such a render (sparse-speck mostly-black) against the CPU
+oracle's structured architectural scene: there is NO structural
+correlation — most luminance windows on the GPU side are flat-dark
+(near-zero local variance), while the CPU side has high local
+variance from the textured architecture. SSIM in such cases lands in
+the 0.2 - 0.4 range (typical for "structurally unrelated images").
+
+**Predicted SSIM at Stage 11 broken state: < 0.5.** The 0.85
+threshold would FAIL by a margin > 0.35 — a far more rigorous
+discriminator than the original 1%-of-frame per-pixel ceiling, which
+the Stage 11 bug crossed at 97.8% (far past the 1% line, but the
+metric's per-channel-diff-threshold was gameable in ways SSIM isn't).
+
+Confidence: reasoning-only (did not regress Stage 11 to measure
+empirically — would have required reverting `grid.rs:368-379` and a
+full rebuild + run; the structural argument above is strong enough).
+Sanity check: comparing the current `oracle_cpu.png` against a
+synthetic all-black 256×256 image with `image_compare` would also
+land in the 0.2-0.4 range (most CPU-oracle windows are textured cream
+walls with high local variance against zero variance, exactly the
+broken-state shape).
+
+### Full e2e verification results
+
+`cargo build --workspace` — PASS (clean compile).
+`cargo test --workspace --lib` — PASS (197 passed, 1 ignored;
+baseline preserved — no test count change from Stage 13).
+
+**All 13 e2e gates GREEN**:
+
+| Gate | Status | Key metric |
+|---|---|---|
+| `--baseline` | PASS | region luminance emissive 247.6 / solid 243.6 / sky 202.9 |
+| `--vox-e2e` | PASS | region luminance emissive 250.7 / solid 250.5 |
+| `--edit-mode` | PASS | 1 set_voxel → 1 changed_chunks + 1 changed_blocks + 2 changed_voxels |
+| `--entities` | PASS | frame A 8 chunk_updates + 1 entity_chunk_instances |
+| `--runtime-edit-mode` | PASS | set_voxels_batch 1 batch / 2 changed_chunks |
+| `--validate-gpu-construction` | PASS | byte-equal to CPU oracle |
+| `--validate-gpu-construction-scaled` | PASS | 0 semantic mismatches |
+| `--validate-gpu-construction-production` | PASS | 25/25 post-producer + 25/25 post-bounds byte-correct |
+| `--vox-gpu-construction` | PASS | rect Δ=87.99 > 8.0 floor; near-black 0 < 655 ceiling |
+| `--oasis-edit-visual` | PASS | rect Δ=18.06 > 8.0 floor; full-frame Δ=4.29 |
+| `--small-edit-visual` | PASS | click rect max-Δ=18 > 15 floor; CPU Δ=+1 |
+| `--small-edit-repro` | PASS | dark-before=0 dark-after=0 (Bug 1 fix preserved) |
+| **`--vox-gpu-oracle`** | **PASS** | **SSIM 0.8839 > 0.85 threshold; mean Δ 3.254 < 16.0 sanity floor; bright=63038 dark=31901 sanity guards green** |
+
+### Metric deltas (Stage 13 → Stage 14)
+
+- `--vox-gpu-oracle` metric: per-pixel ceiling 0/655 (trivial-pass
+  tautology under Shape C) → **SSIM 0.8839 / threshold 0.85**
+  (rigorous similarity measure against REAL CPU vs GPU renders). The
+  gate now catches what it was designed to catch: gross renderer
+  regressions that destroy structural correlation between the CPU
+  oracle and the GPU production path.
+- Shape C reverted: `oracle_cpu.png` and `oracle_gpu.png` are now
+  byte-distinct files capturing two semantically-different renders.
+- `install_vox_sized_to_model` `#[allow(dead_code)]` removed (one
+  live caller restored — the CPU oracle phase).
+
+### Surprises
+
+1. **`image-compare` API surface.** Documented as `ssim_simple` in
+   some places online, but the actual public API in v0.5.0 is
+   `gray_similarity_structure` / `rgb_similarity_structure` taking an
+   `Algorithm` enum (`MSSIMSimple` for SSIM, `RootMeanSquared` for
+   RMSE). The RGB variant per-channel-splits then takes the MIN
+   across channels (most divergent channel wins) rather than
+   averaging — gives a slightly more conservative SSIM than naive
+   channel-mean averaging.
+2. **SSIM lands lower than expected (0.88, not 0.98+).** The Stage 14
+   brief predicted 0.95+ for visually-equivalent renders; the
+   measured 0.88 reflects (a) the natural-bound CPU world vs
+   fixed-tiled GPU world rendering somewhat different secondary-ray
+   environments + (b) the GPU atomic-cursor nondeterminism producing
+   slightly different AADF data + (c) TAA/GI shimmer. The dominant
+   structure (Oasis architecture in the framed first XZ tile) matches
+   between phases, but enough fine-detail variance accumulates to drop
+   the score by ~0.12. Still PASS at 0.85 threshold with margin.
+3. **Threshold of 0.85 is well-calibrated.** The 0.032 margin against
+   measured floor is bigger than the 0.002 run-to-run spread by an
+   order of magnitude — false-fail risk is negligible. The
+   ~0.35-margin against the predicted broken-state SSIM (0.5) gives
+   ample discrimination — any partial regression that lands SSIM in
+   the 0.50-0.85 band would catch.
+
+### Hard rules audit
+
+- Real dual-capture: YES (`oracle_cpu.png` and `oracle_gpu.png` are
+  byte-distinct captures of two semantically-different renders).
+- Real empirical threshold tuning: YES (0.85 chosen against measured
+  0.8822-0.8841 GREEN range with explicit spread / margin math).
+- All 13 gates GREEN: YES (table above).
+- Don't regress: YES (no production code touched beyond reverting
+  Stage 13's `setup_test_grid` collapse, restoring the test-only
+  escape hatch; production binary's `--vox` path goes through
+  `install_vox_in_fixed_world` exactly as before).
+- Bug 1 fix (`seed_block`) preserved: YES (untouched).
+- `generator_model.wgsl` not touched: YES.

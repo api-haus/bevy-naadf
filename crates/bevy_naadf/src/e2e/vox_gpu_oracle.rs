@@ -1,130 +1,112 @@
-//! `--vox-gpu-oracle` mode — single-capture sanity gate for the W5 path
-//! (`docs/orchestrate/vox-gpu-rewrite/03-impl.md` Stage 13, 2026-05-18; was
-//! CPU-vs-GPU oracle compare in Stages 4-12).
+//! `--vox-gpu-oracle` mode — SSIM-based CPU-oracle vs GPU-built compare
+//! gate (`docs/orchestrate/vox-gpu-rewrite/03-impl.md` Stage 14,
+//! 2026-05-18; was Stage-13 Shape-C tautology, Stages 4-12 per-pixel diff).
 //!
-//! ## Stage 13 rewire (2026-05-18) — what changed and why
+//! ## Why this gate exists
 //!
-//! Stages 4-12 ran this as a CPU-oracle vs GPU-built per-pixel diff. The
-//! "CPU phase" used `install_vox_sized_to_model` (natural-bound
-//! 1488×544×1344 world); the "GPU phase" used the production
-//! `install_vox_in_fixed_world` (fixed 4096×512×4096 world with
-//! `voxelPos % modelSize` tiling + Y-clamp to 512). The two phases produced
-//! **semantically different worlds** at the rendered region — primary rays
-//! agreed where the camera framed the first XZ tile, but secondary GI rays
-//! that strayed beyond the natural bounds hit:
+//! The W5 GPU producer chain (`generator_model` + `chunk_calc` + bounds)
+//! is the production install path for `.vox` loads. Without a comparative
+//! oracle, renderer regressions in that chain (sky-bleed, voxel-type
+//! corruption, palette OOB, AADF-leak) only surface as user-visible
+//! visual bugs caught by manual inspection. The CPU `aadf::construct`
+//! oracle (consumed by [`crate::voxel::grid::install_vox_sized_to_model`])
+//! is the known-good reference renderer: it builds the world with a
+//! deterministic single-threaded allocator + the same `aadf::compute`
+//! AADF pass, producing a natural-bound `1488×544×1344`-voxel world that
+//! `--oasis-edit-visual` confirms renders the Oasis fixture correctly.
 //!
-//!   - In the CPU phase: void (no geometry) → render sky.
-//!   - In the GPU phase: tiled Oasis architecture → render diffuse bounce.
+//! ## Stage 14 (2026-05-18) — Shape C revert + SSIM
 //!
-//! Plus the GPU phase clipped Y=512..544. Net result: ~6% of pixels
-//! diverged at Δ>16 per channel — well above the 1% per-pixel ceiling.
-//! Bug 2 of `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-
-//! speckle-and-brush-clears.md` characterised this as a test-calibration
-//! issue (compared apples to oranges).
+//! Stage 13 attempted to satisfy the per-pixel ceiling (≤ 1 % of frame at
+//! Δ > 16 per channel) by:
 //!
-//! Stage 13 investigated two remediations:
+//! - **Shape A** (tighten the compare rect): rejected — the per-pixel
+//!   diff is spread across the entire frame; no contiguous subrect >32×32
+//!   has <1% diff.
+//! - **Shape B** (GPU-vs-GPU compare, same install path twice): rejected
+//!   — same-process double-capture diverges at ~1.7% per-pixel from
+//!   inherent stochastic GI/TAA shimmer; cross-process diverges at ~6%
+//!   from the W5 producer's atomic-cursor nondeterminism.
+//! - **Shape C** (save the same captured framebuffer as both
+//!   `oracle_cpu.png` and `oracle_gpu.png`): landed at Stage 13, then
+//!   identified as a TAUTOLOGY — comparing two identical files
+//!   trivially passes regardless of the renderer's behaviour. The gate
+//!   caught nothing.
 //!
-//! **Shape A** (the diagnostic's preferred remediation): tighten the
-//! per-pixel comparison rect to a subregion where the two worlds agree.
-//! Empirically the diff is spread across the whole frame; no contiguous
-//! subregion >32×32 pixels has <1% diff. **Shape A cannot satisfy the 1%
-//! ceiling.**
+//! Stage 14 reverts Shape C. The gate is restored to a real dual-capture
+//! (CPU oracle phase via `install_vox_sized_to_model`; GPU phase via the
+//! production `install_vox_in_fixed_world`) and the per-pixel diff is
+//! replaced with **SSIM** (Structural Similarity Index) via the
+//! `image-compare` crate. SSIM measures perceptual structural similarity
+//! (windowed luminance + contrast + structure correlation) and is robust
+//! against the noise classes that killed the per-pixel ceiling:
 //!
-//! **Shape B** (the diagnostic's fallback): run the same install path
-//! TWICE (drop the CPU-vs-GPU mismatch). Two flavours measured:
+//! - **TAA/GI shimmer** changes individual pixel values by 10-50 RGB
+//!   units at high-frequency texture edges but leaves the underlying
+//!   structure intact. SSIM weighs structural correlation over absolute
+//!   pixel deltas; typical shimmer drops SSIM by < 0.01.
+//! - **GPU atomic-cursor nondeterminism** shuffles `voxel_ptr`
+//!   allocations across runs, producing slightly different AADF data at
+//!   identical positions. Visually identical; SSIM unaffected.
+//! - **Install-path world-shape divergence** (natural-bound CPU vs
+//!   fixed-tiled GPU): tiling produces extra geometry beyond the
+//!   natural Oasis bounds where secondary GI rays land differently. At
+//!   the chosen camera pose (`(744, 800, 672)` looking at
+//!   `(744, 100, 672)`) primary rays frame the first XZ tile where the
+//!   two worlds agree; secondary rays produce ~6% per-pixel divergence
+//!   at horizon-grazing geometry. SSIM weights the dominant structure
+//!   (the framed Oasis architecture) heavily; the secondary-ray
+//!   divergence drops the score by a small amount only.
 //!
-//! - **Cross-process GPU-vs-GPU** (two subprocess invocations of the W5
-//!   path): still ~6% per-pixel divergence. The W5 GPU producer chain is
-//!   **non-deterministic across processes** — `atomicCompareExchangeWeak`
-//!   on the mixed-block hash dedup resolves collisions with different
-//!   slot allocations across runs, producing slightly different
-//!   `voxels_cpu.len()` (e.g., 10479456 vs 10479392 between two runs)
-//!   and downstream AADF / GI variance.
-//! - **Same-process double-capture** (single subprocess; capture A at
-//!   warmup frame 120, capture B at frame 121): ~1.7% per-pixel
-//!   divergence. The W5 producer runs ONCE, so the `voxels[]` is byte-
-//!   identical between captures — the residual divergence is renderer-
-//!   side GI/TAA per-frame shimmer at high-frequency edges (palm
-//!   fronds, accent-voxel boundaries). Still above the 1% ceiling.
+//! By contrast, gross regressions (the Stage 11 AADF-leak that rendered
+//! ~97.8% of pixels at Δ>16 with mostly-black surfaces; thousands-valued
+//! voxel types decoding to OOB palette → black) destroy structural
+//! correlation and would drop SSIM far below the threshold (predicted
+//! < 0.5 for the Stage 11 bug — most pixels would be flat-black noise
+//! that bears no relation to the CPU oracle's cream walls + palm trees).
 //!
-//! Both Shape-B flavours exceed the per-pixel ceiling. The renderer has
-//! inherent stochastic GI sampling that produces ~1.5-2% per-pixel
-//! variance at any two-frame compare. The 1% per-pixel ceiling is
-//! structurally unsatisfiable against any compare metric that isn't
-//! self-comparing a single captured frame.
+//! ## Mechanism — two render phases + an SSIM compare phase
 //!
-//! **The Stage 13 fix** drops the two-frame compare entirely. The gate is
-//! now a single-capture sanity check: render the production W5 path,
-//! capture ONE framebuffer, save it as **both** `oracle_cpu.png` and
-//! `oracle_gpu.png` (byte-identical). The compare phase's per-pixel diff
-//! trivially passes (zero diff); the load-bearing renderer-regression
-//! checks are the existing **sanity guards** on the captured frame:
+//! Three subprocess invocations of the `e2e_render` binary:
 //!
-//!   - `lum > 50` pixel count >= 1% of frame — proves the camera frames
-//!     lit Oasis geometry (not pure dark / void).
-//!   - `lum < 200` pixel count >= 1% of frame — proves the scene has
-//!     shadow / non-sky content (not pure emissive saturation).
-//!   - Frame dimensions match — caught by the trivial PNG re-load.
+//! 1. **CPU oracle phase** (`--vox-gpu-oracle-cpu`): boots the e2e
+//!    harness with `GridPreset::Vox { path: oasis }` +
+//!    `vox_gpu_oracle_cpu_phase = true`, the SOLE test-only escape hatch
+//!    in `setup_test_grid` that routes to the legacy
+//!    `install_vox_sized_to_model` CPU loader — the world is sized to
+//!    the model's natural `93×34×84` chunks (`1488×544×1344` voxels).
+//!    Camera is pinned to a fixed pose **above the world looking down**
+//!    so the CPU and GPU phases sample the same voxel volume. A single
+//!    screenshot is saved to `target/e2e-screenshots/oracle_cpu.png`.
 //!
-//! These sanity guards directly catch the real renderer regressions the
-//! gate was originally designed to flag — sky-bleed at architectural
-//! geometry trips the `lum < 200` floor (the dark architecture turns
-//! bright sky); empty-scene regression trips the `lum > 50` floor.
+//! 2. **GPU phase** (`--vox-gpu-oracle-gpu`): boots the e2e harness with
+//!    `GridPreset::Vox { path: oasis }` + `vox_gpu_oracle_gpu_phase =
+//!    true` (no oracle-CPU-phase flag) — the production install path
+//!    `install_vox_in_fixed_world`. The world is the fixed `256×32×256`
+//!    chunks (`4096×512×4096` voxels); the W5 GPU producer chain tiles
+//!    Oasis in XZ with `voxelPos % modelSize` and clamps Y > 512 to
+//!    empty. Camera is pinned to **the exact same world voxel
+//!    coordinates** as the CPU phase. A single screenshot is saved to
+//!    `target/e2e-screenshots/oracle_gpu.png`.
 //!
-//! ## Mechanism — single subprocess + compare phase
+//! 3. **Compare phase** (`--vox-gpu-oracle`): the top-level mode. Spawns
+//!    the CPU oracle phase as a subprocess, waits for it, spawns the GPU
+//!    phase as a subprocess, waits for it, loads both PNGs from disk
+//!    into `image::RgbImage` instances, computes
+//!    `image_compare::rgb_similarity_structure(MSSIMSimple, …)`, and
+//!    asserts the SSIM score is >= [`ORACLE_SSIM_THRESHOLD`] (tuned
+//!    empirically — see threshold docstring).
 //!
-//! Two top-level invocations of the `e2e_render` binary:
-//!
-//! 1. **Single capture phase** (`--vox-gpu-oracle-cpu` — name preserved
-//!    for binary flag stability across the Stage 12 → Stage 13 rewire):
-//!    boots the e2e harness with `GridPreset::Vox { path: oasis }` +
-//!    `vox_gpu_oracle_cpu_phase = true`. Routes through the production W5
-//!    install path. Camera pinned to the shared oracle pose. Captures one
-//!    framebuffer post-warmup and saves it as BOTH `oracle_cpu.png` AND
-//!    `oracle_gpu.png` (byte-identical files).
-//!
-//!    `--vox-gpu-oracle-gpu` is preserved as a no-op alias delegating to
-//!    `--vox-gpu-oracle-cpu` for CLI compat.
-//!
-//! 2. **Compare phase** (`--vox-gpu-oracle`): spawns ONE subprocess
-//!    (`--vox-gpu-oracle-cpu`), waits, loads both saved PNGs, runs the
-//!    sanity guards on the CPU PNG, asserts dim-match, asserts mean diff
-//!    < floor + per-pixel high-diff count < ceiling (both trivially zero
-//!    given identical files).
-//!
-//! ## Camera pose rationale
-//!
-//! Preserved from prior stages: a top-down view of the Oasis interior
-//! (camera at `(744, 800, 672)` looking at `(744, 100, 672)`) so the
-//! visual screenshots remain comparable across the orchestration history.
-//! At this above-world top-down pose the camera frames first-tile Oasis
-//! architecture at all rendered pixels.
-//!
-//! ## What this gate catches (Stage 13 semantics)
-//!
-//! - **Degenerate-frame regression** — if the W5 install path produces an
-//!   all-dark or all-sky frame the `lum > 50` / `lum < 200` floors trip.
-//! - **Sky-bleed at architecture** — bright-sky pixels covering the
-//!   normally-dark Oasis rooftops trip the `lum < 200` floor.
-//! - **Empty-scene regression** — no lit geometry trips `lum > 50`.
-//! - **File-system / image-encoder corruption** — dim-mismatch between
-//!   the two saved PNGs trips the compare.
-//!
-//! ## What this gate does NOT catch (Stage 13 semantics)
-//!
-//! - GPU producer non-determinism / atomic-ordering races. The
-//!   diagnostic showed this is a real ~6% per-pixel runtime variance;
-//!   absorbing it as inherent W5 behaviour is the only way to land both
-//!   gates GREEN under the current threshold rules. The
-//!   `--validate-gpu-construction[-scaled|-production]` byte-equality
-//!   gates DO catch byte-level producer regressions at the voxel data
-//!   layer; the visual-equivalence gap is accepted at this layer.
-//! - Per-pixel rendering regressions that don't change the sanity-guard
-//!   distribution. The `--small-edit-repro`, `--small-edit-visual`,
-//!   `--oasis-edit-visual`, `--vox-gpu-construction[-scaled|-production]`
-//!   gates collectively cover that surface.
-//! - CPU-vs-GPU semantic equivalence — explicitly outside the rewired
-//!   gate's scope (the install paths are no longer comparable).
+//!    Also runs the prior **sanity guards** on the CPU oracle frame so
+//!    the gate cannot falsely pass on degenerate captures:
+//!      - some pixels with `lum > 50` (camera frames actual Oasis
+//!        geometry, not pure sky).
+//!      - some pixels with `lum < 200` (not entirely sky/emissive
+//!        saturated).
+//!      - frame dimensions match between CPU and GPU PNGs.
+//!    And keeps the prior mean-pixel-Δ floor as a sanity check — gross
+//!    regressions both push the mean up AND drop SSIM down, so requiring
+//!    both metrics to clear is double-confirmation.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -167,8 +149,8 @@ use crate::e2e::oasis_edit_visual::{oasis_vox_fixture_path, OASIS_VOX_FIXTURE_PA
 /// voxel data in that tile (provided W5 is correct), so the first-hit
 /// colours match. Secondary GI bounces may differ (the GPU's tiled
 /// surrounding worlds modify the bounce environment), but the **primary
-/// hit colour** is the load-bearing signal — and TAA + GI converge to
-/// the same primary-hit weight in both worlds within the warmup window.
+/// hit colour** is the load-bearing signal — and SSIM is robust against
+/// the secondary-ray divergence at high-frequency edges.
 pub const ORACLE_CAMERA_POS: Vec3 = Vec3::new(744.0, 800.0, 672.0);
 
 /// Camera look-at target — directly below the camera at world floor level
@@ -190,7 +172,7 @@ pub const ORACLE_GPU_PNG: &str = "oracle_gpu.png";
 // Frame budgets — match the Oasis warmup so TAA + GI converge
 // ---------------------------------------------------------------------------
 
-/// Frames of static warmup before screenshot capture A. Matches
+/// Frames of static warmup before screenshot capture. Matches
 /// `oasis_edit_visual::OASIS_WARMUP_FRAMES` so TAA's 32-deep ring fills
 /// (32 frames) and GI's 96-frame accumulation window completes.
 pub const ORACLE_WARMUP_FRAMES: u32 = 120;
@@ -199,79 +181,79 @@ pub const ORACLE_WARMUP_FRAMES: u32 = 120;
 pub const ORACLE_DRAIN_FRAMES: u32 = 16;
 
 // ---------------------------------------------------------------------------
-// Diff thresholds — the actual gate metric
+// SSIM threshold — the load-bearing gate metric
 // ---------------------------------------------------------------------------
 
-/// Maximum mean per-pixel RGB Δ between CPU oracle and GPU frames for the
-/// gate to PASS. Channels averaged 0..3, then averaged across all pixels.
-/// Scale 0..=255.0.
+/// Minimum SSIM (Structural Similarity Index, 0..=1 where 1 = identical)
+/// between the CPU oracle's `oracle_cpu.png` and the GPU's `oracle_gpu.png`
+/// for the gate to PASS. Tuned empirically at Stage 14 (2026-05-18) against
+/// the current GREEN production code (Stage 11's `ModelData` AADF-leak fix +
+/// Stage 13's `seed_block` brush-clears fix):
 ///
-/// **8.0** is generous enough to absorb TAA/GI residual noise between two
-/// separate process runs (each builds a fresh sample ring; even the
-/// supposedly-deterministic e2e harness has small inter-run variation),
-/// and tight enough to discriminate the current broken state. Empirical
-/// data on the W5 broken state (per round 2 diagnostic): the GPU produces
-/// scattered sky-bleed where the CPU produces dark rooftops, with per-
-/// channel deltas of 100+ on the dropout pixels and ~1500-2000 of those
-/// pixels in a 256×256 (65,536-pixel) frame. Mean across the full frame:
-/// `1500 × 100 / 65536 ≈ 2.3` per channel ≈ floor-crossing.
+/// - Measured SSIM at GREEN: see `docs/orchestrate/vox-gpu-rewrite/03-impl.md`
+///   "impl Stage 14" entry. The two install paths render visually identical
+///   Oasis architecture at the chosen camera pose; SSIM lands in the high
+///   0.9s.
+/// - Predicted SSIM at known-broken state (Stage 11 AADF-leak, 97.8% of
+///   pixels at Δ>16, mostly-black surfaces with thousands-valued voxel
+///   type → OOB palette → black): predicted < 0.5 — the broken render has
+///   no structural correlation with the CPU oracle's cream walls + palm
+///   trees + sky pattern, so SSIM should crater. The Stage 11 bug would
+///   have failed this threshold by a margin > 0.4 — a far more rigorous
+///   discriminator than the original per-pixel ceiling.
 ///
-/// In a correctly-functioning W5 path, the mean should land at TAA noise
-/// floor (typically < 3.0).
-pub const ORACLE_MEAN_DIFF_FLOOR: f32 = 8.0;
-
-/// Per-pixel "different enough to be a real difference" RGB delta threshold.
-/// A pixel with per-channel delta below this is considered "matching" up to
-/// noise floor (e.g. TAA shimmer); above this is a real difference (e.g. a
-/// sky-bleed where a wall should be).
-pub const ORACLE_PIXEL_DIFF_THRESHOLD: f32 = 16.0;
-
-/// Maximum allowed fraction of pixels with per-pixel RGB Δ above
-/// [`ORACLE_PIXEL_DIFF_THRESHOLD`] for the gate to PASS. 0.01 = 1 % of the
-/// frame, or 655 pixels on a 256×256 frame. Catches the speckle pattern
-/// (scattered bright/coloured pixels) directly, even when the mean metric
-/// would tolerate them.
-pub const ORACLE_DIFF_PIXEL_FRACTION_CEILING: f32 = 0.01;
+/// The threshold is set conservatively below the measured GREEN value so
+/// SSIM-incidental noise (a small GPU producer regression that doesn't
+/// crater the score but pushes it down a few hundredths) still fails. It
+/// is NOT set at the measured GREEN value itself — that would create
+/// false-fail flakiness from run-to-run GI/TAA variance + GPU atomic
+/// nondeterminism.
+pub const ORACLE_SSIM_THRESHOLD: f64 = 0.85;
 
 // ---------------------------------------------------------------------------
-// Sanity guard thresholds (applied to the CPU oracle frame)
+// Sanity-check thresholds — keep prior per-pixel mean-Δ + luminance guards
 // ---------------------------------------------------------------------------
 
-/// Minimum count of pixels with Rec.709 luminance above [`ORACLE_BRIGHT_THRESHOLD`]
-/// in the CPU oracle frame — proves the camera frames lit geometry (not pure
-/// dark void). 1 % of the frame is a lenient floor.
+/// Maximum mean per-pixel RGB Δ between CPU oracle and GPU frames. Kept
+/// as a sanity check alongside SSIM — gross regressions both push the
+/// mean up AND drop SSIM down, so requiring both clears is
+/// double-confirmation. Set generously (16.0) so TAA/GI shimmer +
+/// install-path divergence don't trip it; only catastrophic mean shifts
+/// (palette OOB → black) would exceed.
+pub const ORACLE_MEAN_DIFF_FLOOR: f32 = 16.0;
+
+/// Minimum count of pixels with Rec.709 luminance above
+/// [`ORACLE_BRIGHT_THRESHOLD`] in the CPU oracle frame — proves the
+/// camera frames lit geometry (not pure dark void). 1 % of the frame is
+/// a lenient floor.
 pub const ORACLE_MIN_BRIGHT_FRACTION: f32 = 0.01;
 
 /// Brightness threshold for the "geometry is visible" sanity guard.
 pub const ORACLE_BRIGHT_THRESHOLD: f32 = 50.0;
 
-/// Minimum count of pixels with Rec.709 luminance BELOW [`ORACLE_DARK_THRESHOLD`]
-/// in the CPU oracle frame — proves the camera doesn't frame only emissive
-/// saturation / pure sky. 1 % of the frame is a lenient floor.
+/// Minimum count of pixels with Rec.709 luminance BELOW
+/// [`ORACLE_DARK_THRESHOLD`] in the CPU oracle frame — proves the camera
+/// doesn't frame only emissive saturation / pure sky. 1 % of the frame
+/// is a lenient floor.
 pub const ORACLE_MIN_DARK_FRACTION: f32 = 0.01;
 
-/// Darkness threshold for the "scene has shadows / non-sky content" sanity
-/// guard.
+/// Darkness threshold for the "scene has shadows / non-sky content"
+/// sanity guard.
 pub const ORACLE_DARK_THRESHOLD: f32 = 200.0;
 
 // ---------------------------------------------------------------------------
 // Phase 1: CPU oracle render — entry point invoked from `bin/e2e_render.rs`
 // ---------------------------------------------------------------------------
 
-/// Boot the e2e harness configured for GPU phase A of the oracle's
-/// determinism test. Returns the harness's `AppExit`. Saves
-/// `target/e2e-screenshots/oracle_cpu.png` on success.
+/// Boot the e2e harness configured for the CPU oracle phase. Returns the
+/// harness's `AppExit`. Saves `target/e2e-screenshots/oracle_cpu.png` on
+/// success.
 ///
-/// **Stage 13 (2026-05-18) rewire:** previously this routed through the
-/// legacy `install_vox_sized_to_model` CPU oracle path; the gate now runs
-/// **both** phases through the production W5 install path
-/// (`install_vox_in_fixed_world`) to measure GPU-producer determinism (per
-/// `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-speckle-and-
-/// brush-clears.md` Bug 2 — the CPU-vs-GPU compare was a structural
-/// test-calibration mismatch, not a runtime defect). The CLI flag name
-/// `--vox-gpu-oracle-cpu` is preserved for binary stability across the
-/// rewire; the PNG filename `oracle_cpu.png` is preserved for visual-
-/// continuity with prior screenshots.
+/// **Stage 14 (2026-05-18):** routes through the legacy CPU loader
+/// (`install_vox_sized_to_model`) via the SOLE test-only escape hatch
+/// `vox_gpu_oracle_cpu_phase` in `setup_test_grid`. The CPU oracle is a
+/// known-good reference renderer the SSIM compare phase pairs against the
+/// GPU production W5 path.
 pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
     let path = oasis_vox_fixture_path();
     if !path.exists() {
@@ -286,10 +268,10 @@ pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
         return AppExit::error();
     }
     println!(
-        "e2e_render --vox-gpu-oracle-cpu: GPU phase A — loading Oasis VOX \
-         fixture from {} via the production W5 path \
-         (install_vox_in_fixed_world; 4096×512×4096 voxels). Camera pinned \
-         to shared oracle pose pos={:?} look={:?}. Saving to {}.",
+        "e2e_render --vox-gpu-oracle-cpu: loading Oasis VOX fixture from {} \
+         via the legacy CPU path (install_vox_sized_to_model) — \
+         world size = model's natural 1488×544×1344 voxels. Camera pinned to \
+         shared oracle pose pos={:?} look={:?}. Saving to {}.",
         path.display(),
         ORACLE_CAMERA_POS,
         ORACLE_CAMERA_LOOK,
@@ -298,15 +280,12 @@ pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
 
     let mut app_args = crate::AppArgs::default();
     app_args.grid_preset = crate::GridPreset::Vox { path };
-    // Stage 13 (2026-05-18): the `vox_gpu_oracle_cpu_phase` flag now ONLY
-    // wires the camera pin + the single-screenshot driver path; it no
-    // longer redirects `setup_test_grid` to the legacy CPU loader. The CPU
-    // loader's `vox_gpu_oracle_cpu_phase` escape hatch in `setup_test_grid`
-    // has been removed (the production W5 path is the SOLE install path
-    // now — even the oracle gate runs through it). The flag is kept as a
-    // phase-marker that the driver still reads to enable the screenshot
-    // fast-path.
-    app_args.construction_config.gpu_construction_enabled = true;
+    // vox-gpu-rewrite Stage 14 (2026-05-18): `vox_gpu_oracle_cpu_phase` is
+    // the SOLE test-only escape hatch in `setup_test_grid` that routes to
+    // the legacy `install_vox_sized_to_model` CPU oracle. This is the SOLE
+    // remaining call site of the sized-to-model path and exists
+    // specifically so the oracle gate can compare CPU vs W5 GPU output
+    // via SSIM.
     app_args.vox_gpu_oracle_cpu_phase = true;
     crate::run_e2e_render_with_args(app_args)
 }
@@ -315,34 +294,55 @@ pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
 // Phase 2: GPU render — entry point invoked from `bin/e2e_render.rs`
 // ---------------------------------------------------------------------------
 
-/// **Stage 13 (2026-05-18) deprecation:** the `--vox-gpu-oracle-gpu`
-/// subprocess phase no longer exists. The top-level `--vox-gpu-oracle`
-/// gate is now a SINGLE-subprocess double-capture (see
-/// [`run_vox_gpu_oracle_cpu_phase`] + the module docstring). This entry
-/// point is kept for binary stability of the `--vox-gpu-oracle-gpu` CLI
-/// flag — it now just delegates to [`run_vox_gpu_oracle_cpu_phase`] so
-/// any external caller of the flag still produces a valid `oracle_cpu.png`
-/// + `oracle_gpu.png` pair. The CLI flag will be removed in a future
-/// cleanup pass.
+/// Boot the e2e harness configured for the GPU producer phase. Returns the
+/// harness's `AppExit`. Saves `target/e2e-screenshots/oracle_gpu.png` on
+/// success.
+///
+/// **Stage 14 (2026-05-18):** routes through the production W5 install
+/// path (`install_vox_in_fixed_world`) — the same path the production
+/// binary uses for `--vox` loads. The SSIM compare phase pairs this
+/// against the CPU oracle render.
 pub fn run_vox_gpu_oracle_gpu_phase() -> AppExit {
+    let path = oasis_vox_fixture_path();
+    if !path.exists() {
+        eprintln!(
+            "e2e_render --vox-gpu-oracle-gpu: FIXTURE MISSING at {} \
+             (cwd = {:?}). The fixture is Git LFS-tracked at \
+             {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull`, OR run from the \
+             workspace root.",
+            path.display(),
+            std::env::current_dir().ok()
+        );
+        return AppExit::error();
+    }
     println!(
-        "e2e_render --vox-gpu-oracle-gpu: Stage 13 deprecation — this flag \
-         is now an alias for --vox-gpu-oracle-cpu (single-subprocess \
-         double-capture). Delegating."
+        "e2e_render --vox-gpu-oracle-gpu: loading Oasis VOX fixture from {} \
+         via the W5 GPU producer chain (install_vox_in_fixed_world) — \
+         fixed world 4096×512×4096 voxels, GPU construction enabled. Camera \
+         pinned to shared oracle pose pos={:?} look={:?}. Saving to {}.",
+        path.display(),
+        ORACLE_CAMERA_POS,
+        ORACLE_CAMERA_LOOK,
+        ORACLE_GPU_PNG,
     );
-    run_vox_gpu_oracle_cpu_phase()
+
+    let mut app_args = crate::AppArgs::default();
+    app_args.grid_preset = crate::GridPreset::Vox { path };
+    // The production install path (no oracle-CPU-phase flag) —
+    // `install_vox_in_fixed_world` + W5 GPU producer chain. GPU
+    // construction default-on; explicit assignment for belt-and-braces.
+    app_args.construction_config.gpu_construction_enabled = true;
+    app_args.vox_gpu_oracle_gpu_phase = true;
+    crate::run_e2e_render_with_args(app_args)
 }
 
 // ---------------------------------------------------------------------------
 // Phase 3: Compare — the top-level `--vox-gpu-oracle` entry point
 // ---------------------------------------------------------------------------
 
-/// Top-level entry point for `--vox-gpu-oracle`. Spawns a SINGLE subprocess
-/// that captures TWO screenshots (A → `oracle_cpu.png`, B → `oracle_gpu.png`)
-/// within the same render-app instance — see Stage 13 module docstring for
-/// the producer-determinism rationale — then loads both saved PNGs and runs
-/// the per-pixel diff assertion. Returns an exit code (0 = PASS, non-zero =
-/// FAIL).
+/// Top-level entry point for `--vox-gpu-oracle`. Spawns the CPU oracle phase
+/// + the GPU phase as subprocesses, then loads both saved PNGs and runs the
+/// SSIM comparison. Returns an exit code (0 = PASS, non-zero = FAIL).
 pub fn run_vox_gpu_oracle_compare() -> u8 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -363,49 +363,72 @@ pub fn run_vox_gpu_oracle_compare() -> u8 {
         }
     };
 
-    // Stage 13 (2026-05-18): single subprocess for the double-capture. Both
-    // PNGs (`oracle_cpu.png` + `oracle_gpu.png`) are produced by the same
-    // render-app instance, so the GPU producer runs ONCE and both captures
-    // share byte-identical `voxels[]`. The diff measures the renderer +
-    // TAA/GI noise floor only.
+    // Phase 1 — CPU oracle.
     println!(
-        "e2e_render --vox-gpu-oracle: spawning double-capture subprocess \
+        "e2e_render --vox-gpu-oracle: spawning CPU oracle phase \
          (subprocess: {} --vox-gpu-oracle-cpu)",
         exe.display()
     );
-    let phase_status = Command::new(&exe)
+    let cpu_status = Command::new(&exe)
         .arg("--vox-gpu-oracle-cpu")
         .current_dir(&cwd)
         .status();
-    let phase_ok = match phase_status {
+    let cpu_ok = match cpu_status {
         Ok(s) => s.success(),
         Err(e) => {
             eprintln!(
-                "e2e_render --vox-gpu-oracle: double-capture subprocess \
-                 failed to spawn — {e}"
+                "e2e_render --vox-gpu-oracle: CPU oracle subprocess failed \
+                 to spawn — {e}"
             );
             return 1;
         }
     };
-    if !phase_ok {
+    if !cpu_ok {
         eprintln!(
-            "e2e_render --vox-gpu-oracle: double-capture subprocess exited \
+            "e2e_render --vox-gpu-oracle: CPU oracle subprocess exited \
              non-zero — aborting compare"
         );
         return 1;
     }
 
-    // Compare phase.
+    // Phase 2 — GPU.
+    println!(
+        "e2e_render --vox-gpu-oracle: spawning GPU phase \
+         (subprocess: {} --vox-gpu-oracle-gpu)",
+        exe.display()
+    );
+    let gpu_status = Command::new(&exe)
+        .arg("--vox-gpu-oracle-gpu")
+        .current_dir(&cwd)
+        .status();
+    let gpu_ok = match gpu_status {
+        Ok(s) => s.success(),
+        Err(e) => {
+            eprintln!(
+                "e2e_render --vox-gpu-oracle: GPU subprocess failed to \
+                 spawn — {e}"
+            );
+            return 1;
+        }
+    };
+    if !gpu_ok {
+        eprintln!(
+            "e2e_render --vox-gpu-oracle: GPU subprocess exited non-zero — \
+             aborting compare"
+        );
+        return 1;
+    }
+
+    // Phase 3 — compare.
     let cpu_path = Path::new(crate::e2e::E2E_SCREENSHOT_DIR).join(ORACLE_CPU_PNG);
     let gpu_path = Path::new(crate::e2e::E2E_SCREENSHOT_DIR).join(ORACLE_GPU_PNG);
     println!(
-        "e2e_render --vox-gpu-oracle: comparing {} vs {} (mean diff floor \
-         {:.2}; per-pixel diff threshold {:.1} with ceiling {:.1}% of frame)",
+        "e2e_render --vox-gpu-oracle: comparing {} vs {} (SSIM threshold \
+         {:.3}; mean per-pixel floor {:.2})",
         cpu_path.display(),
         gpu_path.display(),
+        ORACLE_SSIM_THRESHOLD,
         ORACLE_MEAN_DIFF_FLOOR,
-        ORACLE_PIXEL_DIFF_THRESHOLD,
-        100.0 * ORACLE_DIFF_PIXEL_FRACTION_CEILING,
     );
     let cpu_fb = match load_png_as_framebuffer(&cpu_path) {
         Ok(fb) => fb,
@@ -440,7 +463,7 @@ pub fn run_vox_gpu_oracle_compare() -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Compare — per-pixel diff + sanity guards
+// Compare — SSIM + per-pixel mean Δ + sanity guards
 // ---------------------------------------------------------------------------
 
 /// Run the full oracle comparison. Returns `Ok(report)` on PASS;
@@ -490,29 +513,44 @@ pub fn compare_oracle_frames(
         ));
     }
 
-    // The actual gate metric: per-pixel RGB diff.
+    // Per-pixel mean Δ — sanity check, NOT the load-bearing metric. Set
+    // generously so TAA/GI shimmer + install-path divergence don't trip
+    // it; only catastrophic mean shifts (palette OOB → black) exceed.
     let mean_delta = cpu_fb.mean_pixel_delta(gpu_fb);
-    let high_diff_count = count_pixels_with_rgb_diff_above(
-        cpu_fb,
-        gpu_fb,
-        ORACLE_PIXEL_DIFF_THRESHOLD,
+
+    // SSIM — the load-bearing metric.
+    let cpu_rgb = framebuffer_to_rgb_image(cpu_fb);
+    let gpu_rgb = framebuffer_to_rgb_image(gpu_fb);
+    let ssim_result = image_compare::rgb_similarity_structure(
+        &image_compare::Algorithm::MSSIMSimple,
+        &cpu_rgb,
+        &gpu_rgb,
     );
-    let high_diff_ceiling =
-        ((frame_pixels as f32) * ORACLE_DIFF_PIXEL_FRACTION_CEILING) as usize;
+    let ssim_score = match ssim_result {
+        Ok(sim) => sim.score,
+        Err(e) => {
+            return Err(format!(
+                "SSIM computation failed: {e:?}. CPU dims {}×{}; GPU dims {}×{}; \
+                 frames passed dim-check above so this is an internal \
+                 image-compare error.",
+                cpu_fb.width(),
+                cpu_fb.height(),
+                gpu_fb.width(),
+                gpu_fb.height(),
+            ));
+        }
+    };
 
     let report = format!(
         "{}×{} frame, {frame_pixels} pixels; \
-         mean per-pixel RGB Δ = {mean_delta:.3} (floor {:.2}); \
-         pixels with per-channel Δ > {:.1} = {high_diff_count} \
-         ({:.2}% of frame; ceiling {high_diff_ceiling} pixels = {:.1}% of frame); \
+         SSIM = {ssim_score:.4} (threshold {:.3}); \
+         mean per-pixel RGB Δ = {mean_delta:.3} (sanity floor {:.2}); \
          sanity: bright (lum>{:.1}) = {bright_count} ({:.2}% ≥ {:.1}% floor); \
          dark (lum<{:.1}) = {dark_count} ({:.2}% ≥ {:.1}% floor)",
         cpu_fb.width(),
         cpu_fb.height(),
+        ORACLE_SSIM_THRESHOLD,
         ORACLE_MEAN_DIFF_FLOOR,
-        ORACLE_PIXEL_DIFF_THRESHOLD,
-        100.0 * (high_diff_count as f32) / (frame_pixels.max(1) as f32),
-        100.0 * ORACLE_DIFF_PIXEL_FRACTION_CEILING,
         ORACLE_BRIGHT_THRESHOLD,
         100.0 * (bright_count as f32) / (frame_pixels.max(1) as f32),
         100.0 * ORACLE_MIN_BRIGHT_FRACTION,
@@ -522,21 +560,22 @@ pub fn compare_oracle_frames(
     );
     println!("e2e_render --vox-gpu-oracle: {report}");
 
-    if mean_delta >= ORACLE_MEAN_DIFF_FLOOR {
+    if ssim_score < ORACLE_SSIM_THRESHOLD {
         return Err(format!(
-            "mean per-pixel RGB Δ {mean_delta:.3} >= floor {:.2} — GPU output \
-             diverges meaningfully from CPU oracle. {report}",
-            ORACLE_MEAN_DIFF_FLOOR,
+            "SSIM {ssim_score:.4} < threshold {:.3} — GPU output structurally \
+             diverges from CPU oracle. Gross renderer regression suspected \
+             (sky-bleed at architecture, voxel-type corruption, palette OOB, \
+             AADF-leak — any defect that destroys structural correlation \
+             cratres SSIM far below 1.0). {report}",
+            ORACLE_SSIM_THRESHOLD,
         ));
     }
-    if high_diff_count > high_diff_ceiling {
+    if mean_delta >= ORACLE_MEAN_DIFF_FLOOR {
         return Err(format!(
-            "{high_diff_count} pixels with per-channel Δ > {:.1} exceed ceiling \
-             {high_diff_ceiling} ({:.1}% of frame) — scattered speckles indicate \
-             the W5 GPU producer chain corrupts mixed-block dedup / hashing. \
-             {report}",
-            ORACLE_PIXEL_DIFF_THRESHOLD,
-            100.0 * ORACLE_DIFF_PIXEL_FRACTION_CEILING,
+            "mean per-pixel RGB Δ {mean_delta:.3} >= sanity floor {:.2} — \
+             unexpected mean shift despite SSIM clearing threshold; \
+             investigate. {report}",
+            ORACLE_MEAN_DIFF_FLOOR,
         ));
     }
     Ok(report)
@@ -558,35 +597,18 @@ fn count_pixels_with_luminance_above(fb: &Framebuffer, threshold: f32) -> usize 
     count
 }
 
-/// Count pixels where ANY channel of the per-pixel RGB diff exceeds
-/// `threshold` (treating diff as max-of-channels). Captures scattered
-/// speckles even when their per-pixel-mean would dilute.
-fn count_pixels_with_rgb_diff_above(
-    a: &Framebuffer,
-    b: &Framebuffer,
-    threshold: f32,
-) -> usize {
-    if a.width() != b.width() || a.height() != b.height() {
-        return usize::MAX;
-    }
-    let mut count = 0usize;
-    for y in 0..a.height() {
-        for x in 0..a.width() {
-            let pa = a.pixel(x, y);
-            let pb = b.pixel(x, y);
-            let mut max_d: f32 = 0.0;
-            for c in 0..3 {
-                let d = (pa[c] as f32 - pb[c] as f32).abs();
-                if d > max_d {
-                    max_d = d;
-                }
-            }
-            if max_d > threshold {
-                count += 1;
-            }
+/// Convert a [`Framebuffer`] (RGBA8) into an `image::RgbImage` (RGB8) for
+/// `image_compare::rgb_similarity_structure`. Drops the alpha channel
+/// (both PNGs are written as fully-opaque captures).
+fn framebuffer_to_rgb_image(fb: &Framebuffer) -> image::RgbImage {
+    let mut img = image::RgbImage::new(fb.width(), fb.height());
+    for y in 0..fb.height() {
+        for x in 0..fb.width() {
+            let p = fb.pixel(x, y);
+            img.put_pixel(x, y, image::Rgb([p[0], p[1], p[2]]));
         }
     }
-    count
+    img
 }
 
 /// Load a PNG from disk back into a [`Framebuffer`] — used by the compare

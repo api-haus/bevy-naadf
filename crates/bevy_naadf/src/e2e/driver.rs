@@ -197,45 +197,33 @@ pub enum E2ePhase {
     SmallEditReproDrainAfter,
     /// Run `assert_no_pitch_black_pixels`, save PNGs, write the verdict.
     SmallEditReproAssert,
-    // --- vox-gpu-oracle phases (Stage 4 — per-pixel oracle gate;
-    // Stage 13 rewire — single-capture sanity gate for the W5 path) ---
+    // --- vox-gpu-oracle phases (Stage 4 — per-pixel CPU oracle vs GPU
+    // gate; Stage 14 — SSIM-based comparison restoring real dual-capture) ---
     //
-    // Selected when `AppArgs.vox_gpu_oracle_cpu_phase == true` (the
-    // renamed phase marker; `vox_gpu_oracle_gpu_phase` is preserved as a
-    // no-op alias for CLI stability). Single subprocess; single-capture
-    // fast-path: warmup → shoot → drain → save-twice → exit. The captured
-    // framebuffer is saved as BOTH `oracle_cpu.png` AND `oracle_gpu.png`
-    // (byte-identical files); the out-of-process compare in
-    // `vox_gpu_oracle::run_vox_gpu_oracle_compare` then loads both, runs
-    // the per-pixel diff (trivially zero) + the load-bearing CPU-frame
-    // SANITY GUARDS (`lum > 50` floor / `lum < 200` floor / frame-dim
-    // match) which catch the real renderer regressions: degenerate
-    // frames, all-sky / all-dark, all-emissive saturation, dimension
-    // mismatches.
+    // Selected when `AppArgs.vox_gpu_oracle_cpu_phase == true` OR
+    // `AppArgs.vox_gpu_oracle_gpu_phase == true`. Single-screenshot
+    // fast-path: warmup → shoot → drain → save → exit. The driver picks
+    // the destination filename (`oracle_cpu.png` for the CPU phase,
+    // `oracle_gpu.png` for the GPU phase). No edit phase, no Δ assertion —
+    // the compare happens out-of-process in
+    // `vox_gpu_oracle::run_vox_gpu_oracle_compare`, which loads both PNGs
+    // and runs the SSIM (Structural Similarity Index) compare. SSIM
+    // tolerates the renderer's inherent stochastic GI/TAA shimmer + the
+    // GPU atomic-cursor nondeterminism + the install-path world-shape
+    // divergence (natural-bound CPU vs fixed-tiled GPU) while still
+    // dropping far below the threshold on gross regressions (sky-bleed,
+    // dropouts, voxel-type corruption, palette OOB).
     //
-    // Stage 13 (2026-05-18) rationale: prior CPU-vs-GPU compare shape
-    // routed phase A through `install_vox_sized_to_model` (CPU oracle,
-    // natural-bound 1488×544×1344 world) and phase B through
-    // `install_vox_in_fixed_world` (production W5 path, fixed
-    // 4096×512×4096 world with tiling + Y-clamp). The two install paths
-    // produced semantically different worlds → secondary GI rays
-    // diverged at ~6% per-pixel level (Bug 2 of
-    // `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-speckle-
-    // and-brush-clears.md`). Stage 13 measurements established that even
-    // a same-path GPU-vs-GPU compare diverges at ~1.7% per-pixel just
-    // from frame-to-frame GI/TAA shimmer (inherent stochastic GI sample
-    // sequence); the 1% per-pixel ceiling is structurally
-    // unsatisfiable against any two-frame compare. The honest fix is to
-    // drop the two-frame compare entirely and lean on the sanity guards
-    // for renderer-regression detection (genuine bugs like sky-bleed and
-    // dropouts trip the `lum > 50` / `lum < 200` floors directly).
+    // Stage 13's Shape-C tautology (save same captured framebuffer as
+    // both `oracle_cpu.png` and `oracle_gpu.png`) is reverted — that
+    // shape made the gate catch nothing.
     /// Warmup at the shared oracle pose — TAA + GI convergence.
     VoxGpuOracleWarmup,
     /// Spawn `Screenshot::primary_window()`.
     VoxGpuOracleShoot,
-    /// Drain the async capture, decode to a [`Framebuffer`], save the
-    /// PNG to disk BOTH as `oracle_cpu.png` and `oracle_gpu.png`
-    /// (byte-identical), then write `AppExit::Success`.
+    /// Drain the async capture, decode to a [`Framebuffer`], save the PNG to
+    /// disk (`oracle_cpu.png` for the CPU phase, `oracle_gpu.png` for the GPU
+    /// phase), then write `AppExit::Success`.
     VoxGpuOracleDrain,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
@@ -1485,29 +1473,34 @@ pub fn e2e_driver(
             if let Some(image) = screenshot.0.take() {
                 match Framebuffer::from_image(&image) {
                     Ok(fb) => {
-                        // Stage 13 (2026-05-18): save the captured frame as
-                        // BOTH `oracle_cpu.png` AND `oracle_gpu.png` (byte-
-                        // identical). The per-pixel diff in the compare
-                        // phase trivially passes; the SANITY GUARDS on the
-                        // captured frame (lum>50 / lum<200 / dim-match) are
-                        // the load-bearing renderer-regression checks.
+                        // Stage 14 (2026-05-18): real dual-capture
+                        // restored. The CPU phase saves to
+                        // `oracle_cpu.png`, the GPU phase to
+                        // `oracle_gpu.png`; the compare phase loads both
+                        // and runs an SSIM comparison.
+                        let is_cpu = app_args
+                            .as_deref()
+                            .is_some_and(|a| a.vox_gpu_oracle_cpu_phase);
+                        let is_gpu = app_args
+                            .as_deref()
+                            .is_some_and(|a| a.vox_gpu_oracle_gpu_phase);
+                        let filename = if is_cpu {
+                            super::vox_gpu_oracle::ORACLE_CPU_PNG
+                        } else if is_gpu {
+                            super::vox_gpu_oracle::ORACLE_GPU_PNG
+                        } else {
+                            // Unreachable in practice: routed in only when
+                            // one of the two flags is set.
+                            super::vox_gpu_oracle::ORACLE_CPU_PNG
+                        };
                         println!(
                             "e2e_render --vox-gpu-oracle: capture {}x{}; \
-                             saving to {} AND {} (byte-identical — \
-                             Stage 13 single-capture sanity gate)",
+                             saving to {}",
                             fb.width(),
                             fb.height(),
-                            super::vox_gpu_oracle::ORACLE_CPU_PNG,
-                            super::vox_gpu_oracle::ORACLE_GPU_PNG,
+                            filename
                         );
-                        super::vox_gpu_oracle::save_oracle_screenshot(
-                            &fb,
-                            super::vox_gpu_oracle::ORACLE_CPU_PNG,
-                        );
-                        super::vox_gpu_oracle::save_oracle_screenshot(
-                            &fb,
-                            super::vox_gpu_oracle::ORACLE_GPU_PNG,
-                        );
+                        super::vox_gpu_oracle::save_oracle_screenshot(&fb, filename);
                         vox_gpu_oracle.captured = Some(fb);
                         vox_gpu_oracle.saved = true;
                         outcome.gate_result = Some(Ok(()));

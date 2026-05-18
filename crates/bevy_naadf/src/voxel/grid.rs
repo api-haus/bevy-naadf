@@ -84,27 +84,40 @@ pub const DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS: [u32; 3] = GRID_SIZE_IN_CHUNKS;
 ///   producer chain runs `generator_model` + `chunk_calc` per segment to
 ///   build the world directly on the device.
 ///
-/// **Stage 13 (2026-05-18):** the `vox_gpu_oracle_cpu_phase` escape hatch
-/// that previously routed Vox loads to [`install_vox_sized_to_model`] has
-/// been removed. The `--vox-gpu-oracle` gate now runs **both** phases
-/// through the production W5 install path
-/// ([`install_vox_in_fixed_world`]) — measuring GPU-producer determinism
-/// rather than CPU-vs-GPU equivalence (Bug 2 of
-/// `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-speckle-and-
-/// brush-clears.md`). The `vox_gpu_oracle_cpu_phase` flag is preserved as
-/// a phase marker the e2e driver reads to wire the camera pin + the
-/// single-screenshot fast-path; it no longer changes the install path.
+/// **Stage 14 (2026-05-18):** the `vox_gpu_oracle_cpu_phase` escape hatch
+/// is restored as the SOLE test-only branch that routes `Vox` loads to
+/// [`install_vox_sized_to_model`] (the legacy natural-bound CPU oracle).
+/// The `--vox-gpu-oracle` gate is now an SSIM-based comparison between two
+/// REAL renders (CPU oracle vs production W5 GPU path), replacing the
+/// Stage 13 Shape C tautology that saved the same captured framebuffer as
+/// both `oracle_cpu.png` and `oracle_gpu.png` (which made the per-pixel
+/// diff trivially zero and the gate caught nothing). SSIM (Structural
+/// Similarity Index) tolerates the ~1.5-6% per-pixel TAA/GI shimmer +
+/// atomic-cursor nondeterminism + tiling-vs-natural-bound divergence that
+/// killed the per-pixel ceiling, while still flagging gross renderer
+/// regressions (sky-bleed, dropouts, voxel-type corruption) that would
+/// drop SSIM far below 1.0.
 ///
-/// `install_vox_sized_to_model` is retained for hand-debugging the
-/// natural-bound CPU world (no live caller, but the function stays since
-/// the CPU oracle path itself remains useful as a reference).
+/// Production callers never set `vox_gpu_oracle_cpu_phase`; the binary's
+/// `--vox` path always routes here with the flag `false` and therefore
+/// always invokes [`install_vox_in_fixed_world`].
 pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
     match &args.grid_preset {
         GridPreset::Default => {
             install_default_embedded_in_fixed_world(&mut commands);
         }
         GridPreset::Vox { path } => {
-            install_vox_in_fixed_world(&mut commands, path);
+            if args.vox_gpu_oracle_cpu_phase {
+                // Test-only CPU oracle phase for `--vox-gpu-oracle`. The
+                // gate's compare phase pairs this CPU render against the
+                // GPU render of the same fixture through the production W5
+                // path; the SSIM compare tolerates the world-shape
+                // divergence (natural-bound CPU vs fixed-tiled GPU) while
+                // still flagging gross renderer regressions.
+                install_vox_sized_to_model(&mut commands, path);
+            } else {
+                install_vox_in_fixed_world(&mut commands, path);
+            }
         }
     }
 }
@@ -217,18 +230,13 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
 
 /// Legacy `.vox` loader — sizes the world to the model's natural bounds.
 ///
-/// **Stage 13 (2026-05-18) status:** dead code from production + e2e
-/// gates. The `--vox-gpu-oracle` gate (the only prior caller via the
-/// `vox_gpu_oracle_cpu_phase` escape hatch) has been rewired to a
-/// GPU-vs-GPU determinism test (Bug 2 of
-/// `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-speckle-and-
-/// brush-clears.md` — the CPU-vs-GPU compare was a structural
-/// test-calibration mismatch, not a runtime defect). The function is kept
-/// for hand-debugging the natural-bound CPU world if a future
-/// investigation needs to compare a sized-to-model render against the
-/// fixed-world tiled render; suppressed-warning attribute reflects the
-/// no-caller state.
-#[allow(dead_code)]
+/// **Stage 14 (2026-05-18) status:** reachable ONLY via the test-only
+/// `AppArgs.vox_gpu_oracle_cpu_phase` branch in [`setup_test_grid`] — the
+/// CPU oracle phase of the SSIM-based `--vox-gpu-oracle` gate. The
+/// production binary always routes through [`install_vox_in_fixed_world`].
+/// Kept as a separate path so the CPU-vs-GPU SSIM compare measures two
+/// distinct install paths' renders rather than two captures of the same
+/// render.
 fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path) {
     match vox_import::load_vox_tiled(path, 1) {
         Ok(imp) => {
