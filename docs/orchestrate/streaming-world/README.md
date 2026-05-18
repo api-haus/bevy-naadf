@@ -41,7 +41,7 @@ consolidated mode disqualified.
 - [x] Step 2.5 — Mode selection (distributed)
 - [x] Step 4 — Architectural Q&A
 - [x] Step 5 — Shared-context files (`README.md`, `01-context.md`)
-- [ ] 02 — Architecture design (`delegate-architect` → `02-design.md`)
+- [x] 02 — Architecture design (`delegate-architect` → `02-design.md`)
 - [ ] **Hard gate** — submit design to user, wait for confirmation
 - [ ] 03 — Implementation (`general-purpose` → code + `03-impl.md`)
 - [ ] **Hard gate** — submit impl to user, wait for confirmation

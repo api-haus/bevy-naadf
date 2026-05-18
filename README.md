@@ -4,11 +4,12 @@ A Bevy **0.19** port of [NAADF](https://github.com/cg-tuwien/NAADF) — a C#/Mon
 raytracing engine ("Nested Axis-Aligned Distance Fields", Ulschmid et al., CGF 2026) — to
 Rust/Bevy, building natively on Linux.
 
-The port is split into **four gated phases** (see the roadmap below). **Phase A** — the
-NAADF substrate (the three-layer chunk/block/voxel cell hierarchy + AADF empty-space
-distance fields), CPU-side AADF construction, the DDA-with-AADF traversal, and an
-albedo-only first-hit WGSL render path — is complete. NVIDIA DLSS Ray Reconstruction
-plumbing is kept dormant for the later GI phases.
+The port is essentially complete — the NAADF substrate (three-layer chunk/block/voxel
+cell hierarchy + AADF empty-space distance fields, CPU + GPU construction), the
+DDA-with-AADF traversal, the full GI pipeline (atmosphere precompute, ReSTIR GI, sparse
+bilateral denoiser, long-term TAA), and real-time GPU editing all land in the current
+build. NVIDIA DLSS Ray Reconstruction plumbing is in place but currently dormant — see
+the roadmap for the open noise-reduction integration work.
 
 ## What it does
 
@@ -18,8 +19,6 @@ renders it with a two-pass custom render graph: a compute pass that casts a prim
 per pixel through the AADF DDA traversal (`shootRay`, ported faithfully from NAADF's HLSL)
 and writes a compact G-buffer + a flat sun-and-ambient shaded colour, then a fullscreen
 blit that tonemaps it to the screen. Fly through it with the free camera.
-
-No bounce lighting, no TAA, no GI yet — those are the later phases.
 
 ## Requirements
 
@@ -111,7 +110,7 @@ the cross-origin-isolated page needs).
 | `E` `Q`                | Fly up / down                                       |
 | `Shift`                | Move faster                                         |
 | Mouse                  | Look around                                         |
-| `D`                    | Toggle DLSS Ray Reconstruction on/off (dormant in Phase A) |
+| `D`                    | Toggle DLSS Ray Reconstruction on/off (currently dormant — see roadmap) |
 
 The on-screen overlay shows FPS, the active renderer, DLSS-RR state, and per-pass NAADF
 render-node GPU timings (`first-hit`, `final-blit`).
@@ -161,23 +160,36 @@ later without another restructure.
 
 ## Roadmap
 
-The port is sequenced as four gated phases — each phase's design + implementation does not
-begin until the prior phase is reviewed and confirmed runnable.
+The NAADF port is essentially complete — the substrate, GI pipeline, and GPU-side
+construction + editing all landed. The remaining work is content / streaming on top.
 
-1. **Toolchain proof-of-concept** — Bevy 0.19 + Solari + DLSS-RR running on Linux. ✅
-   *(superseded — Solari was stripped; it is reference-only, not the GI substrate.)*
-2. **Phase A — NAADF substrate + albedo first-hit.** ✅ The three-layer chunk/block/voxel
-   cell hierarchy, CPU-side AADF construction + cuboid expansion, the DDA-with-AADF
-   traversal, the int+frac `PositionSplit` camera, and a two-pass albedo first-hit WGSL
-   render path (compute first-hit → fullscreen blit). Flat-lit, no bounce lighting, no TAA.
-3. **Phase A-2 — long-term-memory TAA.** ✅ The 16-frame / 64-bit-sample temporal
-   anti-aliasing pass, slotting between first-hit and the final blit.
-4. **Phase B — the GI pipeline.** ✅ The full NAADF `WorldRenderBase` real-time GI
-   pipeline: the atmosphere precompute, the 4-plane-bounce first-hit, the adaptive
-   ~0.25-spp `rayQueueCalc` sampler, compressed ReSTIR GI (lit/unlit separation, 8×8
-   screen-space regions, the 12-iteration spatial pass), the sparse bilateral denoiser,
-   and the `base/` long-term TAA (`ReprojectOld` + `CalcNewTaaSample`). 13 render-graph
-   nodes; the GI bounce lights the scene.
-5. **Phase C — GPU world construction & editing.** The GPU hashing construction
-   (Algorithm 1), the background chunk-AADF queue, and flood-fill edit invalidation — a
-   scalability / editability track, not a rendering foundation.
+- [x] Toolchain proof-of-concept — Bevy 0.19 + DLSS-RR on Linux *(Solari was stripped; it
+      is reference-only, not the GI substrate)*
+- [x] NAADF substrate + albedo first-hit — three-layer chunk/block/voxel cell hierarchy,
+      CPU-side AADF construction + cuboid expansion, DDA-with-AADF traversal, int+frac
+      `PositionSplit` camera, two-pass albedo first-hit WGSL render path
+- [x] Long-term-memory TAA — 16-frame / 64-bit-sample temporal anti-aliasing pass,
+      slotting between first-hit and the final blit
+- [x] GI pipeline — atmosphere precompute, 4-plane-bounce first-hit, adaptive ~0.25-spp
+      `rayQueueCalc` sampler, compressed ReSTIR GI with lit/unlit separation + 8×8
+      screen-space regions + 12-iteration spatial pass, sparse bilateral denoiser,
+      `base/` long-term TAA — 13 render-graph nodes; GI bounce lights the scene
+- [x] GPU world construction & editing — GPU hashing construction per Algorithm 1,
+      background chunk-AADF queue, flood-fill edit invalidation, real-time voxel edits
+- [ ] Showcase a `.vox` world in the web build
+- [ ] Procedural pseudo-infinite sliding world
+- [ ] Persistent streamable world format
+- [ ] DLSS Ray Reconstruction — actual integration for noise reduction (plumbing is in
+      place but currently dormant; needs research/investigation on input-signal routing,
+      motion vectors, and denoiser interaction with the ReSTIR GI / bilateral pass)
+
+### Platform verification
+
+- [x] Linux — native (Vulkan)
+- [x] Linux — web (wasm32 / WebGPU via Trunk, Chrome)
+- [ ] Windows — native
+- [ ] Windows — web
+- [ ] macOS — native (Metal)
+- [ ] macOS — web
+- [ ] iOS — web (Safari WebGPU)
+- [ ] Android — web (Chrome WebGPU)

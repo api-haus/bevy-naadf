@@ -57,8 +57,8 @@ of the problem** and are **complementary, not competing**:
 
 ## Ideas for `bevy-naadf`
 
-They compose rather than conflict. NAADF stays the core GI substrate (Phase A done, Phase B =
-GI). Aokana fills exactly the gap NAADF's scope leaves open — **LOD and streaming**.
+They compose rather than conflict. NAADF stays the core GI substrate. Aokana fills exactly
+the gap NAADF's scope leaves open — **LOD and streaming**.
 
 1. **Treat Aokana as the blueprint for a later streaming/LOD phase**, layered on top of the
    AADF-DDA core — not a replacement for it. Relevant if/when `bevy-naadf` needs open-world
@@ -81,4 +81,5 @@ GI). Aokana fills exactly the gap NAADF's scope leaves open — **LOD and stream
 - Does the NAADF paper discuss LOD/streaming at all, or is it strictly out of scope? (Digest
   suggests out of scope; confirm against the source paper before committing to idea 1.)
 - AADF vs. Aokana's structural empty-space skip — would an AADF-augmented chunk make Aokana's
-  Hi-Z pass redundant, or are they additive? Worth a thought experiment before Phase B.
+  Hi-Z pass redundant, or are they additive? Worth a thought experiment before layering
+  LOD/streaming on top.
