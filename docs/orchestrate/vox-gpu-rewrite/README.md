@@ -61,8 +61,11 @@ handoff also cites W1/W3/W4 precedent which used the distributed flow.
 - [x] Step 6 — Checkpoint commit + W5.3-fix Stage 1 dispatch (commit `a4f2697` checkpoint; Stage 1 uncommitted pending next checkpoint)
 - [x] Step 6 — Stage 1 landed: 3 fixes (buffer sizing, 3D workgroup distribution, **per-segment encoder/submit — TRUE ROOT CAUSE not in diagnostic**) + W5.5 rewritten as two-frame camera-sweep Δ gate; all 10/10 e2e gates GREEN
 - [x] Hard gate — user live-tested; Oasis renders but surfaces inverted (screenshot shared)
-- [x] Diagnostic dispatch — `06-diagnostic-inversion.md` identified ROOT CAUSE: `prepare_construction:925-930` gate requires `dense_voxel_types` non-empty → W5 path skips production hash_map + hash_coefficients allocation → every mixed block hashes to 0 → CAS collisions → scattered missing voxels
-- [ ] Step 6 — Checkpoint commit + inversion-fix dispatch (extend gate + guard segment_voxel_buffer dense-derived allocation; ALSO fix `bound_group_queue_max_size = 1` per-segment overwrite — perf-only secondary bug)  ← CURRENT
+- [x] Diagnostic dispatch — `06-diagnostic-inversion.md` identified hash_map placeholder hypothesis (LANDED Stage 1.5; did NOT fix the user-visible bug)
+- [x] Stage 1.5 landed (commit `9964105`) — gate widened, bound_group_queue_max_size fixed; user re-tested, same broken rendering
+- [x] Diagnostic round 2 — `07-diagnostic-inversion-round-2.md` proposed initial_hash_map_size bump (1<<18 → 1<<20) — MEDIUM confidence
+- [x] Compound dispatch (Stage 2) — applied hash_map_size bump (LANDED, harmless, C#-faithful) + 4 iterative experiments. Hash_map saturation REFUTED at 8M slots. Disabling chunk_calc dedup-hit branch dropped near-black 23092→20875 (~10%). NEW root-cause hypothesis (MEDIUM-HIGH confidence): WGSL dedup-hit memory-ordering race on non-atomic `voxels[]` reads after atomic spin-wait.
+- [ ] Hard gate — submit Stage 2 + round-3 diagnostic, two open items: (a) replace gate metric (C# pose has 35% legitimate-dark baseline — three alternatives proposed); (b) land atomic `voxels[]` + `atomicLoad` fix per `08-diagnostic-inversion-round-3.md`  ← CURRENT
 - [ ] Step 6 — Checkpoint commit + impl W5.4 (delete CPU stop-gap)
 - [ ] Hard gate — submit, wait
 - [ ] Step 6 — Checkpoint commit + impl W5.6 (document default-scene divergence)

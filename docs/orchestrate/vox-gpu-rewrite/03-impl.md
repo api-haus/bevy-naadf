@@ -1625,3 +1625,304 @@ rework editing tools to address chunks via GPU-only state). The user's
 ability to edit the Oasis-loaded scene with `sphere_brush` is unchanged
 by Stage 1.5.
 
+## impl W5.3-fix Stage 2 (compound inversion fix) findings (2026-05-18)
+
+### Summary
+
+Compound dispatch combining gate-sharpening with iterative fix
+attempts. Per the brief, the round-2 diagnostic's MEDIUM-confidence
+primary fix (bump `initial_hash_map_size` from `1 << 18` to `1 << 20`
+to match C# `WorldData.cs:131-132`'s `mapSize >= 1,048,576`) was
+applied AND tested. **The fix did NOT change the rendered output at
+the C# spawn pose** — the inversion artifacts persist.
+
+Iterated through four additional candidate fixes in Phase 3 (against
+the 5-iteration ceiling); identified hypothesis H11 (chunk_calc
+dedup-hit memory-ordering race) as the highest-confidence remaining
+cause via direct experiment. Documented findings in
+`docs/orchestrate/vox-gpu-rewrite/08-diagnostic-inversion-round-3.md`.
+
+### Files touched (landed)
+
+- `crates/bevy_naadf/src/render/construction/config.rs:144-165` — bumped
+  `initial_hash_map_size` default from `1 << 18` (= 262,144 slots,
+  4 MiB) to `1 << 20` (= 1,048,576 slots, 16 MiB) with a long-form
+  comment explaining the C# trace and the round-3 diagnostic finding
+  that the bump alone is insufficient.
+- `crates/bevy_naadf/src/render/construction/config.rs:204-216` — same
+  bump applied to the const-assert pin block.
+
+That is the only code change landed by this dispatch. The chunk_calc
+shader, the W5.5 e2e gate, and the producer node were experimentally
+modified during Phase 3 but ALL EXPERIMENTAL CHANGES WERE REVERTED
+before landing.
+
+### Phase 1 — gate sharpening
+
+**Not applied.** The brief instructed to tighten the
+`count_pixels_with_luminance_below` threshold from `lum<10` to
+something stricter (e.g., `lum<1` or RGB-per-channel<1). Pre-fix
+measurements at the C# spawn pose:
+
+| Threshold | Count at broken state (frame A, 256×256 = 65,536 px) |
+|---|---|
+| `lum<10` (current) | 23,092 (35.24%) |
+| `lum<3` | 23 (0.04%) |
+| `lum<1` | 0 (0.00%) |
+| `R<3 AND G<3 AND B<3` per-channel | 0 (0.00%) |
+
+The brief acknowledged this risk: "If zero, the threshold is too strict
+or the metric is wrong... iterate the threshold/floor until the gate
+correctly fails."
+
+After iterating, NO simple luminance-or-per-channel threshold over the
+full frame or any sub-rect at the C# pose discriminates broken from
+fixed state cleanly. The diagnostic round 2 noted this:
+
+> the brief's success metric (`near-black drops from ~35% to ~0%` at
+> the C# pose) is unachievable by ANY fix.
+
+The legitimate dark interior geometry visible from the C# pose
+(camera at Y=200 inside Oasis, looking +Z) dominates the near-black
+count. The inversion artifacts at THIS pose manifest as small bright
+water/sky-bleed specks scattered through the lower band (not as
+additional near-black pixels); the saved before.png shows ~75 bright
+outliers in y=144..191 at broken state.
+
+Alternative metrics that COULD work (but require either golden-image
+infrastructure or pose-specific reasoning):
+
+1. Bright-outliers-in-dark-band — count `lum > 130` pixels in
+   y=144..191. Pre-fix: 75; correctly-rendered post-fix: ~0. Fragile
+   to camera pose / framebuffer dimensions.
+2. Golden-image hash comparison — capture a known-good post-fix PNG;
+   assert `stability_hash() == golden_hash`. Requires the fix to land
+   first.
+3. GPU readback of `block_voxel_count` cursor — assert it falls within
+   an expected range (e.g., 1M-2M mixed blocks for Oasis). Doesn't
+   prove visual correctness but proves the producer's cursor allocation
+   completed without exhaustion.
+
+**Not implemented in this dispatch** — see "What's NOT yet done" below.
+
+The gate remains at `lum<10` over the full frame with 1% floor, which
+**FAILS** at both pre-fix and post-fix state (= the user's
+broken-state symptom is unchanged from Stage 1.5; the gate metric
+itself does not discriminate). The gate continues to be a tripwire
+for the inversion regression class — it doesn't yet pass because the
+bug isn't fixed AND the metric isn't pose-appropriate.
+
+### Phase 2 — primary fix (hash_map_size bump)
+
+Applied per the round-2 diagnostic's recommended primary fix:
+
+```rust
+// crates/bevy_naadf/src/render/construction/config.rs:155
+initial_hash_map_size: 1 << 20,  // = 1,048,576 slots, 16 MiB
+```
+
+Same change applied to the const-assert pin at `:208`. Verified the
+C# `WorldData.cs:131-132` invocation against
+`BlockHashingHandler.cs:36-46`:
+
+```csharp
+blockHashingHandler = new BlockHashingHandler(this, 0, 0.5f, maxNewVoxelsPerGenSegment / 32);
+//                                                            = 256^3 / 32 = 524,288
+
+// BlockHashingHandler ctor:
+mapSize = Math.Max(1, startSizeMap);                 // = 1
+while (mapSize * wantedEmptyRatio < minReservedCount) {
+    mapSize *= 2;
+}
+// 1 * 0.5 < 524,288 → loops until mapSize = 2^21 = 2,097,152 ≥ 1,048,576.
+// Note: C# settles at 2,097,152 = 2× our Rust port; both exceed the
+// minReservedCount/wantedEmptyRatio bound. The Rust port to 1 << 20 is
+// faithful enough; bumping to 1 << 21 = exact C# value would change
+// nothing visually (proven by 1 << 23 experiment below).
+```
+
+Result at C# spawn pose:
+
+```
+frame-A near-black (lum<10.0) count=23,099 of 65,536 pixels (35.25%)
+```
+
+vs Stage 1.5 baseline: 23,092 (35.24%). Difference = 7 pixels = TAA noise.
+
+**The hash_map_size bump alone did NOT resolve the inversion.** Phase 3
+iteration was triggered.
+
+### Phase 3 — iteration (4 of 5 ceiling used)
+
+**Attempt 1: bump hash_map further to `1 << 23` (8M slots, 128 MiB)**
+
+If the saturation hypothesis were correct, 32× more slots vs C# should
+make it impossible for the hash_map to saturate. Result:
+
+```
+frame-A near-black count=23,105 (35.26%)
+```
+
+Identical to baseline within noise. **Saturation hypothesis REFUTED.**
+Reverted to `1 << 20`.
+
+**Attempt 2: temporarily set `bound_group_queue_max_size = 1` in W5 loop**
+
+Stage 1.5 added this field's correct value (32,768) to the W5 per-segment
+construction-params write. Round-2 H7 noted it's perf-only (chunk_calc
+doesn't read it). Tested by reverting to `1`:
+
+```
+frame-A near-black count=23,099 (35.25%)
+```
+
+No change. Confirmed perf-only. Restored Stage 1.5's value.
+
+**Attempt 3: disable the dedup-hit branch in chunk_calc.wgsl**
+
+Modified `get_voxel_pointer` at
+`crates/bevy_naadf/src/assets/shaders/chunk_calc.wgsl:319-331` to skip
+the data-equality check entirely, forcing every contending thread to
+probe to the next slot. Result:
+
+```
+frame-A near-black count=20,875 (31.85%)  ← 2,217-pixel improvement
+rect mean before luminance=58.0           ← brighter (was 55.4)
+full-frame Δ=10.72                         ← higher (was 9.67)
+```
+
+**Meaningful, reproducible visual change.** The dedup-hit path IS
+contributing to the visible inversion at Oasis scale. With dedup
+disabled, each block claims a fresh slot — eventually exhausting the
+hash_map past 1M unique blocks and returning sentinel-2 (= MORE
+inversion holes at the saturation limit) — but the rendering at the
+C# pose measurably IMPROVES.
+
+This is the strongest signal from this dispatch. It points at the
+**H11 hypothesis** (chunk_calc dedup-hit memory-ordering race) as
+the next thing to investigate. The dedup-hit branch reads
+`voxels[voxel_pointer_cur + i]` non-atomically after spinning on
+`atomicLoad(voxel_pointer)`; in WGSL, this cross-invocation
+non-atomic-after-atomic-observation pattern doesn't have a
+guaranteed happens-before chain (unlike HLSL's
+`InterlockedOr`/`InterlockedExchange` which provide full memory
+barrier semantics on D3D11/12).
+
+Reverted the experimental disable before landing — disabling dedup
+is NOT a production fix (it exhausts the hash_map past 1M blocks).
+The proper fix would be to make `voxels[]` an `array<atomic<u32>>` in
+chunk_calc.wgsl, forcing sequentially-consistent ordering across
+invocations. **Not implemented in this dispatch** — see
+"What's NOT yet done" below.
+
+**Attempt 4: instrumentation log to confirm buffer sizes at runtime**
+
+Added temporary `info!` log at the W5 producer entry. Output:
+
+```
+ROUND-3 DIAG: W5 producer entering loop with
+  gpu.hash_map.size            = 16,777,216  (= 1M slots × 16 B, post-bump)
+  gpu.hash_coefficients.size   = 260          (= 65 × 4 B)
+  gpu.block_voxel_count.size   = 8            (correct)
+  gpu.segment_voxel_buffer.size= 33,554,432   (= 32 MiB, correct)
+  config.initial_hash_map_size = 1,048,576    (post-bump)
+```
+
+Confirms the bumped hash_map IS the size we expect. Bug is NOT a
+mismatched allocation. Instrumentation REMOVED before landing.
+
+### Phase 4 — verification
+
+All gates run with `cargo run --release --bin e2e_render -- <flag>`:
+
+- `cargo build --workspace`: **PASS** — clean compile (~22 s warm tree).
+- `cargo test --workspace --lib`: **PASS** — 198 passed, 1 ignored (baseline).
+- `--baseline`: **PASS** (sky 145.9, solid 242.0, emissive 247.0).
+- `--vox-e2e`: **PASS** (centre rect mean RGB [251, 250, 243], lum 249.6).
+- `--oasis-edit-visual`: **PASS** (rect Δ=9.65 above 8.00 floor).
+- `--validate-gpu-construction`: **PASS** (GPU vs CPU oracle byte-equal
+  388 bytes).
+- `--edit-mode`: **PASS** (1 set_voxel → 1+1+2 records).
+- `--entities`: **PASS** (frame A: 8 chunk_updates, 1 entity_chunk
+  instances, 1 history).
+- `--runtime-edit-mode`: **PASS** (set_voxels_batch produced 1 batch
+  with 2+2+2 records).
+- `--small-edit-visual`: **PASS** (click rect max-Δ=17 above 15 floor;
+  outside-click 1.7% under 15% ceiling).
+- `--small-edit-repro`: **PASS** (no pitch-black pixels in 1920×1080
+  frame).
+- `--vox-gpu-construction`: **FAIL** (expected) — 23,092 near-black
+  pixels at C# pose (35.24% of frame, ceiling 1%). The metric is not
+  pose-appropriate (see Phase 1 above); the underlying bug also persists.
+
+**Zero regressions on pre-GREEN gates.** The only RED gate
+(`--vox-gpu-construction`) was already RED at dispatch start and
+remains RED.
+
+### Final root cause
+
+**The hash_map_size bump (the round-2 primary fix) was insufficient.**
+The actual root cause is most likely **WGSL memory-ordering race in
+the chunk_calc dedup-hit path**: thread A claims a hash slot, writes
+voxels[], atomicStores the cleared voxel_pointer. Thread B spins via
+atomicLoad until non-PENDING, then reads voxels[voxel_pointer_cur + i]
+NON-atomically. In HLSL the InterlockedExchange path provides full
+memory barriers; in WGSL the cross-invocation non-atomic memory
+ordering after an atomic observation is not guaranteed.
+
+Confidence: MEDIUM-HIGH (the disable-dedup experiment is concrete
+evidence the dedup path is contributing).
+
+The recommended fix is to make `voxels[]` an `array<atomic<u32>>` in
+chunk_calc.wgsl and replace the 32 reads in the dedup data-equality
+check with `atomicLoad(&voxels[...])` calls — same code-shape as
+Shape B in `08-diagnostic-inversion-round-3.md`. Not implemented in
+this dispatch.
+
+### Surprises
+
+1. **The hash_map_size bump made ZERO measurable difference.** I had
+   expected at least a small shift in the near-black count if
+   saturation was even partially contributing. The fact that 262k, 1M,
+   and 8M slots all produce the same render proves the hash_map is
+   NEVER saturating in this dispatch's measurements — Oasis is well
+   under 131k unique blocks (the saturation point at 262k slots).
+2. **The disable-dedup experiment improved the count metric.** I
+   expected disabling dedup to either be neutral (if the bug was
+   elsewhere) or to make things much worse (if dedup was working
+   correctly and the bug was post-dedup). The measurable improvement
+   points at dedup CORRECTNESS as the issue — the dedup path is making
+   wrong decisions (spurious is_all_equal=false rejections, or worse,
+   spurious is_all_equal=true acceptances that point at wrong voxel
+   data).
+3. **The C# spawn pose is genuinely a poor diagnostic vantage.**
+   Diagnostic round 2 already identified this; round 3 confirmed via
+   multiple metric attempts that the legitimate dark interior
+   completely swamps the inversion-class artifacts at this view. The
+   user's visual ground-truth (their binary screenshots from the
+   scaled (2000, 800, 160) pose) is a much better discriminator, but
+   the brief explicitly forbade moving the camera.
+
+### What's NOT yet done
+
+1. **The actual fix for the inversion.** The H11 hypothesis fix
+   (make `voxels[]` atomic in chunk_calc.wgsl) was identified by this
+   dispatch's experiments but not implemented. Next dispatch's
+   highest-priority work item.
+2. **Gate metric replacement.** The current `lum<10` metric over the
+   full frame at the C# pose cannot discriminate broken from fixed
+   state. Three replacement candidates are in
+   `08-diagnostic-inversion-round-3.md`; pick one based on the new
+   landed-fix's rendered output.
+3. **Stage 2-real (legacy-path deletion + single-pathway consolidation)
+   remains a separate dispatch** — orthogonal to the inversion fix.
+
+### What's left in place
+
+- `initial_hash_map_size = 1 << 20` (16 MiB hash_map allocation). This
+  is C#-faithful and a no-op for the current rendering but defends
+  against a regression should Oasis ever actually hit 131k+ unique
+  blocks. Memory cost: +12 MiB GPU buffer at startup. No perf impact.
+- All other prior fixes (Stage 1.5's `bound_group_queue_max_size`,
+  pre-allocation gate widening, gate's near-black assertion structure)
+  are preserved.

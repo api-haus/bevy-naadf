@@ -141,8 +141,20 @@ impl Default for ConstructionConfig {
             // CPU-built buffers via `prepare_world_gpu`; flipping the consumer
             // is W2/W3 work. See `15-design-c.md` §1.6 / §2.1 W1 row.
             gpu_construction_enabled: true,
-            // `BlockHashingHandler.cs:32` — 1 << 18 = 262144.
-            initial_hash_map_size: 1 << 18,
+            // vox-gpu-rewrite W5.3-fix Stage 2 (2026-05-18) — sized for the
+            // fixed-world case. `WorldData.cs:131-132` passes
+            // `minReservedCount = maxNewVoxelsPerGenSegment / 32 = 256^3 / 32
+            // = 524,288` into `BlockHashingHandler`, whose doubling loop at
+            // `BlockHashingHandler.cs:38-40` forces `mapSize >= 1,048,576`
+            // (= 2^20) at startup. The pre-Stage-2 `1 << 18 = 262,144` was
+            // the `BlockHashingHandler` DEFAULT-ctor value
+            // (`BlockHashingHandler.cs:32`'s `minReservedCount = 64`
+            // parameter), NOT the per-segment Oasis invocation's value. The
+            // bump alone did NOT fix the rendered inversion (round-3
+            // diagnostic — likely the bug is downstream of the hash map),
+            // but it makes the Rust port faithful to C# for when the actual
+            // bug is fixed.
+            initial_hash_map_size: 1 << 20,
             // `BlockHashingHandler.cs` — `wantedEmptyRatio = 0.5`.
             wanted_empty_ratio: 0.5,
             // `BlockHashingHandler.cs` — `maxProbes = 250`.
@@ -203,8 +215,10 @@ impl From<&crate::AppArgs> for ConstructionConfig {
 // (the new test is `construction_params_layout` in `gpu_types.rs`).
 const _: () = {
     let cfg = ConstructionConfig {
-        // `BlockHashingHandler.cs:32`.
-        initial_hash_map_size: 1 << 18,
+        // vox-gpu-rewrite W5.3-fix Stage 2 — see the runtime default's
+        // long-form rationale above. C# `WorldData.cs:131-132` forces
+        // `mapSize >= 1,048,576` for the fixed-world segment size.
+        initial_hash_map_size: 1 << 20,
         // `BlockHashingHandler.cs` — `wantedEmptyRatio = 0.5`.
         wanted_empty_ratio: 0.5,
         // `BlockHashingHandler.cs` — `maxProbes = 250`.
