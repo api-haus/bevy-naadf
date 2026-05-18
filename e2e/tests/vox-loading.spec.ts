@@ -1,7 +1,23 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
-import { test, expect, type ConsoleMessage } from "@playwright/test";
+import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { test, expect, type ConsoleMessage, type Page } from "@playwright/test";
 import { ConsoleCollector } from "./helpers/console-collector.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Shared tempdir used by the skybox-baseline test to publish its PNG path
+ * to the loaded-phase test. Lives under the OS tmpdir so it survives
+ * across the two test cases inside the same `test.describe.serial` block.
+ */
+const SHARED_TMP_DIR = path.join(
+  os.tmpdir(),
+  `bevy-naadf-vox-parity-${process.pid}`,
+);
 
 /**
  * End-to-end test for the web `.vox` loading pipeline added in
@@ -23,29 +39,169 @@ import { ConsoleCollector } from "./helpers/console-collector.js";
  *  4. No console errors, no Bevy ERROR-level logs, no wasm panics
  *     occurred at any point.
  *
- *  The post-install renderer state is captured to a PNG so on-failure we
- *  can tell "DeviceLost killed everything" (black canvas) apart from
- *  "scene rendered, then something else broke" (visible content).
+ *  ## web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6
  *
- *  The current failure mode tracked by the team is the wgpu buffer-usage
- *  panic in `populate_cpu_mirror_from_gpu_producer` — the
- *  `naadf_block_voxel_count_w2_placeholder` buffer lacks `CopySrc` on the
- *  wgpu WebGPU backend's stricter validation. That surfaces here as a Bevy
- *  ERROR log followed by a wasm panic, both of which the collector picks
- *  up — so this test will fail until the underlying buffer-flags fix
- *  lands. That's the intended signal.
+ *  Additionally captures a **skybox-only baseline** via the `?skybox=1` URL
+ *  param + a **post-install loaded screenshot** and shells out to
+ *  `cargo run --bin e2e_render -- --ssim-compare <skybox> <loaded>
+ *  --ssim-max 0.85` to assert the two are **dissimilar** (SSIM < 0.85). The
+ *  Rust binary's SSIM impl is shared with the native `--vox-web-parity`
+ *  gate (per Decision 4: zero metric drift between web + native).
  */
-test.describe("Web .vox loading", () => {
-  test("startup-fetches and installs the default .vox without errors", async ({
-    page,
+
+const REPO_ROOT = path.resolve(__dirname, "..", "..");
+const SSIM_DISSIMILARITY_MAX = 0.85;
+const CANVAS_SETTLE_MS = 10_000;
+const SKYBOX_SETTLE_MS = 5_000;
+
+/**
+ * Capture a screenshot of the wasm canvas after the loading overlay clears
+ * and the scene has settled for `settleMs` milliseconds. Returns the PNG
+ * bytes plus the test-run-local path it was written to.
+ */
+async function captureSettledCanvas(
+  page: Page,
+  filename: string,
+  settleMs: number,
+  outDir?: string,
+): Promise<{ bytes: Buffer; outPath: string }> {
+  // Wait for `#loading.hidden` to be attached so we don't capture the
+  // overlay covering the canvas. Generous timeout — the wasm boot streams
+  // ~50 MB on first load.
+  const loadingHidden = page.locator("#loading.hidden");
+  await expect(loadingHidden).toBeAttached({ timeout: 90_000 });
+  // Make sure the canvas is in the DOM and laid out.
+  const canvas = page.locator("canvas#bevy");
+  await expect(canvas).toBeVisible({ timeout: 10_000 });
+  // Let the renderer draw enough frames to settle (TAA convergence, GI
+  // accumulation, the W5 GPU producer chain dispatch + the Q3 cross-frame
+  // CPU mirror readback all complete inside this window).
+  await page.waitForTimeout(settleMs);
+  // Screenshot, attach, write to disk for the SSIM compare step.
+  const bytes = await canvas.screenshot();
+  await test.info().attach(filename, { body: bytes, contentType: "image/png" });
+  const targetDir = outDir ?? test.info().outputDir;
+  await fs.mkdir(targetDir, { recursive: true });
+  const outPath = path.join(targetDir, filename);
+  await fs.writeFile(outPath, bytes);
+  return { bytes, outPath };
+}
+
+/**
+ * Shell out to `cargo run --bin e2e_render -- --ssim-compare <a> <b>
+ * --ssim-max <max>`. Returns the exit code and captured stdout/stderr.
+ *
+ * Exit-code semantics (per `crates/bevy_naadf/src/e2e/ssim.rs`):
+ *   - `0` — gate passed.
+ *   - `1` — gate failed (SSIM >= --ssim-max).
+ *   - `2` — internal error (file not found, decode error, dimension
+ *     mismatch).
+ */
+async function runSsimCompare(
+  a: string,
+  b: string,
+  max: number,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(
+      "cargo",
+      [
+        "run",
+        "--bin",
+        "e2e_render",
+        "--",
+        "--ssim-compare",
+        a,
+        b,
+        "--ssim-max",
+        String(max),
+      ],
+      {
+        cwd: REPO_ROOT,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    proc.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    proc.on("error", reject);
+    proc.on("close", (code: number | null) => {
+      resolve({ code: code ?? -1, stdout, stderr });
+    });
+  });
+}
+
+test.describe.serial("Web .vox loading", () => {
+  // Skybox-baseline PNG is captured in a dedicated test (separate browser
+  // context so the wasm workers from the loaded-phase don't conflict). The
+  // path is published into a process-global variable that the loaded-phase
+  // test reads + the SSIM-compare step uses.
+  let skyboxBaselinePath: string | undefined;
+
+  // Use a fresh browser context per test to avoid wasm-worker / SAB state
+  // leakage between the skybox and loaded phases (each navigation involves
+  // a wasm-bindgen-rayon worker pool spawn; re-using the same context
+  // races the worker teardown against the next navigation's worker
+  // setup and Chrome reports "Failed to fetch dynamically imported module").
+  test.use({ contextOptions: {} });
+
+  test("captures skybox baseline via ?skybox=1", async ({ browser }) => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const collector = new ConsoleCollector();
+    collector.attach(page);
+
+    // Boot the page with `?skybox=1`. The wasm bootstrap reads the param
+    // via `voxel::web_vox::resolve_skybox_only_param`, inserts a
+    // `WebSkyboxOverride` resource, and `setup_test_grid` installs an
+    // empty world (renderer produces a pure-sky frame).
+    await page.goto("/?skybox=1", { waitUntil: "commit" });
+    const skybox = await captureSettledCanvas(
+      page,
+      "canvas-skybox-baseline.png",
+      SKYBOX_SETTLE_MS,
+      SHARED_TMP_DIR,
+    );
+    skyboxBaselinePath = skybox.outPath;
+
+    // The skybox phase shouldn't produce console errors / panics; any
+    // that do are real and should fail this test (independently of the
+    // loaded-phase below).
+    for (const err of collector.errors) {
+      test.info().annotations.push({
+        type: err.type,
+        description: err.text,
+      });
+    }
+    expect(
+      collector.hasPanic,
+      `WASM panic during skybox baseline capture: ${collector.firstPanic}`,
+    ).toBe(false);
+    await context.close();
+  });
+
+  test("startup-fetches and installs the default .vox without errors, then SSIM-asserts dissimilar from skybox baseline", async ({
+    browser,
   }) => {
+    expect(
+      skyboxBaselinePath,
+      "skybox baseline test must have run first (use test.describe.serial)",
+    ).toBeDefined();
+
+    const context = await browser.newContext();
+    const page = await context.newPage();
     const collector = new ConsoleCollector();
     collector.attach(page);
 
     // Watch for the install-complete log line emitted by
-    // `install_vox_bytes_in_fixed_world`. The tracing-wasm bridge emits it
-    // as `console.log` with `%cINFO%c` CSS markers; the literal message
-    // text is still present.
+    // `install_imported_vox` ("NAADF .vox loaded from …"). The tracing-wasm
+    // bridge emits it as `console.log` with `%cINFO%c` CSS markers; the
+    // literal message text is present.
     let voxInstallSeen = false;
     page.on("console", (msg: ConsoleMessage) => {
       if (msg.text().includes("NAADF .vox loaded from")) {
@@ -53,53 +209,27 @@ test.describe("Web .vox loading", () => {
       }
     });
 
-    // Use the `?vox=<url>` query-string override (parsed by
-    // `voxel::web_vox::resolve_startup_vox_url`) to point at a same-origin
+    // `?vox=<url>` override (parsed by
+    // `voxel::web_vox::resolve_startup_vox_url`) — point at a same-origin
     // copy of the Oasis fixture served by `serve.mjs` under
     // `/test-fixtures/`. The default URL targets the live R2 bucket which
-    // may or may not have the right key uploaded — the test should not
-    // depend on the live deploy.
-    //
-    // `waitUntil: "commit"` so we don't wait for the full WASM init
-    // (Trunk's loader awaits `init()` which blocks the `load` event).
+    // may not have the right key uploaded.
     await page.goto("/?vox=/test-fixtures/oasis_hard_cover.vox", {
       waitUntil: "commit",
     });
 
-    // Phase 1: WASM init complete. The loader hides `#loading` once
-    // `TrunkApplicationStarted` fires; then `web_vox` re-shows it with
-    // "Downloading default model…". So we check for the *first*
-    // hidden→shown transition is racy; instead we just wait for the
-    // initial boot to finish (i.e. for `#loading.hidden` to ever become
-    // attached at all).
+    // Phase 2a — wasm init complete.
     const loadingHidden = page.locator("#loading.hidden");
     await expect(loadingHidden).toBeAttached({ timeout: 90_000 });
 
-    // Phase 2: The canvas must be visible — proves the renderer is alive
-    // and `setup_test_grid` installed the default embedded scene before
-    // the .vox fetch even starts. If this fails, boot itself is broken
-    // and the smoke test catches it; we re-check here so the failure
-    // message is local to .vox loading.
+    // Phase 2b — canvas visible.
     const canvas = page.locator("canvas#bevy");
     await expect(canvas).toBeVisible({ timeout: 10_000 });
 
-    // Phase 3: Wait for one of three terminal conditions:
+    // Phase 2c — wait for one of three terminal conditions:
     //   (a) the install-complete INFO log fires (happy path),
     //   (b) a wasm panic fires,
-    //   (c) any console.error / Bevy ERROR / pageerror lands —
-    //       including `DeviceLost`, which the headless WebGPU stack throws
-    //       when the wasm main thread blocks too long during the sync
-    //       parse and the browser's watchdog gives up on the device.
-    //
-    // Polling for (c) too means we bail out fast when something has clearly
-    // gone wrong rather than burning the full 120 s budget on a generic
-    // "expect didn't become truthy" timeout — and the final assertions
-    // then surface the exact error text from `collector.errors`.
-    //
-    // Total budget is generous because the default .vox is ~85 MB (network)
-    // + several seconds of synchronous parse on the wasm main thread (the
-    // followup is to move that off-thread via `wasm-bindgen-rayon`; for now
-    // we just give it room).
+    //   (c) any console.error / Bevy ERROR / pageerror lands.
     await expect
       .poll(
         () =>
@@ -115,46 +245,15 @@ test.describe("Web .vox loading", () => {
       )
       .toBeTruthy();
 
-    if (collector.hasPanic) {
-      // Fall through to the screenshot block below so the on-failure
-      // image is still attached, then throw at the assertions stage with
-      // a more useful message than `expect.poll` produces on its own.
-      // We don't `test.fail()` here — that's for marking expected
-      // failures; this is a real failure we want surfaced.
-    }
+    // Phase 2d — let TAA/GI/Q3 readback settle, then capture.
+    const loaded = await captureSettledCanvas(
+      page,
+      "canvas-after-vox-install.png",
+      CANVAS_SETTLE_MS,
+      SHARED_TMP_DIR,
+    );
 
-    // Phase 4: Give the renderer time to actually draw the post-install
-    // frames. The two-stage deferred-parse dance in `apply_pending_vox`
-    // means the install runs on frame N+1 after the bytes arrive; the GPU
-    // producer chain then has to dispatch its compute passes (W5) and the
-    // CPU-mirror readback has to round-trip. A 10 s wait covers all of
-    // that even on slow GPUs.
-    await page.waitForTimeout(10_000);
-
-    // Phase 5: Snapshot the canvas. Attached to the Playwright HTML
-    // report AND written to the test-results dir so it's accessible
-    // without opening the report. We do this regardless of pass/fail so a
-    // black canvas on failure can be told apart from "scene rendered,
-    // then something downstream broke".
-    try {
-      const png = await canvas.screenshot();
-      await test.info().attach("canvas-after-vox-install", {
-        body: png,
-        contentType: "image/png",
-      });
-      await fs.writeFile(
-        path.join(test.info().outputDir, "canvas-after-vox-install.png"),
-        png,
-      );
-    } catch (err) {
-      test.info().annotations.push({
-        type: "screenshot-failed",
-        description: String(err),
-      });
-    }
-
-    // Phase 6: Report all collected errors as annotations so the HTML
-    // report shows them inline against this test.
+    // === Phase 3 — Report errors as annotations ============================
     for (const err of collector.errors) {
       test.info().annotations.push({
         type: err.type,
@@ -162,7 +261,7 @@ test.describe("Web .vox loading", () => {
       });
     }
 
-    // Final assertions.
+    // === Phase 4 — Error / panic / install-seen assertions =================
     expect(
       collector.hasPanic,
       `WASM panic during .vox lifecycle: ${collector.firstPanic}`,
@@ -181,5 +280,32 @@ test.describe("Web .vox loading", () => {
       "Expected to see the install-complete INFO log " +
         '("NAADF .vox loaded from …") within the timeout',
     ).toBe(true);
+
+    // === Phase 5 — SSIM-compare skybox vs loaded ===========================
+    //
+    // Shell out to `cargo run --bin e2e_render -- --ssim-compare` for
+    // metric-parity with the native `--vox-web-parity` gate (Decision 4).
+    // Asserts SSIM < `SSIM_DISSIMILARITY_MAX` — a silent failure mode
+    // (e.g. install path no-ops, renders sky) would land at SSIM ≈ 1.0
+    // and fail; a healthy install lands far below the threshold.
+    const ssim = await runSsimCompare(
+      skyboxBaselinePath!,
+      loaded.outPath,
+      SSIM_DISSIMILARITY_MAX,
+    );
+    test.info().annotations.push({
+      type: "ssim-compare-stdout",
+      description: ssim.stdout,
+    });
+    test.info().annotations.push({
+      type: "ssim-compare-stderr",
+      description: ssim.stderr,
+    });
+
+    expect(
+      ssim.code,
+      `--ssim-compare exited non-zero (${ssim.code}) — stdout:\n${ssim.stdout}\nstderr:\n${ssim.stderr}`,
+    ).toBe(0);
+    await context.close();
   });
 });

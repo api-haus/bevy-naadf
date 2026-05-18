@@ -402,6 +402,8 @@ dependencies = [
  "ron",
  "serde",
  "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-rayon",

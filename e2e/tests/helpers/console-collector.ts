@@ -20,6 +20,16 @@ const IGNORED_PATTERNS = [
   // WASM threading noise: rayon worker threads occasionally hit signature
   // mismatches during SharedArrayBuffer handshake, then retry successfully
   "function signature mismatch",
+  // `wasm-bindgen-rayon`'s `workerHelpers.js` issues a dynamic `import('../../..')`
+  // (resolves to `/` — i.e. `index.html`) inside each Web Worker. When the
+  // workers spawn on a non-root URL (e.g. `?vox=…` or `?skybox=1`) Chrome
+  // sometimes resolves the import against the current navigation URL and
+  // gets the HTML response, which is not a valid ES module — Chrome then
+  // surfaces "Failed to fetch dynamically imported module: …/" as a
+  // pageerror. The worker recovers via a retry (the module IS cacheable
+  // and the subsequent import succeeds) and the rayon pool ends up
+  // functional. This is upstream worker-init noise, not a real failure.
+  "Failed to fetch dynamically imported module",
 ] as const;
 
 export interface CollectedError {

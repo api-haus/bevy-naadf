@@ -29,9 +29,12 @@ pub mod oasis_edit_visual;
 pub mod readback;
 pub mod small_edit_repro;
 pub mod small_edit_visual;
+pub mod ssim;
+pub mod tracing_error_counter;
 pub mod vox_e2e;
 pub mod vox_gpu_construction;
 pub mod vox_gpu_oracle;
+pub mod vox_web_parity;
 
 use bevy::camera::Hdr;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -226,6 +229,8 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<small_edit_visual::SmallEditVisualState>()
         .init_resource::<small_edit_repro::SmallEditReproState>()
         .init_resource::<vox_gpu_oracle::VoxGpuOracleState>()
+        .init_resource::<vox_web_parity::VoxWebParityState>()
+        .init_resource::<tracing_error_counter::TracingErrorCounter>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
         // camera `Transform` + `PositionSplit` during the `MOTION` / `SETTLE`
@@ -258,6 +263,12 @@ pub fn add_e2e_systems(app: &mut App) {
                 // the birdseye write the Oasis pin emits when oasis-mode
                 // fast-path triggers).
                 vox_gpu_oracle::pin_vox_gpu_oracle_camera
+                    .after(oasis_edit_visual::pin_oasis_camera),
+                // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 —
+                // parity gate camera pin. Runs `.after(pin_oasis_camera)`
+                // for the same override reason `pin_vox_gpu_oracle_camera`
+                // does.
+                vox_web_parity::pin_vox_web_parity_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
                 .before(crate::camera::sync_position_split),

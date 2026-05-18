@@ -101,7 +101,24 @@ pub const DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS: [u32; 3] = GRID_SIZE_IN_CHUNKS;
 /// Production callers never set `vox_gpu_oracle_cpu_phase`; the binary's
 /// `--vox` path always routes here with the flag `false` and therefore
 /// always invokes [`install_vox_in_fixed_world`].
-pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
+pub fn setup_test_grid(
+    mut commands: Commands,
+    args: Res<AppArgs>,
+    skybox_override: Option<Res<WebSkyboxOverride>>,
+) {
+    // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — the wasm
+    // bootstrap inserts `WebSkyboxOverride` when the URL contains
+    // `?skybox=1`. When present we install the empty world regardless of
+    // what `grid_preset` says — the wasm side has no CLI flags so this is
+    // the only mechanism for selecting the skybox-only preset on web.
+    if skybox_override.is_some() {
+        info!(
+            "voxel/grid: WebSkyboxOverride present — installing empty world \
+             (?skybox=1 URL param)"
+        );
+        install_empty_world(&mut commands);
+        return;
+    }
     match &args.grid_preset {
         GridPreset::Default => {
             install_default_embedded_in_fixed_world(&mut commands);
@@ -119,7 +136,74 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                 install_vox_in_fixed_world(&mut commands, path);
             }
         }
+        GridPreset::Empty => {
+            install_empty_world(&mut commands);
+        }
     }
+}
+
+/// Marker resource inserted by the wasm bootstrap (or any other caller) to
+/// force [`setup_test_grid`] to install an empty world regardless of
+/// `AppArgs.grid_preset`. Used by the `?skybox=1` URL query parameter (Q6).
+#[derive(Resource, Default)]
+pub struct WebSkyboxOverride;
+
+/// Install an EMPTY [`WorldData`] at the fixed world size. The renderer
+/// reads empty `WorldGpu` buffers and produces a pure-sky frame — useful as
+/// the SSIM-baseline for the `--vox-web-parity` gate.
+///
+/// No [`crate::aadf::generator::ModelData`] resource is inserted so the
+/// `populate_cpu_mirror_from_gpu_producer` gate at
+/// `render/construction/mod.rs:~941-948` short-circuits (legacy path), and
+/// the W5 GPU producer chain doesn't run (`want_gpu_producer = false` at
+/// `mod.rs:~1184-1186` because `model_data` is `None` AND
+/// `dense_voxel_types` is empty).
+///
+/// `voxel_types` is a single transparent slot (palette index 0) — the
+/// renderer needs at least one entry to bind the storage buffer.
+pub fn install_empty_world(commands: &mut Commands) {
+    let palette = build_palette();
+    info!(
+        "voxel/grid: install_empty_world — empty WorldData at fixed world \
+         size {}×{}×{} chunks ({}×{}×{} voxels); GPU producer chain disabled \
+         (no ModelData, empty dense_voxel_types); rendered frame is pure sky.",
+        WORLD_SIZE_IN_CHUNKS.x,
+        WORLD_SIZE_IN_CHUNKS.y,
+        WORLD_SIZE_IN_CHUNKS.z,
+        WORLD_SIZE_IN_VOXELS.x,
+        WORLD_SIZE_IN_VOXELS.y,
+        WORLD_SIZE_IN_VOXELS.z,
+    );
+
+    // Camera pose: same as the embedded-default scene so the camera is
+    // pointed at a reasonable view of the world (the framed pixels will be
+    // pure sky anyway, but at least the camera isn't staring at
+    // (0, 0, 0) — which is technically empty void inside the world).
+    let cam_pos = Vec3::new(11.0, 7.0, 17.0);
+    let cam_look = Vec3::new(0.0, 4.0, -3.0);
+    commands.insert_resource(crate::camera::InitialCameraPose(
+        Transform::from_translation(cam_pos).looking_at(cam_look, Vec3::Y),
+    ));
+
+    let world_data = WorldData {
+        chunks_cpu: Vec::new(),
+        blocks_cpu: Vec::new(),
+        voxels_cpu: Vec::new(),
+        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
+        bounding_box: IAabb3 {
+            min: IVec3::ZERO,
+            max: IVec3::new(
+                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
+            ),
+        },
+        pending_edits: Default::default(),
+        dense_voxel_types: Vec::new(),
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+    };
+    commands.insert_resource(world_data);
+    commands.insert_resource(VoxelTypes { types: palette });
 }
 
 /// C#-faithful default — build the same primitive scene the small-world path

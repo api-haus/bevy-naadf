@@ -225,6 +225,24 @@ pub enum E2ePhase {
     /// disk (`oracle_cpu.png` for the CPU phase, `oracle_gpu.png` for the GPU
     /// phase), then write `AppExit::Success`.
     VoxGpuOracleDrain,
+    // --- vox-web-parity phases (web-vox-async-loading 2026-05-18 follow-up
+    // Step 8 / Q5 — new native gate) ---------------------------------------
+    //
+    // Selected when `AppArgs.vox_web_parity_skybox_phase == true` OR
+    // `AppArgs.vox_web_parity_loaded_phase == true`. Same single-screenshot
+    // fast-path shape as `--vox-gpu-oracle`: warmup → shoot → drain → save
+    // → exit. Filename depends on which sub-phase flag is set
+    // (`vox_web_parity_skybox.png` vs `vox_web_parity_loaded.png`). The
+    // out-of-process SSIM compare lives in
+    // `vox_web_parity::run_vox_web_parity_compare`.
+    /// Warmup at the parity pose — TAA + GI convergence.
+    VoxWebParityWarmup,
+    /// Spawn `Screenshot::primary_window()`.
+    VoxWebParityShoot,
+    /// Drain the async capture, decode to [`Framebuffer`], save PNG, write
+    /// `AppExit::Success`. If `vox_web_parity_loaded_phase` is true and the
+    /// `TRACING_ERROR_COUNT` is non-zero post-warmup, the gate fails.
+    VoxWebParityDrain,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -440,6 +458,7 @@ pub fn e2e_driver(
     mut small_edit: ResMut<super::small_edit_visual::SmallEditVisualState>,
     mut small_edit_repro: ResMut<super::small_edit_repro::SmallEditReproState>,
     mut vox_gpu_oracle: ResMut<super::vox_gpu_oracle::VoxGpuOracleState>,
+    mut vox_web_parity: ResMut<super::vox_web_parity::VoxWebParityState>,
     world_data: Option<ResMut<crate::world::data::WorldData>>,
     diagnostics: Res<DiagnosticsStore>,
     pipeline_scan: Res<PipelineScanResult>,
@@ -532,6 +551,27 @@ pub fn e2e_driver(
     if vox_gpu_oracle_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::VoxGpuOracleWarmup;
         state.phase_ticks = 0;
+    }
+
+    // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — vox-web-parity
+    // fast-path. Routes into VoxWebParityWarmup on tick 0 when either parity
+    // sub-phase flag is set. Camera pose is owned by
+    // `super::vox_web_parity::pin_vox_web_parity_camera`.
+    let vox_web_parity_mode = app_args.as_deref().is_some_and(|a| {
+        a.vox_web_parity_skybox_phase || a.vox_web_parity_loaded_phase
+    });
+    if vox_web_parity_mode
+        && state.phase == E2ePhase::Warmup
+        && state.phase_ticks == 0
+    {
+        state.phase = E2ePhase::VoxWebParityWarmup;
+        state.phase_ticks = 0;
+        // Reset the tracing-error counter at the start of each parity run
+        // so it doesn't inherit events from prior in-process activity
+        // (only relevant if the harness ever ran multiple apps in one
+        // process — the e2e binary does NOT, but the reset is cheap +
+        // safe).
+        super::tracing_error_counter::reset_tracing_error_count();
     }
 
     match state.phase {
@@ -1523,6 +1563,100 @@ pub fn e2e_driver(
                 let err = format!(
                     "vox-gpu-oracle: capture never delivered within {} drain frames",
                     super::vox_gpu_oracle::ORACLE_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
+        }
+        // ---- vox-web-parity phases (Step 8 / Q5 — single-screenshot save)
+        //      ----
+        E2ePhase::VoxWebParityWarmup => {
+            let _ = &mut camera;
+            state.phase_ticks += 1;
+            if state.phase_ticks >= super::vox_web_parity::PARITY_WARMUP_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::VoxWebParityShoot;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::VoxWebParityShoot => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::VoxWebParityDrain;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::VoxWebParityDrain => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        let is_skybox = app_args
+                            .as_deref()
+                            .is_some_and(|a| a.vox_web_parity_skybox_phase);
+                        let is_loaded = app_args
+                            .as_deref()
+                            .is_some_and(|a| a.vox_web_parity_loaded_phase);
+                        let filename = if is_skybox {
+                            super::vox_web_parity::PARITY_SKYBOX_PNG
+                        } else if is_loaded {
+                            super::vox_web_parity::PARITY_LOADED_PNG
+                        } else {
+                            super::vox_web_parity::PARITY_SKYBOX_PNG
+                        };
+                        println!(
+                            "e2e_render --vox-web-parity: capture {}x{}; saving \
+                             to {}",
+                            fb.width(),
+                            fb.height(),
+                            filename
+                        );
+                        super::vox_web_parity::save_parity_screenshot(&fb, filename);
+
+                        // Loaded-phase only: assert zero tracing errors fired
+                        // during the warmup + capture. If non-zero, exit
+                        // with error so the top-level compare phase catches
+                        // it via the subprocess's non-zero exit code.
+                        if is_loaded {
+                            let count =
+                                super::tracing_error_counter::tracing_error_count();
+                            if count > 0 {
+                                let err = format!(
+                                    "vox-web-parity-loaded: {count} \
+                                     `tracing::error!` events fired during \
+                                     the run — the gate asserts zero. \
+                                     Investigate the console output for \
+                                     ERROR-level lines."
+                                );
+                                eprintln!("e2e_render: FAIL — {err}");
+                                outcome.gate_result = Some(Err(err));
+                                exit.write(AppExit::error());
+                                state.phase = E2ePhase::Done;
+                                return;
+                            }
+                        }
+
+                        vox_web_parity.captured = Some(fb);
+                        vox_web_parity.saved = true;
+                        outcome.gate_result = Some(Ok(()));
+                        exit.write(AppExit::Success);
+                        state.phase = E2ePhase::Done;
+                    }
+                    Err(msg) => {
+                        let err =
+                            format!("vox-web-parity: capture decode failed: {msg}");
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::vox_web_parity::PARITY_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "vox-web-parity: capture never delivered within {} drain frames",
+                    super::vox_web_parity::PARITY_DRAIN_FRAMES,
                 );
                 eprintln!("e2e_render: FAIL — {err}");
                 outcome.gate_result = Some(Err(err));

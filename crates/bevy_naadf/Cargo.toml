@@ -70,6 +70,13 @@ image = { version = "=0.25.10", default-features = false, features = [
 # (sky-bleed, voxel-type corruption, palette OOB) that would drop SSIM far
 # below 1.0. Pure-Rust dep, no native compile.
 image-compare = "0.5"
+# tracing / tracing-subscriber — direct deps so the e2e
+# `tracing_error_counter` module can implement a `Layer<Registry>` via the
+# Bevy 0.19 `LogPlugin::custom_layer` hook (web-vox-async-loading Step 8 /
+# Q5). Both are already transitive via Bevy; pinning to compatible majors so
+# the trait impl resolves against the same `Layer` type Bevy uses.
+tracing = "0.1"
+tracing-subscriber = "0.3"
 # ron = the `*.texarray.ron` texture-array definition format
 # (`src/texture_array/def.rs`). Bevy already pulls `ron` transitively at this
 # minor version.

@@ -166,6 +166,21 @@ fn resolve_startup_vox_url() -> String {
     DEFAULT_VOX_URL.to_string()
 }
 
+/// web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — detect the
+/// `?skybox=1` URL query parameter. When present, the wasm bootstrap skips
+/// the HTTP fetch + installs an empty world (skybox-only baseline for the
+/// Playwright SSIM compare).
+///
+/// Checks both `skybox=1` and `?skybox=1` after the leading `?`. The
+/// architect's design (`03-architecture.md` § Q6 "Skybox-baseline-on-web
+/// mechanism") locks this as the smallest possible URL surface.
+pub fn resolve_skybox_only_param() -> bool {
+    let Some(window) = web_sys::window() else { return false; };
+    let search = window.location().search().unwrap_or_default();
+    let Some(stripped) = search.strip_prefix('?') else { return false; };
+    stripped.split('&').any(|p| p == "skybox=1")
+}
+
 async fn fetch_vox_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
     let resp_value =
@@ -260,11 +275,28 @@ fn install_dnd_listeners() -> Result<(), JsValue> {
 /// listeners, and kick off the background fetch of the default `.vox`. The
 /// resolved bytes land in [`PENDING_VOX_BYTES`] and are picked up by
 /// [`apply_pending_vox`] on the next `Update`.
-pub fn startup_fetch_default_vox() {
+///
+/// **`?skybox=1` short-circuit** (Q6): if the URL contains `skybox=1`, the
+/// HTTP fetch is skipped and the DOM overlay is hidden immediately. The
+/// `setup_test_grid` system (which runs in the same `Startup` schedule)
+/// sees the `WebSkyboxOverride` resource inserted below and installs the
+/// empty world. Used by the Playwright SSIM-baseline capture.
+pub fn startup_fetch_default_vox(mut commands: Commands) {
     install_panic_hook();
     if let Err(e) = install_dnd_listeners() {
         error!("web_vox: failed to attach drag-drop listeners: {:?}", e);
     }
+
+    if resolve_skybox_only_param() {
+        info!(
+            "web_vox: ?skybox=1 detected — skipping HTTP fetch + DND-installed \
+             default; setup_test_grid will install the empty skybox-only world"
+        );
+        commands.insert_resource(crate::voxel::grid::WebSkyboxOverride);
+        hide_loading_overlay();
+        return;
+    }
+
     let url = resolve_startup_vox_url();
     info!("web_vox: kicking off startup fetch — {url}");
     show_loading_overlay("Downloading default model…");
