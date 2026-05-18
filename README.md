@@ -8,8 +8,7 @@ The port is essentially complete — the NAADF substrate (three-layer chunk/bloc
 cell hierarchy + AADF empty-space distance fields, CPU + GPU construction), the
 DDA-with-AADF traversal, the full GI pipeline (atmosphere precompute, ReSTIR GI, sparse
 bilateral denoiser, long-term TAA), and real-time GPU editing all land in the current
-build. NVIDIA DLSS Ray Reconstruction plumbing is in place but currently dormant — see
-the roadmap for the open noise-reduction integration work.
+build.
 
 ## What it does
 
@@ -22,39 +21,8 @@ blit that tonemaps it to the screen. Fly through it with the free camera.
 
 ## Requirements
 
-- **NVIDIA RTX GPU** with Vulkan ray tracing (RTX 20-series or newer). DLSS Ray
-  Reconstruction is NVIDIA-only. Developed against an RTX 5080, driver 595.71.05.
-- **Linux** with a recent NVIDIA driver and the Vulkan loader. DLSS + Solari are
-  **Vulkan-only** — no DX12/Metal/GL fallback.
 - **Rust** stable (developed with 1.93).
-- System packages: `vulkan-headers`, `vulkan-icd-loader`, `clang`, `shaderc`
-  (Arch/CachyOS package names; `clang` is needed by `dlss_wgpu`'s `bindgen` build step).
-
-## One-time setup: the DLSS SDK
-
-Bevy's `dlss` feature pulls in the [`dlss_wgpu`](https://github.com/bevyengine/dlss_wgpu)
-crate, whose build script needs the NVIDIA DLSS SDK. Clone **v310.5.3** somewhere on your
-machine — `git-lfs` must be installed so the `.so` binaries download (not just LFS pointers):
-
-```sh
-git clone --branch v310.5.3 --depth 1 https://github.com/NVIDIA/DLSS.git <path>
-```
-
-The SDK is covered by NVIDIA's own license (`LICENSE.txt` in that repo) and is **not**
-vendored into this repository — clone it yourself.
-
-Then point the build at it via environment variables. Machine-specific paths are kept out
-of committed config — copy the template to a gitignored `.envrc` and fill in your paths:
-
-```sh
-cp .envrc.example .envrc
-$EDITOR .envrc        # set DLSS_SDK and VULKAN_SDK
-direnv allow          # direnv loads .envrc automatically; otherwise source it yourself
-```
-
-`DLSS_SDK` is read both at build time (by `dlss_wgpu`'s build script) and at runtime (NGX
-uses it to locate the DLSS feature libraries), so make sure it is exported in whatever
-shell you run `cargo` from.
+- A GPU + driver wgpu can drive (Vulkan / Metal / DX12 native; WebGPU in the browser).
 
 ## Build & run
 
@@ -62,8 +30,7 @@ shell you run `cargo` from.
 cargo run -p bevy-naadf --release   # or: just run
 ```
 
-The first build compiles all of Bevy and `dlss_wgpu`, so it takes a while. A successful
-build confirms the `dlss_wgpu` build script found `DLSS_SDK`, `VULKAN_SDK`, and `clang`.
+The first build compiles all of Bevy, so it takes a while.
 
 ### Texture-array assets
 
@@ -93,8 +60,8 @@ Source textures referenced by a `*.texarray.ron` need a `Load`-action `.png.meta
 ### Web build (WebGPU, wasm32)
 
 `just web` builds the `bevy-naadf` binary for `wasm32-unknown-unknown` with
-`--no-default-features --features webgpu` (the `dlss` feature has no web build), serves it
-with [Trunk](https://trunkrs.dev/), and opens it in Chrome. `just web-build-release`
+`--no-default-features --features webgpu`, serves it with [Trunk](https://trunkrs.dev/),
+and opens it in Chrome. `just web-build-release`
 produces the optimised `crates/bevy_naadf/dist/` bundle without serving. The Playwright
 smoke test under `e2e/` (`just install-e2e` then `just test-wasm-full`) loads that bundle
 headless and asserts it boots without panics. `.github/workflows/deploy-cloudflare.yml`
@@ -110,22 +77,14 @@ the cross-origin-isolated page needs).
 | `E` `Q`                | Fly up / down                                       |
 | `Shift`                | Move faster                                         |
 | Mouse                  | Look around                                         |
-| `D`                    | Toggle DLSS Ray Reconstruction on/off (currently dormant — see roadmap) |
 
-The on-screen overlay shows FPS, the active renderer, DLSS-RR state, and per-pass NAADF
-render-node GPU timings (`first-hit`, `final-blit`).
+The on-screen overlay shows FPS, the active renderer, and per-pass NAADF render-node
+GPU timings (`first-hit`, `final-blit`).
 
 ## Known caveats
 
-- **Expect Vulkan validation errors.** They originate from a bug in the DLSS SDK itself
-  (documented in the `dlss_wgpu` README) and are safe to ignore.
 - **Solari is experimental.** Some artifacts are expected — e.g. shimmer at world-cache LOD
   transitions, imperfect denoising on curved mirrors.
-- **`DLSS is not supported on this system`** in the log means NGX could not find the DLSS
-  feature libraries — almost always because `DLSS_SDK` was not set in the environment the
-  binary actually ran in. `DLSS_SDK` is read at *runtime*, not just at build time, so run
-  via `cargo run` from a shell where `.envrc` is loaded (or otherwise export `DLSS_SDK`).
-  `LD_LIBRARY_PATH` does not help here — NGX uses its own search path, seeded from `DLSS_SDK`.
 
 ## Project layout
 
@@ -138,9 +97,9 @@ later without another restructure.
 
 | Path                              | Responsibility                                                          |
 | --------------------------------- | ----------------------------------------------------------------------- |
-| `crates/bevy_naadf/src/main.rs`   | App wiring: plugins, `DlssProjectId`, CLI args, system scheduling        |
+| `crates/bevy_naadf/src/main.rs`   | App wiring: plugins, CLI args, system scheduling                         |
 | `crates/bevy_naadf/src/camera/`   | Free-fly camera spawn + the int+frac `PositionSplit` camera-relative type |
-| `crates/bevy_naadf/src/voxel/`    | Voxel-type / material system + the hard-coded Phase-A test-grid builder  |
+| `crates/bevy_naadf/src/voxel/`    | Voxel-type / material system + the hard-coded test-grid builder           |
 | `crates/bevy_naadf/src/aadf/`     | The chunk/block/voxel cell encode/decode, CPU AADF construction + bounds |
 | `crates/bevy_naadf/src/world/`    | `WorldData` / `VoxelTypes` resources + the `GrowableBuffer` GPU wrapper  |
 | `crates/bevy_naadf/src/render/`   | Render-world extract/prepare, GPU types, pipelines, the render-graph nodes |
@@ -155,7 +114,6 @@ later without another restructure.
 | `workers/r2-proxy/`               | Cloudflare Worker — serves the R2-hosted wasm with CORS / CORP headers  |
 | `scripts/`                        | `patch-wasm-loading.sh` (CI R2 loader injection) + `lint/wasm-compat.sh` |
 | `.github/workflows/`              | `deploy-cloudflare.yml` — builds both crates + deploys to Pages         |
-| `.envrc.example`                  | Template for the gitignored `.envrc` (`DLSS_SDK`, `VULKAN_SDK`)          |
 | `.cargo/config.toml`              | `mold` linker config — no machine-specific paths                        |
 
 ## Roadmap
@@ -163,8 +121,8 @@ later without another restructure.
 The NAADF port is essentially complete — the substrate, GI pipeline, and GPU-side
 construction + editing all landed. The remaining work is content / streaming on top.
 
-- [x] Toolchain proof-of-concept — Bevy 0.19 + DLSS-RR on Linux *(Solari was stripped; it
-      is reference-only, not the GI substrate)*
+- [x] Toolchain proof-of-concept — Bevy 0.19 on Linux *(Solari was stripped; it is
+      reference-only, not the GI substrate)*
 - [x] NAADF substrate + albedo first-hit — three-layer chunk/block/voxel cell hierarchy,
       CPU-side AADF construction + cuboid expansion, DDA-with-AADF traversal, int+frac
       `PositionSplit` camera, two-pass albedo first-hit WGSL render path
@@ -179,9 +137,6 @@ construction + editing all landed. The remaining work is content / streaming on 
 - [ ] Showcase a `.vox` world in the web build
 - [ ] Procedural pseudo-infinite sliding world
 - [ ] Persistent streamable world format
-- [ ] DLSS Ray Reconstruction — actual integration for noise reduction (plumbing is in
-      place but currently dormant; needs research/investigation on input-signal routing,
-      motion vectors, and denoiser interaction with the ReSTIR GI / bilateral pass)
 
 ### Platform verification
 
