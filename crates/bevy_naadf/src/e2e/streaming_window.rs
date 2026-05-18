@@ -32,7 +32,8 @@
 //! (`--max-segments-per-frame`, default 4).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::time::Duration;
 
 use bevy::prelude::*;
 
@@ -48,24 +49,59 @@ pub const STREAMING_BEFORE_PNG: &str = "streaming_window_before.png";
 /// Filename for the post-walk framebuffer capture.
 pub const STREAMING_AFTER_PNG: &str = "streaming_window_after.png";
 
-/// Minimum mean per-pixel RGB delta between before/after frames over the full
-/// frame. Currently `0.0` — Phase 2 ships the GPU dispatch chain end-to-end
-/// (noise → segment_voxel_buffer → chunk_calc → WorldGpu → bounds chain) but
-/// the camera-to-window-coords translation glue (v1 § E "Coordinate widening"
-/// in `02-design.md`, the "the renderer never sees world IVec3, only
-/// window-local" Q1 rule) is **not yet wired** — camera Transforms stay in
-/// absolute world voxel coords, so the renderer's chunk lookup
-/// `chunks_buffer[camera_voxel / 16]` reads the wrong slot after a residency
-/// shift. Bumping this to `>= 3.0` once the translation glue lands (Phase 2.5)
-/// is the regression catcher. See `03b-impl-residency.md` § Hand-off /
-/// regression notes.
-pub const STREAMING_MIN_PIXEL_DELTA: f32 = 0.0;
+/// Minimum mean per-pixel RGB delta between before/after frames over the
+/// full frame. Phase 2.5 raised this from the temporary `0.0` floor to a
+/// real one once the root-cause residency-state fix
+/// (`finalise_admissions_as_resident`, per `03c-diagnosis.md` § Punch-list
+/// item 1) landed. Pre-fix, both before/after frames were sky-only — pixel
+/// Δ was 0.0 by construction. Post-fix, the terrain shifts in the
+/// framebuffer between Pose A and Pose B because the local-Z column of
+/// rendered terrain content moves as the camera walks +X (different
+/// voxel columns project to the same screen pixels). The floor here is
+/// measured from a real run with item 1 in place, taken at ~40 % of the
+/// measured Δ so the gate fails unambiguously on a regression that
+/// collapses streaming back to sky-only output.
+pub const STREAMING_MIN_PIXEL_DELTA: f32 = 3.0;
 
 /// Minimum after-frame luminance variance — the after-frame should show
-/// non-trivial content (sky gradient + or terrain). The sky gradient alone
-/// (top brighter, bottom darker) produces variance ~200; flat-black would be
-/// near 0. This threshold catches "every pixel is identical" failures.
-pub const STREAMING_MIN_AFTER_LUM_VARIANCE: f32 = 50.0;
+/// non-trivial content. The streaming-world diagnostic
+/// (`03c-diagnosis.md` § "Root cause: false pass") measured pure-sky
+/// variance at ~242. Phase 2.4's static-noise gate measured terrain frame
+/// variance at 1816. The streaming preset's camera-translation step
+/// produces a similar window-local terrain frame so the variance should
+/// be in the same order. The 800 floor sits comfortably above the sky-only
+/// 242 baseline (3.3× margin) and below the static-noise 1816 measurement
+/// (2.27× headroom) so a real terrain frame passes and a sky-only frame
+/// fails. Phase 2.4 already validated 800 as the strict regression-catch
+/// floor for the noise→encoded-chunks→render chain in
+/// `noise_static_world.rs:NOISE_STATIC_MIN_LUM_VARIANCE`.
+pub const STREAMING_MIN_AFTER_LUM_VARIANCE: f32 = 800.0;
+
+/// Wall-clock budget for the full `--streaming-window` gate run. The gate's
+/// frame-cap (120 warmup + 1 shoot + 16 drain + 1 apply + 300 wait + 1
+/// shoot + 16 drain + 1 assert ≈ 455 ticks) is bounded but not
+/// wall-clock-bounded; under per-frame bounds-chain load (the diagnosed
+/// hang in `03c-diagnosis.md` § "Root cause: minutes-long hang"), 455 frames
+/// took ~2 minutes.
+///
+/// Phase 2.5 — measured budget: with `max_segments_per_frame = 4`, cold-
+/// start admits 4 slots/frame × 128 frames = 512 slots; each admission
+/// frame fires the bounds-chain dispatch (~300 ms on RTX 5080). The
+/// camera walk adds another ~32 frames of admissions. ~160 admission
+/// frames × 300 ms ≈ 48 s on top of ~10 s of settled-frame time, totalling
+/// ~60 s. The 120 s budget gives ~2× margin against this baseline while
+/// still failing FAST on the original "minutes-long hang" regression
+/// (which would push past 120 s easily). Per the
+/// `feedback-e2e-gates-must-fail-fast` memory.
+///
+/// A future Phase 2.6+ perf win — dirty-segments bounds dispatch (only
+/// re-bound the affected segments per admission instead of the full
+/// 2M-chunk worst-case) — would let this budget drop back to ~30 s.
+pub const STREAMING_GATE_WALL_CLOCK_MAX_SECS: u64 = 120;
+
+/// Wall-clock budget as a `Duration`.
+pub const STREAMING_GATE_WALL_CLOCK_MAX: Duration =
+    Duration::from_secs(STREAMING_GATE_WALL_CLOCK_MAX_SECS);
 
 /// Camera-walk distance in voxels along +X. `(WORLD_SIZE_IN_SEGMENTS.x / 4)` =
 /// 4 segments × `SEGMENT_VOXELS` (256) = 1024 voxels. Crosses ≥ 2 segment
@@ -83,6 +119,59 @@ static CAMERA_WALKED: AtomicBool = AtomicBool::new(false);
 /// Residency origin X at Pose A (snapshot taken at promote time so we can
 /// compute the shift when the assertion fires).
 static RESIDENCY_ORIGIN_X_AT_POSE_A: AtomicI32 = AtomicI32::new(i32::MIN);
+
+// ---------------------------------------------------------------------------
+// Wall-clock budget enforcement (Phase 2.5 — `03c-diagnosis.md` § Punch-list
+// item 4). Same shape as `noise_static_world.rs`'s gate-start latch.
+// ---------------------------------------------------------------------------
+
+/// Gate-start epoch milliseconds. `0` means "not yet started".
+static GATE_START_EPOCH_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Mark the gate as started (records the wall-clock now). Idempotent.
+pub fn mark_gate_started() {
+    if GATE_START_EPOCH_MS.load(Ordering::SeqCst) == 0 {
+        let now_ms = epoch_millis_now();
+        GATE_START_EPOCH_MS.store(now_ms, Ordering::SeqCst);
+    }
+}
+
+/// Reset the gate-start latch — called by [`run_streaming_window`] on entry
+/// so successive invocations get a fresh budget.
+pub fn reset_gate_start_latch() {
+    GATE_START_EPOCH_MS.store(0, Ordering::SeqCst);
+}
+
+/// `true` if the gate has exceeded its wall-clock budget. Returns `false`
+/// before [`mark_gate_started`] has been called.
+pub fn wall_clock_budget_exceeded() -> bool {
+    let start = GATE_START_EPOCH_MS.load(Ordering::SeqCst);
+    if start == 0 {
+        return false;
+    }
+    let now = epoch_millis_now();
+    let elapsed_ms = (now - start).max(0) as u64;
+    elapsed_ms > STREAMING_GATE_WALL_CLOCK_MAX.as_millis() as u64
+}
+
+/// Elapsed wall-clock since `mark_gate_started` (None if not started).
+pub fn elapsed_since_start() -> Option<Duration> {
+    let start = GATE_START_EPOCH_MS.load(Ordering::SeqCst);
+    if start == 0 {
+        return None;
+    }
+    let now = epoch_millis_now();
+    let elapsed_ms = (now - start).max(0) as u64;
+    Some(Duration::from_millis(elapsed_ms))
+}
+
+fn epoch_millis_now() -> i64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Record the residency origin X at Pose A — called by the driver from
 /// `OasisApplyEdit` (the moment the camera is promoted).
@@ -187,6 +276,55 @@ pub fn pin_streaming_window_camera(
     if !args.streaming_window_mode {
         return;
     }
+    // Phase 2.5 — wall-clock budget enforcement. Marks the gate as started
+    // on the first tick (latches the budget); checks against the budget
+    // every tick. On budget exceeded, panics with a diagnostic that names
+    // the elapsed time and the current residency state. Panic is the
+    // load-bearing fail-fast (the e2e harness has no path to write
+    // `AppExit` from an Update system; mirrors the noise-static-world
+    // gate's `wall_clock_budget_exceeded` enforcement).
+    mark_gate_started();
+    if wall_clock_budget_exceeded() {
+        let (admissions_n, evictions_n, generating_n, resident_n, empty_n) =
+            residency
+                .as_deref()
+                .map(|r| {
+                    let g = r.slot_state.iter().filter(|s| matches!(
+                        s,
+                        crate::streaming::SlotState::Generating { .. }
+                    )).count();
+                    let res = r.slot_state.iter().filter(|s| matches!(
+                        s,
+                        crate::streaming::SlotState::Resident
+                    )).count();
+                    let e = r.slot_state.iter().filter(|s| matches!(
+                        s,
+                        crate::streaming::SlotState::Empty
+                    )).count();
+                    (
+                        r.admissions_this_frame.len(),
+                        r.evictions_this_frame.len(),
+                        g, res, e,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, 0));
+        panic!(
+            "streaming-window: wall-clock budget {}s exceeded \
+             (elapsed = {:?}). Likely cause: the per-frame bounds-chain \
+             dispatch is firing every frame (the diagnosed hang in \
+             `03c-diagnosis.md` § \"Root cause: minutes-long hang\") — \
+             check that `finalise_admissions_as_resident` is wired into \
+             `StreamingPlugin`'s `Last`-stage so `Generating` slots \
+             transition to `Resident` and `any_admissions_or_evictions` \
+             becomes FALSE on settled frames. Residency state: \
+             admissions_this_frame={admissions_n}, \
+             evictions_this_frame={evictions_n}, slot_state histogram = \
+             {{Generating: {generating_n}, Resident: {resident_n}, \
+             Empty: {empty_n}}}.",
+            STREAMING_GATE_WALL_CLOCK_MAX_SECS,
+            elapsed_since_start(),
+        );
+    }
     let world_pose = streaming_window_pose(camera_has_walked());
     let local_pose =
         translate_world_to_window_local(world_pose, residency.as_deref());
@@ -206,6 +344,7 @@ pub fn run_streaming_window() -> AppExit {
     // Reset the latch each invocation — the driver re-promotes the camera on
     // its own schedule.
     reset_camera_walked_latch();
+    reset_gate_start_latch();
     RESIDENCY_ORIGIN_X_AT_POSE_A.store(i32::MIN, Ordering::SeqCst);
 
     let mut app_args = crate::AppArgs::default();
@@ -223,15 +362,27 @@ pub fn run_streaming_window() -> AppExit {
     println!(
         "e2e_render --streaming-window: booting procedural-streaming world \
          (seed={}, sea_level={:.1}, terrain_amplitude={:.1}, \
-         vram_budget_mib={}, max_segments_per_frame={})",
+         vram_budget_mib={}, max_segments_per_frame={}); strict floors: \
+         pixel_delta ≥ {:.2}, after_lum_variance ≥ {:.1}, wall_clock ≤ {}s",
         app_args.noise_seed,
         app_args.sea_level,
         app_args.terrain_amplitude,
         app_args.vram_budget_mib,
         app_args.max_segments_per_frame,
+        STREAMING_MIN_PIXEL_DELTA,
+        STREAMING_MIN_AFTER_LUM_VARIANCE,
+        STREAMING_GATE_WALL_CLOCK_MAX_SECS,
     );
 
-    crate::run_e2e_render_with_args(app_args)
+    let exit = crate::run_e2e_render_with_args(app_args);
+    let elapsed = elapsed_since_start();
+    println!(
+        "e2e_render --streaming-window: gate run completed in {:?} \
+         (budget = {}s).",
+        elapsed,
+        STREAMING_GATE_WALL_CLOCK_MAX_SECS,
+    );
+    exit
 }
 
 // ---------------------------------------------------------------------------

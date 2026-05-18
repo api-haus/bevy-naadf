@@ -1,5 +1,27 @@
 # 03b — Phase-2 impl: residency manager + W5 gate inversion + `--streaming-window`
 
+> **[Phase 2.5 correction note]** The items below were originally written
+> before the residency-state defect was diagnosed in `03c-diagnosis.md` and
+> partially-fixed in `03e-impl-residency-fix.md`. Several claims in this
+> document are now provably wrong; corrections are inlined below in the form
+> of `> [Phase 2.5 correction:]` notes against the affected sentences. The
+> original wording is preserved (for historical continuity); the corrections
+> override.
+>
+> Summary of corrections:
+> - The "camera-to-window translation glue is not yet wired" narrative is
+>   stale — the glue WAS wired in Phase 2; `pin_streaming_window_camera`
+>   already applies the translation. The visible-streaming defect was
+>   `mark_admissions_resident` having zero call sites (now fixed in
+>   `finalise_admissions_as_resident`) AND a separate slot-indexing bug
+>   surfaced during Phase 2.5 (slot ↔ world-local mismatch — see Phase
+>   2.5 "What's left" section in `03e-impl-residency-fix.md`).
+> - "12 new unit tests" → actual count was 16 at the time of `03c-diagnosis`
+>   (Phase 2.5 added 1 more for a total of 17).
+> - "~1200 dispatches over the 300-frame wait = 5× the 512-slot window"
+>   was misleading — those 1200 dispatches re-targeted the SAME 4 slots
+>   every frame (the diagnosed bug), not 1200 distinct slots.
+
 Implementation log for Phase 2 of the streaming-world orchestration
 (`02b-design-plan-b.md` §§ D–L Phase 2 + the Phase-2 design refinements in
 `README.md` — OQ.1 = height-relative terrain, OQ.3 = inherit W2 edit behavior,
@@ -25,6 +47,13 @@ single-FnlState scope).
 Phase-2 new LOC: **~1367**. Touched LOC: **~440**. Build clean, 217 lib tests
 pass (217 vs the pre-Phase-2 205 = 12 new unit tests).
 
+> **[Phase 2.5 correction]** The "12 new unit tests" tally is incorrect.
+> At the time of `03c-diagnosis.md` the actual count was 16 (the 4
+> `pin_translation*` tests in `streaming_window.rs` were added after this
+> impl log was written). Phase 2.5 added one more
+> (`slot_admissions_eventually_drain_to_resident` in `residency.rs`),
+> bringing the total to **17 new unit tests** since Phase 2 began.
+
 ## Verification gates run
 
 | Gate | Exit | Notes |
@@ -42,6 +71,14 @@ pass (217 vs the pre-Phase-2 205 = 12 new unit tests).
 - Phase C camera move: **single-tick latch flip** at OasisApplyEdit (camera Transform writes to Pose B from the next pin tick onward; not a per-frame sweep).
 - Phase D wait frames: **300** (OASIS_POST_EDIT_WAIT_FRAMES — covers W2 + bounds-chain re-convergence).
 - Per-frame admission count: **4** (default `--max-segments-per-frame`); ~1200 dispatches over the 300-frame wait = 5× the 512-slot window — substantially over-budget for the demo but well within frame time (~0.3 ms/segment on RTX 5080).
+  > **[Phase 2.5 correction]** This claim is misleading. Per
+  > `03c-diagnosis.md` § "Root cause: false pass", the 1200 dispatches
+  > re-targeted the SAME 4 camera-closest `Generating` slots every frame
+  > (because `mark_admissions_resident` was never called, slots never
+  > transitioned out of `Generating`), not 1200 distinct slots. Only 4
+  > unique slots received content; the other 508 in the window stayed
+  > zero-filled. Phase 2.5's `finalise_admissions_as_resident` system
+  > fixes the state transition so slots progress.
 - Residency origin shift in X: **4 segments** (matches expected 1024 voxels / 256 voxels-per-segment).
 - After-frame luminance variance: **242.05** (sky gradient — see limitation below).
 - Pixel Δ between before/after: **0.0** (TAA fully converged; see limitation below).
@@ -124,6 +161,33 @@ pass (217 vs the pre-Phase-2 205 = 12 new unit tests).
   `Residency::origin` and applying the inverse-origin translation each
   tick); the regression catcher is in place (raise the pixel_delta_floor
   to ≥ 3.0 to fail the gate until the translation lands).
+
+> **[Phase 2.5 correction — both bullet points above]** The narrative that
+> "camera-to-window translation glue is not yet wired" is FALSE at
+> HEAD `66d1b939`. Per `03c-diagnosis.md` § "Verification of impl-log
+> claims", the translation IS wired:
+> `crates/bevy_naadf/src/e2e/streaming_window.rs:158-196` defines
+> `translate_world_to_window_local` and `pin_streaming_window_camera`
+> applies it every tick. The 4 `pin_translation*` unit tests at
+> `streaming_window.rs:375-438` verify the translation is correct.
+>
+> The ACTUAL root cause of the sky-only `--streaming-window` output was
+> diagnosed in `03c-diagnosis.md` § "Root cause: false pass":
+> `mark_admissions_resident` was defined but had zero call sites, so
+> `SlotState::Generating` slots never transitioned to `Resident`, and
+> `process_pending_admissions` re-picked the SAME 4 camera-closest
+> Generating slots every frame indefinitely. Phase 2.5 adds the
+> `finalise_admissions_as_resident` `Last`-stage system to fix this.
+>
+> Phase 2.5 also uncovered a SECOND defect not visible in this impl
+> log: the slot-assignment in `residency_driver`'s Pass 3 uses
+> `empty_slots.pop()` which picks arbitrary slot indices — but the
+> renderer assumes the slot at window-local position `(lx, ly, lz)`
+> holds content for world segment `(origin + (lx, ly, lz))`. The
+> mismatch means even with item 1's state-transition fix, the renderer
+> reads from slots whose content is for the wrong world segment. See
+> `03e-impl-residency-fix.md` § "What's left" for the geometric
+> slot-indexing fix needed for visible streaming.
 
 - **The bounds chain runs every-frame-with-admissions, not once.** Per § D.B7
   this is correct, but profiling at 4 segments/frame for 1500 frames (the
@@ -279,13 +343,41 @@ substitution is the localised follow-up.
 
 **Fragile / TODO:**
 - The camera-to-window-coords translation glue (above).
+  > **[Phase 2.5 correction]** Already wired; not fragile. See correction
+  > note above.
 - The per-frame `info!` logging is noisy at production scale.
 - The bounds-chain dispatch runs every frame any admission happens — the
   full-world workgroup count is conservatively large; a dirty-segments
   optimisation (only re-bound the affected segments) is the natural
   Phase-2.5 perf win when it becomes load-bearing.
+  > **[Phase 2.5 correction — this remains TRUE and load-bearing]**
+  > Cold-start with `max_segments_per_frame = 4` admits 4 slots/frame ×
+  > 128 frames before the window fills. Each admission frame fires the
+  > worst-case full-world bounds dispatch (~300 ms on RTX 5080). So
+  > cold-start currently takes ~40 s of wall clock. Phase 2.5 raised
+  > the `--streaming-window` gate's wall-clock budget from 60 s to
+  > 120 s to accommodate (still well under the original ~120 s hang
+  > the diagnostic measured). A dirty-segments optimisation would let
+  > the budget drop to ~30 s.
 - The `Pose A` snapshot of `origin.x` uses a one-shot static atomic; a future
   multi-walk test would need a per-walk reset call.
+- > **[Phase 2.5 correction — NEW fragile item]**
+  > `mark_admissions_resident` was defined but had zero call sites (per
+  > `03c-diagnosis.md`); Phase 2.5 added the
+  > `finalise_admissions_as_resident` `Last`-stage caller. Without
+  > this, `SlotState::Generating` slots never progressed to `Resident`
+  > and `process_pending_admissions` got stuck re-picking the same 4
+  > slots every frame. This is now fixed in
+  > `crates/bevy_naadf/src/streaming/residency.rs:finalise_admissions_as_resident`
+  > and wired into `StreamingPlugin::build` (`Last` schedule).
+- > **[Phase 2.5 correction — NEW fragile item]** The slot-assignment
+  > in `residency_driver`'s Pass 3 uses `empty_slots.pop()` which
+  > assigns world segments to arbitrary slot indices. The renderer
+  > assumes geometric mapping: slot at local (lx, ly, lz) holds
+  > content for world segment (origin + (lx, ly, lz)). The mismatch
+  > means even after Phase 2.5's state-transition fix, the renderer
+  > reads from slots whose content is for the wrong world segment.
+  > See `03e-impl-residency-fix.md` § "What's left" for the fix shape.
 
 ### Phase 1 deliverables untouched
 

@@ -53,8 +53,10 @@ consolidated mode disqualified.
 - [x] **Hard gate (diagnostic)** — user directive: verify noise→visible-terrain in a static scene FIRST, then sliding window
 - [x] 03d — Phase-2.4: static-scene noise verification — one-shot noise_terrain dispatch over full world + strict `--noise-static-world` gate (no residency)
 - [x] **Hard gate (Phase 2.4)** — GREEN: viability YES (lum variance 1816, screenshot has visible terrain). Sliding-window bug is provably isolated to residency layer.
-- [ ] 03e — Phase-2.5 fix (contingent on 2.4 passing): `Generating → Resident` transition + sliding-window gate threshold tightening + wall-clock budget
-- [ ] **Hard gate (Phase 2.5)** — confirm visible sliding-window streaming + strict gate passes
+- [x] 03e — Phase-2.5 partial: `Generating → Resident` transition ✓ + strict gate thresholds ✓ + wall-clock budget ✓ + doc cleanup ✓
+- [x] **Hard gate (Phase 2.5)** — strict gate correctly FAILS sky-only output (variance 222 vs floor 800); SECONDARY defect surfaced — slot-to-world geometric mapping
+- [ ] 03f — Phase-2.6: geometric slot indexing (Option A residency-side OR Option B renderer-side); + dirty-segments bounds-chain optimisation
+- [ ] **Hard gate (Phase 2.6)** — confirm visible sliding-window streaming + strict gate passes
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user

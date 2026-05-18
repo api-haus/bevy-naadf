@@ -362,6 +362,19 @@ pub fn residency_driver(
 
     // Pass 3 — assign empty slots to pending admissions (camera-distance first).
     // Move-out → reassign empty_slots without holding the borrow.
+    //
+    // KNOWN PHASE-2.5 LIMITATION (see `03e-impl-residency-fix.md`): slots
+    // are popped from `empty_slots` in arbitrary order, so a world
+    // segment may land at any free slot index. This is correct for the
+    // residency table's internal consistency (forward/reverse maps stay
+    // in sync) but breaks the renderer's geometric assumption that
+    // `chunks_buffer[local_xyz]` holds content for world segment
+    // `(origin + local_xyz)`. The renderer at world camera position N
+    // dereferences a slot whose content is for some other world segment
+    // and sees the wrong content (sky-only when that other content is
+    // empty). Item 1's `Generating → Resident` transition fixed the
+    // residency-state drain but not this slot-indexing mismatch — a
+    // Phase 2.6 follow-up.
     let mut empty_slots: Vec<u32> = residency
         .slot_to_world
         .iter()
@@ -446,6 +459,55 @@ pub fn mark_admissions_resident(
     }
 }
 
+/// `Last`-stage system — flip `Generating → Resident` for the segments that
+/// were placed on `admissions_this_frame` earlier this frame.
+///
+/// Phase 2.5 — the root-cause fix for the `--streaming-window` false-pass
+/// diagnosed in `docs/orchestrate/streaming-world/03c-diagnosis.md` § "Root
+/// cause: false pass". Without this transition, `process_pending_admissions`
+/// re-picks the SAME 4 camera-closest `Generating` slots every frame, leaving
+/// the other 508/512 slots zero-filled forever; the renderer sees terrain in
+/// only 4 segments and the rest of the window stays sky.
+///
+/// Schedule placement: `Last` — runs at the end of the main world's frame.
+/// By this point, the previous frame's `ExtractSchedule` has already
+/// extracted the admissions list into the render world (the extract runs
+/// AFTER `Last` of the previous frame and BEFORE `PreUpdate` of the next
+/// frame in Bevy's main_loop order). Marking slots `Resident` here is
+/// effectively saying "the GPU dispatch for these admissions has been
+/// queued and will run before next frame's residency tick".
+///
+/// Race model: at worst a slot is marked Resident one frame before the
+/// renderer's first read sees the correctly-written content (the renderer
+/// reads from a buffer the GPU dispatch is still writing); next frame's
+/// render sees the correct content. Per the diagnostic's analysis this is
+/// harmless.
+///
+/// **Important: this system does NOT clear `admissions_this_frame`.** The
+/// next frame's `residency_driver` (PreUpdate) clears it at frame entry,
+/// and the render-world's `extract_streaming_state` is the only system
+/// that reads it — the extract runs after `Last`, so clearing here would
+/// strip the admissions list before the render world ever sees them
+/// (which is what the diagnostic's punch-list inadvertently caused on
+/// first attempt — the dispatch never fired).
+pub fn finalise_admissions_as_resident(residency: Option<ResMut<Residency>>) {
+    let Some(mut residency) = residency else {
+        return;
+    };
+    if residency.admissions_this_frame.is_empty() {
+        return;
+    }
+    // Snapshot to satisfy the borrow checker (mark_admissions_resident takes
+    // `&mut residency` while we'd otherwise hold a borrow on its
+    // `admissions_this_frame` field).
+    let snapshot: Vec<(WorldSegmentPos, SlotIndex)> =
+        residency.admissions_this_frame.clone();
+    mark_admissions_resident(&mut residency, &snapshot);
+    // Do NOT clear admissions_this_frame here — the extract schedule needs
+    // to read it. `residency_driver` clears it at the next frame's
+    // PreUpdate entry.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +583,90 @@ mod tests {
     #[should_panic(expected = "VRAM budget pre-flight FAILED")]
     fn vram_budget_panics_below_floor() {
         super::assert_vram_budget_sufficient(0);
+    }
+
+    /// Phase 2.5 root-cause regression catcher. Simulates the
+    /// `residency_driver → finalise_admissions_as_resident` cycle on a
+    /// purely-CPU residency state and asserts the count of `Generating`
+    /// candidates strictly DECREASES each frame — proving the loop
+    /// monotonically drains pending slots rather than re-picking the same 4
+    /// every frame (the diagnosed bug).
+    #[test]
+    fn slot_admissions_eventually_drain_to_resident() {
+        let mut residency = Residency::empty(4);
+        // Plant 12 Generating slots — more than 1 frame's budget so we
+        // observe the drain over multiple cycles.
+        for slot_i in 0..12u32 {
+            residency.slot_to_world[slot_i as usize] = Some(WorldSegmentPos(
+                IVec3::new(slot_i as i32, 0, 0),
+            ));
+            residency.world_to_slot.insert(
+                WorldSegmentPos(IVec3::new(slot_i as i32, 0, 0)),
+                SlotIndex(slot_i),
+            );
+            residency.slot_state[slot_i as usize] =
+                SlotState::Generating { dispatched_frame: 0 };
+        }
+        residency.last_camera_seg = Some(IVec3::ZERO);
+
+        let count_generating = |r: &Residency| -> usize {
+            r.slot_state
+                .iter()
+                .filter(|s| matches!(s, SlotState::Generating { .. }))
+                .count()
+        };
+
+        let initial = count_generating(&residency);
+        assert_eq!(initial, 12);
+
+        // Simulate three driver ticks. Matches the production schedule:
+        //   - PreUpdate: clear deltas, process_pending_admissions →
+        //     populates admissions_this_frame with up to 4 slots.
+        //   - ExtractSchedule (irrelevant to this CPU-only test): reads
+        //     admissions_this_frame → render world.
+        //   - (render dispatch — irrelevant for this CPU-only test)
+        //   - Last: finalise_admissions_as_resident marks those 4
+        //     admissions Resident. Does NOT clear admissions_this_frame —
+        //     the extract already consumed it; the next frame's PreUpdate
+        //     clears at frame entry.
+        let mut prev_count = initial;
+        for tick in 0..3 {
+            // PreUpdate-equivalent.
+            residency.admissions_this_frame.clear();
+            residency.evictions_this_frame.clear();
+            process_pending_admissions(&mut residency);
+            let admitted = residency.admissions_this_frame.len();
+            assert_eq!(
+                admitted,
+                4.min(prev_count),
+                "tick {tick}: process_pending_admissions picked {admitted}, \
+                 expected min(4, generating={prev_count})",
+            );
+
+            // Last-equivalent (production: finalise_admissions_as_resident).
+            // Snapshot + mark Resident; do NOT clear (the next frame's
+            // PreUpdate clears).
+            let snapshot = residency.admissions_this_frame.clone();
+            mark_admissions_resident(&mut residency, &snapshot);
+
+            let now_count = count_generating(&residency);
+            assert!(
+                now_count < prev_count,
+                "tick {tick}: Generating count did NOT decrease \
+                 (was {prev_count}, now {now_count}) — the residency loop \
+                 is stuck re-picking the same slots (the diagnosed bug).",
+            );
+            prev_count = now_count;
+        }
+
+        // After 3 ticks × 4 admissions/tick = 12 admissions, every slot
+        // should be Resident.
+        assert_eq!(count_generating(&residency), 0);
+        let resident_count = residency
+            .slot_state
+            .iter()
+            .filter(|s| matches!(s, SlotState::Resident))
+            .count();
+        assert_eq!(resident_count, 12);
     }
 }

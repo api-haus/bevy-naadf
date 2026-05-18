@@ -44,10 +44,10 @@ pub use noise_dispatch::{
     NOISE_TERRAIN_SHADER_PATH, NOISE_TERRAIN_SHADER_SRC,
 };
 pub use residency::{
-    assert_vram_budget_sufficient, compute_slab_total_mib, mark_admissions_resident,
-    residency_driver, segment_to_voxel_origin, target_origin_for_camera_seg,
-    world_voxel_to_segment, Residency, SlotIndex, SlotState, WorldSegmentPos,
-    SEGMENT_CHUNKS, SEGMENT_VOXELS,
+    assert_vram_budget_sufficient, compute_slab_total_mib, finalise_admissions_as_resident,
+    mark_admissions_resident, residency_driver, segment_to_voxel_origin,
+    target_origin_for_camera_seg, world_voxel_to_segment, Residency, SlotIndex, SlotState,
+    WorldSegmentPos, SEGMENT_CHUNKS, SEGMENT_VOXELS,
 };
 
 /// Phase-2 `StreamingPlugin` — wires:
@@ -70,6 +70,14 @@ impl Plugin for StreamingPlugin {
         // Main-world residency driver. `PreUpdate` so the per-frame
         // admissions/evictions are visible to the render extract that follows.
         app.add_systems(PreUpdate, residency_driver);
+        // Phase 2.5 root-cause fix (`03c-diagnosis.md` § "Root cause: false
+        // pass"): flip `Generating → Resident` for the segments admitted this
+        // frame. Runs in `Last` — after the render world has extracted the
+        // admissions list and dispatched the per-segment noise + chunk_calc
+        // passes. Without this, `process_pending_admissions` re-picks the
+        // same 4 camera-closest Generating slots every frame and the
+        // remaining 508/512 slots stay zero-filled forever (sky-only render).
+        app.add_systems(Last, finalise_admissions_as_resident);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
