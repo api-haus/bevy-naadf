@@ -271,6 +271,40 @@ impl Framebuffer {
         }
     }
 
+    /// Count of pixels within `rect` whose Rec.709 luminance is **strictly
+    /// below** `threshold` (channels `0.0..=255.0`). Pass `None` to scan the
+    /// whole framebuffer.
+    ///
+    /// Added by vox-gpu-rewrite W5.3-fix Stage 1.5 for the
+    /// `--vox-gpu-construction` gate's near-black-pixel assertion: when the
+    /// W5 GPU producer chain mis-handles mixed blocks (CAS collision class
+    /// of regression — see `docs/orchestrate/vox-gpu-rewrite/06-diagnostic-inversion.md`),
+    /// scattered "hole" pixels appear where solid walls should render. A
+    /// correctly-rendered Oasis frame has architectural detail at varying
+    /// luminances but very few near-zero "hole" pixels; an inverted frame
+    /// has many. `count_pixels_with_luminance_below(fb, None, T) > FLOOR`
+    /// catches the inversion class directly.
+    pub fn count_pixels_with_luminance_below(&self, rect: Option<Rect>, threshold: f32) -> usize {
+        let rect = rect.unwrap_or(Rect {
+            x0: 0,
+            y0: 0,
+            x1: self.width,
+            y1: self.height,
+        });
+        let mut count = 0usize;
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                let p = self.pixel(x, y);
+                let lum =
+                    Self::luminance([p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]);
+                if lum < threshold {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Fraction (`0.0..=1.0`) of the *whole* framebuffer whose pixels are **not
     /// pitch black** — luminance strictly above `eps` (`0.0..=255.0`).
     ///

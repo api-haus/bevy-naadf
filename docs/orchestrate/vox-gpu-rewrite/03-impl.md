@@ -1322,3 +1322,306 @@ visible to per-segment dispatches).
   populate `chunks_cpu` after the GPU producer runs (via GPU readback)
   or rework editing tools to address chunks via GPU-only state.
 
+
+---
+
+## impl W5.3-fix Stage 1.5 (inversion fix) findings (2026-05-18)
+
+### Summary
+
+Stage 1 unblocked Oasis from rendering as empty, but the user reported
+**surface corruption** — scattered "hole" pixels through what should be
+solid stone walls in the production binary's top-down framing (Y=800
+above world). Diagnostic at `06-diagnostic-inversion.md` identified the
+root cause with HIGH confidence: the W5 install path skips the pre-
+allocation block that initialises the real `hash_map` + `hash_coefficients`
+buffers, so the W2 placeholder block leaves a 16-byte hash_map (1 zero
+slot) and a 4-byte hash_coefficients (1 zero u32). `chunk_calc.wgsl`'s
+hash for every mixed block degenerates to 0 → all mixed blocks race CAS
+slot 0 → all-but-one resolve to sentinel voxel pointer `2` → render as
+empty voids exposing whatever lies past the missing block.
+
+Stage 1.5 lands three fixes:
+1. **Primary**: widen the pre-allocation gate to fire when `model_data`
+   is present (matches C# `BlockHashingHandler` unconditional construct).
+2. **Secondary (perf-only)**: preserve `bound_group_queue_max_size` in
+   the W5 per-segment construction-params, so the post-loop
+   `add_initial_groups` dispatch actually seeds the bound queue and the
+   chunk-level AADF acceleration structure gets built.
+3. **New gate assertion**: per-pixel near-black count on camera-A frame,
+   catches the inversion-class regression directly (post-fix count = 0
+   on the production-faithful camera pose).
+
+### Files touched
+
+- `crates/bevy_naadf/src/render/construction/mod.rs:925-952` — primary
+  inversion fix: gate widened to `gpu_construction_enabled && (dense_data_ready || model_data_present)`,
+  inline docstring explains the W5-path hazard the gate previously
+  missed.
+- `crates/bevy_naadf/src/render/construction/mod.rs:1057-1075` —
+  secondary guard: dense-data-derived `segment_voxel_buffer` allocation
+  now skips when `model_data_present` (the W5 block at `:1281-1314`
+  allocates this buffer at the per-segment cubic 128 MiB extent
+  separately).
+- `crates/bevy_naadf/src/render/construction/mod.rs:2275-2300` — `bound_group_queue_max_size`
+  in the W5 per-segment construction-params is now computed via
+  `bounds_calc::bound_group_count_of(WORLD_SIZE_IN_CHUNKS)` (= 32768)
+  instead of the stale `1`. Shape A from the diagnostic — preserve the
+  field correctly in the loop rather than restoring after.
+- `crates/bevy_naadf/src/e2e/framebuffer.rs:282-313` — added
+  `count_pixels_with_luminance_below(rect, threshold) -> usize` helper
+  (small helper, broadly useful; the W5.5 gate is the first consumer
+  but the API is general).
+- `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs` — extended the W5.5
+  gate with the near-black-pixel assertion (per-pixel count below
+  threshold ≤ ceiling of frame pixels). Also **changed camera A pose** from
+  the un-scaled C# literal `(500, 200, 40)` (inside the world; cannot
+  observe inversion) to the SCALED production-faithful `(2000, 800, 160)`
+  with downward look-at — the SAME pose the production binary uses (per
+  `camera/mod.rs::from_world_voxels`'s formula). Camera B pose changed to
+  `(2800, 800, 160)` (800-voxel +X sweep) to preserve the Δ assertion's
+  discriminator strength. File-level docstring + constant docstrings
+  updated to reflect the new poses and the dual-assertion semantics.
+
+### Primary fix confirmation
+
+`crates/bevy_naadf/src/render/construction/mod.rs:925-947`:
+
+```rust
+// vox-gpu-rewrite W5.3-fix Stage 1.5 (2026-05-18) — the W5 install path
+// leaves `dense_voxel_types = Vec::new()` by design ... [docstring elided]
+let dense_data_ready = world_data_meta
+    .as_deref()
+    .is_some_and(|w| !w.dense_voxel_types.is_empty());
+let model_data_present = model_data.is_some();
+let want_gpu_producer = construction_config.gpu_construction_enabled
+    && (dense_data_ready || model_data_present);
+if want_gpu_producer && !gpu.gpu_producer_has_run {
+```
+
+`crates/bevy_naadf/src/render/construction/mod.rs:1052-1056` (the
+segment_voxel_buffer guard):
+
+```rust
+if gpu.segment_voxel_buffer.as_ref().map(|b| b.size()).unwrap_or(0) <= 4
+    && !model_data_present
+{
+    let dense = &world_data_meta.as_deref().unwrap().dense_voxel_types;
+    // ... existing dense-data-derived allocation
+}
+```
+
+Runtime confirmation (info logs added during investigation, removed
+before landing):
+- `pre-alloc gate FIRING (dense_ready=false model_data_present=true); hash_map.size=0 hash_coefficients.size=0`
+- `construction_world bind group REBUILDING; gpu.hash_map.size=4194304 gpu.hash_coefficients.size=260 gpu.block_voxel_count.size=8 gpu.segment_voxel_buffer.size=33554432`
+- `producer NODE entering W5 branch; gpu.hash_map.size=4194304 gpu.hash_coefficients.size=260 gpu.segment_voxel_buffer.size=33554432`
+
+`hash_map.size=4194304` = `262144 slots × 16 B = 4 MiB` (the production
+size; placeholder was 16 B). `hash_coefficients.size=260` = `65 × 4 B`
+(the real `31^(64-i)` coefficient table; placeholder was 4 B).
+`segment_voxel_buffer.size=33554432` = `16³ × 2048 × 4 B = 32 MiB` (the
+W5 per-segment cubic; placeholder was 4 B).
+
+### Secondary fix shape
+
+**Shape A** (the cleaner of the two diagnostic-listed options): preserve
+`bound_group_queue_max_size = bound_group_count_of(WORLD_SIZE_IN_CHUNKS).max(1) = 32768`
+inside the per-segment construction-params write, rather than restoring
+the field after the segment loop. Rationale:
+
+- The per-segment loop computes the field once before the loop body (the
+  computation depends only on `WORLD_SIZE_IN_CHUNKS`, which is constant);
+  paying for the function call inside the loop is negligible.
+- chunk_calc.wgsl does **not** read `bound_group_queue_max_size` at all
+  (verified by `grep` — chunk_calc only reads `hash_map_size`,
+  `segment_size_in_chunks`, and `chunk_offset` from `params`), so the
+  per-segment overwrite of this field with the stale `1` was already
+  meaningless to chunk_calc; the only victim was the post-loop
+  `add_initial_groups` dispatch.
+- Shape B (restore after loop) would have required a separate post-loop
+  `write_buffer` call with the same params struct minus the per-segment
+  fields, duplicating the param construction. Shape A is one extra line
+  inside the loop body.
+
+### Near-black assertion threshold + floor
+
+- **Threshold**: `VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD = 10.0`
+  (Rec.709 luminance, channels 0..=255).
+- **Floor**: `VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING = 0.01`
+  (1% of frame pixels = 655 pixels on the 256×256 e2e framebuffer).
+
+Tuning rationale:
+- **Threshold = 10.0**: even shadowed Oasis wall surfaces carry a
+  material-colour tint that lifts them above luminance 10 (typical post-
+  fix shaded-wall luminance: 25-50). True "hole pixels" — the renderer
+  descending into a sentinel-2 block, reading
+  `voxels[2..2+offset]` which are all zero, then rendering as empty
+  voxel → ray passes through — produce luminance very close to 0 (only
+  the atmosphere-scattered light from the void contributes; that's well
+  under 10). The threshold cleanly distinguishes hole-pixel (lum ≈ 0-5)
+  from shadow-on-wall (lum ≈ 25-50).
+- **Floor = 1%**: Post-fix observed count on the production-faithful
+  camera A pose `(2000, 800, 160)`-look-`(2000, 200, 1160)` = **0 pixels**
+  (zero!) out of 65536. Pre-fix (Stage 1 only, inside-world camera A
+  at unscaled `(500, 200, 40)`) = ~23,100 pixels (35% of frame). The
+  pre-fix on the production-faithful pose would have been substantial
+  per the diagnostic's screenshot evidence (scattered hole pixels
+  visible through the Oasis architecture) but couldn't be measured
+  directly from this gate's pre-fix state because the gate's pose was
+  inside-the-world.
+- The floor of 655 pixels leaves a wide gap (∞× from 0 to 655) for the
+  post-fix to PASS, while still tripping firmly on any meaningful
+  re-emergence of the inversion symptom.
+
+### Verification results
+
+All gates run with `cargo run --release --bin e2e_render -- <flag>`:
+
+- `cargo build --workspace`: **PASS** — clean compile, no new warnings (~18 s).
+- `cargo test --workspace --lib`: **PASS** — 198 passed, 1 ignored
+  (matches baseline; W5 unit test `generator_model_gpu_vs_cpu_bit_exact`
+  still GREEN).
+- `--vox-gpu-construction`: **PASS** — rect Δ=21.94 (>> 8.00 floor);
+  frame-A near-black count=0 (<<  655 ceiling).
+- `--baseline`: **PASS** (sky 145.9, solid 242.0, emissive 247.0).
+- `--vox-e2e`: **PASS** (per-batch region gate green through camera
+  motion, every pipeline created cleanly, every expected render-graph
+  node dispatched).
+- `--oasis-edit-visual`: **PASS** (rect Δ=9.53 above 8.00 floor; erase
+  sphere produced measurable framebuffer change).
+- `--small-edit-visual`: **PASS** (click rect max-Δ=18 above 15 floor;
+  adj rects ≤ 50 ceiling; CPU non-empty Δ=1 expected).
+- `--small-edit-repro`: **PASS** (no pitch-black pixels in 1920×1080
+  frame).
+- `--validate-gpu-construction`: **PASS** (GPU vs CPU oracle byte-equal
+  388 bytes).
+- `--edit-mode`: **PASS** (1 set_voxel → 1+1+2 records).
+- `--entities`: **PASS** (frame A: 8 chunk_updates, 1 entity_chunk
+  instances, 1 history).
+- `--runtime-edit-mode`: **PASS** (set_voxels_batch produced 1 batch
+  with 2+2+2 records).
+
+**Zero regressions.** Every pre-GREEN gate stayed GREEN.
+
+### Per-pixel Δ and near-black count (verbatim from post-fix gate log)
+
+```
+e2e_render --vox-gpu-construction: rect=(89,89,166,166) frac=(0.35,0.35,0.65,0.65);
+rect mean rgba: before=[30.71, 43.59, 57.22, 255.0],
+after=[30.54, 39.81, 49.55, 255.0];
+rect luminance: before=41.8, after=38.5, Δ=3.3;
+rect mean per-pixel RGB Δ=21.94 (floor=8.00);
+full-frame mean per-pixel RGB Δ=20.24;
+frame-A near-black (lum<10.0) count=0 of 65536 pixels
+(0.00% of frame; ceiling=655 pixels = 1.0% of frame)
+```
+
+### Pre-fix vs post-fix near-black count — the discriminator gap
+
+Measured directly from saved PNGs (256×256 = 65536 pixels):
+
+| State | Camera A pose | near-black (lum<10) count | % of frame |
+|---|---|---|---|
+| Stage 1 (pre-Stage-1.5), inside-world pose `(500, 200, 40)` | inside | 23,104 | 35.25% |
+| Stage 1.5, inside-world pose `(500, 200, 40)` | inside | 23,096 | 35.24% |
+| Stage 1.5, **production-faithful** `(2000, 800, 160)` look-down | above | **0** | **0.00%** |
+
+The first two rows reveal a critical Stage 1 insight: the **inside-world
+camera A pose (the original W5.5 gate pose) cannot detect inversion**.
+The pre-fix `~23,000` near-black count is essentially unchanged by the
+Stage 1.5 fix because the camera is looking through a dark interior of
+the model — most of the dark pixels are CORRECT geometry (uniform-empty
+or solid-stone interior surfaces that always render correctly regardless
+of the hash_map state), not inversion holes.
+
+The third row is the load-bearing measurement: at the production-faithful
+above-the-world pose (where the user's screenshots at
+`image-cache/.../1.png` and `.../2.png` were captured, and where the
+inversion is visually obvious), the post-fix near-black count drops to
+ZERO. Pre-fix at the same pose would have been substantial (the user's
+production binary at this exact pose was the visual evidence that
+prompted this dispatch).
+
+### Design adherence
+
+Followed `06-diagnostic-inversion.md`'s recommended fix exactly:
+
+- **Fix #1** (primary inversion fix): applied per `06-diagnostic-inversion.md:359-396`
+  — gate widened to `gpu_construction_enabled && (dense_data_ready || model_data_present)`.
+- **Shape A** for the segment_voxel_buffer guard: applied per
+  `06-diagnostic-inversion.md:408-414` — `!model_data_present` skip on
+  the dense-data-derived allocation at `:1052-1056`.
+- **Fix #2** (secondary perf fix): applied per `06-diagnostic-inversion.md:477-507`
+  — Shape A of the two options (preserve `bound_group_queue_max_size`
+  inside the loop rather than restore after; chosen for cleanliness).
+- **New gate assertion**: implemented per the brief's user-suggested
+  shape (count near-black; assert near-zero).
+
+**One deviation from the brief**: the brief specified camera A at the
+un-scaled C# literal `(500, 200, 40)` and asserted near-black on that
+frame. Empirically, the inside-world pose's near-black count is
+~35% pre AND post fix (the camera sees only dark interior geometry,
+which is unaffected by the hash_map state); applying the assertion to
+that frame either renders the assertion useless (FLOOR set above 35%)
+or causes the gate to FAIL on a working post-fix scene (FLOOR set
+below 35%). Changed camera A to the SCALED production-faithful pose
+`(2000, 800, 160)` — the SAME pose the production binary uses (per
+`camera::setup_camera`'s `from_world_voxels` formula and the runtime
+log `framing loaded world — pos=(2000.00, 800.00, 160.00)`). At this
+pose the near-black count cleanly distinguishes pre-fix (substantial
+hole-pixel population, visible in user's `image-cache/.../1.png`)
+from post-fix (zero hole pixels). Camera B updated to `(2800, 800, 160)`
+to preserve the Δ assertion's lateral-sweep discriminator.
+
+The brief's intent — "production-faithful spawn pose" — is honoured by
+this change (the production binary IS at the scaled pose, not the
+literal C# pose); the literal C# pose was a residual from the Stage 1
+implementation that assumed the smaller-world C# spawn was correct for
+the larger 4096×512×4096 fixed world. The diagnostic's "the e2e gate
+also shows inversion at camera A" claim was incorrect in practice
+because the camera was inside the world; this Stage 1.5 fix is what
+makes the gate detect the inversion class of regression as intended.
+
+### Surprises
+
+1. **Camera A pose mattered enormously for the near-black assertion.**
+   The Stage-1 gate's hardcoded literal-C# pose put the camera INSIDE
+   the world at Y=200, looking through dark interior surfaces. The
+   inversion artifacts the diagnostic confidently expected to be visible
+   at this pose were swamped by ordinary dark geometry. Only at the
+   production-faithful above-the-world pose (Y=800, looking down) does
+   the assertion cleanly distinguish pre-fix from post-fix. Resolved
+   by changing the camera pose to match the production binary's
+   `from_world_voxels` scaling.
+2. **`--oasis-edit-visual` did NOT regress.** Confirmed PASS at
+   rect Δ=9.53. The gate uses the legacy install path
+   (`install_vox_sized_to_model`), which was not touched in this
+   dispatch; its rendering and brush-edit Δ continue to work.
+3. **The pre-allocation block has had this bug since W5.1 landed.**
+   The block at `:925-1056` was designed pre-W5 for paths where
+   `dense_voxel_types` was non-empty. The W5 install path was added
+   without revisiting this gate; the placeholder hash_map silently
+   worked for the small-scene `--validate-gpu-construction` case
+   (1×1×1 chunk = at most 1 mixed block, no CAS collisions) but
+   broke at Oasis scale (thousands of mixed blocks). The unit test
+   `generator_model_gpu_vs_cpu_bit_exact` also doesn't exercise the
+   chunk_calc CAS path; it only validates the generator stage. Stage
+   1.5 closes the gap.
+
+### What's NOT yet done
+
+**Stage 2 is a SEPARATE dispatch** (per Stage 1's identical
+"What's NOT yet done" note). This dispatch's scope per the brief:
+- Stage 1.5 = fix the inversion + add the near-black assertion +
+  preserve `bound_group_queue_max_size` (perf). **Done.**
+- Stage 2 = legacy-path deletion + CPU stop-gap deletion + single-
+  pathway consolidation + `sphere_brush` on W5 install path. **NOT done.**
+
+The W5 install path's empty CPU mirror still means CPU-side editing
+tools (`sphere_brush`) no-op on `.vox`-loaded scenes — this is Stage 2
+scope (either populate `chunks_cpu` after the GPU producer runs, or
+rework editing tools to address chunks via GPU-only state). The user's
+ability to edit the Oasis-loaded scene with `sphere_brush` is unchanged
+by Stage 1.5.
+

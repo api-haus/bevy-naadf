@@ -922,11 +922,29 @@ pub fn prepare_construction(
     // upload-skip in `prepare_world_gpu` is reversed by a follow-up check
     // there — but in practice every code path that sets
     // `gpu_construction_enabled = true` also authors a `DenseVolume`).
+    // vox-gpu-rewrite W5.3-fix Stage 1.5 (2026-05-18) — the W5 install path
+    // leaves `dense_voxel_types = Vec::new()` by design (the GPU producer
+    // chain consumes `ModelData` instead of a dense CPU mirror). Before this
+    // gate-widening, `want_gpu_producer` therefore evaluated `false` on the
+    // W5 path → the pre-allocation block below was SKIPPED → the W2
+    // placeholder block at `:1644-1721` left `hash_map = 16 B` (1 slot of
+    // zero) and `hash_coefficients = 4 B` (1 u32 of zero). The chunk_calc
+    // shader's hash computation degenerated to identically-zero for every
+    // mixed block (`chunk_coefficients[i]` OOB-reads return zero per WebGPU
+    // spec) → all mixed blocks raced for `hash_map[0]` via CAS → all-but-one
+    // resolved to sentinel voxel-pointer `2` → rendered as scattered empty
+    // holes. Diagnostic: `docs/orchestrate/vox-gpu-rewrite/06-diagnostic-inversion.md`.
+    //
+    // Fix (per `06-diagnostic-inversion.md:359-396`): widen the gate to also
+    // fire when `model_data` is present. C# has no equivalent gate —
+    // `BlockHashingHandler` is constructed unconditionally in
+    // `WorldData.GenerateWorld` (`WorldData.cs:131-132`).
     let dense_data_ready = world_data_meta
         .as_deref()
         .is_some_and(|w| !w.dense_voxel_types.is_empty());
-    let want_gpu_producer =
-        construction_config.gpu_construction_enabled && dense_data_ready;
+    let model_data_present = model_data.is_some();
+    let want_gpu_producer = construction_config.gpu_construction_enabled
+        && (dense_data_ready || model_data_present);
     if want_gpu_producer && !gpu.gpu_producer_has_run {
         // Pre-allocate REAL hash_map / segment_voxel_buffer /
         // hash_coefficients / block_voxel_count, replacing the
@@ -1024,7 +1042,17 @@ pub fn prepare_construction(
         // The padded buffer is `seg^3 * 2048` u32s. NAADF's real segmented
         // iteration is a memory/bandwidth optimisation; collapsing to one
         // dispatch over the cubic extent is functionally equivalent.
-        if gpu.segment_voxel_buffer.as_ref().map(|b| b.size()).unwrap_or(0) <= 4 {
+        // vox-gpu-rewrite W5.3-fix Stage 1.5 — when `model_data` is present
+        // (W5 install path), the segment_voxel_buffer is allocated at the
+        // per-segment cubic 128 MiB extent by the W5 block at `:1281-1314`
+        // (NOT the dense-derived shape). Skip the dense-derived allocation
+        // here so the two blocks don't fight over the same field. The W5
+        // block's `gpu.segment_voxel_buffer.is_none()` guard then sees None
+        // (since this block is the only other writer) and allocates the
+        // proper 128 MiB buffer.
+        if gpu.segment_voxel_buffer.as_ref().map(|b| b.size()).unwrap_or(0) <= 4
+            && !model_data_present
+        {
             let dense = &world_data_meta.as_deref().unwrap().dense_voxel_types;
             let size_in_chunks = [
                 world_gpu.chunks_size_in_chunks.x,
@@ -2254,6 +2282,26 @@ pub fn naadf_gpu_producer_node(
 
                     // 2) Per-segment construction params — mirrors C#
                     //    `WorldData.cs:492-503` `CalculateChunkBlocks`.
+                    //
+                    // vox-gpu-rewrite W5.3-fix Stage 1.5 (2026-05-18) —
+                    // `bound_group_queue_max_size` is preserved at
+                    // `bound_group_count.max(1)` (not the stale `1` from
+                    // pre-Stage-1.5). chunk_calc.wgsl does NOT read this
+                    // field, but the post-loop `add_initial_groups`
+                    // dispatch DOES (`bounds_calc.wgsl:239 / :257-260`):
+                    // its workgroup gate
+                    // `if group_index >= params.bound_group_queue_max_size
+                    //  { return; }` short-circuited 32767 of 32768
+                    // workgroups when this field was `1`, leaving the
+                    // chunk-level AADF acceleration structure unbuilt.
+                    // Effect was perf-only (rays step chunk-by-chunk
+                    // instead of skipping at chunk granularity); diagnostic
+                    // at `06-diagnostic-inversion.md:477-507`.
+                    let bound_group_count = bounds_calc::bound_group_count_of([
+                        crate::WORLD_SIZE_IN_CHUNKS.x,
+                        crate::WORLD_SIZE_IN_CHUNKS.y,
+                        crate::WORLD_SIZE_IN_CHUNKS.z,
+                    ]);
                     let construction_params = crate::render::gpu_types::GpuConstructionParams {
                         size_in_chunks: [
                             crate::WORLD_SIZE_IN_CHUNKS.x,
@@ -2268,7 +2316,7 @@ pub fn naadf_gpu_producer_node(
                                 crate::WORLD_SIZE_IN_CHUNKS.z,
                             ]),
                         _pad1: 0,
-                        bound_group_queue_max_size: 1,
+                        bound_group_queue_max_size: bound_group_count.max(1),
                         hash_map_size: config.initial_hash_map_size,
                         segment_size_in_chunks: segment_chunks,
                         max_group_bound_dispatch: config.max_group_bound_dispatch,

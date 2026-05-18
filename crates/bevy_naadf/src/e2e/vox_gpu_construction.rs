@@ -35,28 +35,46 @@
 //! 1. Load `OASIS_VOX_FIXTURE_PATH` through the production
 //!    `install_vox_in_fixed_world` W5 GPU producer chain (the *same* code
 //!    path the binary runs when given `--vox <path>`).
-//! 2. Pin camera A at C#'s literal `(500, 200, 40)` voxel spawn pose
-//!    (`WorldRender.cs:48-49`) looking `+Z`.
+//! 2. Pin camera A at the scaled C# spawn pose (`(2000, 800, 160)`
+//!    voxels in the 4096×512×4096 world — Y=800 above the world's 512-
+//!    voxel ceiling) tilted DOWN toward Oasis architecture (look-at
+//!    `(2000, 200, 1160)`). This matches the production binary's
+//!    `setup_camera::from_world_voxels` pose (`camera/mod.rs:54-64`).
 //! 3. Warmup → capture frame A.
 //! 4. `OasisApplyEdit` phase: instead of a brush, *promote the camera*
 //!    via the `oasis.edit_applied` flag — the pin function reads the flag
-//!    and switches to camera B at `(500, 200, 200)` (160 voxels forward,
-//!    still inside the populated Oasis tile).
+//!    and switches to camera B at `(2800, 800, 160)` (800 voxels lateral
+//!    sweep in +X) with matched downward tilt.
 //! 5. Wait ~5 s for TAA + GI convergence at the new pose → capture frame B.
 //! 6. Assert per-pixel mean RGB Δ over a central rect exceeds
-//!    [`VOX_GPU_CONSTRUCTION_DIFF_FLOOR`].
+//!    [`VOX_GPU_CONSTRUCTION_DIFF_FLOOR`] (catches empty-scene regression
+//!    class) AND assert frame A's count of pixels with luminance below
+//!    [`VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD`] stays under
+//!    [`VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING`] of the frame
+//!    (catches inversion-class regression where scattered mixed blocks
+//!    fail the CAS hash insert and render as voxel pointer `2` → empty
+//!    voids exposing whatever lies past).
 //!
-//! ## Why this catches the empty-scene regression
+//! ## Why this catches both regression classes
 //!
-//! In a populated world, the camera at camera-A pose sees Oasis geometry
-//! (mixed colours, variance high) and the camera at camera-B pose sees a
-//! DIFFERENT view of geometry — moving 160 voxels forward sweeps blocks
-//! in and out of the frustum, producing a substantial per-pixel Δ. In an
-//! EMPTY world (the W5.3 regression state), both camera A and camera B
-//! render the atmosphere-tinted sky (luminance ~146, near-constant across
-//! the framebuffer); the per-pixel Δ collapses to near-zero (TAA noise
-//! floor only). **Δ below [`VOX_GPU_CONSTRUCTION_DIFF_FLOOR`] is the
-//! load-bearing regression signal.**
+//! In a CORRECTLY-rendered populated world, camera A sees Oasis
+//! architecture top-down (lots of mid-luminance stone surfaces, very few
+//! near-black "void" pixels) and camera B sees a DIFFERENT view of
+//! architecture from 800 voxels +X — geometry sweeps laterally through
+//! the frustum, producing a substantial per-pixel Δ.
+//!
+//! - **Empty-scene regression** (W5.3 pre-Stage-1; buffer underallocation):
+//!   both camera A and camera B render the atmosphere-tinted sky
+//!   (luminance ~146, near-constant); the per-pixel Δ collapses to
+//!   near-zero (TAA noise floor only) — the Δ-vs-floor check fails.
+//! - **Inversion-class regression** (W5.3-fix Stage 1; placeholder
+//!   `hash_map` / `hash_coefficients` leaking through on the W5 install
+//!   path): camera A sees Oasis architecture but with scattered "hole"
+//!   pixels through what should be solid walls (the renderer descends
+//!   into sentinel-2 blocks → reads zero voxels → renders as voids
+//!   exposing whatever lies past). The Δ assertion still passes (some
+//!   geometry IS visible), but the near-black-pixel count spikes —
+//!   the near-black-count check fails.
 
 use std::path::PathBuf;
 
@@ -70,21 +88,43 @@ use crate::e2e::oasis_edit_visual::{oasis_vox_fixture_path, OASIS_VOX_FIXTURE_PA
 // Camera poses — C#-faithful literal voxel coordinates
 // ---------------------------------------------------------------------------
 
-/// C# `WorldRender.cs:48-49` literal camera spawn: `(500, 200, 40)` voxels,
-/// looking `+Z`. For the 4096×512×4096 fixed world this puts the camera at
-/// `Y=200 < ceiling 512` (well inside the world). Pose A — used for frame
-/// A (pre-camera-promotion).
-pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_A: Vec3 = Vec3::new(500.0, 200.0, 40.0);
+/// C# `WorldRender.cs:48-49` literal camera spawn scaled to the
+/// 4096×512×4096 fixed world (`camera/mod.rs::from_world_voxels`'s formula:
+/// `pos = (W * 500/1024, H * 200/128, D * 40/1024)`). For the 4096×512×4096
+/// world this evaluates to `(2000, 800, 160)` — Y=800 > ceiling 512 (above
+/// the world); the camera looks +Z down onto Oasis architecture, which is
+/// the SAME pose the production binary `bevy-naadf -- --vox <path>` uses
+/// (see `camera/mod.rs:101` runtime log "framing loaded world —
+/// pos=(2000.00, 800.00, 160.00)"). This is the view that REVEALS the
+/// inversion class of regression as scattered dark "hole" pixels through
+/// otherwise-intact Oasis architecture; the un-scaled literal
+/// `(500, 200, 40)` puts the camera INSIDE the world where the inversion
+/// is masked by uniform-block geometry (the W5.3-fix Stage 1 e2e pose;
+/// `06-diagnostic-inversion.md` thought camera A would reveal the
+/// inversion but empirically the inside-the-world pose does not — fixed
+/// at Stage 1.5).
+pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_A: Vec3 = Vec3::new(2000.0, 800.0, 160.0);
 
-/// Camera B — translated 160 voxels in the `+Z` direction (still inside
-/// the populated Oasis tile; Oasis's first XZ tile spans
-/// `0..1488 × 0..544 × 0..1344` voxels). Pose B — used for frame B
-/// (post-camera-promotion). The translation is large enough that the
-/// per-pixel Δ between A and B is well above the TAA-noise floor for a
-/// populated world (geometry sweeps through the frustum), but small
-/// enough that B still sits inside the same tile as A (no chunk-pointer
-/// edge cases to worry about).
-pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_B: Vec3 = Vec3::new(500.0, 200.0, 200.0);
+/// Camera A look-at target: framing forward (+Z) and tilting DOWN onto
+/// Oasis architecture (instead of the production binary's horizontal +Z).
+/// The downward tilt puts Oasis geometry into the central rect (where the
+/// per-pixel Δ assertion samples), making the Δ-vs-empty discriminator
+/// load-bearing for the gate.
+pub const VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A: Vec3 =
+    Vec3::new(2000.0, 200.0, 1160.0);
+
+/// Camera B — translated 800 voxels in the `+X` direction from camera A;
+/// still framing the Oasis fixture from above (Oasis's first XZ tile spans
+/// `0..1488 × 0..544 × 0..1344` voxels; both A and B Y=800 sit above the
+/// world's 512-voxel ceiling). The lateral translation sweeps architecture
+/// laterally through the frustum, producing a per-pixel Δ well above the
+/// TAA noise floor in a populated world; in an empty world both poses
+/// render uniform sky and the Δ collapses to near-zero.
+pub const VOX_GPU_CONSTRUCTION_CAMERA_POS_B: Vec3 = Vec3::new(2800.0, 800.0, 160.0);
+
+/// Camera B look-at target: matched downward tilt with B's lateral offset.
+pub const VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B: Vec3 =
+    Vec3::new(2800.0, 200.0, 1160.0);
 
 // ---------------------------------------------------------------------------
 // Diff threshold + bounding box fractions
@@ -105,6 +145,41 @@ pub const VOX_GPU_CONSTRUCTION_DIFF_RECT_FRACS: (f32, f32, f32, f32) =
 /// geometry → brush adds voxels into an empty world but the renderer's
 /// chunks pointers are still bogus → framebuffer unchanged).
 pub const VOX_GPU_CONSTRUCTION_DIFF_FLOOR: f32 = 8.0;
+
+/// Near-black luminance threshold for the inversion-class regression
+/// assertion (`docs/orchestrate/vox-gpu-rewrite/06-diagnostic-inversion.md`).
+///
+/// Pixels with Rec.709 luminance **strictly below** this value are counted
+/// as "hole pixels" — the visual signature of the inversion bug, where
+/// scattered mixed blocks fail the CAS hash insert and render as voxel
+/// pointer `2` → reads from the seed region of `voxels[]` (all zero) →
+/// renders as empty voids exposing whatever is past the missing block.
+///
+/// Tuned by observation: the post-Stage-1.5 (correct) frame at camera A
+/// (Y=800 above world, top-down) measures ZERO near-black pixels at the
+/// `lum < 10` threshold — even shadowed wall surfaces and dark crenellation
+/// underside luminate ABOVE 10 because they carry material-colour tint
+/// (typically luminance 30+). The pre-Stage-1.5 (inverted) frame at the
+/// scaled production camera pose had a visible "hole pixel" population
+/// (the diagnostic's screenshot at `image-cache/...1.png` shows scattered
+/// near-black holes through what should be solid stone walls). Anything
+/// with `lum < 10` on the corrected camera-A frame is consistent with a
+/// true "hole pixel" (the renderer descending into a sentinel-2 block
+/// and reading zero voxels).
+pub const VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD: f32 = 10.0;
+
+/// Maximum allowed fraction of near-black pixels in the camera-A frame
+/// for the gate to PASS, expressed as a fraction of the frame's pixel
+/// count. The post-Stage-1.5 frame measures ZERO near-black pixels at
+/// the (2000, 800, 160) production-faithful camera A pose; the pre-fix
+/// frame at the same pose would have produced a substantial near-black
+/// count (~3-15% based on the diagnostic's screenshot observation of
+/// scattered hole pixels). Set conservatively at 1% (655 pixels on a
+/// 256×256 frame) — well above the observed post-fix count of 0,
+/// allowing for occasional TAA-noise-floor undershoot on a few isolated
+/// pixels, while still tripping firmly on any meaningful re-emergence
+/// of the inversion symptom.
+pub const VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING: f32 = 0.01;
 
 // ---------------------------------------------------------------------------
 // Entry point — invoked from `bin/e2e_render.rs`
@@ -136,13 +211,18 @@ pub fn run_vox_gpu_construction() -> AppExit {
     println!(
         "e2e_render --vox-gpu-construction: loading Oasis VOX fixture from \
          {} ({} bytes) into the W5 GPU producer chain (production-path \
-         camera-sweep gate; camera A at C# {:?} → camera B at {:?}, both \
-         looking +Z; expecting per-pixel RGB Δ ≥ {:.2} over central rect)",
+         camera-sweep gate; camera A at {:?} look {:?} → camera B at {:?} \
+         look {:?}; expecting per-pixel RGB Δ ≥ {:.2} over central rect AND \
+         frame-A near-black (lum<{:.1}) count ≤ {:.1}% of frame pixels)",
         path.display(),
         std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
         VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
+        VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A,
         VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
+        VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B,
         VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
+        VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD,
+        100.0 * VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING,
     );
 
     let mut app_args = crate::AppArgs::default();
@@ -199,12 +279,18 @@ pub fn pin_vox_gpu_construction_camera(
         return;
     }
     let promoted = oasis.as_deref().is_some_and(|o| o.edit_applied);
-    let pos = if promoted {
-        VOX_GPU_CONSTRUCTION_CAMERA_POS_B
+    let (pos, look_at) = if promoted {
+        (
+            VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
+            VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B,
+        )
     } else {
-        VOX_GPU_CONSTRUCTION_CAMERA_POS_A
+        (
+            VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
+            VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A,
+        )
     };
-    let pose = Transform::from_translation(pos).looking_at(pos + Vec3::Z, Vec3::Y);
+    let pose = Transform::from_translation(pos).looking_at(look_at, Vec3::Y);
     let (transform, position_split) = &mut *camera;
     **transform = pose;
     **position_split = PositionSplit::from_world(pose.translation);
@@ -264,12 +350,26 @@ pub fn assert_vox_gpu_construction_landed(
     let rect_delta = region_mean_pixel_delta(before, after, rect);
     let full_delta = before.mean_pixel_delta(after);
 
+    // vox-gpu-rewrite W5.3-fix Stage 1.5 — near-black-pixel assertion on
+    // the camera-A frame (production-faithful spawn pose). Counts pixels
+    // with luminance strictly below VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD
+    // and asserts that count stays below
+    // VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING * frame_pixels.
+    // See docstrings on those constants + `06-diagnostic-inversion.md`.
+    let frame_pixels = (before.width() as usize) * (before.height() as usize);
+    let near_black_ceiling =
+        ((frame_pixels as f32) * VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING) as usize;
+    let near_black_count = before
+        .count_pixels_with_luminance_below(None, VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD);
+
     let report = format!(
         "rect=({},{},{},{}) frac=({:.2},{:.2},{:.2},{:.2}); \
          rect mean rgba: before={:?}, after={:?}; \
          rect luminance: before={:.1}, after={:.1}, Δ={:.1}; \
          rect mean per-pixel RGB Δ={:.2} (floor={:.2}); \
-         full-frame mean per-pixel RGB Δ={:.2}",
+         full-frame mean per-pixel RGB Δ={:.2}; \
+         frame-A near-black (lum<{:.1}) count={} of {} pixels \
+         ({:.2}% of frame; ceiling={} pixels = {:.1}% of frame)",
         rect.x0,
         rect.y0,
         rect.x1,
@@ -286,6 +386,12 @@ pub fn assert_vox_gpu_construction_landed(
         rect_delta,
         VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
         full_delta,
+        VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD,
+        near_black_count,
+        frame_pixels,
+        100.0 * (near_black_count as f32) / (frame_pixels.max(1) as f32),
+        near_black_ceiling,
+        100.0 * VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING,
     );
     println!("e2e_render --vox-gpu-construction: {report}");
 
@@ -308,6 +414,28 @@ pub fn assert_vox_gpu_construction_landed(
             VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
             VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
             VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
+        ));
+    }
+
+    if near_black_count > near_black_ceiling {
+        return Err(format!(
+            "vox-gpu-construction gate FAIL — frame A has {near_black_count} pixels \
+             with luminance < {:.1} ({:.2}% of frame), exceeding the ceiling of \
+             {near_black_ceiling} pixels ({:.1}% of frame). \
+             {report}. \
+             This is the W5.3-fix Stage 1 inversion regression class \
+             (`docs/orchestrate/vox-gpu-rewrite/06-diagnostic-inversion.md`): \
+             scattered mixed blocks failed the CAS hash insert (placeholder \
+             `hash_map` + `hash_coefficients` buffers leak through when the \
+             pre-allocation gate doesn't fire on the W5 install path) and \
+             render as voxel pointer `2` → reads from the zero seed region of \
+             `voxels[]` → renders as empty voids exposing whatever lies past \
+             the missing block. Inspect \
+             target/e2e-screenshots/vox_gpu_construction_before.png — \
+             scattered dark holes through what should be solid stone walls.",
+            VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD,
+            100.0 * (near_black_count as f32) / (frame_pixels.max(1) as f32),
+            100.0 * VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING,
         ));
     }
 
