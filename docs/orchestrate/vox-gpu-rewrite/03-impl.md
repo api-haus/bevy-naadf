@@ -2653,3 +2653,234 @@ bounds) rather than the current chunk_calc-only path.
 - No new e2e gates added in this dispatch (the D1-readback log is the
   diagnostic surface; Part B used existing instrumentation rather
   than a new gate).
+
+---
+
+## impl W3-T1 fix findings (2026-05-18)
+
+### Summary
+
+Stage 7 of vox-gpu-rewrite landed `13-diagnostic-w3-bounds-calc.md` with
+HIGH-confidence identification of **Bug W3-T1**: `naadf_bounds_compute_node`
+in `crates/bevy_naadf/src/render/construction/bounds_calc.rs` runs the
+regime-2 `prepare_group_bounds` + `compute_group_bounds` chain BEFORE the
+regime-1 `add_initial_groups_to_bound_queue` seed has populated
+`bound_group_queues`. The CPU pre-seeded `bound_queue_info[0..2].size =
+32768` (`mod.rs:1334`) plus zero-initialized `bound_group_queues` is an
+inconsistent state — the regime-2 prepare pass mistakenly believes the
+size-0 queue is full of work, and `compute_group_bounds` drains
+zero-decoded queue slots interpreting them as group `(0,0,0)`, then
+corrupts the queue with re-enqueues at `(0,0,0)`. When the real regime-1
+seed finally fires one frame later, the queue is already poisoned.
+
+This dispatch lands the minimal one-line fix per the diagnostic
+recommendation: a `!construction_gpu.bounds_initialized → early-return`
+gate at the start of `naadf_bounds_compute_node`'s body. The fix uses the
+**existing** `ConstructionGpu::bounds_initialized` flag (declared at
+`construction/mod.rs:147`, flipped to `true` at `:1671` immediately after
+the regime-1 seed dispatch runs in `prepare_construction`). No new flag
+required.
+
+### Files touched
+
+- `crates/bevy_naadf/src/render/construction/bounds_calc.rs:331-345` —
+  added the `!bounds_initialized → return` early-return gate with a
+  doc-block explaining the regime-1/regime-2 ordering invariant and
+  cross-referencing the diagnostic doc. Net change: 14 LOC added
+  (13 comment lines + 3 code lines: `if !construction_gpu.bounds_initialized
+  { return; }`).
+
+No other code changes. No shader changes. No flag additions. The fix
+uses the existing `ConstructionGpu::bounds_initialized` flag set by the
+regime-1 seed dispatch at `mod.rs:1671`.
+
+### Exact gate flag chosen + rationale
+
+**Chosen: `construction_gpu.bounds_initialized`** (existing flag).
+
+Rationale:
+- The diagnostic explicitly recommends this flag (`13-diagnostic-w3-bounds-calc.md:163-167`).
+- It is set to `true` immediately after `dispatch_add_initial_groups`
+  fires in `prepare_construction` (`mod.rs:1671`), so it precisely tracks
+  "the regime-1 seed has run" — which is the exact invariant the
+  consumer (regime-2) needs.
+- No new field needed: the flag's existing one-shot semantics ("true once
+  the seed has dispatched") exactly match the gate's required semantics
+  ("the seed has populated `bound_group_queues`").
+- Adding a new `seed_has_run` field would have been redundant with
+  `bounds_initialized`, which already exists and is set in the right
+  place.
+
+The alternative — `gpu_producer_has_run` — was considered and rejected.
+That flag flips when the W5 GPU producer node finishes its dispatch, but
+the regime-1 seed runs ONE FRAME LATER (in `prepare_construction`, gated
+on `gpu_producer_has_run`). Gating regime-2 on `gpu_producer_has_run`
+would let it run BEFORE the seed, perpetuating the exact bug we are
+fixing. `bounds_initialized` is the correct downstream flag.
+
+### Exact line of the early-return
+
+`crates/bevy_naadf/src/render/construction/bounds_calc.rs:343`:
+```rust
+if !construction_gpu.bounds_initialized {
+    return;
+}
+```
+
+Positioned AFTER the `gpu_construction_enabled` and
+`max_group_bound_dispatch == 0` early-returns (those preserve the C#
+faithful gate semantics from `WorldBoundHandler.cs:94-95`) and BEFORE
+the bind-group + pipeline resolution (those are the more expensive checks).
+
+### Full e2e verification results
+
+All non-oracle gates PASS with the fix in place. The `--vox-gpu-oracle`
+gate does NOT flip green — a layered second bug is at play (see
+"Surprises" + "What's not yet done" below).
+
+- `cargo build --workspace`: **PASS** — clean compile (~14 s incremental).
+- `cargo test --workspace --lib`: **PASS** — 198 passed, 1 ignored
+  (matches baseline; no W3 unit test regression).
+- `cargo run --release --bin e2e_render -- --vox-gpu-oracle`: **FAIL**
+  (mean per-pixel RGB Δ = 127.84; floor = 8.00) — gate stays RED.
+  Surprise: the GPU-side PNG capture is **byte-identical** before vs
+  after the fix (verified by stashing the fix and re-running). The
+  fix is structurally correct per the diagnostic but does not affect
+  the rendered output, indicating a second bug.
+- `cargo run --release --bin e2e_render -- --baseline`: **PASS**
+  (sky 145.9, solid 242.0, emissive 247.0).
+- `cargo run --release --bin e2e_render -- --vox-e2e`: **PASS**
+  (vox_geometry center rect luminance 249.6 above 160 threshold).
+- `cargo run --release --bin e2e_render -- --oasis-edit-visual`: **PASS**
+  (rect mean per-pixel RGB Δ=9.81 above 8.00 floor; erase sphere r=30
+  produced measurable framebuffer change).
+- `cargo run --release --bin e2e_render -- --small-edit-visual`: **PASS**
+  (click rect max-Δ=17 above 15 floor; adj rects below 50 ceiling; CPU
+  non-empty Δ=1 expected).
+- `cargo run --release --bin e2e_render -- --small-edit-repro`: **PASS**
+  (no pitch-black pixels in 1920×1080 frame).
+- `cargo run --release --bin e2e_render -- --validate-gpu-construction`:
+  **PASS** (GPU vs CPU oracle byte-equal 388 bytes).
+- `cargo run --release --bin e2e_render -- --validate-gpu-construction-scaled`:
+  **PASS** (all 27 fixtures semantic-byte-equal).
+- `cargo run --release --bin e2e_render -- --vox-gpu-construction`:
+  **PASS** (rect mean per-pixel RGB Δ=16.56 above 8.00 floor; frame-A
+  near-black count=0).
+- `cargo run --release --bin e2e_render -- --edit-mode`: **PASS**
+  (1 set_voxel → 1+1+2 records).
+- `cargo run --release --bin e2e_render -- --entities`: **PASS**
+  (frame A: 8 chunk_updates, 1 entity_chunk_instances, 1 history;
+  frame B: 8 chunk_updates).
+- `cargo run --release --bin e2e_render -- --runtime-edit-mode`: **PASS**
+  (set_voxels_batch → 2+2+2 records; 2 edited_groups for the BFS oracle).
+
+### `--vox-gpu-oracle` before-fix vs after-fix value
+
+- **Before-fix** (Stage 4 baseline + Stage 5/6 with no W3-T1 fix):
+  mean per-pixel RGB Δ = **127.84** (97.85% of pixels exceed
+  per-channel Δ > 16 threshold).
+- **After-fix** (this dispatch, with `bounds_initialized` gate landed):
+  mean per-pixel RGB Δ = **127.84** (basically unchanged: observed
+  127.806, 127.841, 127.908 across re-runs — all within TAA-noise
+  variation of the broken-state baseline).
+- **GPU-side PNG capture before vs after fix**: byte-identical (verified
+  by stashing the fix, rebuilding, and re-running `--vox-gpu-oracle-gpu`
+  alone — the two `oracle_gpu.png` files compared identically).
+
+The fix DID NOT flip the gate green.
+
+### Surprises
+
+1. **The fix has zero observable rendering effect.** The diagnostic
+   predicted (HIGH confidence) that gating regime-2 on
+   `bounds_initialized` would prevent the chunk-AADF corruption and
+   thus restore proper distant-chunk traversal in the renderer. In
+   practice, the fix gates regime-2 correctly (verified via temporary
+   `info!` log: regime-2 fires only AFTER `bounds_initialized = true`),
+   but the GPU-side `oracle_gpu.png` is byte-identical before vs after
+   — i.e., the chunk-AADF state the renderer reads is unchanged.
+
+2. **The GPU image is NOT fully black.** Inspection of `oracle_gpu.png`
+   shows actual Oasis architecture (walls, windows, doors) visible as
+   silhouettes against a dark background, with scattered bright
+   emissive points (lamps). This is INCONSISTENT with the diagnostic's
+   predicted "chunk-AADFs are zero everywhere → renderer single-steps
+   and exhausts march budget → mostly empty void". If the diagnostic's
+   mechanism were the dominant pathology, the image would be fully
+   black (or fully sky-bleed). The fact that geometry IS visible — just
+   with broken lighting/shading — suggests the rendering path is mostly
+   functional and the bug is elsewhere.
+
+3. **The fix is structurally correct.** Direct verification via
+   temporary `info!` log in `naadf_bounds_compute_node`:
+   `gpu_producer_has_run=false → EARLY-RETURN` on first frame, then
+   `bounds_initialized=true; gpu_producer_has_run=true → FIRING regime-2`
+   on the frame after the producer flag flips. The gate works as
+   intended; the seed runs before regime-2 fires.
+
+4. **All other gates pass.** Including the new `--vox-gpu-construction`
+   gate (Stage 1.5) which uses a center-of-world camera pose and
+   measures per-pixel RGB Δ on a camera-A → camera-B promote. That gate
+   passes with Δ=16.56 > 8.00 floor, indicating the renderer CAN render
+   meaningful content from the GPU-built world from at least some
+   camera positions. The `--vox-gpu-oracle` gate uses a different
+   (corner-of-world) camera pose: pos=(744,800,672) look=(744,100,672).
+
+### What's not yet done
+
+1. **`--vox-gpu-oracle` does NOT flip green.** Per the brief: "STOP, do
+   not lower its floor or move the camera. The diagnostic's predicted
+   mechanism may have been wrong OR there's a layered second bug.
+   Investigate + report." The bug is **layered** — the W3-T1 fix is
+   structurally correct but insufficient to restore the oracle gate.
+   Suspected layered bug candidates:
+   - Camera-pose sensitivity: oracle camera (744,800,672) is near a
+     world CORNER; vox-gpu-construction camera (2048,762,2048) is at
+     world CENTER and passes. Maybe the GPU world's chunk-AADFs are
+     correct at world center but broken near the corner (e.g., model-
+     tiling boundary effects, model-clip artifacts where the 34-chunk-
+     tall model is clipped to the 32-chunk-tall world).
+   - GI / shading: the GPU image shows correct geometry silhouettes but
+     dark surfaces. Maybe the W5 producer's `voxels` cursor offset or
+     `blocks` cursor offset breaks how the renderer dereferences voxel
+     pointers for SHADING (the geometry traversal works; the per-voxel
+     colour fetch reads wrong bytes).
+   - Bounds_calc convergence rate at Oasis scale: 120 warmup frames
+     may not be enough for a 256×32×256 world's 32 bound-levels to
+     fully propagate. The diagnostic predicted "few hundred frames per
+     bound-size level" for true convergence — but at 5 rounds/frame and
+     32768 groups/round this should be ~7 frames per level. Worth
+     verifying with a per-frame chunk readback.
+   - Renderer-side `world_meta` divergence between subprocesses: the
+     CPU oracle world is 1488×544×1344 voxels; the GPU world is
+     4096×512×4096 voxels. The `bounding_box_max` upload differs, so
+     the renderer's `rayAABB` clipping differs. The cameras start
+     OUTSIDE both worlds (y=800 above each) and ray-step down. This
+     should not matter for the visible content at x=744,z=672 (interior
+     of both views) — but worth verifying the renderer reads the
+     correct `chunks[]` buffer.
+
+2. **Stage 2 (legacy-path-deletion consolidation)** is a separate
+   dispatch per `13-diagnostic-w3-bounds-calc.md` and the Stage 1.5
+   impl log. NOT in scope for this dispatch.
+
+3. **Identifying the layered second bug.** Recommended next dispatch:
+   instrument with a per-frame chunk-AADF readback at fixed (x,y,z)
+   positions inside and outside the model-cover region. Compare GPU vs
+   CPU oracle byte-by-byte across the warmup window. If the readbacks
+   show the chunk-AADF chain converges correctly, the layered bug is
+   in the renderer or shading. If not, the bounds_calc chain has a
+   second bug independent of the W3-T1 ordering issue.
+
+### What's left in place (preserved from earlier stages)
+
+- All Stage 1, 1.5, 2, 3, 4, 5, 6 prior fixes preserved unchanged.
+- Stage 1.5's `bound_group_queue_max_size = 32768` per-segment fix
+  (`mod.rs:2524`) preserved — verified the W3-T1 fix does not undo it.
+- W5 producer code (`generator_model.wgsl`, `chunk_calc.wgsl`,
+  `naadf_gpu_producer_node`) unchanged — Stage 6 proved byte-equality
+  with CPU oracle across 27 fixtures including real Oasis.
+- No shader changes.
+- No new e2e gates added (the existing `--vox-gpu-oracle` gate is
+  intentionally left RED as the canonical tripwire for the layered
+  second bug).

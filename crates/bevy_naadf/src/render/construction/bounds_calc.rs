@@ -328,6 +328,21 @@ pub fn naadf_bounds_compute_node(
         // NAADF early-return — `WorldBoundHandler.cs:94-95`.
         return;
     }
+    // vox-gpu-rewrite Bug W3-T1 fix (2026-05-18) — regime-2 (prepare +
+    // compute) MUST NOT run before regime-1 (`add_initial_groups_to_bound_queue`)
+    // has populated `bound_group_queues`. The CPU pre-seed of
+    // `bound_queue_info[0..2].size = 32768` plus zero-initialized
+    // `bound_group_queues` is an internally inconsistent state — `compute_group_bounds`
+    // would drain 32768 queue slots all decoding to group (0,0,0), corrupt the
+    // queue with re-enqueues at (0,0,0), and permanently strand the real seed
+    // data when it finally lands one frame later. C# avoids this by calling
+    // `WorldBoundHandler.Initialize` synchronously before any `Update()`
+    // (`WorldBoundHandler.cs:53-89`); the Rust port splits the two across
+    // schedules so we must gate the consumer on the producer's flag.
+    // Diagnostic: `docs/orchestrate/vox-gpu-rewrite/13-diagnostic-w3-bounds-calc.md`.
+    if !construction_gpu.bounds_initialized {
+        return;
+    }
 
     // Pull the three bind groups + the indirect buffer.
     let Some(bounds_world_bg) = construction_bind_groups.construction_bounds_world.as_ref()
