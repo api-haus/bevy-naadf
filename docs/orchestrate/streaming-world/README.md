@@ -55,8 +55,10 @@ consolidated mode disqualified.
 - [x] **Hard gate (Phase 2.4)** — GREEN: viability YES (lum variance 1816, screenshot has visible terrain). Sliding-window bug is provably isolated to residency layer.
 - [x] 03e — Phase-2.5 partial: `Generating → Resident` transition ✓ + strict gate thresholds ✓ + wall-clock budget ✓ + doc cleanup ✓
 - [x] **Hard gate (Phase 2.5)** — strict gate correctly FAILS sky-only output (variance 222 vs floor 800); SECONDARY defect surfaced — slot-to-world geometric mapping
-- [ ] 03f — Phase-2.6: geometric slot indexing (Option A residency-side OR Option B renderer-side); + dirty-segments bounds-chain optimisation
-- [ ] **Hard gate (Phase 2.6)** — confirm visible sliding-window streaming + strict gate passes
+- [x] 02c — Phase-2.6 design: `WindowedSlotMap` primitive (pool + mapping + indirection table) — design at `02c-design-windowed-slot-map.md`
+- [ ] **Hard gate (Phase 2.6 design)** — submit refined design to user before impl dispatch
+- [ ] 03f — Phase-2.6 impl: `WindowedSlotMap` data structure + GPU indirection buffer + shader helper threading (per `02c` § G migration plan)
+- [ ] **Hard gate (Phase 2.6 impl)** — confirm visible sliding-window streaming + strict gate passes
 - [ ] 04 — Fresh-eyes review brief (`04-review.md` written by orchestrator, scoped to BOTH Phase 1 + Phase 2)
 - [ ] 05 — Fresh-eyes review (`delegate-reviewer` → `05-review-findings.md`)
 - [ ] **Hard gate** — synthesise review against `01-context.md`, submit to user
