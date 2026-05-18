@@ -154,26 +154,49 @@ impl WorldData {
                     continue;
                 }
                 // Hash the existing voxel content and register the slot.
-                // `add_block` will dedup if multiple block positions
-                // already happen to share content (rare; construction
-                // allocates fresh slots so the first occurrence of each
-                // unique content gets its own slot, and subsequent
-                // identical content increments use_count).
+                //
+                // **Use `seed_block`, NOT `add_block`** (Bug 1 of
+                // `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-
+                // speckle-and-brush-clears.md`): the prior `add_block` call
+                // unconditionally appended a duplicate copy of seeded
+                // content to `voxels_cpu` and registered the appended END
+                // pointer in the hash table. GPU's `voxels[]` only had data
+                // at the ORIGINAL pointers (in the 0..N range populated by
+                // construction); the appended END pointers (in the N..M
+                // range) were never written to GPU. Edit-time
+                // `add_block` for unchanged blocks then returned an END
+                // pointer; GPU's `apply_block_change` wrote END pointer
+                // into `blocks[]`; renderer descended into zero data → an
+                // empty-voxel decode → 16-voxel-wide dark void around the
+                // brush (the user-visible "making edits clears areas"
+                // symptom).
+                //
+                // `seed_block` registers `voxel_ptr` (the existing pointer
+                // already in `blocks_cpu` and on GPU's `blocks[]`) directly,
+                // with no append. Subsequent edit-time `add_block` returns
+                // the original pointer; GPU `voxels[]` has data there;
+                // unchanged blocks render correctly post-edit.
                 let pairs = {
                     let slice = &self.voxels_cpu
                         [vbase..vbase + crate::aadf::block_hash::BLOCK_VOXEL_PAIRS];
-                    // Copy into a stack array so add_block's &mut voxels_cpu
-                    // borrow doesn't conflict with this read.
                     let mut buf = [0u32; crate::aadf::block_hash::BLOCK_VOXEL_PAIRS];
                     buf.copy_from_slice(slice);
                     buf
                 };
                 let hash = self.block_hashing.compute_hash(&pairs);
-                let (registered_ptr, is_new) =
-                    self.block_hashing.add_block(hash, &pairs, &mut self.voxels_cpu);
+                let (registered_ptr, is_new) = self.block_hashing.seed_block(
+                    hash,
+                    &pairs,
+                    voxel_ptr,
+                    &self.voxels_cpu,
+                );
                 // If the seed produced a different pointer (because content
                 // matched an earlier seed and was deduped), patch the block
-                // word to point at the canonical slot.
+                // word to point at the canonical slot. Both pointers
+                // reference identical voxel content; GPU `voxels[]` has
+                // correct data at both addresses, so the patch is purely a
+                // CPU-side dedup that converges the CPU mirror onto the
+                // handler's choice of canonical slot.
                 if !is_new && registered_ptr != voxel_ptr {
                     self.blocks_cpu[block_idx] = (block_raw & !0x3FFF_FFFF) | registered_ptr;
                 }

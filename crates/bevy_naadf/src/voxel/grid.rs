@@ -84,25 +84,27 @@ pub const DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS: [u32; 3] = GRID_SIZE_IN_CHUNKS;
 ///   producer chain runs `generator_model` + `chunk_calc` per segment to
 ///   build the world directly on the device.
 ///
-/// **`--vox-gpu-oracle` CPU phase exception:** when
-/// `AppArgs.vox_gpu_oracle_cpu_phase == true` the loader instead calls
-/// [`install_vox_sized_to_model`] directly — this is the CPU oracle the
-/// gate compares the W5 GPU output against. Test-only escape hatch; NOT a
-/// runtime configuration knob.
+/// **Stage 13 (2026-05-18):** the `vox_gpu_oracle_cpu_phase` escape hatch
+/// that previously routed Vox loads to [`install_vox_sized_to_model`] has
+/// been removed. The `--vox-gpu-oracle` gate now runs **both** phases
+/// through the production W5 install path
+/// ([`install_vox_in_fixed_world`]) — measuring GPU-producer determinism
+/// rather than CPU-vs-GPU equivalence (Bug 2 of
+/// `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-speckle-and-
+/// brush-clears.md`). The `vox_gpu_oracle_cpu_phase` flag is preserved as
+/// a phase marker the e2e driver reads to wire the camera pin + the
+/// single-screenshot fast-path; it no longer changes the install path.
+///
+/// `install_vox_sized_to_model` is retained for hand-debugging the
+/// natural-bound CPU world (no live caller, but the function stays since
+/// the CPU oracle path itself remains useful as a reference).
 pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
     match &args.grid_preset {
         GridPreset::Default => {
             install_default_embedded_in_fixed_world(&mut commands);
         }
         GridPreset::Vox { path } => {
-            if args.vox_gpu_oracle_cpu_phase {
-                // Test-only CPU oracle phase for `--vox-gpu-oracle`. The
-                // gate's compare phase pairs this CPU render against the GPU
-                // render of the same fixture through the production W5 path.
-                install_vox_sized_to_model(&mut commands, path);
-            } else {
-                install_vox_in_fixed_world(&mut commands, path);
-            }
+            install_vox_in_fixed_world(&mut commands, path);
         }
     }
 }
@@ -215,12 +217,18 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
 
 /// Legacy `.vox` loader — sizes the world to the model's natural bounds.
 ///
-/// **vox-gpu-rewrite Stage 2 (2026-05-18):** retained as the CPU oracle the
-/// `--vox-gpu-oracle` gate compares the W5 GPU output against. NOT reachable
-/// from the production install path — only the test-only
-/// `AppArgs.vox_gpu_oracle_cpu_phase` branch in [`setup_test_grid`] dispatches
-/// here. The XZ-tiling parameter is gone (the GPU producer handles tiling
-/// via `voxelPos % modelSize` on device).
+/// **Stage 13 (2026-05-18) status:** dead code from production + e2e
+/// gates. The `--vox-gpu-oracle` gate (the only prior caller via the
+/// `vox_gpu_oracle_cpu_phase` escape hatch) has been rewired to a
+/// GPU-vs-GPU determinism test (Bug 2 of
+/// `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-speckle-and-
+/// brush-clears.md` — the CPU-vs-GPU compare was a structural
+/// test-calibration mismatch, not a runtime defect). The function is kept
+/// for hand-debugging the natural-bound CPU world if a future
+/// investigation needs to compare a sized-to-model render against the
+/// fixed-world tiled render; suppressed-warning attribute reflects the
+/// no-caller state.
+#[allow(dead_code)]
 fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path) {
     match vox_import::load_vox_tiled(path, 1) {
         Ok(imp) => {

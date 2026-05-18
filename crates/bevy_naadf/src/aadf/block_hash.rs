@@ -192,6 +192,101 @@ impl BlockHashingHandler {
         );
     }
 
+    /// Register an EXISTING (already-in-`voxels_cpu`) slot in the hash table
+    /// without allocating new storage. Used by [`crate::world::data::WorldData::
+    /// seed_block_hashing`] after a fresh world load (or post-GPU-readback) to
+    /// teach the handler about pre-existing block slots so subsequent
+    /// edit-time `add_block` / `delete_block` calls see correct refcounts AND
+    /// dedup against the **original** pointers the renderer / GPU `blocks[]`
+    /// already references.
+    ///
+    /// Behaviour difference from [`Self::add_block`]:
+    ///
+    /// - On first-occurrence (`is_new = true`): registers `existing_ptr`
+    ///   directly. No allocation, no extension of `voxels_cpu`, no copy of
+    ///   `voxel_pairs` into the buffer. The hash entry's `voxels_pointer`
+    ///   equals `existing_ptr` — matching the pointer already stored in
+    ///   `blocks_cpu[block_idx]` (and on GPU's `blocks[]`).
+    /// - On dedup hit (`is_new = false`): returns the **earlier** seeded
+    ///   pointer (which is also somewhere in the 0-N range that GPU
+    ///   `voxels[]` was populated with at construction). Caller patches
+    ///   `blocks_cpu[block_idx]` to that pointer if it differs from
+    ///   `existing_ptr` — both pointers reference identical voxel content,
+    ///   GPU's `voxels[]` has correct data at both addresses, so the patch
+    ///   is purely a CPU-side dedup that converges the CPU mirror onto the
+    ///   handler's choice of canonical slot.
+    ///
+    /// Hash-collision tie-breaking uses byte-equality against the
+    /// already-registered entry's content (read from `voxels_cpu` —
+    /// **immutable borrow only**). Same probe semantics as `add_block`.
+    ///
+    /// Returns `(registered_ptr, is_new)`:
+    ///   - `registered_ptr` — the pointer registered in the hash entry
+    ///     (either `existing_ptr` itself, or the earlier seeded canonical
+    ///     pointer on dedup).
+    ///   - `is_new` — `true` if this is the first time the content has been
+    ///     registered, `false` if it dedup-merged with an earlier entry.
+    ///
+    /// Cross-references:
+    ///
+    /// - Bug 1 of `docs/orchestrate/vox-gpu-rewrite/17-diagnostic-residual-
+    ///   speckle-and-brush-clears.md`. `add_block`'s `alloc_voxel_slot` branch
+    ///   appended a duplicate copy of seeded content to the end of
+    ///   `voxels_cpu` and stored that END pointer in the hash entry; the
+    ///   GPU's `voxels[]` was never written at those END addresses. Edit-time
+    ///   `add_block` calls for unchanged blocks then returned the END pointer
+    ///   → GPU `apply_block_change` wrote END pointer into `blocks[]` →
+    ///   renderer descended into zero data → 16-voxel-wide void around brush.
+    /// - C# `WorldData.cs:131-132`: shares a single `BlockHashingHandler`
+    ///   instance between the GPU producer and the editor, so there is no
+    ///   "seed from GPU readback" step in C# — the same handler reference
+    ///   flows through both paths. The Rust port had to add a seed pass
+    ///   after the GPU→CPU readback; this method makes that seed pass
+    ///   semantically faithful (the handler's pointers match the GPU
+    ///   `blocks[]`'s pointers, not duplicated appended copies).
+    pub fn seed_block(
+        &mut self,
+        hash: u32,
+        voxel_pairs: &[u32],
+        existing_ptr: u32,
+        voxels_cpu: &[u32],
+    ) -> (u32, bool) {
+        debug_assert_eq!(voxel_pairs.len(), BLOCK_VOXEL_PAIRS);
+        let mask = (self.map_size as u32).wrapping_sub(1);
+        let mut idx = (hash & mask) as usize;
+        for _ in 0..self.probe_cap {
+            let entry = self.map[idx];
+            if entry.voxels_pointer == 0 {
+                // Empty slot → register `existing_ptr` directly, no append.
+                self.map[idx] = BlockHashEntry {
+                    voxels_pointer: existing_ptr,
+                    use_count: 1,
+                    hash,
+                };
+                self.used_count += 1;
+                self.resize_if_needed();
+                return (existing_ptr, true);
+            }
+            if entry.hash == hash {
+                let base = entry.voxels_pointer as usize;
+                if base + BLOCK_VOXEL_PAIRS <= voxels_cpu.len() {
+                    let existing = &voxels_cpu[base..base + BLOCK_VOXEL_PAIRS];
+                    if existing == voxel_pairs {
+                        self.map[idx].use_count += 1;
+                        return (entry.voxels_pointer, false);
+                    }
+                }
+                // Hash collision (or unreachable existing — keep probing).
+            }
+            idx = ((idx as u32 + 1) & mask) as usize;
+        }
+        panic!(
+            "BlockHashingHandler::seed_block: linear probe exceeded {} slots — \
+             hashmap is either full or pathologically clustered (used={}, size={})",
+            self.probe_cap, self.used_count, self.map_size
+        );
+    }
+
     /// Decrement a slot's `use_count` by 1. Mirrors C# `DeleteBlock`.
     ///
     /// Returns `true` when the count dropped to 0 — the caller (or this
@@ -439,6 +534,53 @@ mod tests {
         assert_eq!(
             &voxels[ptr_b as usize..ptr_b as usize + BLOCK_VOXEL_PAIRS],
             &b[..]
+        );
+    }
+
+    /// `seed_block` registers an existing pointer without appending to
+    /// `voxels_cpu`, and edit-time `add_block` for the same content returns
+    /// THAT pointer (not an appended-end pointer). Regression guard for
+    /// Bug 1 of `vox-gpu-rewrite/17-diagnostic-residual-speckle-and-brush-
+    /// clears.md`.
+    #[test]
+    fn seed_block_preserves_existing_pointer_and_dedup_works() {
+        let mut h = BlockHashingHandler::new();
+        // Simulate post-construction `voxels_cpu` with the sentinel + one
+        // mixed block at offset 1 (its "original" pointer the GPU also has).
+        let mut voxels = vec![0u32];
+        let block = make_block(7);
+        voxels.extend_from_slice(&block);
+        let existing_ptr = 1u32;
+        let hash = h.compute_hash(&block);
+        let voxels_len_before = voxels.len();
+        // Seed the handler with the existing slot.
+        let (registered_ptr, is_new) =
+            h.seed_block(hash, &block, existing_ptr, &voxels);
+        assert!(is_new, "first seed of a unique content is is_new=true");
+        assert_eq!(
+            registered_ptr, existing_ptr,
+            "seed_block must register the original pointer, not append a duplicate"
+        );
+        assert_eq!(
+            voxels.len(),
+            voxels_len_before,
+            "seed_block must NOT extend voxels_cpu"
+        );
+        assert_eq!(h.used_count(), 1);
+        // Now simulate an edit-time `add_block` on the unchanged content.
+        // It must return the original pointer (not append + return an end
+        // pointer). This is the exact bug-1 scenario.
+        let (edit_ptr, edit_is_new) =
+            h.add_block(hash, &block, &mut voxels);
+        assert!(!edit_is_new, "unchanged content must dedup to seeded slot");
+        assert_eq!(
+            edit_ptr, existing_ptr,
+            "edit-time add_block on unchanged content must return the original (seeded) pointer"
+        );
+        assert_eq!(
+            voxels.len(),
+            voxels_len_before,
+            "edit-time dedup must NOT extend voxels_cpu"
         );
     }
 
