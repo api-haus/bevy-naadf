@@ -67,7 +67,9 @@
 }
 #import "shaders/pbr_sampling.wgsl"::{
     triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
-    pom_displace_uv, select_layer_variant,
+    triplanar_sample_pom, triplanar_sample_normal_pom,
+    dominant_axis_from_weights, pom_displaced_uv_dominant,
+    select_layer_variant,
     MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
 
@@ -271,21 +273,41 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 break;
             }
 
-            // PBR hit — sample MRH, albedo, then decide mirror vs. defer.
-            // POM is not applied in the first-hit path (it would shift the
-            // hit position and break the G-buffer plane reconstruction);
-            // POM is the GI/spatial-resampling pass's job once that lands.
-            let mrh = triplanar_sample(
-                pbr_mrh, pbr_sampler, hit_world_pos, blend_weights, layer,
+            // PBR hit — sample MRH (geometric uv), then POM-displace the
+            // dominant plane's UV from the MRH.B height channel, then
+            // re-sample MRH / diffuse / normal with POM applied on the
+            // dominant plane. POM changes the SHADING-INPUT UVs only — the
+            // geometric hit position written into the G-buffer
+            // (`compress_first_hit_data` below uses `distance_ray` +
+            // `norm_tangs`, both untouched by POM) is unaffected.
+            let dominant_axis = dominant_axis_from_weights(blend_weights);
+            let displaced_uv = pom_displaced_uv_dominant(
+                pbr_mrh, pbr_sampler,
+                hit_world_pos, ray_dir, layer, dominant_axis,
+            );
+            let mrh = triplanar_sample_pom(
+                pbr_mrh, pbr_sampler,
+                hit_world_pos, blend_weights, layer, dominant_axis, displaced_uv,
             );
             let sampled_metallic = mrh.r;
             let sampled_roughness = mrh.g;
 
-            let diffuse_ao = triplanar_sample(
-                pbr_diffuse_ao, pbr_sampler, hit_world_pos, blend_weights, layer,
+            let diffuse_ao = triplanar_sample_pom(
+                pbr_diffuse_ao, pbr_sampler,
+                hit_world_pos, blend_weights, layer, dominant_axis, displaced_uv,
             );
             // sRGB-decoded albedo × per-VoxelType tint, × per-voxel-face AO.
             let sampled_albedo = diffuse_ao.rgb * voxel_type.albedo_tint * diffuse_ao.a;
+
+            // Perturbed (normal-mapped) surface normal — RNM-blended tangent
+            // normals lifted into world space. Replaces the geometric
+            // axis-aligned face normal for every BRDF call below (mirror
+            // Schlick + reflection axis), so the normal map is visible.
+            let perturbed_normal = triplanar_sample_normal_pom(
+                pbr_normal, pbr_sampler,
+                hit_world_pos, blend_weights, face_normal,
+                layer, dominant_axis, displaced_uv,
+            );
 
             // Polished metal / glass — re-enter the existing 4-iteration
             // perfect-reflect mirror loop. Schlick Fresnel weights the
@@ -293,13 +315,16 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // same as the prior C# mirror branch (`02-design.md` decision
             // #14). Reuses the `mix(0.04, albedo, metallic)` F0 to make
             // metallic mirrors retain their metallic tint.
+            //
+            // Mirror Fresnel + reflect axis use the PERTURBED normal so the
+            // normal map shows up even on near-mirror metals.
             if (sampled_roughness < MIRROR_ROUGHNESS_EPSILON) {
-                let cos_theta = clamp(dot(face_normal, -ray_dir), 0.0, 1.0);
+                let cos_theta = clamp(dot(perturbed_normal, -ray_dir), 0.0, 1.0);
                 let f_base = mix(vec3<f32>(0.04), sampled_albedo, sampled_metallic);
                 let one_minus_ct = 1.0 - cos_theta;
                 let r = f_base + (vec3<f32>(1.0) - f_base) * pow(one_minus_ct, 5.0);
                 acc.absorption = acc.absorption * r;
-                ray_dir = reflect(ray_dir, face_normal);
+                ray_dir = reflect(ray_dir, perturbed_normal);
                 old_pos = vec3<f32>(cur_pos_int) + cur_pos_frac;
                 i = i + 1u;
                 continue;

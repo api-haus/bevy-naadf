@@ -63,6 +63,9 @@
     select_layer_variant, eval_pbr, PbrEval,
     ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
+// `triplanar_sample_normal` is imported above and called below to sample the
+// perturbed (normal-mapped) surface normal so the BRDF sees the bump detail
+// instead of the axis-aligned geometric face normal.
 
 // --- @group(1) — the GI-specific bindings -----------------------------------
 
@@ -256,6 +259,15 @@ fn calc_global_ilum(
     );
     let first_hit_albedo = first_hit_diffuse_ao.rgb
         * first_hit_type.albedo_tint * first_hit_diffuse_ao.a;
+    // Perturbed (normal-mapped) surface normal at the reconstructed first
+    // hit. Replaces `first_hit_result.normal` in every BRDF call below
+    // (initial bounce VNDF, throughput eval_pbr). The geometric normal stays
+    // in use only for geometric tests (ray offset, ≤0 cos cull).
+    let first_hit_perturbed_normal = triplanar_sample_normal(
+        pbr_normal, pbr_sampler,
+        first_hit_world_pos, first_hit_blend, first_hit_result.normal,
+        first_hit_layer,
+    );
 
     // A primary-ray miss (voxelTypeRaw == 0) is never queued by `rayQueueCalc`,
     // but the indirect dispatch tail lanes read a zero-cleared `ray_queue` slot
@@ -296,11 +308,15 @@ fn calc_global_ilum(
         var rough_normal = vec3<f32>(0.0, 0.0, 0.0);
         var count: i32 = 0;
         loop {
+            // VNDF sample around the perturbed normal so normal-map bumps
+            // bias the reflection direction (and thus the bounce sample).
             rough_normal = sample_vndf_isotropic(
                 next_rand2(&rand), -cur_dir,
-                first_hit_roughness_sampled, first_hit_result.normal,
+                first_hit_roughness_sampled, first_hit_perturbed_normal,
             );
             cur_dir = reflect(cur_dir, rough_normal);
+            // Geometric ≤0 cull stays on the geometric face normal so a
+            // perturbed-but-still-self-occluded bounce gets re-rolled.
             if (!(dot(cur_dir, first_hit_result.normal) <= 0.0 && count < 2)) {
                 break;
             }
@@ -310,19 +326,22 @@ fn calc_global_ilum(
         // sampled the VNDF (importance-sampled around `rough_normal`), so the
         // remaining factor is `geometry_term * F` (the VNDF pdf cancels D and
         // the `4 n·l n·v` denom). Reuse `eval_pbr`'s F0 to keep the metallic
-        // tint baked into the throughput.
+        // tint baked into the throughput. BRDF uses the perturbed normal so
+        // the metallic tint × normal-map shading is visible in the bounce.
         let pbr = eval_pbr(
-            cur_dir, -ray_dir, first_hit_result.normal,
+            cur_dir, -ray_dir, first_hit_perturbed_normal,
             first_hit_albedo, first_hit_metallic, first_hit_roughness_sampled,
         );
         let gi = geometry_term(
             first_hit_roughness_sampled,
-            clamp(dot(cur_dir, first_hit_result.normal), 0.0, 1.0),
+            clamp(dot(cur_dir, first_hit_perturbed_normal), 0.0, 1.0),
         );
         extra_absorption = gi * pbr.fresnel;
     } else {
+        // Uniform-hemisphere sample around the perturbed normal — Lambertian
+        // diffuse benefits from normal-map detail too.
         cur_dir = get_uniform_hemisphere_sample(
-            next_rand2(&rand), first_hit_result.normal, 0.0,
+            next_rand2(&rand), first_hit_perturbed_normal, 0.0,
         );
     }
     let sample_dir = cur_dir;
@@ -396,6 +415,10 @@ fn calc_global_ilum(
         var sampled_albedo = vec3<f32>(1.0);
         var sampled_metallic: f32 = 0.0;
         var sampled_roughness: f32 = 1.0;
+        // Perturbed normal at the bounce hit. Initialised to the geometric
+        // normal so the Emissive fast-path (skipping the PBR sample below)
+        // still has a sensible value for any geometric tests that follow.
+        var bounce_perturbed_normal = ray_result.normal;
         if (material_state == SURFACE_PBR) {
             let mrh = triplanar_sample(
                 pbr_mrh, pbr_sampler, hit_world_pos, hit_blend, hit_layer,
@@ -412,6 +435,12 @@ fn calc_global_ilum(
             // conservation (`02-design.md` § E).
             cur_absorption = cur_absorption
                 * ((vec3<f32>(1.0) - vec3<f32>(sampled_metallic)) * sampled_albedo);
+            // Sample the perturbed normal so the BRDF sees the bump detail
+            // on every GI bounce (not just primary visibility).
+            bounce_perturbed_normal = triplanar_sample_normal(
+                pbr_normal, pbr_sampler,
+                hit_world_pos, hit_blend, ray_result.normal, hit_layer,
+            );
         }
         // Emissive: no colour transport (the emissive contribution adds to
         // `radiance`, not multiplied into throughput).
@@ -433,12 +462,16 @@ fn calc_global_ilum(
             // weight is preserved (it folds the hemisphere-sample pdf into
             // the integrand — `2 = 2π/π` for the canonical cosine-weighted
             // estimator). Result is a `vec3` (diffuse + specular).
+            //
+            // Surface normal here is the PERTURBED normal so the sun-shading
+            // varies with the normal map; the cos(θ_l) weight uses the same
+            // perturbed normal for consistency.
             let pbr = eval_pbr(
-                sun_dir_rand, -cur_dir, ray_result.normal,
+                sun_dir_rand, -cur_dir, bounce_perturbed_normal,
                 sampled_albedo, sampled_metallic, sampled_roughness,
             );
             let fac = pbr.f
-                * (2.0 * clamp(dot(ray_result.normal, sun_dir_rand), 0.0, 1.0));
+                * (2.0 * clamp(dot(bounce_perturbed_normal, sun_dir_rand), 0.0, 1.0));
 
             // The single sun-shadow ray (`gi_params.max_ray_steps_sun_secondary`
             // runtime knob — `21-design-quality-panel.md`).
@@ -479,10 +512,13 @@ fn calc_global_ilum(
             var count: i32 = 0;
             new_dir = cur_dir;
             loop {
+                // VNDF importance sample around the perturbed normal so the
+                // normal-map bumps bias the next-bounce direction.
                 rough_normal = sample_vndf_isotropic(
-                    next_rand2(&rand), -new_dir, sampled_roughness, ray_result.normal,
+                    next_rand2(&rand), -new_dir, sampled_roughness, bounce_perturbed_normal,
                 );
                 new_dir = reflect(new_dir, rough_normal);
+                // Geometric ≤0 cull stays on the geometric face normal.
                 if (!(dot(new_dir, ray_result.normal) <= 0.0 && count < 2)) {
                     break;
                 }
@@ -493,7 +529,7 @@ fn calc_global_ilum(
             } else {
                 let gi = geometry_term(
                     sampled_roughness,
-                    clamp(dot(new_dir, ray_result.normal), 0.0, 1.0),
+                    clamp(dot(new_dir, bounce_perturbed_normal), 0.0, 1.0),
                 );
                 // F0 with metallic split — preserves the metallic tint in
                 // the reflected bounce's throughput.
@@ -503,10 +539,11 @@ fn calc_global_ilum(
                 cur_absorption *= gi * f;
             }
         } else {
+            // Lambertian hemisphere sample around the perturbed normal.
             new_dir = get_uniform_hemisphere_sample(
-                next_rand2(&rand), ray_result.normal, 0.0,
+                next_rand2(&rand), bounce_perturbed_normal, 0.0,
             );
-            cur_absorption *= clamp(dot(ray_result.normal, new_dir), 0.0, 1.0) * 2.0;
+            cur_absorption *= clamp(dot(bounce_perturbed_normal, new_dir), 0.0, 1.0) * 2.0;
         }
         if (rough_break) {
             break;

@@ -370,3 +370,24 @@ four-branch material-class switch to one PBR path + one Emissive
 fast-path. The `GpuVoxelType` stays at exactly 16 bytes with 40 bits
 reserved. The mirror loop is preserved per decision #14 and gated on
 texture-sampled roughness.
+
+## diagnose-fix dispatch (2026-05-18)
+
+See `docs/orchestrate/pbr-raymarching/05-diagnostic.md` for the full
+root-cause + fix log.
+
+### Summary of code changes (file list only)
+
+- `crates/bevy_naadf/src/assets/shaders/pbr_sampling.wgsl`
+- `crates/bevy_naadf/src/assets/shaders/naadf_first_hit.wgsl`
+- `crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl`
+- `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl`
+- `crates/bevy_naadf/src/e2e/pbr_visual.rs`
+- `docs/orchestrate/pbr-raymarching/05-diagnostic.md` (new)
+
+### Verdict
+
+SUCCESS — Bug A (normal map invisible), Bug B (NaN-cascade splotches),
+Bug C (POM dormant) all root-caused with evidence + fixed; `--pbr-visual`
+gate tightened with `normal-rect std-dev` and `texture sat-frac`
+assertions; all 9 verification gates green.

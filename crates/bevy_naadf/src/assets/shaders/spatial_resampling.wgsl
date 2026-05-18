@@ -67,7 +67,8 @@
 }
 #import "shaders/common.wgsl"::PI
 #import "shaders/pbr_sampling.wgsl"::{
-    triplanar_blend_weights, triplanar_sample, select_layer_variant,
+    triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
+    select_layer_variant,
     eval_pbr, PbrEval, MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
 }
 
@@ -211,6 +212,17 @@ fn sample_neighbors(
     );
     let first_hit_albedo = fh_diffuse_ao.rgb
         * first_hit_type.albedo_tint * fh_diffuse_ao.a;
+    // Perturbed (normal-mapped) surface normal at the reconstructed first
+    // hit. Used in all BRDF calls below (`get_brdf`, the resolved-color
+    // `eval_pbr`, the sun-sample `eval_pbr`) so the spatial-resampling pass
+    // shares the same per-pixel normal-map response as the first-hit pass.
+    // Geometric tests (visibility ray origin, sun-shadow ray origin,
+    // bucket-classification) keep using `first_hit.normal` — they are
+    // geometric face-orientation lookups, not BRDF inputs.
+    let first_hit_perturbed_normal = triplanar_sample_normal(
+        pbr_normal, pbr_sampler,
+        fh_world_pos, fh_blend, first_hit.normal, fh_layer,
+    );
 
     // `is_diffuse` split mirrors the first-hit pass's gate
     // (`ROUGH_SPECULAR_DIFFUSE_THRESHOLD`, `02-design.md` decision #7). A
@@ -455,7 +467,7 @@ fn sample_neighbors(
         let brdf_neighbor = select(
             get_brdf(
                 first_hit_roughness, first_hit_albedo, first_hit_metallic,
-                first_hit.normal, dir_to_sample_now_or_sun, -first_hit.ray_dir,
+                first_hit_perturbed_normal, dir_to_sample_now_or_sun, -first_hit.ray_dir,
             ),
             vec3<f32>(1.0),
             first_hit_is_diffuse,
@@ -550,27 +562,29 @@ fn sample_neighbors(
     let brdf = select(
         get_brdf(
             first_hit_roughness, first_hit_albedo, first_hit_metallic,
-            first_hit.normal, selected_ray_dir, -first_hit.ray_dir,
+            first_hit_perturbed_normal, selected_ray_dir, -first_hit.ray_dir,
         ),
         vec3<f32>(1.0),
         first_hit_is_diffuse,
     );
     let target_function_new = get_target_function_new(
-        selected_ray_dir, first_hit.normal, selected_color, brdf,
+        selected_ray_dir, first_hit_perturbed_normal, selected_color, brdf,
     );
     let average_weight_new = sum_weight
         / max(0.0000000000001, sum_samples * target_function_new);
     var color = average_weight_new * selected_color;
     if (!first_hit_is_diffuse) {
-        // Specular weighting: full `eval_pbr` BRDF * incident cos.
+        // Specular weighting: full `eval_pbr` BRDF * incident cos. Uses the
+        // perturbed normal so normal-map detail modulates the specular lobe.
         let pbr = eval_pbr(
-            selected_ray_dir, -first_hit.ray_dir, first_hit.normal,
+            selected_ray_dir, -first_hit.ray_dir, first_hit_perturbed_normal,
             first_hit_albedo, first_hit_metallic, first_hit_roughness,
         );
         color *= pbr.f;
     } else {
-        // Diffuse weighting: Lambertian.
-        color *= clamp(dot(first_hit.normal, selected_ray_dir), 0.0, 1.0) * (1.0 / PI);
+        // Diffuse weighting: Lambertian against the perturbed normal so the
+        // normal-map shading varies in the resampled diffuse output too.
+        color *= clamp(dot(first_hit_perturbed_normal, selected_ray_dir), 0.0, 1.0) * (1.0 / PI);
     }
 
     // --- the sun sample (renderSpatialResampling.fx:321-339) -----------------
@@ -603,7 +617,10 @@ fn sample_neighbors(
             i32(max(gi_params.max_ray_steps_sun, 1u)),
             &sun_temp,
         );
-        let sun_dir_cos_theta = clamp(dot(sun_dir_rand, first_hit.normal), 0.0, 1.0);
+        // `sun_dir_cos_theta` uses the perturbed normal so the sun
+        // shading varies with the normal map; geometric self-shadowing was
+        // already accounted for by `shoot_ray`.
+        let sun_dir_cos_theta = clamp(dot(sun_dir_rand, first_hit_perturbed_normal), 0.0, 1.0);
         if (!is_sun_blocked && first_hit.normal_tang != HIT_NOTHING
             && sun_dir_cos_theta > 0.001) {
             // Post-PBR-raymarching: the sun-sample weighting collapses to
@@ -618,7 +635,7 @@ fn sample_neighbors(
             var weight = vec3<f32>(2.0 * sun_dir_cos_theta);
             if (is_specular) {
                 let pbr = eval_pbr(
-                    sun_dir_rand, -first_hit.ray_dir, first_hit.normal,
+                    sun_dir_rand, -first_hit.ray_dir, first_hit_perturbed_normal,
                     first_hit_albedo, first_hit_metallic, first_hit_roughness,
                 );
                 weight = pbr.f * (2.0 * sun_dir_cos_theta);

@@ -59,9 +59,11 @@ VNDF-GGX BRDF and multi-bounce `shoot_ray` scaffolding already in the shaders.
 - [x] Hard gate — design reviewed
 - [x] Checkpoint commit (design) — `85105f3`
 - [x] Implementer dispatched (Stage 8 SUCCESS — all 9 gates pass)
-- [ ] Hard gate — impl reviewed (user does live visual check on the binary)
-- [ ] Checkpoint commit (impl)
-- [ ] `delegate-reviewer` dispatched
+- [x] User live visual check #1 — reported 3 bugs (normal map invisible, POM dormant, glitchy splotches)
+- [x] Checkpoint commit (impl) — `ae42a6d`
+- [x] Compound diagnose+fix dispatched (per user direction) — SUCCESS; see `05-diagnostic.md`
+- [ ] Checkpoint commit (diagnose+fix)
+- [ ] User live visual check #2
 - [ ] Final synthesis + user sign-off
 
 ## Worktree

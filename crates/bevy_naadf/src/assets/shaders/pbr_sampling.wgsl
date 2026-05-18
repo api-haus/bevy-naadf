@@ -106,6 +106,75 @@ fn triplanar_sample(
     return s_x * weights.x + s_y * weights.y + s_z * weights.z;
 }
 
+// `dominant_axis_from_weights` — return 0 for X-plane, 1 for Y-plane,
+// 2 for Z-plane (the index of the plane that carries the largest blend
+// weight under `triplanar_blend_weights`). Used by the POM-aware sampling
+// helpers below to pick which plane's UV gets the height displacement.
+fn dominant_axis_from_weights(weights: vec3<f32>) -> u32 {
+    if (weights.x >= weights.y && weights.x >= weights.z) { return 0u; }
+    if (weights.y >= weights.z) { return 1u; }
+    return 2u;
+}
+
+// POM-aware triplanar sample. Applies the precomputed `displaced_uv` to the
+// dominant plane's lookup; the two non-dominant planes use the geometric
+// world-pos UV (their weights are ≤ ~5% under TRIPLANAR_BLEND_SHARPNESS=8 on
+// axis-aligned face normals, so a POM-displaced UV on those planes would not
+// be visible — design § F.4 "dominant projection only").
+fn triplanar_sample_pom(
+    tex:           texture_2d_array<f32>,
+    smp:           sampler,
+    world_pos:     vec3<f32>,
+    weights:       vec3<f32>,
+    layer:         u32,
+    dominant_axis: u32,
+    displaced_uv:  vec2<f32>,
+) -> vec4<f32> {
+    let p = world_pos * WORLD_UV_SCALE;
+    var uv_x = p.yz;
+    var uv_y = p.zx;
+    var uv_z = p.xy;
+    if (dominant_axis == 0u) { uv_x = displaced_uv; }
+    else if (dominant_axis == 1u) { uv_y = displaced_uv; }
+    else { uv_z = displaced_uv; }
+    let s_x = textureSampleLevel(tex, smp, uv_x, i32(layer), 0.0);
+    let s_y = textureSampleLevel(tex, smp, uv_y, i32(layer), 0.0);
+    let s_z = textureSampleLevel(tex, smp, uv_z, i32(layer), 0.0);
+    return s_x * weights.x + s_y * weights.y + s_z * weights.z;
+}
+
+// Compute the POM-displaced UV on the dominant plane. `view_dir` is the
+// world-space ray direction (the camera-to-hit ray; NOT reversed). The 2D
+// projection into the plane's UV space uses the same plane swizzling as
+// `triplanar_sample` so the displacement direction stays consistent with the
+// sampled texture coordinates.
+//
+// Returns the displaced UV (consumed by `triplanar_sample_pom` /
+// `triplanar_sample_normal_pom`).
+fn pom_displaced_uv_dominant(
+    mrh_tex:       texture_2d_array<f32>,
+    smp:           sampler,
+    world_pos:     vec3<f32>,
+    view_dir:      vec3<f32>,
+    layer:         u32,
+    dominant_axis: u32,
+) -> vec2<f32> {
+    let p = world_pos * WORLD_UV_SCALE;
+    var base_uv: vec2<f32>;
+    var view_uv: vec2<f32>;
+    if (dominant_axis == 0u) {
+        base_uv = p.yz;
+        view_uv = view_dir.yz;
+    } else if (dominant_axis == 1u) {
+        base_uv = p.zx;
+        view_uv = view_dir.zx;
+    } else {
+        base_uv = p.xy;
+        view_uv = view_dir.xy;
+    }
+    return pom_displace_uv(mrh_tex, smp, base_uv, view_uv, layer);
+}
+
 // --- triplanar normal-map sample (RNM blend) -------------------------------
 
 // Decode a tangent-space normal byte triplet (R,G,B in [0,1]) to a
@@ -144,6 +213,52 @@ fn triplanar_sample_normal(
                 + n_z_world * weights.z;
     // Guard against the rare zero-length blended vector (axis exactly on
     // a knife-edge between two planes); fall back to the face normal.
+    let len2 = dot(blended, blended);
+    if (len2 < 1e-6) {
+        return face_normal;
+    }
+    return blended / sqrt(len2);
+}
+
+// POM-aware variant of `triplanar_sample_normal`. Same blend math as
+// `triplanar_sample_normal`, but the dominant plane samples from
+// `displaced_uv` (the POM-displaced UV produced by
+// `pom_displaced_uv_dominant`); the two non-dominant planes use the
+// geometric world-pos UV. Mirrors `triplanar_sample_pom` for the diffuse /
+// MRH samples so all three texture taps (diffuse, normal, MRH re-sample)
+// stay consistent at the displaced surface point.
+fn triplanar_sample_normal_pom(
+    tex:           texture_2d_array<f32>,
+    smp:           sampler,
+    world_pos:     vec3<f32>,
+    weights:       vec3<f32>,
+    face_normal:   vec3<f32>,
+    layer:         u32,
+    dominant_axis: u32,
+    displaced_uv:  vec2<f32>,
+) -> vec3<f32> {
+    let p = world_pos * WORLD_UV_SCALE;
+    var uv_x = p.yz;
+    var uv_y = p.zx;
+    var uv_z = p.xy;
+    if (dominant_axis == 0u) { uv_x = displaced_uv; }
+    else if (dominant_axis == 1u) { uv_y = displaced_uv; }
+    else { uv_z = displaced_uv; }
+    let n_x_local = textureSampleLevel(tex, smp, uv_x, i32(layer), 0.0).xyz * 2.0 - 1.0;
+    let n_y_local = textureSampleLevel(tex, smp, uv_y, i32(layer), 0.0).xyz * 2.0 - 1.0;
+    let n_z_local = textureSampleLevel(tex, smp, uv_z, i32(layer), 0.0).xyz * 2.0 - 1.0;
+
+    let sign_x = sign(face_normal.x);
+    let sign_y = sign(face_normal.y);
+    let sign_z = sign(face_normal.z);
+
+    let n_x_world = vec3<f32>(n_x_local.z * sign_x, n_x_local.y, n_x_local.x);
+    let n_y_world = vec3<f32>(n_y_local.x, n_y_local.z * sign_y, n_y_local.y);
+    let n_z_world = vec3<f32>(n_z_local.x, n_z_local.y, n_z_local.z * sign_z);
+
+    let blended = n_x_world * weights.x
+                + n_y_world * weights.y
+                + n_z_world * weights.z;
     let len2 = dot(blended, blended);
     if (len2 < 1e-6) {
         return face_normal;
@@ -271,7 +386,14 @@ fn eval_pbr(
     metallic:  f32,
     perceptual_roughness: f32,
 ) -> PbrEval {
-    let alpha = perceptual_roughness * perceptual_roughness;
+    // Clamp `alpha` (the GGX α = perceptual_roughness²) away from zero so
+    // the `D` denominator `n·h² * (α²-1) + 1` cannot collapse to zero at
+    // perfect half-vector alignment (`d = 0/0 = NaN`). 1e-3 is the standard
+    // Frostbite / Filament `MIN_PERCEPTUAL_ROUGHNESS² = (0.045)² ≈ 0.002`
+    // industry tuning. Without the clamp, GI / spatial-resampling
+    // `eval_pbr` calls on metals with authored roughness ≈ 0 generate
+    // occasional NaN sparkles that tonemap as bright clusters.
+    let alpha = max(perceptual_roughness * perceptual_roughness, 1e-3);
     let half_dir = normalize(light_dir + view_dir);
     let n_dot_l = clamp(dot(normal, light_dir), 0.0, 1.0);
     let n_dot_v = clamp(dot(normal, view_dir),  0.0, 1.0);

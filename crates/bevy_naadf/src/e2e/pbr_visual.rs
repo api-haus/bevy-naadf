@@ -61,6 +61,18 @@ pub const PBR_TEXTURE_RECT: Rect = Rect { x0: 60, y0: 180, x1: 140, y1: 260 };
 /// measure different things.
 pub const PBR_F0_RECT: Rect = Rect { x0: 110, y0: 100, x1: 150, y1: 140 };
 
+/// 18×30 px rect on the **interior of the violet metal_02 pillar** —
+/// pinned from the post-fix baseline at `(78,156)-(96,186)`. The pillar
+/// has a uniform `albedo_tint = [115,82,158]` and uniform `metal_02`
+/// material, so the only sources of intra-rect luminance variance are:
+/// (a) GI sampling noise (~2-3 units), (b) normal-map perturbations
+/// modulating the BRDF terms via `dot(n, l)` / `dot(n, v)` / `dot(n, h)`.
+/// The metal_02 base color is nearly flat (luminance std-dev ~2.9 over
+/// the source PNG). So a passing std-dev > `PBR_NORMAL_STD_DEV_FLOOR`
+/// proves the normal-map is contributing to the BRDF — the bug that bit
+/// `03a` (normal map sampled but unused by every BRDF call site).
+pub const PBR_NORMAL_RECT: Rect = Rect { x0: 78, y0: 156, x1: 96, y1: 186 };
+
 /// Minimum mean-luminance the highlight rect must reach.
 ///
 /// **Tuned from baseline.** The standalone Batch-6 default-scene readback
@@ -77,6 +89,24 @@ pub const PBR_TEXTURE_STD_DEV_FLOOR: f32 = 5.0;
 /// + violet tint `[115, 82, 158]`) should show a violet-leaning ratio
 /// stable across runs.
 pub const PBR_F0_TOLERANCE: f32 = 0.5;
+
+/// Minimum std-dev of the 16-tap luminance samples inside the uniform
+/// metallic-pillar rect ([`PBR_NORMAL_RECT`]). Pre-fix (normal map sampled
+/// but BRDF receives geometric face normal) the std-dev sits ≤ 6 — pure
+/// GI noise + minor specular highlights. Post-fix (normal map perturbs
+/// the BRDF) the std-dev rises into the 12-20 range from the normal-map
+/// shading variation modulating the metallic specular lobe. The floor at
+/// 8.0 sits comfortably in the gap. **Catches Bug A** (`05-diagnostic.md`).
+pub const PBR_NORMAL_STD_DEV_FLOOR: f32 = 8.0;
+
+/// Maximum fraction of pixels in [`PBR_TEXTURE_RECT`] whose RGB max
+/// exceeds 254 (essentially saturated). A clean tonemapped framebuffer
+/// has near-zero saturation on a ground texture; an `eval_pbr` NaN /
+/// `D = 0/0` cascade saturates pixel clusters there. The textured rect is
+/// chosen because it sits OUTSIDE the legitimate HDR-emissive blocks.
+/// **Catches Bug B** NaN-cascade class regressions
+/// (`05-diagnostic.md` B-extra).
+pub const PBR_TEXTURE_SAT_FRAC_CEIL: f32 = 0.10;
 
 // ---------------------------------------------------------------------------
 // State resource
@@ -203,10 +233,37 @@ fn region_mean_rgb(fb: &Framebuffer, rect: Rect) -> (f32, f32, f32) {
     }
 }
 
+/// Fraction (`0.0..=1.0`) of pixels in `rect` whose max-channel value is
+/// `> 254`. A clean tonemapped scene has near-zero saturation in a
+/// textured-ground region; a `D = 0/0` NaN cascade in the BRDF saturates
+/// clusters of pixels there.
+fn region_saturated_fraction(fb: &Framebuffer, rect: Rect) -> f32 {
+    let mut sat = 0u32;
+    let mut n = 0u32;
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            let p = fb.pixel(x, y);
+            if p[0] > 254 || p[1] > 254 || p[2] > 254 {
+                sat += 1;
+            }
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sat as f32 / n as f32
+    }
+}
+
 pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
     let highlight_luma = fb.region_luminance(PBR_HIGHLIGHT_RECT);
     let texture_std = region_luminance_std_dev_16(fb, PBR_TEXTURE_RECT);
     let (fr, fg, fb_blue) = region_mean_rgb(fb, PBR_F0_RECT);
+    // New (post-05-diagnostic) — normal-map shading variance + HDR
+    // saturation count.
+    let normal_std = region_luminance_std_dev_16(fb, PBR_NORMAL_RECT);
+    let sat_frac = region_saturated_fraction(fb, PBR_TEXTURE_RECT);
 
     // The metallic pillar carries a violet `albedo_tint = [115, 82, 158]`
     // (PBR-raymarching § A grid-palette assignment), so the F0 colour
@@ -221,6 +278,8 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
     let report = format!(
         "highlight luma {highlight_luma:.1} (floor {PBR_HIGHLIGHT_LUMA_FLOOR}); \
          texture std-dev {texture_std:.2} (floor {PBR_TEXTURE_STD_DEV_FLOOR}); \
+         normal-rect std-dev {normal_std:.2} (floor {PBR_NORMAL_STD_DEV_FLOOR}); \
+         texture sat-frac {sat_frac:.3} (ceil {PBR_TEXTURE_SAT_FRAC_CEIL}); \
          F0 mean RGB ({fr:.1}, {fg:.1}, {fb_blue:.1}), \
          R/G = {r_over_g:.3}, B/G = {b_over_g:.3}",
     );
@@ -239,6 +298,32 @@ pub fn assert_pbr_visual(fb: &Framebuffer) -> Result<String, String> {
              {texture_std:.2} below the floor {PBR_TEXTURE_STD_DEV_FLOOR}. \
              The PBR raymarcher likely fell back to flat per-VoxelType colour \
              (the texture sample is not actually contributing). {report}. \
+             Inspect target/e2e-screenshots/{PBR_VISUAL_PNG}.",
+        ));
+    }
+    // Bug-A regression catch: normal map sampled but never fed into the
+    // BRDF. A flat-shaded metal pillar's luminance variance over a
+    // uniform-albedo region is GI-noise floor (~2-6); a normal-mapped one
+    // shows clear shading variation (~12-20). See `PBR_NORMAL_STD_DEV_FLOOR`.
+    if normal_std < PBR_NORMAL_STD_DEV_FLOOR {
+        return Err(format!(
+            "pbr-visual gate FAIL — normal-map shading on the uniform-albedo \
+             metallic pillar rect has std-dev {normal_std:.2} below the floor \
+             {PBR_NORMAL_STD_DEV_FLOOR}. The normal map is likely sampled but \
+             not propagating into the BRDF (Bug A). {report}. Inspect \
+             target/e2e-screenshots/{PBR_VISUAL_PNG}.",
+        ));
+    }
+    // Bug-B regression catch: NaN cascades from `eval_pbr` produce
+    // saturated HDR clusters in non-emissive regions. The texture rect
+    // sits on the ground (no legitimate HDR sources) — saturation there
+    // is a bug.
+    if sat_frac > PBR_TEXTURE_SAT_FRAC_CEIL {
+        return Err(format!(
+            "pbr-visual gate FAIL — texture rect saturated-pixel fraction \
+             {sat_frac:.3} exceeds ceiling {PBR_TEXTURE_SAT_FRAC_CEIL}. A \
+             NaN-cascade through `eval_pbr` (typically roughness ≈ 0 with \
+             perfect half-vector alignment) saturates pixel clusters. {report}. \
              Inspect target/e2e-screenshots/{PBR_VISUAL_PNG}.",
         ));
     }
