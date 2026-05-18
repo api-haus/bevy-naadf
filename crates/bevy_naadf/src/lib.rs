@@ -412,6 +412,15 @@ pub struct AppArgs {
     /// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
     /// debugger".
     pub pbr_debug_modes_mode: bool,
+    /// PBR splotch-artifact `--pbr-hard-edge` mode — when `true`, the e2e
+    /// driver captures a single screenshot at the metallic-pillar pose and
+    /// scans a cobblestone-interior rect for HARD 1-pixel luminance jumps
+    /// (per user spec: jumps that match the splotch artifact signature
+    /// while ignoring natural self-shadowed gradient dips). See
+    /// [`crate::e2e::pbr_hard_edge`] +
+    /// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "LIGHT
+    /// INTEGRATION splotch diagnose+fix (post-`46e50cd`)".
+    pub pbr_hard_edge_mode: bool,
 }
 
 impl Default for AppArgs {
@@ -433,6 +442,7 @@ impl Default for AppArgs {
             vox_gpu_oracle_gpu_phase: false,
             pbr_visual_mode: false,
             pbr_debug_modes_mode: false,
+            pbr_hard_edge_mode: false,
         }
     }
 }

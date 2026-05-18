@@ -363,7 +363,13 @@ fn calc_global_ilum(
             first_hit_roughness_sampled,
             clamp(dot(cur_dir, first_hit_perturbed_normal), 0.0, 1.0),
         );
-        extra_absorption = gi * pbr.fresnel;
+        // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp `extra_absorption`
+        // to a sane per-channel ceiling. `gi * pbr.fresnel` can spike when the
+        // geometry term is large (near n·v=0) and fresnel approaches 1 — the
+        // per-pixel spike amplifies the secondary bounce's throughput
+        // inconsistently across adjacent pixels, contributing to the splotch
+        // boundary effect via persistent reservoir accumulation.
+        extra_absorption = min(gi * pbr.fresnel, vec3<f32>(8.0));
     } else {
         // Uniform-hemisphere sample around the perturbed normal — Lambertian
         // diffuse benefits from normal-map detail too.
@@ -497,7 +503,13 @@ fn calc_global_ilum(
                 sun_dir_rand, -cur_dir, bounce_perturbed_normal,
                 sampled_albedo, sampled_metallic, sampled_roughness,
             );
-            let fac = pbr.f
+            // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp `pbr.f`
+            // for the same reason as the spatial-resampling resolve. The
+            // GI pass writes `radiance` into the temporal ring; extreme
+            // per-pixel spikes from `D` term blow-ups corrupt the ring's
+            // contents for 64+ frames, surfacing as splotch outlines under
+            // motion + debug-mode switching (user-report image #16).
+            let fac = min(pbr.f, vec3<f32>(16.0))
                 * (2.0 * clamp(dot(bounce_perturbed_normal, sun_dir_rand), 0.0, 1.0));
 
             // The single sun-shadow ray (`gi_params.max_ray_steps_sun_secondary`
@@ -563,7 +575,11 @@ fn calc_global_ilum(
                 let f_base = mix(vec3<f32>(0.04), sampled_albedo, sampled_metallic);
                 let voh = clamp(dot(new_dir, rough_normal), 0.0, 1.0);
                 let f = f_base + (vec3<f32>(1.0) - f_base) * pow(1.0 - voh, 5.0);
-                cur_absorption *= gi * f;
+                // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp
+                // throughput per channel. `gi * f` can spike at near-grazing
+                // angles; an unbounded per-bounce throughput propagates
+                // extreme radiance through the temporal ring.
+                cur_absorption *= min(gi * f, vec3<f32>(4.0));
             }
         } else {
             // Lambertian hemisphere sample around the perturbed normal.

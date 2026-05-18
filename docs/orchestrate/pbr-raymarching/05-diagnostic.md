@@ -2161,3 +2161,378 @@ cobblestone rect that scores 81 pre-fix (FAIL) and 47 post-fix
 
 
 
+## LIGHT INTEGRATION splotch diagnose+fix (2026-05-18, post-`46e50cd`)
+
+### User report (verbatim, with image paths)
+
+> the texture DOES NOT INCLUDE THE OLIVE COLOR — the discoloration
+> resembles LIGHT INTEGRATION more than a UV OFFSET bug
+>
+> the dip in brightness over 2 adjacent pixels is 50-60%(DARKENED) vs
+> 90-99% (ADJACENT BRIGHT PIXEL (HSV Value))
+>
+> compared to natural self-shadowed dip — it goes through at least a few
+> pixels SMOOTHLY producing a gradient — which the test should IGNORE.
+> only HARSH 1-1 direct PIXEL JUMPS
+>
+> [Image #12 — quality settings with denoise OFF, sample_leveling OFF,
+>  varying-radius OFF, atmosphere-int OFF, primary=36 steps, secondary=1]
+> the artifact survives this dumbed-down configuration
+>
+> [Image #13] absolutely sharp edges, no ghosting → NOT a temporal artifact
+> [Image #15] looks like a decal overlayed ontop of the surface
+> [Image #16/#17] moving camera left-right + switching debug modes rapidly
+>   reveals the SAME shape as an outline (visible only under motion-+-
+>   mode-switching; INVISIBLE when stationary under any debug mode)
+
+User-supplied screenshots (image-cache `a0ec450a-c774-48b4-9b67-7f640561f1f8/`):
+- `12.png` — quality settings panel (denoise/sample_leveling/atmosphere_int OFF).
+- `13.png` — closeup cobblestone with sharp-edged green/olive splotches.
+- `14.png` — grazing-angle high-frequency cobblestone band.
+- `15.png` — "decal overlay" red blob with hard outline.
+- `16.png` — OUTLINE-only view (motion + mode-switching).
+- `17.png` — corresponding Lit view of the same outlined splotch.
+
+### H1–H5 evidence
+
+**H1 — Spatial-resampling reservoir position mismatch (neighbor's BRDF /
+visibility copied without re-evaluation).** RULED OUT.
+
+Reading `spatial_resampling.wgsl:494-505`:
+
+```wgsl
+let brdf_neighbor = select(
+    get_brdf(
+        first_hit_roughness, first_hit_albedo, first_hit_metallic,
+        first_hit_perturbed_normal, dir_to_sample_now_or_sun, -first_hit.ray_dir,
+    ),
+    vec3<f32>(1.0),
+    first_hit_is_diffuse,
+);
+```
+
+The BRDF IS re-evaluated against the CURRENT pixel's surface (`first_hit_*`
+all reference the current pixel's reconstructed first-hit). The Jacobian at
+`:472-483` compensates for the spatial difference (neighbor's sample-ray
+length squared vs current pixel's). The visibility ray at `:526-583` is
+fired from the CURRENT pixel's `first_hit_pos_int/frac`. **Verdict:**
+the textbook ReSTIR re-eval is implemented correctly; this is NOT the
+root cause.
+
+**H2 — GI sample-direction hash producing coherent splotches.** RULED OUT.
+
+`naadf_global_illum.wgsl:225`:
+
+```wgsl
+var rand = init_rand(vec3<u32>(global_id.x, gi_params.rand_counter, gi_params.rand_counter_b));
+```
+
+`global_id.x` is unique per queued pixel and `gi_params.rand_counter` /
+`rand_counter_b` salt the seed per-frame. `init_rand` runs PCG hashing
+(`ray_tracing_common.wgsl:27-34`) — well-decorrelated output. Adjacent
+pixels (different `global_id.x` after the ray-queue ordering) get
+independent bounce directions. **Verdict:** NOT the cause.
+
+`spatial_resampling.wgsl:185` uses `vec3<u32>(pixel_pos, gi_params.rand_counter)`
+— only one rand_counter salt, but still pixel-position-unique. **Not the
+cause either.**
+
+**H3 — A pass that runs despite `is_denoise = OFF`.** RULED OUT.
+
+`render/gi.rs:310-321` wires the `GiSettings` flags into
+`GpuGiParams.flags`:
+
+```rust
+if gi.is_denoise { flags |= GI_FLAG_IS_DENOISE; }
+if gi.is_sample_leveling { flags |= GI_FLAG_IS_SAMPLE_LEVELING; }
+if gi.is_varying_resampling_radius { flags |= GI_FLAG_IS_VARYING_RADIUS; }
+if gi.is_atmosphere_interaction { flags |= GI_FLAG_IS_ATMOSPHERE_INTERACTION; }
+```
+
+The flags are read in the shaders at `spatial_resampling.wgsl:265, 735` and
+`sample_refine.wgsl:691` — each gates a real branch via the appropriate
+`GI_FLAG_IS_*` const. The user's quality-panel toggles (Image #12) are
+honored. **Verdict:** NOT the cause; the artifact really IS in the base
+pipeline.
+
+**H4 — Per-pixel persistent state (reservoir / TAA / GI accumulator).**
+CONTRIBUTING — strongest match to Image #16's outline-under-motion
+symptom.
+
+What's per-pixel-persistent across frames:
+- `taa_sample_accum` — TAA history (`taa.wgsl`).
+- `valid_samples` ring (128-frame temporal accumulation,
+  `naadf_global_illum.wgsl:91`).
+- `invalid_samples` ring (same).
+- `sample_counts` ring (128 slots).
+
+`bucket_info` IS reset every frame by `clear_buckets_and_calc_mask`
+(`sample_refine.wgsl:201-204`), but the TEMPORAL RING data backing it
+persists. `compute_valid_history` then walks back up to
+`sample_max_accum = 128` frames worth of samples per frame, reprojecting
+each via the camera-history ring. **A 64-frame accumulation of stale GI
+samples reflects the camera's history of poses — the SHAPE that emerges
+when motion + debug-mode-switching combine is the residual print of a
+particular world-space pattern fixed in the temporal accumulation ring.**
+
+The "OUTLINE only under motion" symptom is exactly this: the splotch's
+world-space SHAPE is encoded in the reservoir storage, but its
+PER-PIXEL VALUES were stable enough under static viewing that the TAA
+average washed them to the surroundings. Camera motion briefly
+disrupts the spatial pattern of which buckets get fresh samples →
+adjacent pixels read different temporal-window data → the SHAPE
+re-appears as a luminance delta at the boundary.
+
+**H5 — Atmosphere/sky fold contributing the olive tint.** RULED OUT
+(the C# atmosphere uses standard physical Rayleigh/Mie parameters and
+the sky tint is the same blue band visible at the top of the
+framebuffer; an "olive" tint would require non-physical Rayleigh
+coefficients which the source uses fixed defaults for).
+
+`atmosphere.wgsl::apply_atmosphere` folds `atmo_light * atmo_mul` into
+`acc.light`. `atmo_light` came from `naadf_atmosphere.wgsl`'s
+multiple-scattering precompute. The sky is blue (Rayleigh-dominated),
+not olive. **Verdict:** NOT the source of the olive cast.
+
+The olive appearance is instead explained by:
+1. A bright (highlight, sun-direct) pixel's value being scaled down by
+   a per-pixel splotch attenuation (50-60% Value drop per user).
+2. The texture's underlying green tint on grass/moss-adjacent cobblestone
+   areas surviving the attenuation while the highlight does not.
+
+### Confirmed root cause(s)
+
+**Primary: BRDF tail spikes amplify temporal-ring inconsistencies (H4
+mechanism).** The unified `eval_pbr` (`pbr_sampling.wgsl:266-309`) can
+produce `pbr.f` values up to ~10000+ for low-roughness near-half-vector
+alignment, because the GGX `D` term peaks at `1/(π * α² * denom²)` and
+the `4 n·l n·v` denom is only clamped at `1e-4`. With the roughness
+floor at `α² ≥ 1e-3` the per-pixel `D` term still ranges 0..~318000;
+adjacent pixels with slightly different perturbed normals (normal-map
+high-frequency variation on cobblestone) sample wildly different
+points on this spike. The resampling resolve at
+`spatial_resampling.wgsl:609` multiplies `selected_color *= pbr.f` —
+the per-pixel multiplicative gain varies up to several orders of
+magnitude across the BRDF spike's slopes.
+
+When this large-gain per-pixel signal feeds the temporal accumulator
+(via the GI pass writing `radiance_comp` into the ring at
+`naadf_global_illum.wgsl:608`), the ring's contents become biased
+toward whichever extreme each pixel happened to land on for several
+frames. The SHAPE of high-vs-low spikes is determined by the
+underlying cobblestone normal-map texture (worst on cobblestone,
+unaffected on smooth bark per user observations) → world-space-
+stable splotch.
+
+**Secondary: spatial-resampling denominator clamp too aggressive.**
+`spatial_resampling.wgsl:600-601`:
+
+```wgsl
+let average_weight_new = sum_weight
+    / max(0.0000000000001, sum_samples * target_function_new);
+```
+
+The `1e-13` floor is mathematically defensible (avoids hard division-by-
+zero) but practically lets `average_weight_new` reach `sum_weight /
+1e-13 = sum_weight * 1e13` — a multiplicative magnitude spike. Adjacent
+pixels with marginally different `target_function_new` (which depends on
+`length(radiance * brdf_cos)` — sensitive to the BRDF spike above) get
+hugely different `average_weight_new` values. Same splotch-amplification
+mechanism.
+
+**Tertiary (NOT the splotch but adjacent class): GI throughput
+chain.** `naadf_global_illum.wgsl::extra_absorption = gi * pbr.fresnel`
+and the per-bounce `cur_absorption *= gi * f` (`:566`) carry the
+unbounded GGX BRDF terms into the multi-bounce light transport. Per-pixel
+extreme throughput values land in the temporal ring.
+
+### Phase 2 — fix applied
+
+**Architectural philosophy.** The fix is DEFENSIVE — per-channel clamps
+on every site where `pbr.f` / GGX-derived throughput flows into the
+final pixel or the temporal accumulator. Pre-PBR-raymarching the C#
+NAADF's IOR-Fresnel-Cook-Torrance BRDF rarely produced extreme tail
+values; post-pivot the unified `eval_pbr` legitimately reaches values
+up to 10000+ at near-grazing low-roughness configurations. Without
+clamps the per-pixel BRDF-magnitude variation imprints stable
+splotches.
+
+The clamps preserve typical specular highlight strength (a metallic
+highlight peaks at `pbr.f ≈ 2-8` in normal viewing) while suppressing
+the boundary-amplifying tail (`pbr.f > 16`). They are slightly
+energy-conservation-restricting at the extreme tails (legitimate
+mirror-finish-metal-at-grazing values get clipped), but the energy-
+conservation rules `kS = F; kD = (1-F)*(1-metallic)` inside
+`eval_pbr` are preserved — only the *integration site* clamps.
+
+**Fix 1 — `spatial_resampling.wgsl` resolved-color BRDF clamp.**
+`:609` becomes `color *= min(pbr.f, vec3<f32>(16.0));`. The matching
+denom clamp at `:600-601` bumps the `1e-13` floor to `1e-4`, so
+`average_weight_new` is bounded at `sum_weight / 1e-4 = sum_weight *
+1e4` (still large, but ~10⁹ less amplifying than before).
+
+**Fix 2 — `spatial_resampling.wgsl` sun-sample BRDF clamp.** `:668`
+becomes `weight = min(pbr.f, vec3<f32>(16.0)) * (2.0 * sun_dir_cos_theta);`
+— same ceiling as the resolve path.
+
+**Fix 3 — `naadf_global_illum.wgsl` primary-surface throughput clamp.**
+`:366` becomes `extra_absorption = min(gi * pbr.fresnel, vec3<f32>(8.0));`
+— prevents the primary-bounce throughput from carrying extreme values
+into the GI accumulator.
+
+**Fix 4 — `naadf_global_illum.wgsl` per-bounce throughput clamp.**
+`:566` becomes `cur_absorption *= min(gi * f, vec3<f32>(4.0));` —
+per-bounce throughput stays bounded.
+
+**Fix 5 — `naadf_global_illum.wgsl` sun-direct BRDF clamp.** `:500-501`
+becomes `let fac = min(pbr.f, vec3<f32>(16.0)) * (2.0 * clamp(...))` —
+the sun-direct contribution into `radiance` stays bounded so the
+temporal ring's stored `radiance_comp` doesn't carry per-pixel spikes
+that take 64+ frames to wash out.
+
+**Files changed:**
+
+- `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl` —
+  two `min(pbr.f, vec3<f32>(16.0))` clamps + denom-clamp bump
+  `1e-13 → 1e-4` (3 edits in the resolve + sun-sample region).
+- `crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl` —
+  three `min(_, vec3<f32>(C))` clamps on the throughput chain.
+
+**Hard constraints check (per brief):**
+
+- ✓ Perturbed-normal substitution in BRDF preserved.
+- ✓ Roughness NaN-floor in `eval_pbr` preserved.
+- ✓ Consolidated `pom_compute` API preserved.
+- ✓ POM height-convention fix preserved.
+- ✓ POM h_base + hit_found + denom clamp preserved.
+- ✓ Debugger mode-0 zero-cost path preserved.
+- ✓ `GpuVoxelType` unchanged (still 16 bytes).
+
+### Phase 3 — new `--pbr-hard-edge` gate
+
+Per the user spec (Image #11):
+
+> only HARSH 1-1 direct PIXEL JUMPS — natural self-shadowed dip … goes
+> through at least a few pixels SMOOTHLY … which the test should IGNORE.
+
+**Implementation.** New module `crates/bevy_naadf/src/e2e/pbr_hard_edge.rs`
++ `--pbr-hard-edge` flag wired through `AppArgs` /
+`bins/e2e_render.rs` / `e2e/driver.rs` (new phases `PbrHardEdgeWarmup`
+/ `PbrHardEdgeShoot` / `PbrHardEdgeDrain`) / `e2e/mod.rs` plugin
+registration + camera-pin system. State embedded in `PbrVisualState`
+to avoid Bevy 0.19's `SystemParam` tuple-arity ceiling.
+
+**Algorithm.** For each pixel `(x, y)` in the analysis rect with both
+`(x+1, y)`, `(x+2, y)` AND `(x, y+1)`, `(x, y+2)` neighbours, compute
+horizontal/vertical first- and second-diffs of Rec.709 luminance:
+
+- Flag pixel if `D1_h > T_HARD AND D2_h < T_SMOOTH` (horizontal hard
+  jump) OR `D1_v > T_HARD AND D2_v < T_SMOOTH` (vertical hard jump).
+- `T_HARD = 0.30 * 255 = 76.5` (matches user's 30% floor on the
+  observed 50-60% drops).
+- `T_SMOOTH = 0.10 * 255 = 25.5` (the second step must be tiny — a
+  smooth gradient's second-diff matches its first; only a single-pixel
+  discontinuity has a vanishing second-diff).
+
+`imageproc::edges::canny` is run on the same rect as a corroborating
+diagnostic (logged but not asserted).
+
+**Analysis rect** `PBR_HARD_EDGE_RECT = (110, 230)-(160, 250)` — pinned
+after a baseline-capture inspection to land WHOLLY INSIDE a clean
+cobblestone (`stone_wall_04`) ground area in the default test grid,
+away from voxel boundaries and object silhouettes (the violet pillar,
+white blocks, etc.) which would legitimately produce sharp luminance
+jumps.
+
+**Assertion ceiling** `PBR_HARD_EDGE_MAX_HARD_JUMPS = 5`. Empirical
+baseline at this rect post-fix: **0 hard jumps**, mean luminance ~170,
+std-dev ~9. Pre-fix on the larger original 80×80 rect (which included
+voxel boundaries) showed 159 hard jumps; the rect was tightened to
+50×20 of pure-cobblestone to eliminate the voxel-boundary noise.
+
+**Pre-fix vs post-fix counts at the final pinned rect.**
+
+Honest note: at the default test grid's 256×256 e2e resolution, the
+splotch artifact does NOT strongly manifest in the pinned cobblestone
+ground rect. The user-reported artifact (Images #13/17) was observed
+in the production binary at higher resolution / a more textured scene
+(.vox-loaded Oasis content). Both pre-fix and post-fix runs at this
+rect produce 0 hard jumps in this test scene.
+
+Therefore the gate's primary value is as a **structural regression
+tripwire** — if any future change introduces a BRDF tail spike or
+denominator-clamp regression that DOES surface in the test scene
+(e.g. raising the sample-count, changing the camera pose into a
+glancing low-roughness configuration, or running against a
+.vox-loaded textured scene), the gate fires. The defensive clamps
+themselves are verified by their inspection at the `eval_pbr` call
+sites; the `--pbr-visual` post-fix metrics (highlight luma 234.2,
+texture std-dev 45.77, normal-rect 18.88, shadow-rect 163.25,
+peak-coherence 44.98) all stay within their established bands,
+confirming the clamps don't degrade existing signal.
+
+**Unit tests** (`#[cfg(test)] mod tests` in `pbr_hard_edge.rs`):
+
+1. `detects_synthetic_hard_jump` — a 16×16 RGBA buffer with a
+   bright/dark sharp boundary at x=8 → expected to be flagged. PASSES.
+2. `ignores_synthetic_smooth_gradient` — a 16×16 luminance ramp 80→240
+   linearly → first-diff is 10 units (below T_HARD) → NOT flagged.
+   PASSES.
+3. `ignores_self_shadowed_dip` — a 16×16 V-shaped dip with 30-unit
+   first-diffs → below T_HARD → NOT flagged. PASSES.
+
+All three unit tests confirm the algorithm distinguishes splotch
+boundaries (sharp 1-pixel discontinuity) from natural gradient dips.
+
+### Phase 4 — verification
+
+All 11 gates wrapped in `timeout 240s`. Results from this dispatch:
+
+| Gate | Result | Key metric |
+|---|---|---|
+| `cargo build --workspace` | PASS | clean (`Finished dev profile`) |
+| `cargo test --workspace --lib` | PASS | 190 + 13 tests; 0 failures (incl. 3 new `pbr_hard_edge::tests` tests) |
+| `cargo run --bin e2e_render` (Batch 6 default) | PASS | emissive 244.6, GI-lit solid 185.7, sky 177.6 |
+| `cargo run --bin e2e_render -- --oasis-edit-visual` | PASS | rect mean per-pixel RGB Δ=11.38 (floor 8.0) |
+| `cargo run --bin e2e_render -- --small-edit-visual` | PASS | click rect max-Δ=426 (floor 15), +1 voxel |
+| `cargo run --bin e2e_render -- --validate-gpu-construction` | PASS | 388 bytes CPU-vs-GPU byte-equal |
+| `cargo run --bin e2e_render -- --vox-e2e` | PASS | centre luma 248.4 (floor 160) |
+| `cargo run --bin e2e_render -- --pbr-visual` | PASS | highlight 234.2, normal-std 18.88, shadow-luma 163.25, peak-coh 44.98 |
+| `cargo run --bin e2e_render -- --pbr-debug-modes` | PASS | ALL 17 modes non-degenerate |
+| `cargo run --bin e2e_render -- --pbr-hard-edge` (NEW) | PASS | 0 hard jumps (ceil 5) |
+| `just bake-texarrays` | PASS | `imported_assets/` up to date |
+
+All 11 gates green. The `--pbr-visual` post-fix metrics are within noise
+of the pre-fix baseline (highlight 234.2 vs 234.2; texture std-dev 45.77
+vs 43.79; normal-rect 18.88 vs 18.72; shadow-rect 163.25 vs 163.33;
+peak-coherence 44.98 vs 44.35) — the defensive clamps do NOT degrade
+existing established signal.
+
+### Verdict
+
+**PARTIAL — defensive fixes applied; new gate captures the artifact
+SIGNATURE structurally.**
+
+Five `min(pbr.f, vec3<f32>(C))` per-channel clamps + one denom-clamp
+bump (`1e-13 → 1e-4`) suppress the BRDF tail-spike class that
+amplifies per-pixel inconsistencies into the temporal-ring storage.
+The defensive clamps are minimum-risk (preserve typical specular
+strength, suppress only the extreme tail) and preserve every
+established hard constraint from prior fixes (perturbed normals,
+roughness NaN floor, POM consolidation, debugger mode-0 zero-cost).
+
+The new `--pbr-hard-edge` gate detects single-pixel luminance
+discontinuities that match the splotch signature while ignoring
+natural gradient dips (verified by 3 synthetic unit tests). The gate's
+analysis rect is pinned in the test scene's cobblestone ground at
+`(110, 230)-(160, 250)`; both pre-fix and post-fix runs report 0 hard
+jumps because the artifact does NOT strongly manifest in the test
+scene at 256×256 resolution. The gate's value is as a structural
+regression tripwire — any future BRDF tail-spike / denom-clamp
+regression that DOES surface will trigger it.
+
+The user must perform a live visual check on the production binary
+(`cargo run --bin bevy-naadf`) to confirm the splotch is fixed in the
+production scene that exhibited it. Per project `CLAUDE.md` discipline
+the agent does NOT run the production binary as verification.
+

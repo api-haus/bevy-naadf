@@ -27,6 +27,7 @@ pub mod framebuffer;
 pub mod gates;
 pub mod oasis_edit_visual;
 pub mod pbr_debug_modes;
+pub mod pbr_hard_edge;
 pub mod pbr_visual;
 pub mod readback;
 pub mod small_edit_repro;
@@ -229,9 +230,10 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<small_edit_repro::SmallEditReproState>()
         .init_resource::<vox_gpu_oracle::VoxGpuOracleState>()
         // `PbrVisualState` carries the `--pbr-visual` capture AND the
-        // embedded `PbrDebugModesState` sub-resource for `--pbr-debug-modes`
-        // (merged so the `e2e_driver` system stays under Bevy 0.19's
-        // `SystemParam` tuple-arity ceiling).
+        // embedded `PbrDebugModesState` + `PbrHardEdgeState` sub-resources
+        // for `--pbr-debug-modes` / `--pbr-hard-edge` (merged so the
+        // `e2e_driver` system stays under Bevy 0.19's `SystemParam`
+        // tuple-arity ceiling).
         .init_resource::<pbr_visual::PbrVisualState>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
@@ -282,6 +284,13 @@ pub fn add_e2e_systems(app: &mut App) {
         .add_systems(
             Update,
             pbr_debug_modes::pin_pbr_debug_modes_camera
+                .after(oasis_edit_visual::pin_oasis_camera)
+                .before(crate::camera::sync_position_split),
+        )
+        // `--pbr-hard-edge` camera pin — same ordering as the other pins.
+        .add_systems(
+            Update,
+            pbr_hard_edge::pin_pbr_hard_edge_camera
                 .after(oasis_edit_visual::pin_oasis_camera)
                 .before(crate::camera::sync_position_split),
         );

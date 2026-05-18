@@ -597,8 +597,19 @@ fn sample_neighbors(
     let target_function_new = get_target_function_new(
         selected_ray_dir, first_hit_perturbed_normal, selected_color, brdf,
     );
+    // LIGHT INTEGRATION splotch fix (post-`46e50cd`): the denom clamp at
+    // `max(_, 1e-13)` is far too aggressive when `sum_samples * tf` is small
+    // — `1e-13` effectively turns the division into a magnitude spike. Bump
+    // to `1e-4` so the weight stays bounded. Pre-fix: a near-zero `tf` from
+    // a boundary pixel made `average_weight_new` explode → adjacent pixels
+    // with slightly larger `tf` had hugely different weights → SHARP
+    // adjacent-pixel discontinuity in the resampled colour. The C# original
+    // also had this latent issue but its `tf` (length(radiance * brdf_cos))
+    // rarely went near zero on the original IOR-Fresnel BRDF; with the
+    // unified `eval_pbr` (which can drive `pbr.f → 0` at extreme angles)
+    // the latent denom degeneracy now bites.
     let average_weight_new = sum_weight
-        / max(0.0000000000001, sum_samples * target_function_new);
+        / max(0.0001, sum_samples * target_function_new);
     var color = average_weight_new * selected_color;
     if (!first_hit_is_diffuse) {
         // Specular weighting: full `eval_pbr` BRDF * incident cos. Uses the
@@ -607,7 +618,18 @@ fn sample_neighbors(
             selected_ray_dir, -first_hit.ray_dir, first_hit_perturbed_normal,
             first_hit_albedo, first_hit_metallic, first_hit_roughness,
         );
-        color *= pbr.f;
+        // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp `pbr.f` to
+        // a saturation ceiling per channel. `eval_pbr`'s GGX `D` term
+        // explodes near grazing angles even with `alpha² ≥ 1e-3` floor —
+        // `D = α²/(π * denom²)` and `denom = n·h² * (α²-1) + 1` can land at
+        // ~0.001 when `n·h ≈ 1` and `α ≈ 0.03` (low-roughness metal facing
+        // light) → `D ≈ 1e6` → `pbr.f ≈ 10000+` for one pixel. The next
+        // pixel's perturbed normal slightly shifts `n·h`, dropping the spike
+        // → adjacent pixels get wildly different multipliers on the same
+        // `selected_color`. Clamping `pbr.f ≤ 16.0` per channel preserves
+        // typical specular highlight strength while suppressing the
+        // boundary-amplifying tail.
+        color *= min(pbr.f, vec3<f32>(16.0));
     } else {
         // Diffuse weighting: Lambertian against the perturbed normal so the
         // normal-map shading varies in the resampled diffuse output too.
@@ -665,7 +687,11 @@ fn sample_neighbors(
                     sun_dir_rand, -first_hit.ray_dir, first_hit_perturbed_normal,
                     first_hit_albedo, first_hit_metallic, first_hit_roughness,
                 );
-                weight = pbr.f * (2.0 * sun_dir_cos_theta);
+                // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp
+                // `pbr.f` to a saturation ceiling for the same reason as
+                // the resolve path above. `pbr.f * 2 * n·l` can spike when
+                // `n·l → 0` and `D` is large at the sun half-vector.
+                weight = min(pbr.f, vec3<f32>(16.0)) * (2.0 * sun_dir_cos_theta);
             }
             sun_accum += gi_params.sun_color.xyz * weight;
         }

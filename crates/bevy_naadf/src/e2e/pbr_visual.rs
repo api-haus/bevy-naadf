@@ -198,6 +198,10 @@ pub struct PbrVisualState {
     /// `PbrDebugModesState`) to keep the `e2e_driver` `SystemParam`
     /// count under Bevy 0.19's `IntoSystemSet` arity ceiling.
     pub debug_modes: super::pbr_debug_modes::PbrDebugModesState,
+    /// `--pbr-hard-edge` splotch-gate capture sub-state — populated only
+    /// by the `--pbr-hard-edge` gate. Inlined for the same SystemParam
+    /// arity reason as `debug_modes` above.
+    pub hard_edge: super::pbr_hard_edge::PbrHardEdgeState,
 }
 
 // ---------------------------------------------------------------------------

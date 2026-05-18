@@ -504,3 +504,44 @@ post-`3a61b9a`)" for the diagnosis + fix log.
 
 SUCCESS — root causes H3 (no `h_base` sample) + H4 (lerp refine on non-intersected data) fixed; 8th gate assertion (peak-coherence max-adjacent-luminance-delta) tightens regression catch; all 10 verification gates pass post-fix.
 
+## LIGHT INTEGRATION splotch diagnose+fix (2026-05-18)
+
+See `05-diagnostic.md` § "LIGHT INTEGRATION splotch diagnose+fix
+(2026-05-18, post-`46e50cd`)" for the full H1–H5 evaluation + fix log.
+
+### Files changed
+
+- `crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl` — two
+  `min(pbr.f, vec3<f32>(16.0))` clamps on resolve + sun-sample BRDF
+  multipliers; denom-clamp bump `1e-13 → 1e-4` in `average_weight_new`.
+- `crates/bevy_naadf/src/assets/shaders/naadf_global_illum.wgsl` —
+  three throughput clamps: `extra_absorption` ≤ 8.0, per-bounce
+  `cur_absorption *= gi*f` clamped at 4.0, sun-direct `fac = min(pbr.f,
+  16.0) * cos`.
+- `crates/bevy_naadf/src/e2e/pbr_hard_edge.rs` (NEW) — `--pbr-hard-edge`
+  gate module with hard-1-pixel-jump detector + 3 unit tests.
+- `crates/bevy_naadf/src/e2e/mod.rs` — registered `pbr_hard_edge` module,
+  embedded `PbrHardEdgeState` into `PbrVisualState`, added camera-pin
+  system.
+- `crates/bevy_naadf/src/e2e/pbr_visual.rs` — added `hard_edge:
+  PbrHardEdgeState` field for the shared-resource pattern.
+- `crates/bevy_naadf/src/e2e/driver.rs` — added `PbrHardEdgeWarmup`,
+  `PbrHardEdgeShoot`, `PbrHardEdgeDrain` phases + the `--pbr-hard-edge`
+  fast-path entry.
+- `crates/bevy_naadf/src/lib.rs` — `AppArgs.pbr_hard_edge_mode: bool` +
+  `Default` initialiser.
+- `crates/bevy_naadf/src/bin/e2e_render.rs` — wired `--pbr-hard-edge`
+  CLI flag → `run_pbr_hard_edge()`.
+- `crates/bevy_naadf/Cargo.toml` — added `imageproc = "0.25"` for the
+  corroborating canny edge-detection diagnostic in the new gate.
+
+### Verdict
+
+PARTIAL — defensive BRDF-tail clamps + denom-clamp bump address the
+tail-spike amplification mechanism that explains the splotch's
+world-space-stable shape (H4 mechanism: per-pixel BRDF magnitude
+variations corrupt the 64-frame temporal accumulation ring). New
+`--pbr-hard-edge` gate carries the artifact's signature as a
+structural regression tripwire; user must visually verify the fix
+on the production binary at the affected scene/resolution.
+

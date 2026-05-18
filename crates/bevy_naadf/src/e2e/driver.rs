@@ -244,6 +244,14 @@ pub enum E2ePhase {
     PbrDebugModesDrain,
     /// Walk every captured framebuffer; assert non-degeneracy; exit.
     PbrDebugModesAssert,
+    /// PBR splotch-artifact gate — warmup at the metallic-pillar pose;
+    /// converge TAA/GI before capturing.
+    PbrHardEdgeWarmup,
+    /// Spawn `Screenshot::primary_window()` for the splotch-rect frame.
+    PbrHardEdgeShoot,
+    /// Drain the async capture, save the PNG, run the hard-edge assertion,
+    /// exit.
+    PbrHardEdgeDrain,
     /// `AppExit` written — the winit runner is exiting; the driver no-ops.
     Done,
 }
@@ -575,6 +583,19 @@ pub fn e2e_driver(
         .is_some_and(|a| a.pbr_debug_modes_mode);
     if pbr_debug_modes_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::PbrDebugModesWarmup;
+        state.phase_ticks = 0;
+    }
+
+    // PBR splotch-artifact `--pbr-hard-edge` fast-path. Routes into
+    // PbrHardEdgeWarmup on tick 0 when the flag is set. Camera pose owned
+    // by `super::pbr_hard_edge::pin_pbr_hard_edge_camera`. See
+    // `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "LIGHT
+    // INTEGRATION splotch diagnose+fix (post-`46e50cd`)".
+    let pbr_hard_edge_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.pbr_hard_edge_mode);
+    if pbr_hard_edge_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
+        state.phase = E2ePhase::PbrHardEdgeWarmup;
         state.phase_ticks = 0;
     }
 
@@ -1792,6 +1813,77 @@ pub fn e2e_driver(
                 exit.write(AppExit::error());
             }
             state.phase = E2ePhase::Done;
+        }
+        // ---- PBR splotch-artifact gate phases (`--pbr-hard-edge`) --------
+        // Camera pose owned by `pin_pbr_hard_edge_camera` (Update system,
+        // `.after(oasis_edit_visual::pin_oasis_camera)`).
+        E2ePhase::PbrHardEdgeWarmup => {
+            let _ = &mut camera;
+            state.phase_ticks += 1;
+            if state.phase_ticks >= super::pbr_hard_edge::PBR_HARD_EDGE_WARMUP_FRAMES {
+                screenshot.0 = None;
+                state.phase = E2ePhase::PbrHardEdgeShoot;
+                state.phase_ticks = 0;
+            }
+        }
+        E2ePhase::PbrHardEdgeShoot => {
+            shoot_primary_window(&mut commands);
+            state.phase = E2ePhase::PbrHardEdgeDrain;
+            state.phase_ticks = 0;
+        }
+        E2ePhase::PbrHardEdgeDrain => {
+            state.phase_ticks += 1;
+            if let Some(image) = screenshot.0.take() {
+                match Framebuffer::from_image(&image) {
+                    Ok(fb) => {
+                        println!(
+                            "e2e_render --pbr-hard-edge: capture {}x{}; saving to {}",
+                            fb.width(),
+                            fb.height(),
+                            super::pbr_hard_edge::PBR_HARD_EDGE_PNG,
+                        );
+                        super::pbr_hard_edge::save_pbr_hard_edge_screenshot(
+                            &fb,
+                            super::pbr_hard_edge::PBR_HARD_EDGE_PNG,
+                        );
+                        let result = super::pbr_hard_edge::assert_pbr_hard_edge(&fb);
+                        pbr_visual.hard_edge.captured = Some(fb);
+                        pbr_visual.hard_edge.saved = true;
+                        match &result {
+                            Ok(msg) => {
+                                println!("e2e_render --pbr-hard-edge: {msg}");
+                                outcome.gate_result = Some(Ok(()));
+                                exit.write(AppExit::Success);
+                            }
+                            Err(msg) => {
+                                eprintln!("e2e_render: FAIL —\n{msg}");
+                                outcome.gate_result = Some(Err(msg.clone()));
+                                exit.write(AppExit::error());
+                            }
+                        }
+                        state.phase = E2ePhase::Done;
+                    }
+                    Err(msg) => {
+                        let err =
+                            format!("pbr-hard-edge: capture decode failed: {msg}");
+                        eprintln!("e2e_render: FAIL — {err}");
+                        outcome.gate_result = Some(Err(err));
+                        exit.write(AppExit::error());
+                        state.phase = E2ePhase::Done;
+                    }
+                }
+            } else if state.phase_ticks
+                >= super::pbr_hard_edge::PBR_HARD_EDGE_DRAIN_FRAMES
+            {
+                let err = format!(
+                    "pbr-hard-edge: capture never delivered within {} drain frames",
+                    super::pbr_hard_edge::PBR_HARD_EDGE_DRAIN_FRAMES,
+                );
+                eprintln!("e2e_render: FAIL — {err}");
+                outcome.gate_result = Some(Err(err));
+                exit.write(AppExit::error());
+                state.phase = E2ePhase::Done;
+            }
         }
         E2ePhase::Done => {
             // `AppExit` is written; the winit runner sees `should_exit()` and

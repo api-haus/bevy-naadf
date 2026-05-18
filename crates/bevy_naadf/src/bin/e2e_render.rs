@@ -124,6 +124,12 @@ fn main() -> ExitCode {
     // debugger"). Iterates every non-zero `DebugViewMode`, captures a
     // per-mode framebuffer, asserts each is non-degenerate.
     let pbr_debug_modes_mode = args.iter().any(|a| a == "--pbr-debug-modes");
+    // PBR splotch-artifact gate
+    // (`docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "LIGHT
+    // INTEGRATION splotch diagnose+fix (post-`46e50cd`)"). Captures a
+    // single screenshot at the metallic-pillar pose and counts hard
+    // 1-pixel luminance jumps in a cobblestone-interior rect.
+    let pbr_hard_edge_mode = args.iter().any(|a| a == "--pbr-hard-edge");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -312,6 +318,8 @@ fn main() -> ExitCode {
         bevy_naadf::e2e::pbr_visual::run_pbr_visual()
     } else if pbr_debug_modes_mode {
         bevy_naadf::e2e::pbr_debug_modes::run_pbr_debug_modes()
+    } else if pbr_hard_edge_mode {
+        bevy_naadf::e2e::pbr_hard_edge::run_pbr_hard_edge()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then
