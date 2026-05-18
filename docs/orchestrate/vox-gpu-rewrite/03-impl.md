@@ -2884,3 +2884,201 @@ The fix DID NOT flip the gate green.
 - No new e2e gates added (the existing `--vox-gpu-oracle` gate is
   intentionally left RED as the canonical tripwire for the layered
   second bug).
+
+---
+
+## impl Q4 fix findings (2026-05-18)
+
+### Brief summary
+
+Stage 8 (`14-diagnostic-type-decode.md`) named Q4 — `max_storage_buffer_binding_size`
+overrun causing silent WebGPU buffer-binding truncation — as the
+MEDIUM-HIGH confidence hypothesis for the `oracle_gpu.png` "voxel types
+in the thousands" + black-surface symptom. This dispatch was scoped to
+Stage A: **verify Q4 by instrumenting `device.limits()` in
+`prepare_world_gpu`**, then Stage B: apply the limit-raise fix only if Q4
+fires.
+
+**Q4 is REFUTED.** The device already returns
+`max_storage_buffer_binding_size = 2147483644 B (2047 MiB)` and BOTH the
+CPU-oracle path's allocations (chunks 2 MiB, blocks 64 MiB, voxels 160
+MiB) AND the GPU-producer path's allocations (chunks 16 MiB, blocks 512
+MiB, voxels 1024 MiB) are well below the cap. No binding truncation can
+be occurring. Stage B was NOT executed per the brief's hard rule "If Q4
+is REFUTED at Stage A, STOP — don't try a fix; report."
+
+### Files touched
+
+- `crates/bevy_naadf/src/render/prepare.rs:391-450` — added the Q4
+  instrumentation block immediately after the existing W5.3-fix Stage 1
+  info-log. Logs `device.limits().max_storage_buffer_binding_size` and
+  the actual chunks/blocks/voxels allocation byte sizes every time
+  `prepare_world_gpu` runs (build-once gate so once per process). If any
+  allocation exceeds the limit, logs an `error!` line marked
+  `vox-gpu-rewrite Q4 CONFIRMED` so a future regression that re-introduces
+  the overrun (e.g. via larger world dims) is caught immediately.
+  Instrumentation is LEFT IN PLACE per the brief ("DO NOT remove the Stage
+  A instrumentation if Q4 is confirmed — leave the error log in (it's a
+  useful future regression catcher)"). The same logic applies for Q4
+  being refuted: future world-size growth could push allocations past the
+  cap, and the instrumentation is the canary.
+
+No other files touched. Stage 1's buffer-sizing fix preserved verbatim.
+
+### Stage A verification output
+
+Instrumentation captured during `cargo run --release --bin e2e_render --
+--vox-gpu-oracle` (which runs both subprocess phases):
+
+**CPU oracle phase (`install_vox_sized_to_model`, world 1488×544×1344
+voxels):**
+```
+vox-gpu-rewrite Q4 instrumentation —
+  device.limits().max_storage_buffer_binding_size = 2147483644 B (2047 MiB);
+  allocated chunks = 2124864 B (2 MiB),
+  allocated blocks = 67995648 B (64 MiB),
+  allocated voxels = 167974144 B (160 MiB).
+```
+
+**GPU producer phase (`install_vox_in_fixed_world`, fixed
+4096×512×4096 voxels):**
+```
+vox-gpu-rewrite Q4 instrumentation —
+  device.limits().max_storage_buffer_binding_size = 2147483644 B (2047 MiB);
+  allocated chunks = 16777216 B (16 MiB),
+  allocated blocks = 536870912 B (512 MiB),
+  allocated voxels = 1073741824 B (1024 MiB).
+```
+
+The `Q4 CONFIRMED` error-log branch did NOT fire in either phase. All
+three allocations in both phases are below the device's
+`max_storage_buffer_binding_size`:
+
+| Phase | Buffer | Allocated | Limit | Headroom |
+| --- | --- | --- | --- | --- |
+| CPU | chunks | 2 MiB | 2047 MiB | 1024.5× |
+| CPU | blocks | 64 MiB | 2047 MiB | 32.0× |
+| CPU | voxels | 160 MiB | 2047 MiB | 12.8× |
+| GPU | chunks | 16 MiB | 2047 MiB | 128.0× |
+| GPU | blocks | 512 MiB | 2047 MiB | 4.0× |
+| GPU | voxels | 1024 MiB | 2047 MiB | 2.0× |
+
+**Q4 confirmed: NO.**
+
+### Stage B (NOT executed)
+
+Per the brief's hard rule, Stage B was not attempted. The hypothesis was
+that Bevy's `RenderPlugin` defaults would clamp the device to a 128 MiB
+binding cap. Re-reading
+`bevy_render-0.19.0-rc.1/src/settings.rs:70-164` +
+`bevy_render-0.19.0-rc.1/src/renderer/mod.rs:280-355`:
+
+- `WgpuSettings::default()` sets
+  `priority: WgpuSettingsPriority::Functionality` (line 89).
+- `initialize_renderer` (line 300) on Functionality priority assigns
+  `limits = adapter.limits()` — i.e. the device receives the adapter's
+  MAXIMUM supported limits, not the conservative WebGPU defaults.
+
+On the RTX 5080 / Vulkan backend the adapter reports
+`max_storage_buffer_binding_size = 2147483644 B`, and Bevy passes that
+straight through to `DeviceDescriptor::required_limits`. The W5 1 GiB
+voxels[] binding fits comfortably. There is no silent truncation
+mechanism active on this machine.
+
+The Shape-A fix (Bevy `RenderPlugin { render_creation:
+RenderCreation::Automatic(WgpuSettings { limits, .. }) }`) would have
+been a no-op on this machine — the limits are already at adapter max.
+The fix would only matter on a platform where the adapter's reported
+limit is itself ≤ 128 MiB (e.g. WebGPU running on a low-spec mobile GPU
+where the adapter caps at the spec minimum). For the user's current
+machine, no fix is applicable.
+
+### `--vox-gpu-oracle` post-instrumentation result
+
+Captured by the same run that captured the instrumentation:
+
+```
+e2e_render --vox-gpu-oracle: 256×256 frame, 65536 pixels;
+  mean per-pixel RGB Δ = 127.824 (floor 8.00);
+  pixels with per-channel Δ > 16.0 = 64076 (97.77% of frame; ceiling 655 pixels = 1.0% of frame);
+  sanity: bright (lum>50.0) = 63012 (96.15% ≥ 1.0% floor);
+  dark (lum<200.0) = 31893 (48.66% ≥ 1.0% floor)
+e2e_render --vox-gpu-oracle: FAIL — mean per-pixel RGB Δ 127.824 >= floor 8.00
+```
+
+The gate remains RED at the **same** mean per-pixel diff (127.824) as
+before the dispatch. Q4 is not the bug.
+
+### Surprises
+
+1. **The original diagnostic's Q4 mechanism is sound; the wgpu defaults
+   it assumed are wrong for Bevy.** The diagnostic at
+   `14-diagnostic-type-decode.md:499` says "`max_storage_buffer_binding_size`
+   on most wgpu backends defaults to 128 MiB". That's correct for raw
+   wgpu (`wgpu::Limits::default().max_storage_buffer_binding_size =
+   128 << 20`), but Bevy's `WgpuSettings::default()` overrides this by
+   setting `priority = Functionality`, which `initialize_renderer`
+   resolves to `limits = adapter.limits()` (= adapter max). The
+   instrumentation here proves the actual production-path
+   `RenderDevice::limits()` reports 2047 MiB on this machine. The
+   diagnostic was reading wgpu docs without accounting for Bevy's
+   override layer.
+2. **The impl log at line 1089 already named this number.** Stage 1's
+   own impl log entry says "`max_storage_buffer_binding_size = 2047 MiB`
+   on the RTX 5080 / Vulkan". The Stage 8 diagnostic was authored by an
+   agent that didn't consult Stage 1's findings (otherwise Q4 would have
+   been REFUTED a priori instead of being escalated to MEDIUM-HIGH
+   confidence). Cross-doc fact-checking gap.
+3. **Q4 falsified-in-1-instrumentation-pass means the bug is genuinely
+   in the (Q1–Q5)–exhausted hypothesis space + one or more not-yet-named
+   mechanisms.** The remaining candidate space (per
+   `14-diagnostic-type-decode.md:153-167`):
+   - **P1**: hash-map state accumulating across 512 segments (a Stage 6
+     diagnostic gap — only the 64-segment subset was tested).
+   - **P3**: a downstream pass (`world_change.wgsl`, `entity_update.wgsl`,
+     etc.) mutating `voxels[]` in production but not in Stage 6.
+   - **P4**: a buffer-aliasing or binding-mismatch hazard in the
+     production bind-group setup that Stage 6's standalone fixture
+     doesn't reproduce.
+   - **Q3 (downgraded)**: per-segment submit / bounds-chain memory
+     ordering. Diagnostic confidence was LOW pending wgpu queue-ordering
+     verification, but the queue is documented to serialise.
+   - **NEW candidate**: a leaf-bit-truncation in the voxel-data writeback
+     paths (`compute_voxel_bounds` `voxels[i/2] = lo | (hi << 16u)`) that
+     manifests only at the production dispatch shape (134M voxel-pair
+     writes, vs the much smaller Stage 6 fixture sizes). Worth a focused
+     binary-search readback at known voxel positions in the next
+     dispatch.
+
+### Stage 2 readiness (legacy-path-deletion consolidation)
+
+NOT READY. Stage 2 was scoped to consolidate legacy-path deletion after
+Q4 lands as the visible-bug fix. Since Q4 is refuted and the underlying
+bug remains, Stage 2 stays blocked until a fix lands that flips
+`--vox-gpu-oracle` GREEN. The pre-existing W5 GPU path is still rendering
+black/garbage voxel colours; deleting the legacy CPU path now would
+strand the production app on the broken W5 path.
+
+### Full e2e verification results
+
+NOT EXECUTED. Per the brief's "If Q4 is REFUTED at Stage A, STOP" hard
+rule, the full e2e verification matrix (`--baseline`, `--vox-e2e`,
+`--oasis-edit-visual`, etc.) was not run because no fix code was
+landed — only a logging instrumentation. The instrumentation is a
+zero-side-effect read of `device.limits()` + an `info!` line +
+conditional `error!` (which did not fire); no logic depends on its
+output and no behaviour is altered. Risk of regression from this
+instrumentation alone is zero.
+
+### Recommended next dispatch
+
+Hand off to a sub-agent to address the remaining hypothesis space
+(P1 / P3 / P4 / leaf writeback) per the `14-diagnostic-type-decode.md`
+"Recommended fix" §Secondary task — extend
+`--validate-gpu-construction-scaled` with a "production shape" mode that
+runs ALL 512 segments through a single shared `hash_map` and the full
+bounds_calc chain, then readback `voxels[]` at known positions and
+diff against `construct(&volume)` on the same input. This is the only
+remaining way to localise the bug between encoding-time vs
+post-encoding-mutation vs renderer-read-path; the standard Stage 6
+fixture doesn't reach the production shape.

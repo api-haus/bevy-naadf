@@ -403,6 +403,59 @@ pub fn prepare_world_gpu(
         cpu_voxels_len,
         chunk_count_u64,
     );
+
+    // vox-gpu-rewrite Q4 instrumentation (2026-05-18) — verify whether the
+    // allocated `blocks`/`voxels`/`chunks` storage buffers exceed the device's
+    // `max_storage_buffer_binding_size`. Per
+    // `docs/orchestrate/vox-gpu-rewrite/14-diagnostic-type-decode.md` Q4, an
+    // overrun causes WebGPU to silently truncate the binding to the limit;
+    // every reader dereference past the truncation returns zero/garbage,
+    // which is the leading hypothesis for the renderer's "random thousands"
+    // voxel-type symptom in `oracle_gpu.png`.
+    //
+    // We use `error!` rather than `assert!` so the binary continues running —
+    // we want the log to fire AND the gate to complete so the
+    // before/after-fix comparison is well-defined. TODO: once Q4's fix lands
+    // and the gate is permanently green, convert this to a hard `assert!`
+    // so a future regression that re-introduces overruns is caught
+    // immediately.
+    {
+        let limits = render_device.limits();
+        let max_binding_bytes = limits.max_storage_buffer_binding_size as u64;
+        let blocks_bytes = (blocks_alloc_len as u64) * 4;
+        let voxels_bytes = (voxels_alloc_len as u64) * 4;
+        let chunks_bytes = chunks_buffer_size;
+        bevy::log::info!(
+            "vox-gpu-rewrite Q4 instrumentation — device.limits().max_storage_buffer_binding_size = {} B ({} MiB); \
+             allocated chunks = {} B ({} MiB), blocks = {} B ({} MiB), voxels = {} B ({} MiB).",
+            max_binding_bytes,
+            max_binding_bytes / (1024 * 1024),
+            chunks_bytes,
+            chunks_bytes / (1024 * 1024),
+            blocks_bytes,
+            blocks_bytes / (1024 * 1024),
+            voxels_bytes,
+            voxels_bytes / (1024 * 1024),
+        );
+        if blocks_bytes > max_binding_bytes
+            || voxels_bytes > max_binding_bytes
+            || chunks_bytes > max_binding_bytes
+        {
+            bevy::log::error!(
+                "vox-gpu-rewrite Q4 CONFIRMED: storage-buffer binding overrun — \
+                 blocks {} B (> limit? {}), voxels {} B (> limit? {}), chunks {} B (> limit? {}), \
+                 max_storage_buffer_binding_size = {} B. \
+                 WebGPU will silently truncate the bound range; the renderer reads zeros past the cap.",
+                blocks_bytes,
+                blocks_bytes > max_binding_bytes,
+                voxels_bytes,
+                voxels_bytes > max_binding_bytes,
+                chunks_bytes,
+                chunks_bytes > max_binding_bytes,
+                max_binding_bytes,
+            );
+        }
+    }
     let mut blocks = GrowableBuffer::<u32>::new(&render_device, "naadf_blocks", blocks_alloc_len as u64);
     let mut voxels = GrowableBuffer::<u32>::new(&render_device, "naadf_voxels", voxels_alloc_len as u64);
     let mut voxel_types = GrowableBuffer::<GpuVoxelType>::new(
