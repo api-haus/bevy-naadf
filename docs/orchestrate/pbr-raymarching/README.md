@@ -51,8 +51,8 @@ VNDF-GGX BRDF and multi-bounce `shoot_ray` scaffolding already in the shaders.
 - [x] `01-context.md` written
 - [x] `README.md` written
 - [x] `04-review.md` skeleton (criteria only)
-- [ ] Checkpoint commit (audit + context files)
-- [ ] Texture extraction dispatched
+- [x] Checkpoint commit (audit + context files) — `ddd092f`
+- [x] Texture extraction dispatched (7 materials + 3 placeholders)
 - [ ] Hard gate — extraction reviewed
 - [ ] Checkpoint commit (extracted assets)
 - [ ] `delegate-architect` dispatched
