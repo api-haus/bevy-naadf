@@ -894,6 +894,23 @@ pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
             name: None,
         };
     }
+    // `--pbr-hard-edge` runs at 768×768 — much larger than the standard
+    // 256×256 e2e window so each cobblestone voxel renders at ~256 px and
+    // the splotch artifact can actually manifest in the analysis rect.
+    // The original 256×256 gate's blind spot was zoomed-out aerial of
+    // tiny tiles where individual cobblestone splotches were physically
+    // sub-pixel. See `crate::e2e::pbr_hard_edge` module docs.
+    if args.pbr_hard_edge_mode {
+        cfg.window = WindowConfig {
+            resolution: Some((
+                crate::e2e::pbr_hard_edge::PBR_HARD_EDGE_WIDTH as f32,
+                crate::e2e::pbr_hard_edge::PBR_HARD_EDGE_HEIGHT as f32,
+            )),
+            resizable: false,
+            title: "bevy-naadf e2e_render pbr-hard-edge",
+            name: None,
+        };
+    }
     let app = build_app_with_args(cfg, args);
     e2e::run_with_app(app)
 }

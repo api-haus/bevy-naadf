@@ -2536,3 +2536,181 @@ The user must perform a live visual check on the production binary
 production scene that exhibited it. Per project `CLAUDE.md` discipline
 the agent does NOT run the production binary as verification.
 
+## --pbr-hard-edge gate rebuilt — sunlit cobblestone top-down (2026-05-19, post-`22ff1f5`)
+
+### User report
+
+Two-stage user correction landed during the post-`22ff1f5` repro
+dispatch. Stage 1 (verbatim):
+
+> target/e2e-screenshots/pbr_hard_edge_baseline.png — this LITERALLY
+> cant see a SINGLE case of it — its zoomed the fuck out
+>
+> position the camera OVER the gound plane in a non-shadowed area,
+> like 3-5 meters above it, looking directly DOWN
+
+Stage 1 prompted a first attempt that repointed the camera to
+small-relative `(50, 7, 32)` looking straight down. Stage 2 (the
+critical correction) followed the first attempt's screenshot:
+
+> this area was not lit, it was in shadow
+
+The first attempt landed inside box B's `-z` shadow envelope (box B
+`x=38..52, z=40..55, y_top=16` projects southward to
+`z = 40 - 16 * (sun_z / sun_y) ≈ 32.82`; the 3.3 m frame footprint
+covered `z ≈ 30.3..33.7` — northern third inside the shadow). The
+captured baseline showed uniformly dark cobblestone with no sun-lit
+reference — confirms shadow coverage.
+
+The second attempt repositions the same close-up top-down pose to a
+patch confirmed clear of every voxel object's `-x/-z` shadow
+projection.
+
+### Scene setup
+
+- **Cobblestone slab:** the existing Default test grid's `TY_GROUND`
+  layer (`stone_wall_04`, palette layer index 8 — confirmed material
+  match for the user's "worst on cobblestone" observation). Spans
+  `y=0..=2` over the full 64×64 small-world footprint
+  (`voxel/grid.rs::build_default_volume:713`). No dedicated slab
+  construction — the existing scene's full-area ground covers the
+  required patch.
+- **Sun direction:** `(cos(0.9)*cos(0.6), sin(0.9), cos(0.9)*sin(0.6))
+  ≈ (0.514, 0.783, 0.351)` (`render/atmosphere.rs:323-330`). Sun
+  comes from `+x, +y, +z`; shadows fall toward `-x, -z`.
+- **Camera position:** world `demo_origin + (32, 7, 14)` —
+  small-relative `(32, 7, 14)`. Camera Y=7 sits 4 voxels (= 4 m) above
+  the cobblestone surface top (slab tops out at y=3).
+- **Camera look direction:** straight down (`Vec3::NEG_Y`), with the
+  up reference `Vec3::Z` so the framebuffer's up direction = world
+  `+z`.
+- **Shadow-envelope analysis (proof of non-shadowing).** Each voxel
+  object's ground shadow projection along `+sun_dir` from its highest
+  point to `y=3`:
+
+  | Object                 | Bounds (x,z)        | y_top | Ground shadow (x,z)   |
+  |------------------------|---------------------|-------|-----------------------|
+  | Box A                  | (12..23, 14..25)    | 20    | (0.85..23, 6.38..25)  |
+  | Box B                  | (38..52, 40..55)    | 16    | (29.47..52, 34.17..55)|
+  | Back wall              | (56..60, 14..49)    | 22    | (42.45..60, 5.03..49) |
+  | Sphere 1               | r=8 @ (30, 11, 30)  | 19    | r≈8 @ (~19.5, ~22.8)  |
+  | Pillar row (z=8..11)   | various             | 17–19 | (22..45, 0.4..11)     |
+  | NW corner tower        | (54..61, 2..9)      | 21    | (41..61, -6..9)       |
+  | NE corner tower        | (54..61, 54..61)    | 24    | (39..61, 44..61)      |
+  | SW corner tower        | (2..9, 2..9)        | 26    | (-14..9, -8..9)       |
+  | SW(z) corner tower     | (2..9, 54..61)      | 18    | (-9..9, 46..61)       |
+  | Emissive amber float   | (46..51, 46..51)    | 29    | (29..51, 35..51)      |
+
+  Frame footprint at small-rel `(32, 14)` with 4 m altitude / 45° FOV
+  / 768² resolution: ground coverage ≈ `30.3..33.7, 12.3..15.7`.
+  Distance from each shadow envelope:
+
+  - Box A shadow ends `x=23` → frame east by `>7 vx`. CLEAR.
+  - Box B shadow ends `z=34.17` → frame south by `>18 vx`. CLEAR.
+  - Wall shadow ends `x=42.45` → frame west by `>8 vx`. CLEAR.
+  - Sphere shadow centre `(19.5, 22.8)` r=8 → frame is `>14 vx` away. CLEAR.
+  - Pillar shadow ends `z=11` → frame north by `>1.3 vx`. CLEAR.
+  - All corner-tower shadows fall in distinct corners. CLEAR.
+  - Emissive amber shadow ends `z=35.38` → frame south by `>19 vx`. CLEAR.
+
+- **GI bounce / tinted contributors:** frame is `>6 vx` from sphere 1
+  (no green-tinted bounce), `>7 vx` from box A (no warm-red bounce),
+  `>26 vx` from box B (no cool-blue bounce). The cobblestone reads its
+  native `stone_wall_04` colour with sun direct + sky bounce only.
+- **Resolution:** 768×768 (configured in `lib.rs::run_e2e_render_with_args`
+  via `args.pbr_hard_edge_mode` gating the window-config override —
+  isolated to this gate only). 3.3 m ground footprint at 45° FOV with
+  768 px wide gives ~256 px per cobblestone voxel — the texture per-cobble
+  pixel density matches the user-screenshot regime where splotches were
+  visible.
+
+### Analysis rect
+
+- **Coords:** `(330, 330)-(420, 420)` — a 90×90 px rect centred at frame
+  centre `(384, 384)`.
+- **Justification:** at the new pose the centre voxel projects to frame
+  centre and one voxel spans ~256 px, so the rect lives wholly inside
+  one cobblestone voxel face with ~60-70 px clearance from the nearest
+  voxel boundary on every side. The 90² area gives the detector ~8100
+  sample pixels — large enough for a single splotch instance to register
+  well above the ceiling-of-5 hard-jump threshold.
+
+### Capture + screenshots
+
+- **Full framebuffer:** `target/e2e-screenshots/pbr_hard_edge_baseline.png`
+  (768×768 PNG, ~1.03 MB).
+- **Rect crop:** `target/e2e-screenshots/pbr_hard_edge_rect.png` (90×90
+  PNG, ~14 KB) — same data as the analysis rect.
+- **Splotch visible in capture? YES.** Both PNGs show:
+  - Brightly-lit cream/beige cobblestone surfaces (sun-direct, not
+    shadow — orders of magnitude brighter than the prior attempt's
+    uniformly-dark shadowed cobblestone).
+  - **Olive/green discoloured patches with sharp 1-pixel boundaries**
+    visible on multiple stones — matches the user-reported splotch
+    artifact signature (image #13, image #17 — "olive/green
+    discoloured patches on cobblestone with HARD 1-pixel boundaries
+    that survive denoise OFF / sample_leveling OFF").
+  - The artifact manifests on a single-pose static capture (no motion
+    required), corroborating the H4 diagnosis: the temporal-ring's
+    world-space-stable splotch shape settles in static viewing too,
+    only the per-pixel BRDF tail spikes are large enough to defeat
+    the TAA average.
+
+### Hard-jump count
+
+- **Pre-fix baseline at the new pose: 80 hard jumps (ceiling 5) →
+  FAIL ✓** (gate honestly reproduces the bug, no pose iteration
+  required after the shadow-shift to `(32, 14)`).
+- Canny edge count (diagnostic only): 403 edges — corroborates the
+  high-frequency boundary density inside the 90² rect.
+
+### Pose iteration log
+
+Attempt #1 (this dispatch): small-relative `(50, 7, 32)`. Captured
+baseline showed uniformly dark cobblestone — user-correctly diagnosed
+"in shadow". Cause: box B's southward shadow envelope reaches
+`z=32.82`, frame `z ≈ 30.3..33.7` — northern third inside box B
+shadow.
+
+Attempt #2 (this dispatch): small-relative `(32, 7, 14)`. Selected by
+exhaustive shadow-envelope analysis of every Default-scene voxel
+object (table above). Captured baseline visibly sunlit + splotch
+artifact visibly present + hard-jump count 80 → 1-attempt success
+after the shadow correction.
+
+### Other gates (regression check)
+
+All 10 sister gates wrapped in `timeout 240s`; the `--pbr-hard-edge`
+gate is the only one that should newly fail. Pose change is fully
+isolated by `args.pbr_hard_edge_mode` (camera-pin system + window-size
+override).
+
+| Gate | Result | Key metric |
+|---|---|---|
+| `cargo build --workspace` | PASS | clean (no new warnings introduced) |
+| `cargo test --workspace --lib` | PASS | 203 passed, 1 ignored (the same baseline) |
+| `cargo run --bin e2e_render` (Batch 6 default) | PASS | emissive 244.6, GI-lit solid 185.7, sky 177.6 |
+| `cargo run --bin e2e_render -- --oasis-edit-visual` | PASS | rect mean per-pixel RGB Δ=11.45 (floor 8.0) |
+| `cargo run --bin e2e_render -- --small-edit-visual` | PASS | click rect max-Δ=429 (floor 15), +1 voxel |
+| `cargo run --bin e2e_render -- --validate-gpu-construction` | PASS | 388 bytes CPU-vs-GPU byte-equal |
+| `cargo run --bin e2e_render -- --vox-e2e` | PASS | centre luma 248.4 (floor 160) |
+| `cargo run --bin e2e_render -- --pbr-visual` | PASS | highlight 234.2, normal-std 18.83, shadow-luma 163.29, peak-coh 53.24 |
+| `cargo run --bin e2e_render -- --pbr-debug-modes` | PASS | ALL 17 modes non-degenerate |
+| `cargo run --bin e2e_render -- --pbr-hard-edge` (THIS) | **FAIL** (intended) | 80 hard jumps > 5 ceiling |
+| `just bake-texarrays` | PASS | `imported_assets/` up to date |
+
+10/10 other gates green; `--pbr-hard-edge` newly fails as the
+deliverable required.
+
+### Verdict
+
+**SUCCESS — bug reproduced in gate (hard-jump count 80 > ceiling 5).**
+
+The gate now honestly captures the user-visible splotch artifact in
+its hard-edge metric, on a sunlit cobblestone patch confirmed clear
+of every shadow caster. The pose iteration log shows the failure mode
+the prior attempt hit (box B southward shadow) and the geometric
+correction that fixed it. No splotch fix attempt was made in this
+dispatch — the deliverable was REPRO ONLY per brief, and the
+orchestrator now has a deterministic regression tripwire for the bug.
+

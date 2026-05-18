@@ -1,10 +1,111 @@
 //! `--pbr-hard-edge` mode — splotch-artifact regression gate.
 //!
-//! Per `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "LIGHT
-//! INTEGRATION splotch diagnose+fix (post-`46e50cd`)": capture a single
-//! frame of the default test grid from the same metallic-pillar side-on pose
-//! as `--pbr-visual`, save the screenshot, then walk a known cobblestone-
-//! interior rect counting **hard 1-pixel luminance jumps**.
+//! ## Repositioned 2026-05-19 — close-up top-down cobblestone capture
+//!
+//! The original `46e50cd` `--pbr-hard-edge` gate framed the **whole** Default
+//! test scene at 256×256 from the side-on metallic-pillar pose. At that pixel
+//! density the cobblestone ground was zoomed-out aerial of tiny tiles and
+//! the user-reported splotch artifact (olive/green discoloured patches with
+//! sharp 1-pixel boundaries — see `docs/orchestrate/pbr-raymarching/
+//! 05-diagnostic.md` § "LIGHT INTEGRATION splotch diagnose+fix (post-
+//! `46e50cd`)") literally **could not physically manifest** in the analysis
+//! rect — every "voxel" was a handful of pixels wide.
+//!
+//! User directive (2026-05-19, verbatim):
+//!
+//! > target/e2e-screenshots/pbr_hard_edge_baseline.png — this LITERALLY
+//! > cant see a SINGLE case of it — its zoomed the fuck out
+//! >
+//! > position the camera OVER the gound plane in a non-shadowed area,
+//! > like 3-5 meters above it, looking directly DOWN
+//!
+//! Follow-up correction (2026-05-19, post-`22ff1f5` first attempt):
+//!
+//! > this area was not lit, it was in shadow
+//!
+//! The post-`22ff1f5` first attempt at small-relative `(50, 32)` landed
+//! the camera footprint partially inside **box B's shadow**: box B
+//! (`x=38..52, z=40..55, y_top=16`) projects a shadow southward along
+//! the sun's `-z` direction to `z = 40 - 16 * (sun_z / sun_y) = 40 -
+//! 16 * 0.351 / 0.783 ≈ 32.82`. The 768×768 / 45° / 4m-above frame
+//! covers `z ≈ 30.3..33.7` at the ground — its northern third lies
+//! INSIDE box B's shadow envelope. The captured baseline showed
+//! uniformly dark cobblestone with no sun-lit reference: confirms
+//! shadow coverage. **Repositioned again to small-relative
+//! `(32, 14)`** — clear of every voxel object's `-x/-z` shadow
+//! projection (see "Non-shadowed patch" geometry below).
+//!
+//! ### New pose
+//!
+//! - **Camera position:** world `(demo_origin + (32, 7, 14))` —
+//!   small-relative `(32, 7, 14)`. The Default test grid's ground slab
+//!   is `y=0..=2` (`crate::voxel::grid::build_default_volume`); the
+//!   cobblestone surface tops out at `y=3`. Camera at `y=7` sits **4
+//!   voxels (= 4 m) above the surface** — squarely in the user-spec
+//!   "3-5 m above" band.
+//!
+//! - **Look direction:** straight down (`Vec3::NEG_Y`). The up reference
+//!   for the look-at math is `Vec3::Z`, so the framebuffer's up direction
+//!   = world +Z (small-relative +Z is "back" toward box B). Any
+//!   perpendicular non-Y vector works as the up reference; Z is the
+//!   cleanest documentary choice.
+//!
+//! - **Non-shadowed patch.** The sun direction is
+//!   `(0.514, 0.783, 0.351)` (from `render/atmosphere.rs:323-330` — elev
+//!   0.9 rad / azim 0.6 rad), so shadows fall toward `(-x, -z)`. The
+//!   shadow envelope of every voxel object projected onto the ground
+//!   along `+sun_dir`:
+//!
+//!   | Object                 | Bounds (x,z)        | y_top | Ground shadow (x,z) |
+//!   |------------------------|---------------------|-------|---------------------|
+//!   | Box A                  | (12..23, 14..25)    | 20    | (0.85..23, 6.38..25) |
+//!   | Box B                  | (38..52, 40..55)    | 16    | (29.47..52, 34.17..55) |
+//!   | Back wall              | (56..60, 14..49)    | 22    | (42.45..60, 5.03..49) |
+//!   | Sphere 1 (centre)      | r=8 @ (30, 11, 30)  | 19    | r≈8 @ (~19.5, ~22.8) |
+//!   | Pillar row (z=8..11)   | x=26..29/34..37/42..45 | 17–19 | (22..45, 0.4..11) |
+//!   | NW corner tower        | (54..61, 2..9)      | 21    | (41..61, -6..9)     |
+//!   | NE corner tower        | (54..61, 54..61)    | 24    | (39..61, 44..61)    |
+//!   | SW corner tower        | (2..9, 2..9)        | 26    | (-14..9, -8..9)     |
+//!   | SW(z) corner tower     | (2..9, 54..61)      | 18    | (-9..9, 46..61)     |
+//!   | Emissive amber float   | (46..51, 46..51)    | 29    | (29..51, 35..51)    |
+//!
+//!   Small-relative `(32, 14)` (3.3 m frame footprint → `30.3..33.7,
+//!   12.3..15.7`):
+//!
+//!   - Box A shadow ends at `x=23` → frame east of A by `>7 vx`. CLEAR.
+//!   - Box B shadow ends at `z=34.17` → frame south of B by `>18 vx`. CLEAR.
+//!   - Wall shadow ends at `x=42.45` → frame west of wall by `>8 vx`. CLEAR.
+//!   - Sphere shadow centred (19.5, 22.8) r=8 → frame is `>14 vx` away. CLEAR.
+//!   - Pillar shadow ends at `z=11` → frame north of pillars by `>1.3 vx`. CLEAR.
+//!   - All corner-tower shadows fall in distinct corners. CLEAR.
+//!   - Emissive amber shadow ends at `z=35.38` → frame south by `>19 vx`. CLEAR.
+//!
+//!   The frame is also `>6 vx` from sphere 1 (no green-tinted GI bounce),
+//!   `>7 vx` from box A (no warm-red GI bounce), and `>26 vx` from box B
+//!   (no cool-blue GI bounce) — the cobblestone reads its native
+//!   `stone_wall_04` colour with sun direct + sky bounce only.
+//!
+//! - **Resolution:** [`PBR_HARD_EDGE_WIDTH`] × [`PBR_HARD_EDGE_HEIGHT`] =
+//!   **768×768**. The standard 256×256 e2e window was the original gate's
+//!   blind-spot. At 768×768 with a 45° FOV camera 4 m above the ground,
+//!   the visible footprint is roughly `2*4*tan(22.5°) ≈ 3.3 m × 3.3 m`
+//!   on the cobblestone surface — three or so cobblestone voxels across
+//!   the frame, each filling **~256 pixels**. Each cobblestone tile
+//!   within a voxel reads at the same per-tile pixel density the user
+//!   observed the splotch at.
+//!
+//! ### Analysis rect
+//!
+//! [`PBR_HARD_EDGE_RECT`] is `(330, 330)-(420, 420)` — a **90×90 px**
+//! rect centred at frame centre `(384, 384)`. At the new pose the centre
+//! voxel `(50, 32)` projects exactly to `(384, 384)`, and one voxel spans
+//! ~256 pixels, so the rect lives **wholly inside one cobblestone voxel
+//! face**, with ~60-70 px clearance from the nearest voxel boundary on
+//! every side. The 90² area gives the detector ~8100 sample pixels,
+//! which is large enough for a single splotch instance to register
+//! comfortably above the ceiling-of-5 threshold.
+//!
+//! ## Algorithm (unchanged from `46e50cd`)
 //!
 //! A "hard 1-pixel jump" pixel satisfies BOTH:
 //!   1. `|L(p+1) - L(p)| > T_HARD` — the immediate step is large
@@ -50,11 +151,29 @@ use crate::world::data::WorldData;
 // ceiling. The driver accesses `pbr_visual.hard_edge` directly.
 
 // ---------------------------------------------------------------------------
-// Screenshot filename
+// Screenshot filenames
 // ---------------------------------------------------------------------------
 
-/// PNG written by the gate on success — overwritten every run.
+/// Full-framebuffer PNG written by the gate on success — overwritten every run.
 pub const PBR_HARD_EDGE_PNG: &str = "pbr_hard_edge_baseline.png";
+
+/// Analysis-rect crop PNG, written alongside the full capture so the user
+/// can see exactly the region the metric is looking at.
+pub const PBR_HARD_EDGE_RECT_PNG: &str = "pbr_hard_edge_rect.png";
+
+// ---------------------------------------------------------------------------
+// Window resolution (the gate runs at a higher resolution than the standard
+// 256×256 e2e window — the original gate's blind spot was that at 256×256
+// each cobblestone voxel was a handful of pixels and the splotch artifact
+// could not physically manifest in the analysis rect).
+// ---------------------------------------------------------------------------
+
+/// Window width for this gate (logical pixels). Picked to give each
+/// cobblestone voxel ~256 px of resolution at the close-up top-down pose
+/// (camera 4 m above, ~3 voxels visible, 768/3 ≈ 256 px per voxel).
+pub const PBR_HARD_EDGE_WIDTH: u32 = 768;
+/// Window height — square aspect to match the analysis rect's square shape.
+pub const PBR_HARD_EDGE_HEIGHT: u32 = 768;
 
 // ---------------------------------------------------------------------------
 // Frame budget — reuses the same convergence schedule as `--pbr-visual` so
@@ -68,23 +187,19 @@ pub const PBR_HARD_EDGE_DRAIN_FRAMES: u32 = 16;
 // Analysis rect + thresholds
 // ---------------------------------------------------------------------------
 
-/// 50×20 px rect on the cobblestone ground (the `stone_wall_04` material
-/// region in the default test grid) — pinned by post-hoc inspection of the
-/// baseline screenshot at `target/e2e-screenshots/pbr_hard_edge_baseline
-/// .png` to land WHOLLY INSIDE a single voxel face's ground area, away
-/// from voxel boundaries (which legitimately produce sharp luminance
-/// jumps) and away from object silhouettes (the pillar / wall / emissive
-/// blocks).
+/// 90×90 px rect centred at frame centre `(384, 384)` on the 768×768
+/// framebuffer. At the new top-down pose the centre voxel
+/// (small-relative `(32, 14)`) projects exactly to frame centre and one
+/// voxel spans ~256 px, so the rect sits well inside a single cobblestone
+/// voxel face with ~60-70 px clearance from the nearest voxel boundary
+/// on every side.
 ///
-/// Empirical baseline at this rect on a clean post-warmup capture:
-/// mean luminance ~170, std-dev ~9, max horizontal pixel-diff ~29, max
-/// vertical pixel-diff ~24 — i.e. natural cobblestone shows smooth
-/// variation across the analysis rect. The splotch artifact (user
-/// images #13, #17) produces 50-60% HSV Value drops in one pixel, which
-/// at luminance scale 255 corresponds to 127-152 unit jumps — five or
-/// more such jumps in the small 50×20 rect would be the splotch
-/// signature.
-pub const PBR_HARD_EDGE_RECT: Rect = Rect { x0: 110, y0: 230, x1: 160, y1: 250 };
+/// **Why bigger than the prior 50×20 rect (`46e50cd`):** the user-reported
+/// splotch (Images #13/#17) has visible features ~30-50 px across at the
+/// production resolution. A 90² rect gives the detector room to capture
+/// at least one splotch boundary while still fitting inside a single
+/// voxel at the new pose.
+pub const PBR_HARD_EDGE_RECT: Rect = Rect { x0: 330, y0: 330, x1: 420, y1: 420 };
 
 /// First-difference threshold for a "hard" 1-pixel jump (Rec.709 luminance,
 /// 0..=255 scale). User-supplied measurement:
@@ -142,17 +257,33 @@ pub fn run_pbr_hard_edge() -> AppExit {
     app_args.pbr_hard_edge_mode = true;
     println!(
         "e2e_render --pbr-hard-edge: splotch-artifact regression gate; \
-         warmup {PBR_HARD_EDGE_WARMUP_FRAMES} frames; default test grid; \
-         side-on metallic-pillar pose; cobblestone analysis rect {:?}.",
+         warmup {PBR_HARD_EDGE_WARMUP_FRAMES} frames at {PBR_HARD_EDGE_WIDTH}\
+         x{PBR_HARD_EDGE_HEIGHT}; default test grid; top-down close-up pose \
+         4 m above small-rel (32, 0..2, 14) cobblestone (clear of every \
+         object's -x/-z shadow envelope); analysis rect {:?}.",
         PBR_HARD_EDGE_RECT,
     );
     crate::run_e2e_render_with_args(app_args)
 }
 
-/// Camera pose — reuse the same side-on view as `--pbr-visual` so the
-/// cobblestone surface is in frame at the same screen-space rect.
+/// Top-down close-up camera pose, 4 m above the Default-scene cobblestone
+/// ground at small-relative `(32, 14)`. See module docs for the patch
+/// selection (sun direction, shadow geometry, surrounding objects); the
+/// shadow-envelope table proves the entire 3.3 m frame footprint sits
+/// outside every voxel object's `-x/-z` shadow projection along the
+/// `(0.514, 0.783, 0.351)` sun direction.
 pub fn pbr_hard_edge_pose() -> Transform {
-    super::gates::e2e_camera_transform()
+    let off = super::gates::demo_origin_v();
+    // Small-relative voxel position: (32, 7, 14). Camera Y=7 = 4 voxels
+    // above the y=3 ground surface (slab fills y=0..=2). World position
+    // = demo_origin + (32, 7, 14).
+    let cam = off + Vec3::new(32.0, 7.0, 14.0);
+    let target = off + Vec3::new(32.0, 0.0, 14.0);
+    // Looking straight down with `Vec3::Z` as the up reference makes the
+    // framebuffer's up direction = world +Z (small-relative +Z, toward
+    // box B). Any perpendicular non-Y vector works; Z is the cleanest
+    // documentary choice.
+    Transform::from_translation(cam).looking_at(target, Vec3::Z)
 }
 
 /// Override the camera pose every frame while the gate is running.
@@ -189,6 +320,40 @@ pub fn save_pbr_hard_edge_screenshot(fb: &Framebuffer, filename: &str) {
     match fb.save_png(&path) {
         Ok(()) => println!(
             "e2e_render --pbr-hard-edge: screenshot saved to {}",
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "e2e_render --pbr-hard-edge: {filename} save failed: {e}"
+        ),
+    }
+}
+
+/// Save the analysis-rect crop as a separate PNG so the user can see
+/// exactly what the metric is looking at. The rect's pixels are copied
+/// out of `fb` into a fresh `Framebuffer` sized to the rect, then
+/// PNG-encoded the same way the full framebuffer is.
+pub fn save_pbr_hard_edge_rect_crop(fb: &Framebuffer, rect: Rect, filename: &str) {
+    let w = rect.x1.saturating_sub(rect.x0);
+    let h = rect.y1.saturating_sub(rect.y0);
+    if w == 0 || h == 0 {
+        eprintln!(
+            "e2e_render --pbr-hard-edge: rect-crop save skipped — rect {:?} \
+             has zero width or height",
+            rect,
+        );
+        return;
+    }
+    let mut data = Vec::with_capacity((w * h) as usize);
+    for j in 0..h {
+        for i in 0..w {
+            data.push(fb.pixel(rect.x0 + i, rect.y0 + j));
+        }
+    }
+    let crop = Framebuffer::from_raw_rgba(data, w, h);
+    let path = Path::new(crate::e2e::E2E_SCREENSHOT_DIR).join(filename);
+    match crop.save_png(&path) {
+        Ok(()) => println!(
+            "e2e_render --pbr-hard-edge: rect crop saved to {}",
             path.display()
         ),
         Err(e) => eprintln!(
@@ -323,8 +488,11 @@ pub fn assert_pbr_hard_edge(fb: &Framebuffer) -> Result<String, String> {
              discoloured patches on cobblestone with HARD 1-pixel \
              boundaries that survive denoise OFF / sample_leveling OFF). \
              See `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § \
-             \"LIGHT INTEGRATION splotch diagnose+fix (post-`46e50cd`)\". \
-             {report}. Inspect target/e2e-screenshots/{PBR_HARD_EDGE_PNG}.",
+             \"LIGHT INTEGRATION splotch diagnose+fix (post-`46e50cd`)\" \
+             and § \"--pbr-hard-edge gate rebuilt — sunlit cobblestone \
+             top-down (post-`22ff1f5`)\". {report}. Inspect \
+             target/e2e-screenshots/{PBR_HARD_EDGE_PNG} (full frame) and \
+             target/e2e-screenshots/{PBR_HARD_EDGE_RECT_PNG} (rect crop).",
         ));
     }
 

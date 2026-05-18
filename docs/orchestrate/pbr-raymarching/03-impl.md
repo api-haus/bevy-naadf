@@ -545,3 +545,29 @@ variations corrupt the 64-frame temporal accumulation ring). New
 structural regression tripwire; user must visually verify the fix
 on the production binary at the affected scene/resolution.
 
+## --pbr-hard-edge gate rebuilt (2026-05-19)
+See `05-diagnostic.md` § "--pbr-hard-edge gate rebuilt — sunlit
+cobblestone top-down (post-`22ff1f5`)" for the new scene + capture.
+
+### Files changed
+- `crates/bevy_naadf/src/e2e/pbr_hard_edge.rs` — module docs rewritten
+  with two-stage user correction + shadow-envelope table; camera pose
+  moved from small-rel `(50, 7, 32)` to `(32, 7, 14)` (clear of every
+  voxel object's `-x/-z` shadow projection); analysis-rect doc updated
+  to reference the new centre voxel; assert error message updated to
+  point at the new diagnostic section header.
+- `crates/bevy_naadf/src/e2e/driver.rs` — unchanged from prior dispatch
+  (already saves the rect-crop alongside the full framebuffer).
+- `crates/bevy_naadf/src/lib.rs` — unchanged from prior dispatch
+  (already gates 768×768 window-config override on
+  `args.pbr_hard_edge_mode`).
+- `docs/orchestrate/pbr-raymarching/05-diagnostic.md` — appended a new
+  section with the user-correction context, the shadow-envelope
+  analysis, the pose iteration log, the capture screenshots, and the
+  10-gate regression check.
+
+### Verdict
+SUCCESS — gate FAILS as required (80 hard jumps > 5 ceiling) with the
+splotch artifact clearly visible in both the full framebuffer and the
+analysis-rect crop. REPRO ONLY dispatch — no splotch fix attempted.
+

@@ -1846,6 +1846,15 @@ pub fn e2e_driver(
                             &fb,
                             super::pbr_hard_edge::PBR_HARD_EDGE_PNG,
                         );
+                        // Also save the analysis-rect crop so the user can
+                        // see exactly what the metric is looking at — pinned
+                        // small + central; the full framebuffer is mostly
+                        // ground texture at this pose.
+                        super::pbr_hard_edge::save_pbr_hard_edge_rect_crop(
+                            &fb,
+                            super::pbr_hard_edge::PBR_HARD_EDGE_RECT,
+                            super::pbr_hard_edge::PBR_HARD_EDGE_RECT_PNG,
+                        );
                         let result = super::pbr_hard_edge::assert_pbr_hard_edge(&fb);
                         pbr_visual.hard_edge.captured = Some(fb);
                         pbr_visual.hard_edge.saved = true;
