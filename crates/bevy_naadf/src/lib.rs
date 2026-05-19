@@ -789,6 +789,15 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         app.add_plugins(diagnostics::DiagnosticsPlugin);
     }
 
+    // 2026-05-19 — `wasm-chunk-aadf-determinism` static device snapshot.
+    // Fires in BOTH configs (production AND e2e) on the first frame the
+    // RenderApp's RenderAdapter/RenderDevice are resolved, writes
+    // `target/diagnostics/device-snapshot-{native,web}.json` on native, and
+    // emits a `[device-snapshot] {json}` sentinel info-log line on wasm32
+    // for the Playwright harness to capture. See
+    // `docs/orchestrate/wasm-chunk-aadf-nondeterminism/01-diagnostics-design.md`.
+    app.add_plugins(diagnostics::device_snapshot::DeviceSnapshotPlugin);
+
     // Load the embedded Roboto Regular font into Assets<Font> and store the
     // handle as DevFont. Runs first so setup_hud / setup_panel can query it.
     app.add_systems(Startup, load_dev_font);

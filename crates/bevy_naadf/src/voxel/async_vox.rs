@@ -48,7 +48,7 @@ pub struct PendingVoxParseInner {
     /// Wall-clock budget tracking for diagnostic-bail per
     /// `feedback-e2e-gates-must-fail-fast.md`. The polling system logs a
     /// warning if the task is still pending after `PARSE_BUDGET_SECS`.
-    pub started_at: std::time::Instant,
+    pub started_at: web_time::Instant,
     /// Source label for diagnostic logging.
     pub source_label: String,
 }
@@ -174,7 +174,7 @@ pub fn spawn_native_vox_parse(commands: &mut Commands, path: std::path::PathBuf)
     commands.insert_resource(PendingVoxParse {
         inner: Some(PendingVoxParseInner {
             task,
-            started_at: std::time::Instant::now(),
+            started_at: web_time::Instant::now(),
             source_label,
         }),
     });
@@ -200,7 +200,7 @@ pub fn spawn_native_vox_parse_from_bytes(
     commands.insert_resource(PendingVoxParse {
         inner: Some(PendingVoxParseInner {
             task,
-            started_at: std::time::Instant::now(),
+            started_at: web_time::Instant::now(),
             source_label,
         }),
     });

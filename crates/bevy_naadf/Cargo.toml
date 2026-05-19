@@ -31,6 +31,15 @@ path = "src/bin/e2e_render.rs"
 name = "bake"
 path = "src/bin/bake.rs"
 
+# 2026-05-19 — `wasm-chunk-aadf-determinism` diagnostic. Tiny standalone CLI
+# that reads the two `target/diagnostics/device-snapshot-{native,web}.json`
+# files produced by the `--device-snapshot-native` mode + the Playwright
+# `device-snapshot.spec.ts` capture, walks them field-by-field, prints
+# divergences. No Bevy boot — pure serde_json comparison.
+[[bin]]
+name = "diag_compare"
+path = "src/bin/diag_compare.rs"
+
 [dependencies]
 # free_camera = the prebuilt fly-camera from bevy_camera_controller (off by default).
 # The `dlss` feature is forwarded from this crate's own `[features]` below;
@@ -86,7 +95,28 @@ ron = "0.12"
 # (`src/texture_array/{loader,saver}.rs`). Both are already in Bevy's tree at
 # these majors, so neither adds a second copy.
 serde = { version = "1", features = ["derive"] }
+# serde_json — single-line JSON emit for the `[device-snapshot]` static
+# diagnostic surface (`src/diagnostics.rs`). Pulled in transitively already
+# via Bevy; declared here so `diagnostics.rs` and `bin/diag_compare.rs` can
+# `use serde_json` without a feature-gate scramble.
+serde_json = "1"
 thiserror = "2"
+# web_time — drop-in replacement for `std::time::{Instant, SystemTime}` that
+# works on both native and wasm32. Required because `std::time::*::now()`
+# panics on wasm32 with "time not implemented on this platform"
+# (`std/src/sys/time/unsupported.rs:35`). The `diagnostics.rs` device snapshot
+# captures `captured_at_unix_seconds` and the wasm32 path triggers the panic
+# without this. Also satisfies `just lint-wasm-compat`.
+web_time = "1"
+# wgpu — direct dep so `src/diagnostics.rs`'s device-snapshot module can name
+# `wgpu::Adapter` / `wgpu::DownlevelCapabilities` / `wgpu::Features` /
+# `wgpu::Limits` / `wgpu::AdapterInfo` without going through Bevy's partial
+# re-export surface (Bevy 0.19-rc.1 re-exports `Limits`/`Features`/
+# `AdapterInfo` from `bevy::render::render_resource` but not `Adapter` or
+# `DownlevelCapabilities`). Pinned to the EXACT version Bevy 0.19-rc.1
+# pulls in transitively (`Cargo.lock` → wgpu 29.0.3) so there's no risk of
+# a second copy.
+wgpu = "=29.0.3"
 # zip = ZIP archive reader for the NAADF `.cvox` format (a ZIP-wrapped custom
 # binary; see `voxel/cvox_import.rs`). The `.cvox` container holds a single
 # DEFLATE-compressed entry named `"data"` whose body is a fixed-width

@@ -134,6 +134,13 @@ fn main() -> ExitCode {
     // similarity against its own WASM canvas screenshot. See
     // `crate::e2e::vox_horizon_parity`.
     let vox_horizon_native_mode = args.iter().any(|a| a == "--vox-horizon-native");
+    // 2026-05-19 — `wasm-chunk-aadf-determinism` static device-snapshot mode.
+    // Boots the standard e2e harness for ONE frame to give the
+    // `DeviceSnapshotPlugin` (`crate::diagnostics::device_snapshot`) a chance
+    // to capture `RenderAdapter`/`RenderDevice` and write
+    // `target/diagnostics/device-snapshot-native.json`. No fixtures needed;
+    // the snapshot is device-shape, not scene-shape.
+    let device_snapshot_native_mode = args.iter().any(|a| a == "--device-snapshot-native");
     // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — `--ssim-compare`
     // short-circuit. Exits without booting a Bevy app. Used by both the
     // top-level `--vox-web-parity` mode (out-of-process SSIM compare) AND
@@ -354,6 +361,18 @@ fn main() -> ExitCode {
         // `vox_web_parity_loaded.png`. Asserts zero `tracing::error!`
         // events fired during the run.
         bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_loaded_phase()
+    } else if device_snapshot_native_mode {
+        // 2026-05-19 — `wasm-chunk-aadf-determinism` device-snapshot capture.
+        // Boots the standard e2e harness with default AppArgs. The
+        // `DeviceSnapshotPlugin` fires on the first render frame, writing
+        // `target/diagnostics/device-snapshot-native.json`. The standard e2e
+        // bounded-frame driver lets the app exit after its frame budget.
+        eprintln!(
+            "e2e_render --device-snapshot-native: booting standard e2e \
+             harness to capture device snapshot. Output → \
+             target/diagnostics/device-snapshot-native.json"
+        );
+        bevy_naadf::run_e2e_render()
     } else if vox_horizon_native_mode {
         // 2026-05-19 — horizon-parity native capture. Loads oasis.cvox via
         // the W5 GPU producer chain, pins the C#-faithful horizon pose,

@@ -410,6 +410,7 @@ dependencies = [
  "rayon",
  "ron",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
@@ -417,6 +418,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-rayon",
  "web-sys",
+ "wgpu",
  "zip",
 ]
 
@@ -5737,6 +5739,7 @@ dependencies = [
  "js-sys",
  "log",
  "naga",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
@@ -5776,6 +5779,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.18",
  "wgpu-core-deps-apple",
+ "wgpu-core-deps-emscripten",
  "wgpu-core-deps-wasm",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
@@ -5788,6 +5792,15 @@ name = "wgpu-core-deps-apple"
 version = "29.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62e51b5447e144b3dbba4feb01f80f4fa21696fa0cd99afb2c3df1affd6fdb28"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-core-deps-emscripten"
+version = "29.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3487cd6293a963bc5c0c0396f6a2192043c50003c07f4efdccbad3d90ec9d819"
 dependencies = [
  "wgpu-hal",
 ]

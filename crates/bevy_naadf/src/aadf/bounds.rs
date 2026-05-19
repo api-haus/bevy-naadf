@@ -712,7 +712,7 @@ mod tests {
     #[test]
     #[ignore]
     fn aadf_layer_speedup_at_scale() {
-        use std::time::Instant;
+        use web_time::Instant;
 
         // 32³ chunk-layer-shaped scenario, max_dist=31: the chunk AADF cost is
         // where the per-cell vs O(3·d·n) gap shows up. (`GridPreset::Default`

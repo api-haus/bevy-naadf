@@ -181,3 +181,33 @@ test-wasm-headless:
 
 # Build the release web artifact, then run the e2e suite (headed) against it.
 test-wasm-full: web-build-release test-wasm
+
+# ── wasm-chunk-aadf-determinism diagnostics (2026-05-19) ────────────────────
+#
+# Static device-snapshot diff: capture wgpu adapter+device limits/features
+# from BOTH native and wasm32/WebGPU targets, write JSON to
+# `target/diagnostics/`, run `diag_compare` to print divergences.
+#
+# See `docs/orchestrate/wasm-chunk-aadf-nondeterminism/01-diagnostics-design.md`
+# for the full surface (every field captured, every divergence flagged).
+
+# Take a fresh native device snapshot via the `--device-snapshot-native`
+# e2e_render mode. Writes target/diagnostics/device-snapshot-native.json.
+diag-native:
+    cargo run --release --bin e2e_render -- --device-snapshot-native
+
+# Take a fresh web device snapshot. Requires a prior `just web-build-release`.
+# Runs the Playwright `device-snapshot.spec.ts` headed-Chrome test which
+# captures the `[device-snapshot]` console-line and persists it to
+# target/diagnostics/device-snapshot-web.json.
+diag-web:
+    cd e2e && npx playwright test device-snapshot.spec.ts --headed
+
+# Compare the two snapshots. Prints structured divergences. Exit code 0 if
+# only expected divergences (target/build/adapter_info.*), 1 if anything
+# else differs, 2 on missing/malformed inputs.
+diag-compare:
+    cargo run --quiet --bin diag_compare
+
+# Convenience: take both snapshots then diff.
+diag: diag-native diag-web diag-compare
