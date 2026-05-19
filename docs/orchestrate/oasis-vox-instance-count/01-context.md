@@ -58,9 +58,10 @@ This means: **the fix is whatever brings Bevy to C# parity**. If C# uses an arbi
 
 | Q | Decision | Notes |
 |---|---|---|
-| Q1 (scoping) | User speculates **world extent / scene size** is the wrap surface | Hypothesis, not a constraint — verify in audit |
+| Q1 (scoping) | User speculates **world extent / scene size** is the wrap surface | Hypothesis FALSIFIED by Phase-1 audit. Root cause is asset-level (Bevy loads `oasis_hard_cover.vox` 1488×544×1344; C# loads `oasis.cvox` 1033×386×1082). World-size constants in Bevy already match C# exactly. |
 | Q2 (success gate) | **User-eyes only** | No new e2e gate. User does side-by-side visual check vs C#. |
-| Q3 (fix scope) | **Minimal — just match C#** | …**unless** multiple divergent hard-coded constants exist (user follow-up constraint), in which case **refactor to single source of truth**. |
+| Q3 (fix scope) | **Minimal — just match C#** | SSoT-refactor constraint does NOT trigger: audit found only one canonical world-size constant chain, already matching C#. |
+| Q4 (fix direction, **post-audit, given by user verbatim**) | **"alright, lets implement both vox and cvox parsers and extend the drag&drop and autoload functionality to support both based on parsed header magic"** | The Bevy port gains a faithful `.cvox` parser (port of C# `ModelData.Load` at `/mnt/archive4/DEV/NAADF/NAADF/World/Model/ModelData.cs:181-258`). Existing `.vox` parser stays. A new dispatch entry point sniffs the magic bytes of the input file and routes to the appropriate parser. Both drag-and-drop and autoload paths consume the dispatch entry point, not the per-format parsers. Once landed, the user can drop `oasis.cvox` (copied from `/mnt/archive4/DEV/NAADF/NAADF/Content/oasis.cvox`) into the Bevy port and observe the expected 4 modulo-wrapped instances. |
 
 ## Output shape contract for the audit
 
