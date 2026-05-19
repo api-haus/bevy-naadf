@@ -660,14 +660,32 @@ pub fn residency_driver(
     // bound-but-undispatched slots in camera-distance order.
     process_pending_admissions(&mut residency);
 
+    // streaming-world Phase 2.14.f — extend the per-shift `info!` line
+    // with the analytical fields from `StreamingDiagnostics`. The user's
+    // load-bearing requirement ("the system must know if it HAS
+    // unfulfilled slots in the middle at startup, not via screenshots")
+    // is partially answered here on every origin-shift; the periodic
+    // logging system in `StreamingPlugin` covers the steady-state +
+    // pre-shift cold-start frames where this line does NOT fire.
+    //
+    // `in_flight` is structurally 0 under the Phase 2.14.b atomic API
+    // and remains in the log as a regression sentinel — a non-zero
+    // value here means a `WindowedSlotMap` mutator has re-introduced
+    // the in-flight escape the atomic API was designed to close.
+    let diag = residency.diagnostics();
     bevy::log::info!(
         "streaming-world residency shift: cam_seg={:?}, new_origin={:?}, \
-         evictions={}, bound_segments={}, admissions_this_frame={}",
+         evictions={}, bound_segments={}, admissions_this_frame={}, \
+         cold_start_complete={}, unfulfilled={}, in_flight={}, dispatched_once={}",
         cam_seg_world.0,
         new_origin,
         residency.evictions_this_frame.len(),
         residency.window.iter_bound().count(),
         residency.admissions_this_frame.len(),
+        diag.cold_start_complete,
+        diag.camera_window_segments_unfulfilled,
+        diag.in_flight_slots,
+        diag.dispatched_once_slots,
     );
 }
 
