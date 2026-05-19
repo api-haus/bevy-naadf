@@ -3545,7 +3545,10 @@ pub fn aadf_delayed_probe(
 
     // 2026-05-19 — decode bound_refined_info (16 u32).
     // [3]=found_bound_size, [4]=found_xyz, [5]=found_size_atomicload,
-    // [6]=expansion_workgroup_counter, [7]=prepare_call_counter.
+    // [6]=expansion_workgroup_counter, [7]=prepare_call_counter,
+    // [8..16) = probe1 ring buffer of `atomicLoad(&bound_queue_info[qi].size)`
+    // observations (one per `prepare_group_bounds` call, ring index =
+    // `prev_calls % 8`).
     let refined_u32 = |i: usize| -> u32 {
         u32::from_le_bytes(refined_bytes[i*4..(i+1)*4].try_into().unwrap())
     };
@@ -3563,6 +3566,51 @@ pub fn aadf_delayed_probe(
         refined_u32(0),
         refined_u32(1),
         refined_u32(2),
+    );
+
+    // 2026-05-19 probe1 — per-round ring decode. Slot `8 + (k % 8)` holds the
+    // `atomicLoad(&bound_queue_info[qi].size)` value observed by the
+    // `prepare_group_bounds` call whose `prev_calls` counter was `k`. With
+    // `prepare_calls_total = N`, the most recent reading lives at slot
+    // `8 + ((N - 1) % 8)` and the slot ordering wraps every 8 calls. The
+    // `[probe1-ring]` sentinel makes this line easy to grep in CI logs.
+    let prepare_calls_total = refined_u32(7);
+    let ring: [u32; 8] = [
+        refined_u32(8),
+        refined_u32(9),
+        refined_u32(10),
+        refined_u32(11),
+        refined_u32(12),
+        refined_u32(13),
+        refined_u32(14),
+        refined_u32(15),
+    ];
+    let newest_slot = if prepare_calls_total == 0 {
+        // No prepare calls yet — ring is all-zero seed; declare the "newest"
+        // as slot 7 to keep the format stable.
+        7u32
+    } else {
+        (prepare_calls_total - 1) % 8
+    };
+    // NOTE: include `[aadf-probe2]` in the message so the Playwright spec's
+    // existing `wgpuDiagnosticLines` filter (`e2e/tests/vox-horizon-parity.spec.ts:225-237`)
+    // forwards this line as `[wasm-diag]` to the test stdout. The `[probe1-ring]`
+    // token is the grep sentinel; the `[aadf-probe2]` token is the pass-through
+    // token. Keeping both keeps the spec untouched.
+    bevy::log::info!(
+        "[aadf-probe2 pass={}] [probe1-ring] prepare_calls_total={} newest_slot={} \
+         ring[0..8]=[{},{},{},{},{},{},{},{}]",
+        pass_tag_r,
+        prepare_calls_total,
+        newest_slot,
+        ring[0],
+        ring[1],
+        ring[2],
+        ring[3],
+        ring[4],
+        ring[5],
+        ring[6],
+        ring[7],
     );
 
     // Decode bound_queue_info (96 entries × 8 B each: start u32, size u32).

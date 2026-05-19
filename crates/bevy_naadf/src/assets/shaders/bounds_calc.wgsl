@@ -312,6 +312,32 @@ fn prepare_group_bounds() {
     // workgroup = no contention concern).
     let prev_calls = bound_refined_info[7];
     bound_refined_info[7] = prev_calls + 1u;
+
+    // 2026-05-19 probe1 — per-round ring buffer of `atomicLoad(&bound_queue_info[qi].size)`
+    // values across the LAST 8 prepare calls. Slots [8..16) form a round-robin
+    // history of `found_size` (the value that prepare's `atomicLoad` actually
+    // observed from the immediately-preceding compute pass's `atomicAdd`
+    // re-enqueues — `bounds_calc.wgsl:439`).
+    //
+    // Wiring (Option C — variant of A using the already-existing non-atomic
+    // counter): `prepare_group_bounds` runs `@workgroup_size(1, 1, 1)`, so the
+    // call counter at slot [7] is naturally race-free. Use `prev_calls % 8` as
+    // the ring index — that gives us the LAST 8 readings in slot
+    // `[8 + (prev_calls % 8)]` order. The next round overwrites the oldest
+    // slot. After convergence (or after the SSIM-screenshot pass) the readback
+    // can decode all 8 entries to see what the shader actually read.
+    //
+    // For the "no queue found" (else) branch we still record a write so the
+    // ring distinguishes "queue exhausted" from "queue had work" — write 0,
+    // matching the `found_size = 0` initialiser at the top.
+    //
+    // H1 prediction: on web, this ring shows VALUES LOWER THAN OR EQUAL to
+    // the corresponding native ring slot at the same logical round, because
+    // Dawn's lowering of WGSL atomics misses Coherent decorations and a
+    // cross-pass `atomicLoad` sees a stale (smaller) value before all
+    // `atomicAdd`s from the prior compute pass have flushed.
+    let ring_index = 8u + (prev_calls % 8u);
+    bound_refined_info[ring_index] = found_size;
 }
 
 // ─── Entry point 3: compute_group_bounds — fx:118-193 ─────────────────────────
