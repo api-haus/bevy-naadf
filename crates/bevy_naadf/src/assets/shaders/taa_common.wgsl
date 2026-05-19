@@ -45,17 +45,23 @@ const taa_neighbor_offsets: array<vec2<i32>, 9> = array<vec2<i32>, 9>(
 // `commonTaa.fxh:20-28`, port-extended for procedural streaming + edits).
 //
 // Phase B extension (2026-05-19 — `docs/orchestrate/taa-hash-world-identity/`):
-// the hash now also mixes a 13-bit world-anchored voxel-cell discriminator
+// the hash now also mixes a 13-bit world-absolute voxel-cell discriminator
 // `data_id_lo13` into bits 2..14 of the pre-mix word. Bits previously: bit 0 =
 // `is_diffuse`, bit 1 = `entity` LSB, bit 15 = `specular_normals` LSB. Bits
 // 2..14 were unused — the Phase-A "this collapses to a single constant value
 // for every hit pixel" header note no longer applies; with `data_id_lo13`
 // varying per world voxel cell, the hash now invalidates TAA history on
-// origin shifts and voxel edits. `data_id_lo13` is derived at both call sites
-// via the canonical `taa_data_id_lo13(...)` helper in `taa.wgsl` (the write
-// site in `taa_compress_sample` and the read site in `reproject_old_samples`
-// MUST use the same derivation; a mismatch is silent hash-reject corruption).
-// Used by the reproject pass's hash reject test.
+// origin shifts (taa-hash-world-identity Phase O — see
+// `docs/orchestrate/taa-hash-world-identity/02-design.md` § "Design — hash
+// world-absolute correction") and voxel edits. `data_id_lo13` is derived at
+// both call sites via the canonical `taa_data_id_lo13(...)` helper in
+// `taa.wgsl`, which composes the GPU-uniform `residency_origin_voxels`
+// offset so the SAME world voxel produces the SAME 13-bit ID across origin
+// shifts (a Phase-O upgrade — pre-Phase-O the helper was mis-labelled
+// "world-anchored" but was in fact window-local-anchored). The write site
+// in `taa_compress_sample` and the read site in `reproject_old_samples`
+// MUST use the same derivation; a mismatch is silent hash-reject
+// corruption. Used by the reproject pass's hash reject test.
 fn taa_hash_from_data(
     is_diffuse: u32,
     specular_normals: u32,

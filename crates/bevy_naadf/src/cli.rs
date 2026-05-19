@@ -290,6 +290,9 @@ fn apply_gate_defaults(args: &mut AppArgs, gate: Gate) {
         Gate::StreamingColdStart => {
             crate::e2e::streaming_cold_start::apply_streaming_cold_start_defaults(args);
         }
+        Gate::StreamingTaaShiftNoise => {
+            crate::e2e::streaming_taa_shift_noise::apply_streaming_taa_shift_noise_defaults(args);
+        }
         Gate::StreamingFramebufferDiff => {
             // Top-level subprocess orchestrator; short-circuited in main
             // BEFORE build_app (mirrors `Gate::VoxGpuOracle`). No defaults
@@ -411,6 +414,16 @@ pub enum Gate {
     /// admission-race bug at the level of decoded chunk state, not
     /// framebuffer SSIM.
     StreamingColdStart,
+    /// taa-hash-world-identity Phase O
+    /// (`docs/orchestrate/taa-hash-world-identity/02-design.md` § "Design —
+    /// new e2e gate streaming-taa-shift-noise") — captures the post-origin-
+    /// shift TAA transient analytically: shadowed-band per-pixel temporal
+    /// variance over frames N..N+3 vs a temporal recovery baseline (frames
+    /// N+5..N+8). Pre-fix the artefact pushes the ratio above the
+    /// threshold; post-fix the ratio settles near 1. Layered on top of
+    /// streaming-window's defaults (same preset + same +X walk that triggers
+    /// the residency shifts).
+    StreamingTaaShiftNoise,
     /// streaming-world Phase 2.12
     /// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § A,
     /// MUST-3) — observable-output gate. Spawns two subprocesses (static
@@ -482,6 +495,7 @@ impl Gate {
             Gate::StreamingWindow => "streaming-window",
             Gate::StreamingAadfParity => "streaming-aadf-parity",
             Gate::StreamingColdStart => "streaming-cold-start",
+            Gate::StreamingTaaShiftNoise => "streaming-taa-shift-noise",
             Gate::StreamingFramebufferDiff => "streaming-framebuffer-diff",
             Gate::StreamingFramebufferStatic => "streaming-framebuffer-static",
             Gate::StreamingFramebufferStreaming => "streaming-framebuffer-streaming",

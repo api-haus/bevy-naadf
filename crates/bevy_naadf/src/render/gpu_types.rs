@@ -191,7 +191,10 @@ pub struct GpuWorldMeta {
 /// widening of `GpuRenderParams`.
 ///
 /// Layout: `mat4 (64) + mat4 (64) + (ivec3+pad) (16) + (vec3+pad) (16) +
-/// 4×u32 (16) + 4×u32 (16)` = 192 bytes, 16-byte aligned throughout.
+/// 4×u32 (16) + (ivec3+u32) (16)` = 192 bytes, 16-byte aligned throughout.
+/// taa-hash-world-identity Phase O repurposes the former trailing
+/// `_pad2/_pad3/_pad4` u32s as `residency_origin_voxels: IVec3 + sample_age: u32`
+/// (struct size unchanged, no bind-group changes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuTaaParams {
@@ -219,15 +222,30 @@ pub struct GpuTaaParams {
     pub frame_count: u32,
     /// `taaIndex = CAMERA_HISTORY_DEPTH - (frame_count % CAMERA_HISTORY_DEPTH) - 1`.
     pub taa_index: u32,
+    /// taa-hash-world-identity Phase O — `residency.origin × SEGMENT_VOXELS`
+    /// (zero in non-streaming presets). Composed with `cam_pos_int` at the
+    /// shader hash call site to give world-absolute integer voxel coords —
+    /// so the SAME world voxel produces the SAME hash across origin shifts
+    /// (otherwise the post-shift `pos` would be offset by
+    /// `newCam_int - oldCam_int` and the hash would over-reject every
+    /// origin-shifted pixel). See
+    /// `docs/orchestrate/taa-hash-world-identity/02-design.md` § "Design —
+    /// hash world-absolute correction".
+    ///
+    /// Layout: offset 176, 12 bytes. Aligned to 16 bytes (176 % 16 == 0).
+    /// `sample_age` follows immediately at offset 188, filling the trailing
+    /// 4 bytes of the WGSL `vec4<i32>` view of this field (the canonical
+    /// `cam_pos_int (IVec3) + _pad0 (u32)` pattern from
+    /// `gpu_types.rs:207-209`, repurposed to carry a meaningful trailing
+    /// scalar instead of padding).
+    pub residency_origin_voxels: IVec3,
     /// How many past frames to walk (C# `sampleAge` / `taaSampleMaxAge`).
     /// Clamped to `[1, TAA_SAMPLE_RING_DEPTH]` in A-2 (`06-design-a2.md` §7.1).
+    /// Lives at offset 188 — the trailing 4 bytes of the
+    /// `residency_origin_voxels` `vec4<i32>` slot in WGSL (Option C in the
+    /// design's "File-by-file change list" item 4.a). Read via
+    /// `u32(params.residency_origin_voxels.w)` in the shader.
     pub sample_age: u32,
-    /// Padding to a 16-byte stride.
-    pub _pad2: u32,
-    /// Padding to a 16-byte stride.
-    pub _pad3: u32,
-    /// Padding to a 16-byte stride.
-    pub _pad4: u32,
 }
 
 /// One slot of the 128-deep camera-history ring, GPU side

@@ -460,6 +460,19 @@ pub struct AppArgs {
     /// loose-SSIM `streaming-framebuffer-diff` gate misses. See
     /// `crate::e2e::streaming_cold_start`.
     pub streaming_cold_start_mode: bool,
+    /// taa-hash-world-identity Phase O
+    /// (`docs/orchestrate/taa-hash-world-identity/02-design.md` § "Design — new
+    /// e2e gate streaming-taa-shift-noise") — runs the
+    /// `--gate streaming-taa-shift-noise` e2e gate. Layered on top of
+    /// `streaming_window_mode = true`: the camera walk fires (so origin shifts
+    /// happen), the gate captures the framebuffer at the first origin-shift
+    /// tick and at +1, +2, +3, +5, +6, +7, +8 ticks afterwards, computes
+    /// per-pixel temporal variance over the shadowed band, and asserts the
+    /// post-shift transient variance is not significantly larger than the
+    /// recovery-window baseline. Pre-fix this MUST FAIL (the residency-frame
+    /// rebase is missing so TAA history is rejected wholesale on every shift);
+    /// post-fix it MUST PASS. See `crate::e2e::streaming_taa_shift_noise`.
+    pub streaming_taa_shift_noise_mode: bool,
     /// streaming-world Phase 2.12
     /// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § A,
     /// MUST-3) — `true` when the e2e harness is running the **static
@@ -536,6 +549,7 @@ impl Default for AppArgs {
             streaming_window_mode: false,
             streaming_aadf_parity_mode: false,
             streaming_cold_start_mode: false,
+            streaming_taa_shift_noise_mode: false,
             streaming_framebuffer_static_phase: false,
             streaming_framebuffer_streaming_phase: false,
             noise_static_mode: false,

@@ -33,6 +33,7 @@ pub mod small_edit_visual;
 pub mod streaming_aadf_parity;
 pub mod streaming_cold_start;
 pub mod streaming_framebuffer_diff;
+pub mod streaming_taa_shift_noise;
 pub mod vox_e2e;
 pub mod streaming_window;
 pub mod vox_gpu_construction;
@@ -323,6 +324,22 @@ pub fn add_e2e_systems(app: &mut App) {
             Update,
             streaming_framebuffer_diff::pin_streaming_framebuffer_camera
                 .after(oasis_edit_visual::pin_oasis_camera)
+                .before(crate::camera::sync_position_split),
+        )
+        // taa-hash-world-identity Phase O
+        // (`docs/orchestrate/taa-hash-world-identity/02-design.md` § "Design —
+        // new e2e gate streaming-taa-shift-noise") — registered as a separate
+        // `add_systems` call because the prior tuple is already at the 11-item
+        // Bevy 0.19 tuple-overload limit. Detects the first residency origin-
+        // shift tick during the walk and captures 8 framebuffers around it
+        // (offsets N..N+3 transient + N+5..N+8 baseline). Inactive on
+        // non-shift-noise gates (early-returns on the mode flag). Runs
+        // `.after(pin_streaming_window_camera)` so the camera-walk delta has
+        // landed before we read the residency origin.
+        .add_systems(
+            Update,
+            streaming_taa_shift_noise::record_shift_transient_frames
+                .after(streaming_window::pin_streaming_window_camera)
                 .before(crate::camera::sync_position_split),
         );
 

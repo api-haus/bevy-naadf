@@ -541,8 +541,16 @@ pub fn e2e_driver(
     let streaming_cold_start_mode = app_args
         .as_deref()
         .is_some_and(|a| a.streaming_cold_start_mode);
+    // taa-hash-world-identity Phase O — layered on streaming_window_mode;
+    // routed in here so the driver enters the OasisWarmup state machine and
+    // (critically) so the streaming-window walk fires (which is what triggers
+    // the residency origin shifts the gate measures).
+    let streaming_taa_shift_noise_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.streaming_taa_shift_noise_mode);
     if (oasis_mode || vox_gpu_construction_mode || streaming_window_mode
-        || noise_static_mode || streaming_cold_start_mode)
+        || noise_static_mode || streaming_cold_start_mode
+        || streaming_taa_shift_noise_mode)
         && state.phase == E2ePhase::Warmup
         && state.phase_ticks == 0
     {
@@ -1205,6 +1213,19 @@ pub fn e2e_driver(
                         .map(|msg| {
                             println!("e2e_render --streaming-cold-start: {msg}");
                         })
+                    } else if streaming_taa_shift_noise_mode {
+                        // taa-hash-world-identity Phase O — must come BEFORE
+                        // `streaming_window_mode` because the shift-noise gate's
+                        // defaults keep streaming_window_mode = true (so the
+                        // camera walk fires + residency origin shifts happen);
+                        // we route here to read the 8 stashed transient/baseline
+                        // framebuffers instead of doing the residency-shift
+                        // before/after compare.
+                        let _ = (&a, &b);
+                        super::streaming_taa_shift_noise::assert_streaming_taa_shift_noise_landed()
+                            .map(|msg| {
+                                println!("e2e_render --streaming-taa-shift-noise: {msg}");
+                            })
                     } else if streaming_window_mode {
                         // streaming-world Phase 2 — compute the residency-
                         // origin shift in X (Pose A snapshot vs current).
@@ -1272,6 +1293,15 @@ pub fn e2e_driver(
                              segment (dsq ≤ 2 ring at spawn pose); \
                              Phase 2.13 deferred-`dispatched_once` ACK \
                              pipeline holding."
+                        );
+                    } else if streaming_taa_shift_noise_mode {
+                        println!(
+                            "e2e_render: streaming-taa-shift-noise PASS — \
+                             shadowed-band temporal variance over the post-\
+                             origin-shift transient (N..N+3) stays within \
+                             {:.2}× the post-recovery baseline (N+5..N+8). \
+                             The structural camera-history rebase is holding.",
+                            super::streaming_taa_shift_noise::STREAMING_TAA_SHIFT_NOISE_RATIO_MAX,
                         );
                     } else if streaming_window_mode {
                         println!(

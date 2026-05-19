@@ -105,12 +105,20 @@
 // `taa_sample_accum` was never written.)
 
 // TAA reproject-pass uniform (mirrors `gpu_types::GpuTaaParams`, 192 bytes):
-//   inv_view_proj  (0..64)   — C# invCamMatrix, rotation-only inverse view-proj
-//   view_proj      (64..128) — C# camMatrix, rotation-only view-proj (current)
-//   cam_pos_int    (128..144) — C# camPosInt + `_pad0` in `.w`
-//   cam_pos_frac   (144..160) — C# camPosFrac + `_pad1` in `.w`
-//   screen_width   160, screen_height 164, frame_count 168, taa_index 172
-//   sample_age     176
+//   inv_view_proj             (0..64)   — C# invCamMatrix, rotation-only inverse view-proj
+//   view_proj                 (64..128) — C# camMatrix, rotation-only view-proj (current)
+//   cam_pos_int               (128..144) — C# camPosInt + `_pad0` in `.w`
+//   cam_pos_frac              (144..160) — C# camPosFrac + `_pad1` in `.w`
+//   screen_width              160, screen_height 164, frame_count 168, taa_index 172
+//   residency_origin_voxels   (176..192) — `.xyz` = residency.origin × SEGMENT_VOXELS
+//                                          (taa-hash-world-identity Phase O);
+//                                          `.w` packs `sample_age` (the Rust struct
+//                                          puts `sample_age: u32` immediately after
+//                                          the `IVec3`; WGSL declares the pair as a
+//                                          single `vec4<i32>` so std140 keeps the
+//                                          struct at 192 B — same pattern as
+//                                          `cam_pos_int: vec4<i32>` carrying
+//                                          `_pad0: u32` in `.w`).
 struct GpuTaaParams {
     inv_view_proj: mat4x4<f32>,
     view_proj: mat4x4<f32>,
@@ -120,7 +128,11 @@ struct GpuTaaParams {
     screen_height: u32,
     frame_count: u32,
     taa_index: u32,
-    sample_age: u32,
+    // `.xyz` = residency.origin × SEGMENT_VOXELS (zero in non-streaming presets).
+    // `.w`   = sample_age as i32 bits (read via `u32(params.residency_origin_voxels.w)`).
+    // The Rust side stores these as `IVec3 + u32`, but a single `vec4<i32>` here
+    // is the std140-correct mapping (see `cam_pos_int: vec4<i32>` precedent).
+    residency_origin_voxels: vec4<i32>,
 }
 
 // One slot of the 128-deep camera-history ring (mirrors
@@ -181,21 +193,24 @@ struct GpuCameraHistorySlot {
 // between the two derivations is silent hash-reject corruption — keep both
 // call sites going through THIS helper.
 //
-// Derives a 13-bit world-anchored voxel-cell discriminator at the first-hit
+// Derives a 13-bit world-absolute voxel-cell discriminator at the first-hit
 // point. `FirstHitResult.pos` is camera-int-relative
 // (`render_pipeline_common.wgsl:375` — `r.pos = cam_pos_frac`, with ray-segment
-// offsets accumulated; `cam_pos_int` is NOT added back). Adding
-// `vec3<f32>(cam_pos_int)` here converts to world-absolute integer voxel
-// coordinates so the SAME world voxel produces the SAME 13-bit ID across
-// origin shifts (otherwise the post-shift `pos` would be offset by
-// `newCam_int - oldCam_int` and the hash would over-reject every origin-
-// shifted pixel — the opposite-but-also-wrong failure mode).
+// offsets accumulated; `cam_pos_int` is NOT added back). To get a
+// WORLD-ABSOLUTE voxel coord we must add BOTH the window-local
+// `cam_pos_int` AND the residency-origin offset (in voxels) — because in
+// the streaming preset `cam_pos_int` itself is window-local (the
+// residency manager re-pins the camera into the new window-local frame
+// on every origin shift). Without the residency-origin term the hash is
+// window-local-anchored: the same WORLD voxel produces DIFFERENT hashes
+// across origin shifts, mis-rejecting history (taa-hash-world-identity
+// Phase O — see `docs/orchestrate/taa-hash-world-identity/02-design.md`
+// § "Design — hash world-absolute correction").
 //
-// Derivation (Iteration 2, 2026-05-19 — replaces the additive 4+4+4+1-parity
-// packing that was the first-pass landing):
+// Derivation:
 //
 //   1. Build a world-absolute integer voxel coord
-//      `vec3<i32>(floor(first_hit_pos + vec3<f32>(cam_pos_int)))`.
+//      `vec3<i32>(floor(first_hit_pos + vec3<f32>(cam_pos_int + residency_origin_voxels)))`.
 //   2. Avalanche all three components through `pcg_hash`
 //      (`ray_tracing_common.wgsl:19`). Each PCG round mixes the prior accumulator
 //      with the next axis (XOR-then-hash), so single-axis shifts of any size —
@@ -212,8 +227,14 @@ struct GpuCameraHistorySlot {
 // same low-bit field to the same output: `pcg_hash` is a full 32-bit avalanche,
 // so a +32 shift in `x` changes ALL 13 retained bits with overwhelming
 // probability.
-fn taa_data_id_lo13(first_hit_pos: vec3<f32>, cam_pos_int: vec3<i32>) -> u32 {
-    let voxel_pos = vec3<i32>(floor(first_hit_pos + vec3<f32>(cam_pos_int)));
+fn taa_data_id_lo13(
+    first_hit_pos: vec3<f32>,
+    cam_pos_int: vec3<i32>,
+    residency_origin_voxels: vec3<i32>,
+) -> u32 {
+    let voxel_pos = vec3<i32>(
+        floor(first_hit_pos + vec3<f32>(cam_pos_int + residency_origin_voxels)),
+    );
     // Avalanche all three components into a single u32, take low 13 bits.
     // Eliminates the axis-aligned collision classes that the prior
     // 4+4+4+parity packing exhibited (32-voxel single-axis shifts
@@ -236,12 +257,26 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let cam_pos_frac = params.cam_pos_frac.xyz;
     let screen_width = params.screen_width;
     let screen_height = params.screen_height;
+    // taa-hash-world-identity Phase O — `.xyz` carries the world-absolute
+    // origin offset in voxels (zero in non-streaming presets); `.w` packs
+    // the formerly-distinct `sample_age` u32 (Option C in the design's
+    // §4.a). Read both here once so the rest of the function uses the
+    // semantically-named locals.
+    let residency_origin_voxels = params.residency_origin_voxels.xyz;
+    let sample_age = u32(params.residency_origin_voxels.w);
 
     // HLSL: pixelPos = uint2(globalID.x % w, globalID.x / w).
     let pixel_pos = vec2<u32>(pixel_index % screen_width, pixel_index / screen_width);
     // `getRayDir(invCamMatrix, pixelPos, w, h)` — NO jitter for this pass
     // (`renderTaaSampleReverse.fx:30` calls `getRayDir` with the default
     // `(0,0)` offset). Reuse the perspective-fixed `get_ray_dir`.
+    // Centre ray_dir — used downstream for `pos_virtual = ray_dir * first_hit_dist`
+    // (centre-only). The 3×3 precompute loop computes its OWN `cur_ray_dir`
+    // per neighbour (taa-hash-world-identity Phase O — 8-neighbour hash
+    // fallback fix; the prior code reused this centre `ray_dir` for the
+    // `get_hit_data_from_planes` call inside the loop, which produced an
+    // asymmetric `pos` and silently broke the post-iteration-2 hash now
+    // that the hash IS position-dependent).
     let ray_dir = get_ray_dir(
         params.inv_view_proj, pixel_pos, screen_width, screen_height, vec2<f32>(0.0, 0.0),
     );
@@ -276,10 +311,23 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
             vec2<i32>(0, 0),
             vec2<i32>(i32(screen_width) - 1, i32(screen_height) - 1),
         ));
+        // taa-hash-world-identity Phase O (`02-design.md` § "Design —
+        // 8-neighbour hash fallback fix") — each neighbour needs ITS OWN
+        // ray_dir for `get_hit_data_from_planes` to reconstruct the
+        // neighbour-pixel's actual hit voxel. Reusing the centre `ray_dir`
+        // here (pre-fix) produced an asymmetric `pos`, silently corrupting
+        // the position-dependent hash for the 8 neighbours. The centre
+        // `ray_dir` local outside the loop is still used downstream for
+        // `pos_virtual = ray_dir * first_hit_dist` (centre-only,
+        // correct).
+        let cur_ray_dir = get_ray_dir(
+            params.inv_view_proj, cur_pixel_pos,
+            screen_width, screen_height, vec2<f32>(0.0, 0.0),
+        );
         let cur_first_hit =
             first_hit_data[cur_pixel_pos.x + cur_pixel_pos.y * screen_width];
         let cur_first_hit_result = get_hit_data_from_planes(
-            cur_first_hit, cam_pos_int, cam_pos_frac, ray_dir,
+            cur_first_hit, cam_pos_int, cam_pos_frac, cur_ray_dir,
         );
 
         // Phase B Batch 6: `get_specular_normals` is real — the `base/`
@@ -313,8 +361,15 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
         valid_normals_spec |= (1u << ((cur_first_hit_specular_normals >> 6u) & 0x7u)) << 14u;
 
         // Phase-B world-identity hash extension — see `taa_data_id_lo13` doc.
-        // `cam_pos_int` is the local at line 182 (`params.cam_pos_int.xyz`).
-        let cur_data_id_lo13 = taa_data_id_lo13(cur_first_hit_result.pos, cam_pos_int);
+        // taa-hash-world-identity Phase O — pass `residency_origin_voxels` so
+        // the derivation is genuinely world-absolute (the prior call passed
+        // only `cam_pos_int`, which is window-local under the residency
+        // window). Both this call site and the calc_new_taa_sample write
+        // site at `taa.wgsl:517` MUST pass the same value (the per-frame
+        // GPU uniform makes this trivially true).
+        let cur_data_id_lo13 = taa_data_id_lo13(
+            cur_first_hit_result.pos, cam_pos_int, residency_origin_voxels,
+        );
         let cur_hash = taa_hash_from_data(
             cur_first_hit_is_diffuse, cur_first_hit_specular_normals, cur_first_hit_entity,
             cur_data_id_lo13,
@@ -346,7 +401,7 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let pos_virtual = ray_dir * first_hit_dist;
     var color_sum = vec4<f32>(0.0, 0.0, 0.0, 0.0); // .rgb accumulated, .a = accepted count
 
-    for (var i = 1u; i < params.sample_age; i = i + 1u) {
+    for (var i = 1u; i < sample_age; i = i + 1u) {
         let cur_history_index = (params.taa_index + i) % 128u;
         // The configurable sample ring — the SECOND `% 32` in the HLSL (`:91`).
         let cur_taa_index = (params.taa_index + i) % TAA_SAMPLE_RING_DEPTH;
@@ -465,6 +520,11 @@ fn calc_new_taa_sample(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let cam_pos_frac = cnts_params.cam_pos_frac.xyz;
     let screen_width = cnts_params.screen_width;
     let screen_height = cnts_params.screen_height;
+    // taa-hash-world-identity Phase O — same Option-C layout as the
+    // reproject pass; `.xyz` carries the world-absolute origin offset.
+    // `calc_new_taa_sample` does NOT use `sample_age`, so the `.w`
+    // (sample_age bits) local isn't needed here.
+    let residency_origin_voxels = cnts_params.residency_origin_voxels.xyz;
 
     // HLSL: pixelPos = uint2(globalID.x % w, globalID.x / w).
     let pixel_pos = vec2<u32>(pixel_index % screen_width, pixel_index / screen_width);
@@ -513,8 +573,12 @@ fn calc_new_taa_sample(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     // Phase-B world-identity hash extension — same derivation as the reproject
     // pass at Site 2 (must be byte-equivalent or the hash reject corrupts
-    // silently). `cam_pos_int` is the local at line 407 (`cnts_params.cam_pos_int.xyz`).
-    let data_id_lo13 = taa_data_id_lo13(first_hit_result.pos, cam_pos_int);
+    // silently). taa-hash-world-identity Phase O — third arg is the
+    // world-absolute origin offset, same value as the reproject pass reads
+    // out of `params.residency_origin_voxels.xyz`.
+    let data_id_lo13 = taa_data_id_lo13(
+        first_hit_result.pos, cam_pos_int, residency_origin_voxels,
+    );
     let sample_comp = taa_compress_sample(
         dist, light, first_hit_result.normal_tang & 0x7u, is_diffuse,
         specular_normals, extra_data8, first_hit.x & 0x3FFFu,

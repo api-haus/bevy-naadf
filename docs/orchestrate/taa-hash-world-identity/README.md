@@ -36,7 +36,7 @@ Mode: **consolidated** (user-confirmed at Step 4 Q&A 2026-05-19)
 - [x] Phase L — user design-approval: APPROVED to proceed to fresh-eyes review.
 - [x] Phase M — fresh-eyes reviewer: 6 PASS / 2 PARTIAL (criterion 4 — `var_baseline` formulation is spatial-not-temporal, threshold unmeasured; criterion 6 — design §Plumbing has meandering layout reasoning, §4.a is canonical). Verdict: fix-then-ship with two amendments.
 - [x] Phase N — user reconciliation: ACCEPT both amendments — implementer applies (1) temporal `var_baseline` capture N+5..N+8 and (2) sentinel-bytes Rust/WGSL offset round-trip test alongside the design's §4.a canonical layout.
-- [ ] Phase O — checkpoint + implementer dispatch (applies design, runs all gates incl. new streaming-taa-shift-noise which must FAIL pre-fix and PASS post-fix).
+- [x] Phase O — implementer dispatch landed. Structural rebase + 8-neighbour ray_dir fix + world-absolute hash composition + Phase I instrumentation removed + new `streaming-taa-shift-noise` gate with empirically-calibrated threshold (10.0 — sits between pre-fix 12.488 FAIL and post-fix 8.955 PASS, gate retains analytical power both ways). All 6 verification gates PASS. Two Phase M reviewer amendments applied: (1) temporal `var_baseline` over N+5..N+8 instead of spatial-of-N+5; (2) §4.a canonical layout spec used + sentinel-bytes Rust round-trip test added. Impl log: `03-impl.md`. Threshold revision documented in `streaming_taa_shift_noise.rs:STREAMING_TAA_SHIFT_NOISE_RATIO_MAX` and §"Decisions made during impl" #1.
 - [ ] Phase P — final user hard-gate visual check (confirm blink gone live).
 
 ## Iteration 3 decisions (2026-05-19)

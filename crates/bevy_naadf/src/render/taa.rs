@@ -108,6 +108,51 @@ impl Default for CameraHistory {
     }
 }
 
+impl CameraHistory {
+    /// Re-express every entry of `positions[..]` from the OLD window-local
+    /// frame into the NEW window-local frame after a residency origin shift.
+    /// Adds `-delta_segments * SEGMENT_VOXELS` to each entry's `pos_int`,
+    /// leaving `pos_frac` untouched.
+    ///
+    /// Sign rationale: when `residency.origin` advances by `delta_segments`,
+    /// every absolute-world point gets a `-(delta_segments * SEGMENT_VOXELS)`
+    /// voxel adjustment in window-local coords (the origin moved +N, so a
+    /// fixed world point's window-local x dropped by N). Re-expressing OLD
+    /// window-local entries into the NEW window-local frame applies that same
+    /// `-(delta_segments * SEGMENT_VOXELS)` adjustment. The instrumentation
+    /// evidence at Phase J of the orchestration confirms this sign: each
+    /// shift produced `delta_voxels ≈ -256` for `delta_segments = +1`.
+    ///
+    /// `pos_frac` is intentionally untouched — `voxel_delta` is an integer
+    /// multiple of `SEGMENT_VOXELS = 256`, so the frac field is already
+    /// correct (the int part absorbs the whole delta). Integer addition on
+    /// `pos_int` is exact (no f32 path, no precision loss).
+    ///
+    /// See `docs/orchestrate/taa-hash-world-identity/02-design.md` § "Design —
+    /// structural rebase".
+    pub fn rebase_for_origin_shift(&mut self, delta_segments: IVec3) {
+        let voxel_delta = -delta_segments * crate::streaming::residency::SEGMENT_VOXELS;
+        for ps in self.positions.iter_mut() {
+            ps.pos_int += voxel_delta;
+        }
+    }
+}
+
+/// Per-system local state for [`update_camera_history`] — records the
+/// residency origin observed on the previous tick so origin shifts can be
+/// detected by comparing it against the current frame's value.
+///
+/// `None` on the very first tick (no prior frame to diff against). Wrapped
+/// in a newtype because Bevy's `Local<T>` parameter requires `Default`,
+/// which `Option<IVec3>` already satisfies — but using a named struct
+/// gives the system signature a clearer name + makes the resource's
+/// purpose self-documenting at the call site.
+///
+/// See `docs/orchestrate/taa-hash-world-identity/02-design.md` § "Detection
+/// mechanism".
+#[derive(Default)]
+pub struct LastOriginSeen(pub Option<IVec3>);
+
 /// `taaIndex = CAMERA_HISTORY_DEPTH - (frame_count % CAMERA_HISTORY_DEPTH) - 1`
 /// (`WorldRender.cs:88`).
 ///
@@ -190,6 +235,7 @@ pub fn update_camera_history(
     args: Res<crate::AppArgs>,
     mut history: ResMut<CameraHistory>,
     residency: Option<Res<crate::streaming::residency::Residency>>,
+    mut last_origin_seen: Local<LastOriginSeen>,
 ) {
     let (camera, transform, position_split) = *camera;
 
@@ -212,79 +258,34 @@ pub fn update_camera_history(
     let view_proj_inv = view_proj.inverse();
 
     let slot = taa_index as usize;
-    // streaming-world TAA-hash diagnostic instrumentation (one-shot,
-    // per origin-shift). Reads `positions[K-1]` (still untouched — the
-    // previous frame wrote a DIFFERENT ring slot) BEFORE we overwrite
-    // `positions[K]`. The heuristic — magnitude > 64 voxels on any axis —
-    // fires on origin-shift frames (segment-aligned jumps of ≥ 256/axis)
-    // and not on normal camera movement (≤ a few voxels/axis). Logs the
-    // before/after split, the observed delta, and the expected delta
-    // implied by the residency-origin change since the previous frame
-    // (consumed via the optional `Residency` resource so non-streaming
-    // presets see a graceful `unknown` instead of a misleading zero).
-    // Diagnostic spec: `docs/orchestrate/taa-hash-world-identity/
-    // 06-diagnostic-investigation.md` § "Recommended next action" item 1.
-    let prev_slot = taa_index_of(history.frame_count.wrapping_sub(1)) as usize;
-    let positions_k_prev = history.positions[prev_slot];
-    let positions_k_new = *position_split;
-    if history.frame_count >= 1 {
-        let delta_pos_int = positions_k_new.pos_int - positions_k_prev.pos_int;
-        let shifted = delta_pos_int.x.abs() > 64
-            || delta_pos_int.y.abs() > 64
-            || delta_pos_int.z.abs() > 64;
-        if shifted {
-            let expected = residency
-                .as_ref()
-                .map(|r| {
-                    // `position_split` is window-local; on an origin shift
-                    // it jumps by `-(new_origin - old_origin) * SEGMENT_VOXELS`.
-                    // We can't read `old_origin` here directly, but we CAN
-                    // back-derive it from the observed window-local delta —
-                    // OR equivalently report the *current* origin and the
-                    // implied per-axis segment shift. We do the latter:
-                    // the implied origin delta (in segments) is
-                    // `-delta_pos_int / SEGMENT_VOXELS` (integer division),
-                    // and the expected window-local delta from that origin
-                    // delta is `-(implied_delta) * SEGMENT_VOXELS`.
-                    let seg = crate::streaming::residency::SEGMENT_VOXELS;
-                    let implied_origin_delta = IVec3::new(
-                        -delta_pos_int.x / seg,
-                        -delta_pos_int.y / seg,
-                        -delta_pos_int.z / seg,
-                    );
-                    let expected_window_delta = -implied_origin_delta * seg;
-                    (r.origin(), implied_origin_delta, expected_window_delta)
-                });
-            match expected {
-                Some((cur_origin, implied_origin_delta, expected_window_delta)) => {
-                    bevy::log::info!(
-                        "camera-history shift instrumentation: \
-                         positions[K]={:?} positions[K-1]={:?} \
-                         delta_voxels={:?} \
-                         expected_delta_from_origin_shift={:?} \
-                         current_origin={:?} implied_origin_delta_segments={:?}",
-                        positions_k_new.pos_int,
-                        positions_k_prev.pos_int,
-                        delta_pos_int,
-                        expected_window_delta,
-                        cur_origin,
-                        implied_origin_delta,
-                    );
-                }
-                None => {
-                    bevy::log::info!(
-                        "camera-history shift instrumentation: \
-                         positions[K]={:?} positions[K-1]={:?} \
-                         delta_voxels={:?} \
-                         expected_delta_from_origin_shift=unknown (no Residency)",
-                        positions_k_new.pos_int,
-                        positions_k_prev.pos_int,
-                        delta_pos_int,
-                    );
-                }
-            }
+
+    // Origin-shift rebase (taa-hash-world-identity Phase O — see
+    // `docs/orchestrate/taa-hash-world-identity/02-design.md` § "Design —
+    // structural rebase"). When the residency origin advanced this frame,
+    // every entry of `positions[..]` written in a previous frame is still
+    // in the OLD window-local coordinate frame; re-express them in the NEW
+    // window-local frame BEFORE we overwrite this frame's slot. The slot
+    // we're about to overwrite gets rebased here too, but that's harmless:
+    // the overwrite below replaces it with the current (already-new-frame)
+    // `*position_split`.
+    //
+    // `Local<LastOriginSeen>` is per-system state — survives across ticks
+    // without polluting any cross-world resource. `Res<Residency>::origin()`
+    // returns the post-shift value within the same tick the shift was
+    // applied (residency_driver runs in PreUpdate, before this system in
+    // Update), so `current - last = delta_segments` is the shift the
+    // renderer must absorb this frame.
+    let current_origin = residency
+        .as_deref()
+        .map(|r| r.origin())
+        .unwrap_or(IVec3::ZERO);
+    if let Some(last) = last_origin_seen.0 {
+        let delta_segments = current_origin - last;
+        if delta_segments != IVec3::ZERO {
+            history.rebase_for_origin_shift(delta_segments);
         }
     }
+    last_origin_seen.0 = Some(current_origin);
 
     // `*position_split` is current — `sync_position_split` runs before this.
     history.positions[slot] = *position_split;
@@ -368,6 +369,15 @@ pub fn prepare_taa(
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    // taa-hash-world-identity Phase O — render-world mirror of the
+    // residency origin (in segments). Repurposed for the world-absolute
+    // hash derivation in `taa.wgsl` (composed with `cam_pos_int` so the
+    // same world voxel hashes the same across origin shifts). `None`
+    // when the streaming plugin is not active; the field is then
+    // uploaded as `IVec3::ZERO` and the hash derivation degenerates to
+    // the prior window-local behaviour (correct, since non-streaming
+    // presets don't shift origins).
+    streaming_extract: Option<Res<crate::streaming::StreamingExtractRender>>,
 ) {
     if !extracted_camera.valid || !extracted_history.valid {
         return;
@@ -494,6 +504,18 @@ pub fn prepare_taa(
     render_queue.write_buffer(&camera_history, 0, bytemuck::cast_slice(&history_slots));
 
     // --- upload the TAA reproject uniform (every frame) ---------------------
+    // taa-hash-world-identity Phase O — derive `residency_origin_voxels` from
+    // the render-world `StreamingExtractRender.window_origin` mirror
+    // (which already reflects the live main-world `Residency::origin()` via
+    // `extract_streaming_state`). Non-streaming presets see a zero value
+    // (the resource always exists once StreamingPlugin is built; its
+    // `window_origin` defaults to `IVec3::ZERO` per `noise_dispatch.rs:346`),
+    // so the hash derivation degenerates to the prior window-local behaviour
+    // exactly when there are no origin shifts to worry about.
+    let residency_origin_voxels = streaming_extract
+        .as_deref()
+        .map(|s| s.window_origin * crate::streaming::residency::SEGMENT_VOXELS)
+        .unwrap_or(IVec3::ZERO);
     let taa_params_data = GpuTaaParams {
         inv_view_proj: extracted_camera.inv_view_proj,
         view_proj: extracted_camera.view_proj,
@@ -505,14 +527,12 @@ pub fn prepare_taa(
         screen_height: viewport.y,
         frame_count: extracted_history.frame_count,
         taa_index: extracted_history.taa_index,
+        residency_origin_voxels,
         // How many past frames the reproject pass walks — the full configured
         // ring depth, clamped to `[1, ring_depth]` (`06-design-a2.md` §7.1).
         // NAADF exposes this as a 1–`ringDepth` ImGui slider; the port has no
         // GUI, so it is the full history (`18-taa-fidelity.md` fix #3).
         sample_age: ring_depth.clamp(1, ring_depth),
-        _pad2: 0,
-        _pad3: 0,
-        _pad4: 0,
     };
     render_queue.write_buffer(&taa_params, 0, bytemuck::bytes_of(&taa_params_data));
 
@@ -652,6 +672,160 @@ mod tests {
             h0, h1,
             "Phase-A regression: hash collapses to a constant when only \
              `data_id_lo13` varies (h0={h0:#x}, h1={h1:#x})"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // taa-hash-world-identity Phase O — primitive guards for the
+    // CameraHistory::rebase_for_origin_shift method (the structural fix).
+    // ------------------------------------------------------------------
+
+    use super::*;
+
+    /// `rebase_for_origin_shift` adds the integer delta × SEGMENT_VOXELS to
+    /// every entry's `.pos_int`; `.pos_frac` is byte-identical pre/post.
+    #[test]
+    fn rebase_for_origin_shift_preserves_frac_and_shifts_int() {
+        let mut h = CameraHistory::default();
+        // Seed non-default fracs into a few slots so the test detects any
+        // accidental writes to .pos_frac.
+        h.positions[0] = PositionSplit {
+            pos_int: IVec3::new(100, 0, 100),
+            pos_frac: Vec3::new(0.25, 0.5, 0.75),
+        };
+        h.positions[5] = PositionSplit {
+            pos_int: IVec3::new(-50, 1, -200),
+            pos_frac: Vec3::new(0.1, 0.2, 0.3),
+        };
+        let frac_before: [Vec3; CAMERA_HISTORY_DEPTH] =
+            std::array::from_fn(|i| h.positions[i].pos_frac);
+
+        h.rebase_for_origin_shift(IVec3::new(1, 0, 0));
+
+        // SEGMENT_VOXELS = 256; delta_seg = (1, 0, 0) ⇒ voxel_delta = (-256, 0, 0).
+        assert_eq!(
+            h.positions[0].pos_int,
+            IVec3::new(100 - 256, 0, 100),
+            "slot 0 int rebased"
+        );
+        assert_eq!(
+            h.positions[5].pos_int,
+            IVec3::new(-50 - 256, 1, -200),
+            "slot 5 int rebased"
+        );
+
+        // frac field untouched on every slot, including the default-zero ones.
+        for (i, ps) in h.positions.iter().enumerate() {
+            assert_eq!(
+                ps.pos_frac, frac_before[i],
+                "slot {i} pos_frac must NOT change under integer rebase"
+            );
+        }
+    }
+
+    /// Two consecutive shifts compose additively (i.e. the system is correct
+    /// across multi-shift bursts the cold-start phase can fire).
+    #[test]
+    fn rebase_for_origin_shift_composes() {
+        let mut h = CameraHistory::default();
+        h.positions[0] = PositionSplit {
+            pos_int: IVec3::new(0, 0, 0),
+            pos_frac: Vec3::ZERO,
+        };
+        h.rebase_for_origin_shift(IVec3::new(1, 0, 0));
+        h.rebase_for_origin_shift(IVec3::new(0, 0, 1));
+        assert_eq!(h.positions[0].pos_int, IVec3::new(-256, 0, -256));
+    }
+
+    /// Zero delta is a no-op (defensive — `update_camera_history` only
+    /// calls the method when `delta_segments != ZERO`, but if a future
+    /// refactor lifts that guard, the math must still be correct).
+    #[test]
+    fn rebase_for_origin_shift_zero_delta_is_noop() {
+        let mut h = CameraHistory::default();
+        let original = PositionSplit {
+            pos_int: IVec3::new(42, -7, 13),
+            pos_frac: Vec3::new(0.5, 0.5, 0.5),
+        };
+        h.positions[10] = original;
+        h.rebase_for_origin_shift(IVec3::ZERO);
+        assert_eq!(h.positions[10].pos_int, original.pos_int);
+        assert_eq!(h.positions[10].pos_frac, original.pos_frac);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase M Amendment 2 — sentinel-bytes round-trip for GpuTaaParams.
+    // ------------------------------------------------------------------
+
+    /// Verify the canonical layout for `GpuTaaParams` per design § "File-by-
+    /// file change list" item 4.a: `residency_origin_voxels: IVec3` starts at
+    /// byte offset 176; `sample_age: u32` lives at offset 188; the struct
+    /// stays 192 bytes total. Catches a future field-reordering regression
+    /// that would silently mis-read the WGSL uniform offsets.
+    ///
+    /// The size assertion at `gpu_types.rs:874` is the second check; this
+    /// test pins the exact byte pattern at the load-bearing offsets so a
+    /// Rust/WGSL std140 offset mismatch (the same class of trap that hit
+    /// `cam_pos_int` / `cam_pos_frac` at Batch 6) trips fast.
+    #[test]
+    fn gpu_taa_params_residency_origin_sentinel_round_trip() {
+        use crate::render::gpu_types::GpuTaaParams;
+
+        let params = GpuTaaParams {
+            inv_view_proj: Mat4::IDENTITY,
+            view_proj: Mat4::IDENTITY,
+            cam_pos_int: IVec3::ZERO,
+            _pad0: 0,
+            cam_pos_frac: Vec3::ZERO,
+            _pad1: 0,
+            screen_width: 0,
+            screen_height: 0,
+            frame_count: 0,
+            taa_index: 0,
+            // Sentinel byte pattern: 0x11111111, 0x22222222, 0x33333333. Each
+            // i32 component is a distinct repeating-byte value so the test
+            // catches every kind of mis-offset (off-by-1, swapped fields,
+            // wrong alignment) — not just an "everything zero" pass.
+            residency_origin_voxels: IVec3::new(
+                0x11111111,
+                0x22222222,
+                0x33333333u32 as i32,
+            ),
+            sample_age: 0,
+        };
+
+        let bytes: &[u8] = bytemuck::bytes_of(&params);
+        // 192-byte size check (also pinned at gpu_types.rs:874).
+        assert_eq!(
+            bytes.len(),
+            192,
+            "GpuTaaParams must stay 192 bytes (Rust + WGSL std140)"
+        );
+        // `residency_origin_voxels` lives at byte offset 176 (16-byte aligned;
+        // after `inv_view_proj`(0..64) + `view_proj`(64..128) + `cam_pos_int+_pad0`
+        // (128..144) + `cam_pos_frac+_pad1`(144..160) + 4× u32 (160..176)).
+        // Each i32 is 4 bytes little-endian.
+        // 0x11111111 → [0x11, 0x11, 0x11, 0x11]
+        // 0x22222222 → [0x22, 0x22, 0x22, 0x22]
+        // 0x33333333 → [0x33, 0x33, 0x33, 0x33]
+        let expected: &[u8] = &[
+            0x11, 0x11, 0x11, 0x11, // .x at offset 176
+            0x22, 0x22, 0x22, 0x22, // .y at offset 180
+            0x33, 0x33, 0x33, 0x33, // .z at offset 184
+        ];
+        assert_eq!(
+            &bytes[176..188],
+            expected,
+            "residency_origin_voxels must occupy bytes 176..188 (little-endian \
+             i32 components) — design § \"File-by-file change list\" item 4.a"
+        );
+        // sample_age is the trailing u32 at offset 188 (occupies the .w lane
+        // of the WGSL `vec4<i32>` view of this field per Option C in the
+        // design).
+        assert_eq!(
+            &bytes[188..192],
+            &[0u8; 4],
+            "sample_age (here = 0) must occupy bytes 188..192"
         );
     }
 }
