@@ -69,7 +69,17 @@ VNDF-GGX BRDF and multi-bounce `shoot_ray` scaffolding already in the shaders.
 - [ ] User live visual check #3
 - [x] Splotch repro gate built (`--pbr-hard-edge` rebuilt — `2b5fa80`)
 - [x] Splotch fix landed (gate 79→2 hard jumps — `a2c3aff`)
-- [ ] Final synthesis + user sign-off
+- [x] Shadow-only residual localised to ReSTIR WRS reservoir variance — `571af22`
+- [x] User decision (2026-05-19): ACCEPT shadow-only residual artifact —
+      sparse, subtle, only manifests on high-frequency normal-map surfaces
+      (cobblestone / snow) in deep shadow at grazing camera angles. Fix
+      requires algorithm-level smoothing (post-WRS averaging, higher
+      `spatial_iter_count`, or deeper bilateral denoise) which would diverge
+      from the C# NAADF faithful port. Per project memory
+      `bevy-naadf-faithful-port-rule`, we keep C# behavior even when C# has
+      the same bug. The runtime quality panel exposes `spatial_iter_count`
+      for users who want to trade GPU cost for cleaner shadows.
+- [x] Final synthesis + user sign-off
 
 ## Worktree
 
