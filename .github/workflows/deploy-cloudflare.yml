@@ -91,6 +91,11 @@ jobs:
       BINARYEN_CORES: "1" # prevent wasm-opt SIGSEGV from a race condition
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Required: `.vox` assets uploaded to R2 below are LFS-tracked.
+          # Without this, the R2 upload ships the LFS pointer file and the
+          # runtime parser rejects it as "Not a valid MagicaVoxel .vox file".
+          lfs: true
 
       - name: Install system dependencies
         # clang + mold: the workspace `.cargo/config.toml` host linker, used
@@ -169,6 +174,20 @@ jobs:
         run: |
           WASM_FILE=$(ls crates/bevy_naadf/dist/*_bg.wasm)
           npx wrangler r2 object put bevy-naadf-assets/bevy-naadf.wasm --file "$WASM_FILE" --remote
+
+      # Upload the default .vox model the web build streams on startup. Served
+      # by the same R2 proxy worker as the wasm (cross-origin allowed), keyed
+      # under `models/`. The URL is hard-coded in
+      # `crates/bevy_naadf/src/voxel/web_vox.rs::DEFAULT_VOX_URL`.
+      - name: Upload default .vox to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler r2 object put \
+            bevy-naadf-assets/models/oasis_hard_cover.vox \
+            --file crates/bevy_naadf/assets/test/oasis_hard_cover.vox \
+            --remote
 
       - name: Patch WASM loading with progress bar
         env:

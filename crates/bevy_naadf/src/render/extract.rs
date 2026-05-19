@@ -86,6 +86,28 @@ pub struct WorldGpuStaging {
     pub dense_voxel_types: Vec<u16>,
 }
 
+/// Transient render-world hand-off carrying a refreshed palette
+/// (`web-vox-color-divergence` fix, 2026-05-18). Emitted by
+/// [`stage_world_gpu_buildonce`] when `Changed<VoxelTypes>` fires AFTER
+/// `WorldGpu` is built (the async `.vox` install case + any future
+/// runtime palette swap). Consumed and dropped by `prepare_world_gpu`'s
+/// focused-refresh branch.
+///
+/// Single-shot: emitted once per `Changed<VoxelTypes>` event after the
+/// initial build-once `WorldGpuStaging` hand-off has been consumed.
+/// `prepare_world_gpu`'s refresh branch re-packs the palette to
+/// `Vec<GpuVoxelType>`, calls `world_gpu.voxel_types.upload_all(...)`,
+/// rebuilds `WorldGpu.bind_group` (the @group(0) world bind group), and
+/// removes `FrameGpu` so `prepare_frame_gpu` re-creates
+/// `calc_new_taa_sample_bind_group` (which also binds
+/// `world_gpu.voxel_types.buffer()`).
+#[derive(Resource, Default)]
+pub struct VoxelTypesRefresh {
+    /// The refreshed palette to upload to GPU. Carried by value so the
+    /// extract-side clone happens exactly once per refresh event.
+    pub types: Vec<VoxelType>,
+}
+
 /// Render-world metadata mirror of `WorldData`'s size + dense voxel-type stream
 /// (`02f` rearch). Populated alongside [`WorldGpuStaging`] by
 /// [`stage_world_gpu_buildonce`] but **outlives** the staging resource: the
@@ -222,13 +244,42 @@ pub fn stage_world_gpu_buildonce(
     mut commands: Commands,
     world_gpu_already_built: Option<Res<crate::render::prepare::WorldGpu>>,
     staging_existing: Option<Res<WorldGpuStaging>>,
+    voxel_types_refresh_existing: Option<Res<VoxelTypesRefresh>>,
     mut meta: ResMut<WorldDataMeta>,
     world_data: Extract<Option<Res<WorldData>>>,
     voxel_types: Extract<Option<Res<VoxelTypes>>>,
 ) {
     // Build-once gate: if WorldGpu exists OR staging is already populated
-    // (waiting to be consumed by prepare_world_gpu), do nothing.
+    // (waiting to be consumed by prepare_world_gpu), do nothing — EXCEPT
+    // when `WorldGpu` exists AND the main-world `VoxelTypes` resource
+    // changed since our last extract run (the async `.vox` install case +
+    // any future runtime palette swap). In that case, emit a one-shot
+    // `VoxelTypesRefresh` hand-off so `prepare_world_gpu` can re-upload
+    // the palette to GPU without rebuilding the geometry buffers
+    // (`web-vox-color-divergence` design D-FOCUSED-REFRESH). Guard against
+    // double-emission with `voxel_types_refresh_existing.is_some()`.
     if world_gpu_already_built.is_some() || staging_existing.is_some() {
+        // Build-once already done. Check for the focused-refresh trigger.
+        if world_gpu_already_built.is_some() && voxel_types_refresh_existing.is_none() {
+            if let Some(vt) = voxel_types.as_ref() {
+                if vt.is_changed() {
+                    // web-vox-color-divergence (2026-05-18) — emit the
+                    // refresh hand-off. This is the load-bearing fix for
+                    // the async `.vox` install path: `install_imported_vox`
+                    // does `commands.insert_resource(VoxelTypes { … })`
+                    // over an existing resource, which flips `Changed<R>`
+                    // for the next-tick extract query.
+                    debug!(
+                        "[palette-refresh] stage_world_gpu_buildonce emitting \
+                         VoxelTypesRefresh (palette_len={})",
+                        vt.types.len(),
+                    );
+                    commands.insert_resource(VoxelTypesRefresh {
+                        types: vt.types.clone(),
+                    });
+                }
+            }
+        }
         return;
     }
     let (Some(world_data), Some(voxel_types)) = (&*world_data, &*voxel_types) else {

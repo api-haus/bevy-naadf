@@ -80,6 +80,21 @@ pub enum GridPreset {
     Vox {
         path: std::path::PathBuf,
     },
+    /// **Skybox-only world** — install an EMPTY [`WorldData`] at the fixed
+    /// world size (no `ModelData`, `dense_voxel_types = Vec::new()`). The
+    /// renderer reads empty `WorldGpu` buffers and produces a pure-sky frame.
+    ///
+    /// Used by the `--vox-web-parity-skybox` sub-mode of the
+    /// `--vox-web-parity` gate (web-vox-async-loading 2026-05-18 follow-up,
+    /// Step 8 / Q5). The gate captures this frame, then captures the
+    /// counterpart `GridPreset::Vox` rendering, then SSIM-asserts the two
+    /// are **dissimilar** (the loaded vox actually rendered geometry).
+    ///
+    /// Also reachable on web via the `?skybox=1` URL query parameter (Q6) —
+    /// the wasm bootstrap inserts a [`crate::voxel::grid::WebSkyboxOverride`]
+    /// resource which `setup_test_grid` consults before installing the
+    /// default scene.
+    Empty,
 }
 
 /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#
@@ -421,6 +436,18 @@ pub struct AppArgs {
     /// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "LIGHT
     /// INTEGRATION splotch diagnose+fix (post-`46e50cd`)".
     pub pbr_hard_edge_mode: bool,
+    /// web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — when `true`,
+    /// boots the e2e harness with `GridPreset::Empty` (skybox baseline) and
+    /// captures a single screenshot to `vox_web_parity_skybox.png`. The
+    /// `--vox-web-parity` top-level mode spawns this as a subprocess.
+    pub vox_web_parity_skybox_phase: bool,
+    /// web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — when `true`,
+    /// boots the e2e harness with `GridPreset::Vox { path: oasis }` (the
+    /// production W5 GPU producer chain) and captures a single screenshot to
+    /// `vox_web_parity_loaded.png`. The `--vox-web-parity` top-level mode
+    /// spawns this as a subprocess; the compare phase SSIM-asserts the two
+    /// captured PNGs are dissimilar.
+    pub vox_web_parity_loaded_phase: bool,
 }
 
 impl Default for AppArgs {
@@ -443,6 +470,8 @@ impl Default for AppArgs {
             pbr_visual_mode: false,
             pbr_debug_modes_mode: false,
             pbr_hard_edge_mode: false,
+            vox_web_parity_skybox_phase: false,
+            vox_web_parity_loaded_phase: false,
         }
     }
 }
@@ -656,6 +685,23 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // `e2e-render-test.md` §2.2 point 1); the `WindowPlugin` carries
             // the fixed-size e2e window.
             DefaultPlugins
+                // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 —
+                // when the e2e harness is active, install the
+                // `CountingLayer` via the `LogPlugin::custom_layer` hook so
+                // the `--vox-web-parity-loaded` gate can assert zero
+                // `tracing::error!` events fired during the run. The
+                // counter is a process-global static; resetting it in the
+                // harness boot via
+                // `tracing_error_counter::reset_tracing_error_count()` is
+                // safe and idempotent.
+                .set(if cfg.add_e2e_systems {
+                    bevy::log::LogPlugin {
+                        custom_layer: e2e::tracing_error_counter::vox_web_parity_log_layer,
+                        ..default()
+                    }
+                } else {
+                    bevy::log::LogPlugin::default()
+                })
                 .set(AssetPlugin {
                     file_path: "src/assets".to_string(),
                     // Web: Trunk's dev server has no `.meta` sidecars and
@@ -747,7 +793,55 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // The test grid + camera spawn — shared. The e2e config spawns a fixed-pose
     // camera instead of the production `setup_camera`; the e2e systems own that
     // (`crate::e2e::add_e2e_systems`).
+    //
+    // On web, `voxel::web_vox::startup_fetch_default_vox` runs `.before`
+    // `setup_test_grid` so it can insert a `WebSkyboxOverride` resource (Q6
+    // `?skybox=1` URL-param handling) before `setup_test_grid` consults it.
+    // The ordering is enforced by an explicit `.before(setup_test_grid)` on
+    // the web-side registration below.
     app.add_systems(Startup, voxel::grid::setup_test_grid);
+
+    // web-vox-async-loading Step 4 (2026-05-18) — async `.vox` parse pump.
+    // The polling system drains the `PendingVoxParse` hand-off resource
+    // produced by the target-specific async parse spawn (native:
+    // `AsyncComputeTaskPool::spawn` from `native_vox_drop_listener`; web:
+    // `rayon::spawn` from `web_vox::apply_pending_vox`). Resource +
+    // system registered on BOTH targets so the cfg-gated internals share
+    // one main-thread driver. The system is wired even when no drop has
+    // landed yet — it short-circuits when `pending.inner.is_none()`.
+    app.init_resource::<voxel::async_vox::PendingVoxParse>()
+        .add_systems(Update, voxel::async_vox::poll_pending_vox_parse);
+
+    // Web-only .vox streaming: kick off the default-model HTTP fetch on
+    // `Startup`, and run the consumer system on `Update` so both the fetch
+    // and any drag-dropped `.vox` files swap the active scene the moment
+    // their bytes are ready. The default scene from `setup_test_grid` stays
+    // visible until then.
+    //
+    // Order: `apply_pending_vox` runs `.after(poll_pending_vox_parse)` so
+    // its overlay-hide branch sees `pending.inner.is_none()` the same
+    // frame the polling system clears the slot post-install. Otherwise
+    // the overlay would linger an extra frame.
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(
+        Startup,
+        voxel::web_vox::startup_fetch_default_vox
+            .before(voxel::grid::setup_test_grid),
+    )
+    .add_systems(
+        Update,
+        voxel::web_vox::apply_pending_vox
+            .after(voxel::async_vox::poll_pending_vox_parse),
+    );
+
+    // Native drag-and-drop: drop a `.vox` file onto the window to replace the
+    // active scene. Gated off the e2e harness — winit emits the event in both
+    // modes but the e2e harness should never see foreign input.
+    #[cfg(not(target_arch = "wasm32"))]
+    if !cfg.add_e2e_systems {
+        app.add_systems(Startup, voxel::grid::log_native_dnd_registered)
+            .add_systems(Update, voxel::grid::native_vox_drop_listener);
+    }
 
     // Phase-C wave-3 — spawn the W4 fixture entity (gated on
     // `args.spawn_test_entity`). Runs after `setup_test_grid` so the world

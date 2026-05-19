@@ -1,6 +1,19 @@
 [toolchain]
-channel = "stable"
-components = ["rustfmt", "clippy"]
+# Nightly pin for wasm32 atomics stability + `build-std` (required by
+# `wasm-bindgen-rayon`'s `+atomics,+bulk-memory` rustflags + shared-memory
+# linker args — see `.cargo/config.toml`'s `[target.wasm32-unknown-unknown]`
+# block). Mirrors `/mnt/archive4/DEV/bevy_pixel_world/rust-toolchain.toml` —
+# a floating nightly can break wasm-bindgen/rayon ABI overnight, so the date
+# is pinned.
+#
+# Pinned to `nightly-2026-04-01` (rustc 1.96.0-nightly) — verified to satisfy
+# Bevy 0.19's MSRV (≥ 1.95) while old enough to have settled. Per
+# follow-up dispatch 2026-05-18 — the prior dispatch left this as floating
+# `nightly`, which is a known footgun (`bevy_pixel_world`'s own
+# rust-toolchain.toml warns "Pin nightly for atomics stability - floating
+# nightly can break wasm-bindgen").
+channel = "nightly-2026-04-01"
+components = ["rustfmt", "clippy", "rust-src"]
 # wasm32-unknown-unknown — the bevy_naadf WebGPU build (Trunk).
 # wasm32-unknown-emscripten — the voxel_noise FastNoise2 C-ABI module (Makefile).
 targets = ["wasm32-unknown-unknown", "wasm32-unknown-emscripten"]

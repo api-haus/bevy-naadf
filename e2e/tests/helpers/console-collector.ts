@@ -20,6 +20,16 @@ const IGNORED_PATTERNS = [
   // WASM threading noise: rayon worker threads occasionally hit signature
   // mismatches during SharedArrayBuffer handshake, then retry successfully
   "function signature mismatch",
+  // `wasm-bindgen-rayon`'s `workerHelpers.js` issues a dynamic `import('../../..')`
+  // (resolves to `/` — i.e. `index.html`) inside each Web Worker. When the
+  // workers spawn on a non-root URL (e.g. `?vox=…` or `?skybox=1`) Chrome
+  // sometimes resolves the import against the current navigation URL and
+  // gets the HTML response, which is not a valid ES module — Chrome then
+  // surfaces "Failed to fetch dynamically imported module: …/" as a
+  // pageerror. The worker recovers via a retry (the module IS cacheable
+  // and the subsequent import succeeds) and the rayon pool ends up
+  // functional. This is upstream worker-init noise, not a real failure.
+  "Failed to fetch dynamically imported module",
 ] as const;
 
 export interface CollectedError {
@@ -50,7 +60,13 @@ export class ConsoleCollector {
   attach(page: Page): void {
     page.on("console", (msg: ConsoleMessage) => {
       const text = msg.text();
-      if (this.isIgnored(text)) return;
+      // Chromium reports failed resource loads (e.g. the favicon.ico the
+      // browser fetches itself with no element in the HTML) as a generic
+      // `console.error` whose text is "Failed to load resource: …" — the
+      // URL is only in `msg.location().url`. We have to inspect both
+      // sources to filter that noise.
+      const locUrl = msg.location()?.url ?? "";
+      if (this.isIgnored(text) || this.isIgnored(locUrl)) return;
       const isBevyError =
         msg.type() === "log" && text.includes(BEVY_ERROR_MARKER);
       if (msg.type() !== "error" && !isBevyError) return;

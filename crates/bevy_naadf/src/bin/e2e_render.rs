@@ -130,6 +130,25 @@ fn main() -> ExitCode {
     // single screenshot at the metallic-pillar pose and counts hard
     // 1-pixel luminance jumps in a cobblestone-interior rect.
     let pbr_hard_edge_mode = args.iter().any(|a| a == "--pbr-hard-edge");
+    // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — three-flag
+    // parity gate. Mirrors the `--vox-gpu-oracle` three-flag pattern:
+    //   --vox-web-parity           = top-level: spawn both sub-modes as
+    //                                subprocesses, SSIM-compare the PNGs.
+    //   --vox-web-parity-skybox    = boot with `GridPreset::Empty`, capture
+    //                                `vox_web_parity_skybox.png`.
+    //   --vox-web-parity-loaded    = boot with `GridPreset::Vox`, capture
+    //                                `vox_web_parity_loaded.png` after
+    //                                W5 + Q3 readback complete.
+    let vox_web_parity_mode = args.iter().any(|a| a == "--vox-web-parity");
+    let vox_web_parity_skybox_mode =
+        args.iter().any(|a| a == "--vox-web-parity-skybox");
+    let vox_web_parity_loaded_mode =
+        args.iter().any(|a| a == "--vox-web-parity-loaded");
+    // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — `--ssim-compare`
+    // short-circuit. Exits without booting a Bevy app. Used by both the
+    // top-level `--vox-web-parity` mode (out-of-process SSIM compare) AND
+    // the Playwright spec (shells out to this binary for the SSIM compare).
+    let ssim_compare_mode = args.iter().any(|a| a == "--ssim-compare");
 
     // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
     // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
@@ -157,6 +176,36 @@ fn main() -> ExitCode {
     // over `app_exit`.
     if vox_gpu_oracle_mode {
         let code = bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_compare();
+        return ExitCode::from(code);
+    }
+
+    // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — top-level
+    // parity gate. Returns its own exit code WITHOUT booting a bevy app
+    // (the compare phase spawns the two sub-phases as subprocesses of THIS
+    // binary). Handled at the top of dispatch so the standard `e2e_render`
+    // flow doesn't fight over `app_exit`.
+    if vox_web_parity_mode {
+        let code = bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_compare();
+        return ExitCode::from(code);
+    }
+
+    // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — `--ssim-compare`
+    // short-circuit. Loads two PNGs from disk, computes SSIM, exits per the
+    // `[min, max)` band assertion. Used by `--vox-web-parity` and by the
+    // Playwright spec. Does NOT boot a bevy app.
+    if ssim_compare_mode {
+        let parsed = match bevy_naadf::e2e::ssim::parse_ssim_compare_args(&args) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "e2e_render --ssim-compare: argument parse error: {e}\n\
+                     Usage: e2e_render --ssim-compare <a.png> <b.png> \
+                     [--ssim-max <f64>] [--ssim-min <f64>]"
+                );
+                return ExitCode::from(2);
+            }
+        };
+        let code = bevy_naadf::e2e::ssim::ssim_compare_command(&parsed);
         return ExitCode::from(code);
     }
 
@@ -304,6 +353,17 @@ fn main() -> ExitCode {
         // `install_vox_in_fixed_world` (W5 GPU producer chain), pins the
         // shared oracle camera pose, captures `oracle_gpu.png`, exits.
         bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_gpu_phase()
+    } else if vox_web_parity_skybox_mode {
+        // web-vox-async-loading Step 8 / Q5 — skybox-baseline sub-mode.
+        // Boots with `GridPreset::Empty`, captures
+        // `vox_web_parity_skybox.png`.
+        bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_skybox_phase()
+    } else if vox_web_parity_loaded_mode {
+        // web-vox-async-loading Step 8 / Q5 — loaded sub-mode. Boots with
+        // the Oasis fixture via the W5 GPU producer chain, captures
+        // `vox_web_parity_loaded.png`. Asserts zero `tracing::error!`
+        // events fired during the run.
+        bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_loaded_phase()
     } else if vox_gpu_construction_mode {
         // `--vox-gpu-construction` — load the Oasis fixture through the
         // production W5 GPU producer chain (vox-gpu-rewrite W5.5). Loads

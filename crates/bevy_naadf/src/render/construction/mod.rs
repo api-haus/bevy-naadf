@@ -225,6 +225,137 @@ pub struct ConstructionGpu {
     /// per segment in the W5.3 segment loop via `RenderQueue::write_buffer`.
     /// (See `02-design.md` Decision: "one params buffer vs 512 buffers".)
     pub model_data_params_buffer: Option<Buffer>,
+
+    // === web-vox-async-loading Q4 (2026-05-18) — label stash for the Q4
+    //     confirmation assertion ============================================
+    //
+    // wgpu 27's `Buffer::label()` accessor isn't re-exported through Bevy
+    // 0.19's `render_resource::Buffer` wrapper, so we stash the label
+    // strings here at allocation time. Used by the debug-only assertion in
+    // `populate_cpu_mirror_from_gpu_producer` that catches a regression to
+    // the gate at `mod.rs:1184-1186` routing a `.vox` run through the W2
+    // placeholder block instead of the `naadf_*_gpu_producer` block.
+    //
+    // Per Decision 1 of `01-context.md` the three flagless W2 placeholders
+    // are dead code on the `.vox` production path; this label-stash +
+    // assertion defends the property explicitly. Release builds skip the
+    // assertion via `#[cfg(debug_assertions)]`.
+    /// Label of the buffer assigned to `block_voxel_count` (set at
+    /// allocation time). Used by the debug-only Q4 assertion only.
+    pub block_voxel_count_label: Option<&'static str>,
+    /// Label of the buffer assigned to `segment_voxel_buffer`.
+    pub segment_voxel_buffer_label: Option<&'static str>,
+    /// Label of the buffer assigned to `hash_map`.
+    pub hash_map_label: Option<&'static str>,
+    /// Label of the buffer assigned to `hash_coefficients`.
+    pub hash_coefficients_label: Option<&'static str>,
+
+    // === web-vox-async-loading Q3 (2026-05-18 follow-up) — cross-frame
+    //     CPU-mirror readback state machine ====================================
+    //
+    // Replaces the sync `Device::poll(wait_indefinitely)` + `get_mapped_range`
+    // pattern that panicked on WebGPU (`Device::poll(wait_indefinitely)` is a
+    // no-op on WebGPU; `get_mapped_range` runs before `mapAsync` resolves and
+    // wgpu panics with "Failed to execute 'getMappedRange' on 'GPUBuffer'").
+    //
+    // The state machine ticks once per `populate_cpu_mirror_from_gpu_producer`
+    // call (every frame in `ExtractSchedule`). Stages cycle:
+    //
+    //   `NotStarted` (initial)
+    //     → issue `copy_buffer_to_buffer` for the cursor buffer, call
+    //       `map_async` with a `Arc<AtomicBool>` callback, `device.poll(Poll)`.
+    //   `CursorPending`
+    //     → each frame `device.poll(Poll)` and check the atomic; once set,
+    //       read the cursor (2 u32s), size + alloc the chunks/blocks/voxels
+    //       staging buffers, record + submit one encoder containing all 3
+    //       `copy_buffer_to_buffer`s, call `map_async` × 3 (each with its own
+    //       atomic), advance to `FullSetPending`.
+    //   `FullSetPending`
+    //     → each frame `device.poll(Poll)` and check all 3 atomics; once all
+    //       fire, read all 3 mapped ranges, commit to `WorldData`, unmap +
+    //       drop staging buffers, set `cpu_mirror_populated = true`, advance
+    //       to `Done`.
+    //   `Done` → no-op.
+    //
+    // Each non-terminal stage increments `stall_frames` per frame; if it
+    // reaches `READBACK_STALL_BUDGET_FRAMES` (600 frames ≈ 10s @ 60fps) the
+    // state machine emits a diagnostic via `error!` and force-advances to
+    // `Done` (marking the mirror populated so it stops retrying). Per
+    // `feedback-e2e-gates-must-fail-fast.md`.
+    //
+    // **Target-agnostic — no `#[cfg(target_arch = "wasm32")]` branch.** The
+    // architect's Q3 design (`03-architecture.md` § Q3) and Decision 2
+    // (web `.vox` MUST build via the GPU pathway identical to native) are
+    // load-bearing.
+    pub cpu_mirror_readback: CpuMirrorReadback,
+}
+
+/// Frame budget for the cross-frame CPU mirror readback state machine. If
+/// the state machine does not progress past its current stage within this
+/// many `populate_cpu_mirror_from_gpu_producer` ticks the system emits a
+/// diagnostic and force-advances to `Done`. 600 frames ≈ 10s @ 60fps —
+/// per `feedback-e2e-gates-must-fail-fast.md`.
+pub const READBACK_STALL_BUDGET_FRAMES: u32 = 600;
+
+/// State machine stage for the cross-frame CPU mirror readback (Q3).
+///
+/// The state machine runs once per `.vox` install (gated on
+/// `gpu_producer_has_run && model_data.is_some() && !cpu_mirror_populated`).
+/// Once it reaches `Done` it stays there for the lifetime of the app.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ReadbackStage {
+    /// Initial state — gate not yet satisfied (or just satisfied this frame
+    /// and the cursor copy hasn't been issued yet).
+    #[default]
+    NotStarted,
+    /// Cursor copy + `map_async` issued; waiting for the callback's
+    /// `AtomicBool` to flip.
+    CursorPending,
+    /// Full-set (chunks + blocks + voxels) copies + `map_async`s issued;
+    /// waiting for all three callbacks' atomics to flip.
+    FullSetPending,
+    /// Readback complete. `cpu_mirror_populated` is true; the state machine
+    /// stays here for the rest of the run.
+    Done,
+}
+
+/// Cross-frame readback state — owned by `ConstructionGpu`. Aggregates the
+/// stage, staging buffers, completion atomics, sizes, and stall counter.
+///
+/// **Target-agnostic** — works identically on native (where `Device::poll`
+/// is a real non-blocking poll) and WebGPU (where `poll` is a no-op but the
+/// JS `mapAsync` promise resolves on subsequent event-loop ticks). See
+/// `03-architecture.md` § Q3 for the design rationale.
+#[derive(Default)]
+pub struct CpuMirrorReadback {
+    /// Current state.
+    pub stage: ReadbackStage,
+    /// Cursor staging buffer (2 u32s) — populated in `NotStarted → CursorPending`.
+    pub cursor_staging: Option<Buffer>,
+    /// `AtomicBool` set by the `map_async` callback on the cursor buffer.
+    pub cursor_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Chunks staging buffer — sized once the cursor is read.
+    pub chunks_staging: Option<Buffer>,
+    /// `AtomicBool` for the chunks `map_async` callback.
+    pub chunks_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Blocks staging buffer.
+    pub blocks_staging: Option<Buffer>,
+    /// `AtomicBool` for the blocks `map_async` callback.
+    pub blocks_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Voxels staging buffer.
+    pub voxels_staging: Option<Buffer>,
+    /// `AtomicBool` for the voxels `map_async` callback.
+    pub voxels_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Cursor[0] = voxels-buffer fill in u32-pairs (×2 to get u32 count).
+    pub voxels_u32_count: u64,
+    /// Cursor[1] = blocks-buffer fill in u32s.
+    pub blocks_u32_count: u64,
+    /// Chunks staging size, computed from `world_gpu.chunks_size_in_chunks`.
+    pub chunks_pair_count_u32: u64,
+    /// Frames spent in the current non-terminal stage. Reset when the stage
+    /// advances. If it exceeds `READBACK_STALL_BUDGET_FRAMES` the state
+    /// machine bails with a diagnostic.
+    pub stall_frames: u32,
 }
 
 /// The render-world `Resource` holding every Phase-C construction-side bind
@@ -909,6 +1040,7 @@ pub fn populate_cpu_mirror_from_gpu_producer(
     render_queue: Res<RenderQueue>,
 ) {
     use bevy::render::render_resource::{MapMode, PollType};
+    use std::sync::atomic::Ordering;
 
     let Some(gpu) = gpu.as_mut() else { return; };
     if !gpu.gpu_producer_has_run || gpu.cpu_mirror_populated {
@@ -920,124 +1052,416 @@ pub fn populate_cpu_mirror_from_gpu_producer(
         // / `install_vox_sized_to_model`); the readback is a no-op +
         // unnecessary risk. Mark populated so we don't keep checking.
         gpu.cpu_mirror_populated = true;
+        gpu.cpu_mirror_readback.stage = ReadbackStage::Done;
         return;
     }
-    let Some(world_gpu) = world_gpu else { return; };
-    let Some(block_voxel_count_buf) = gpu.block_voxel_count.as_ref() else {
-        return;
-    };
 
-    // Helper — copy `count` u32s starting at offset 0 from `src` back to a
-    // mapped staging buffer, return the contents.
-    let readback_u32 = |src: &Buffer, u32_count: u64| -> Vec<u32> {
-        if u32_count == 0 {
-            return Vec::new();
+    // web-vox-async-loading Q4 (2026-05-18) — confirmation assertion per
+    // Decision 1 of `docs/orchestrate/web-vox-async-loading/01-context.md`:
+    // the three flagless W2 placeholders (`hash_map_w2_placeholder`,
+    // `segment_voxel_buffer_w2_placeholder`, `hash_coefficients_w2_placeholder`)
+    // MUST be dead code on the `.vox` production path. The gate at
+    // `mod.rs:1184-1186` widens `want_gpu_producer` to include
+    // `model_data.is_some()`, so the production `naadf_*_gpu_producer`
+    // allocations fire BEFORE the W2 placeholder block — every
+    // `is_none()` guard in the placeholder block then returns `false`.
+    //
+    // Release builds skip the check entirely.
+    #[cfg(debug_assertions)]
+    {
+        if let Some(label) = gpu.block_voxel_count_label {
+            assert!(
+                !label.contains("w2_placeholder"),
+                "vox-gpu-rewrite Q4 regression: block_voxel_count is the W2 \
+                 placeholder on a .vox run — gate logic regression at \
+                 mod.rs:1184-1186 routed past the gpu_producer allocation. \
+                 Label was: {label}"
+            );
         }
+        if let Some(label) = gpu.hash_map_label {
+            assert!(
+                !label.contains("w2_placeholder"),
+                "vox-gpu-rewrite Q4 regression: hash_map is the W2 placeholder \
+                 on a .vox run. Label was: {label}"
+            );
+        }
+        if let Some(label) = gpu.segment_voxel_buffer_label {
+            assert!(
+                !label.contains("w2_placeholder"),
+                "vox-gpu-rewrite Q4 regression: segment_voxel_buffer is the W2 \
+                 placeholder on a .vox run. Label was: {label}"
+            );
+        }
+        if let Some(label) = gpu.hash_coefficients_label {
+            assert!(
+                !label.contains("w2_placeholder"),
+                "vox-gpu-rewrite Q4 regression: hash_coefficients is the W2 \
+                 placeholder on a .vox run. Label was: {label}"
+            );
+        }
+    }
+
+    let Some(world_gpu) = world_gpu else { return; };
+
+    // web-vox-async-loading Q3 (follow-up dispatch 2026-05-18) — cross-frame
+    // CPU-mirror readback state machine. Replaces the sync
+    // `Device::poll(wait_indefinitely)` + `get_mapped_range` panic site at
+    // `mod.rs:944-957` (interim wasm32 escape hatch deleted per Q7).
+    //
+    // Each frame in `ExtractSchedule`, tick the state machine ONCE.
+    // Target-agnostic — no `#[cfg(target_arch = "wasm32")]` branch on this
+    // path (Decision 2).
+    let device = render_device.as_ref();
+    let queue = render_queue.as_ref();
+
+    // Helper — issue copy_buffer_to_buffer + map_async with a callback that
+    // sets `done` on completion. The staging buffer is returned to the caller
+    // (it stays alive on `ConstructionGpu` until we read it in a later frame).
+    fn issue_copy_and_map(
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        src: &Buffer,
+        u32_count: u64,
+        label: &'static str,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Buffer {
         let size = u32_count * 4;
-        let staging = render_device.create_buffer(&BufferDescriptor {
-            label: Some("vox_gpu_rewrite_cpu_mirror_readback_staging"),
+        let staging = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
             size,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut enc = render_device.create_command_encoder(&CommandEncoderDescriptor {
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("vox_gpu_rewrite_cpu_mirror_readback_enc"),
         });
         enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
-        render_queue.submit([enc.finish()]);
+        queue.submit([enc.finish()]);
         let slice = staging.slice(..);
-        slice.map_async(MapMode::Read, |r| r.unwrap());
-        render_device.poll(PollType::wait_indefinitely()).unwrap();
-        let data = slice.get_mapped_range();
-        let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-        staging.unmap();
-        out
-    };
-
-    // 1) Read the cursor pair to size the blocks/voxels readback.
-    let cursor = readback_u32(block_voxel_count_buf, 2);
-    if cursor.len() < 2 {
-        bevy::log::warn!(
-            "vox-gpu-rewrite D1 readback: block_voxel_count read returned {} u32s; \
-             cannot determine GPU-buffer fill levels — skipping CPU mirror population",
-            cursor.len(),
-        );
-        return;
-    }
-    let voxels_u32_count = (cursor[0] / 2) as u64;
-    let blocks_u32_count = cursor[1] as u64;
-
-    // 2) Read chunks (`array<vec2<u32>>` storage buffer; we want the `.x`
-    //    state channel — `.y` is the W4 entity-pointer + counter).
-    let chunks_extent = world_gpu.chunks_size_in_chunks;
-    let chunk_count = (chunks_extent.x * chunks_extent.y * chunks_extent.z) as u64;
-    let chunks_pair_count_u32 = chunk_count * 2; // 2 u32s per pair
-    let chunks_pairs = readback_u32(&world_gpu.chunks_buffer, chunks_pair_count_u32);
-    if chunks_pairs.len() as u64 != chunks_pair_count_u32 {
-        bevy::log::warn!(
-            "vox-gpu-rewrite D1 readback: chunks_buffer read size mismatch \
-             (got {} u32s, expected {})",
-            chunks_pairs.len(),
-            chunks_pair_count_u32,
-        );
-        return;
-    }
-    let mut chunks_cpu: Vec<u32> = Vec::with_capacity(chunk_count as usize);
-    for i in 0..chunk_count as usize {
-        // `.x` is at index 0 of each pair; `.y` at index 1.
-        chunks_cpu.push(chunks_pairs[i * 2]);
+        let done_for_cb = done.clone();
+        slice.map_async(MapMode::Read, move |r| {
+            // Set the flag regardless of map success — the consumer
+            // checks the flag, then attempts `get_mapped_range`. A failed
+            // map will panic at `get_mapped_range`; we log instead.
+            if r.is_err() {
+                bevy::log::error!(
+                    "vox-gpu-rewrite Q3 readback: map_async callback received \
+                     Err — staging buffer map failed"
+                );
+            }
+            done_for_cb.store(true, std::sync::atomic::Ordering::Release);
+        });
+        staging
     }
 
-    // 3) Read blocks + voxels.
-    let blocks_cpu = readback_u32(world_gpu.blocks.buffer(), blocks_u32_count);
-    let voxels_cpu = readback_u32(world_gpu.voxels.buffer(), voxels_u32_count);
-
-    let chunks_len = chunks_cpu.len();
-    let blocks_len = blocks_cpu.len();
-    let voxels_len = voxels_cpu.len();
-
-    // 4) Mutate the main-world `WorldData` via `MainWorld` — Bevy-sanctioned
-    //    pattern (see `extract_world_changes` :703-715 for precedent).
-    let main_world: &mut bevy::ecs::world::World = &mut **main_world.into_inner();
-    let Some(mut world_data) =
-        main_world.get_resource_mut::<crate::world::data::WorldData>()
-    else {
-        bevy::log::warn!(
-            "vox-gpu-rewrite D1 readback: main-world WorldData not present; \
-             skipping CPU mirror population this frame"
+    // Drain the device's callback queue without blocking — drives `mapAsync`
+    // resolutions on native, no-op on WebGPU (the JS event loop drives that
+    // backend's callbacks). Called once per stage tick.
+    let poll_result = device.poll(PollType::Poll);
+    if poll_result.is_err() {
+        bevy::log::error!(
+            "vox-gpu-rewrite Q3 readback: device.poll(Poll) returned Err — \
+             {:?}",
+            poll_result.err()
         );
-        return;
-    };
+    }
 
-    world_data.chunks_cpu = chunks_cpu;
-    world_data.blocks_cpu = blocks_cpu;
-    world_data.voxels_cpu = voxels_cpu;
-    // Re-seed the block-hashing table against the freshly-populated voxel
-    // mirror so the editor's hash-keyed edit path (`set_voxel*`) sees the
-    // correct refcounted slot state. C# does this implicitly because the
-    // GPU producer and the CPU mirror share the same `BlockHashingHandler`
-    // instance (`WorldData.cs:131-132`).
-    world_data.block_hashing = crate::aadf::block_hash::BlockHashingHandler::new();
-    world_data.seed_block_hashing();
-    drop(world_data);
+    match gpu.cpu_mirror_readback.stage {
+        ReadbackStage::Done => {
+            // Reached terminal state from a previous frame (e.g. legacy path
+            // short-circuit). Nothing to do.
+        }
+        ReadbackStage::NotStarted => {
+            let Some(block_voxel_count_buf) = gpu.block_voxel_count.as_ref() else {
+                return;
+            };
+            // Reset atomic, issue cursor copy + map_async.
+            gpu.cpu_mirror_readback
+                .cursor_done
+                .store(false, Ordering::Relaxed);
+            let staging = issue_copy_and_map(
+                device,
+                queue,
+                block_voxel_count_buf,
+                2,
+                "vox_gpu_rewrite_cpu_mirror_readback_cursor",
+                gpu.cpu_mirror_readback.cursor_done.clone(),
+            );
+            gpu.cpu_mirror_readback.cursor_staging = Some(staging);
+            gpu.cpu_mirror_readback.stage = ReadbackStage::CursorPending;
+            gpu.cpu_mirror_readback.stall_frames = 0;
+            bevy::log::info!(
+                "vox-gpu-rewrite Q3 readback: stage NotStarted → CursorPending \
+                 (cursor copy issued + map_async dispatched)"
+            );
+        }
+        ReadbackStage::CursorPending => {
+            if !gpu.cpu_mirror_readback.cursor_done.load(Ordering::Acquire) {
+                // Still waiting for the cursor map_async callback.
+                gpu.cpu_mirror_readback.stall_frames += 1;
+                if gpu.cpu_mirror_readback.stall_frames >= READBACK_STALL_BUDGET_FRAMES {
+                    bevy::log::error!(
+                        "vox-gpu-rewrite Q3 readback: STALLED at stage CursorPending \
+                         after {} frames (~10s @ 60fps) — `mapAsync` callback for the \
+                         cursor staging buffer never fired. Possible causes: device \
+                         lost, render-graph submission stuck, wgpu callback queue \
+                         starved. Forcing advance to Done to unblock subsequent \
+                         frames (CPU mirror stays empty; editor pick-ray will return \
+                         None for every position until a subsequent .vox install \
+                         re-triggers the producer chain).",
+                        READBACK_STALL_BUDGET_FRAMES
+                    );
+                    gpu.cpu_mirror_populated = true;
+                    gpu.cpu_mirror_readback.stage = ReadbackStage::Done;
+                    gpu.cpu_mirror_readback.cursor_staging = None;
+                }
+                return;
+            }
+            // Cursor mapped — read it, size the full set, issue copies.
+            let cursor_staging = gpu
+                .cpu_mirror_readback
+                .cursor_staging
+                .as_ref()
+                .expect("cursor_staging missing in CursorPending stage")
+                .clone();
+            let cursor: Vec<u32> = {
+                let slice = cursor_staging.slice(..);
+                let data = slice.get_mapped_range();
+                let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+                drop(data);
+                cursor_staging.unmap();
+                out
+            };
+            if cursor.len() < 2 {
+                bevy::log::warn!(
+                    "vox-gpu-rewrite Q3 readback: block_voxel_count read returned \
+                     {} u32s; cannot determine GPU-buffer fill levels — aborting \
+                     CPU mirror population (marking populated to avoid retry)",
+                    cursor.len(),
+                );
+                gpu.cpu_mirror_populated = true;
+                gpu.cpu_mirror_readback.stage = ReadbackStage::Done;
+                gpu.cpu_mirror_readback.cursor_staging = None;
+                return;
+            }
+            let voxels_u32_count = (cursor[0] / 2) as u64;
+            let blocks_u32_count = cursor[1] as u64;
 
-    gpu.cpu_mirror_populated = true;
-    bevy::log::info!(
-        "vox-gpu-rewrite W5.3-fix Stage 5 (D1) — CPU mirror populated from \
-         GPU producer output: chunks_cpu.len() = {}, blocks_cpu.len() = {}, \
-         voxels_cpu.len() = {} (cursor[0]={} voxel-pairs → {} u32s, \
-         cursor[1]={} block-u32s, chunks_extent={}×{}×{})",
-        chunks_len,
-        blocks_len,
-        voxels_len,
-        cursor[0],
-        voxels_u32_count,
-        cursor[1],
-        chunks_extent.x,
-        chunks_extent.y,
-        chunks_extent.z,
-    );
+            let chunks_extent = world_gpu.chunks_size_in_chunks;
+            let chunk_count =
+                (chunks_extent.x * chunks_extent.y * chunks_extent.z) as u64;
+            let chunks_pair_count_u32 = chunk_count * 2;
+
+            gpu.cpu_mirror_readback.voxels_u32_count = voxels_u32_count;
+            gpu.cpu_mirror_readback.blocks_u32_count = blocks_u32_count;
+            gpu.cpu_mirror_readback.chunks_pair_count_u32 = chunks_pair_count_u32;
+
+            // Reset all three completion atomics.
+            gpu.cpu_mirror_readback
+                .chunks_done
+                .store(false, Ordering::Relaxed);
+            gpu.cpu_mirror_readback
+                .blocks_done
+                .store(false, Ordering::Relaxed);
+            gpu.cpu_mirror_readback
+                .voxels_done
+                .store(false, Ordering::Relaxed);
+
+            // Issue chunks copy + map_async. Always non-zero (the world has
+            // at least one chunk).
+            let chunks_staging = issue_copy_and_map(
+                device,
+                queue,
+                &world_gpu.chunks_buffer,
+                chunks_pair_count_u32,
+                "vox_gpu_rewrite_cpu_mirror_readback_chunks",
+                gpu.cpu_mirror_readback.chunks_done.clone(),
+            );
+            gpu.cpu_mirror_readback.chunks_staging = Some(chunks_staging);
+
+            // Blocks + voxels copies — skip if u32_count == 0 (an empty world
+            // with no allocated blocks/voxels — the cursor would be at the
+            // initial-prefix bump of 64 minimum, so this is mostly defensive).
+            if blocks_u32_count > 0 {
+                let blocks_staging = issue_copy_and_map(
+                    device,
+                    queue,
+                    world_gpu.blocks.buffer(),
+                    blocks_u32_count,
+                    "vox_gpu_rewrite_cpu_mirror_readback_blocks",
+                    gpu.cpu_mirror_readback.blocks_done.clone(),
+                );
+                gpu.cpu_mirror_readback.blocks_staging = Some(blocks_staging);
+            } else {
+                gpu.cpu_mirror_readback
+                    .blocks_done
+                    .store(true, Ordering::Release);
+            }
+            if voxels_u32_count > 0 {
+                let voxels_staging = issue_copy_and_map(
+                    device,
+                    queue,
+                    world_gpu.voxels.buffer(),
+                    voxels_u32_count,
+                    "vox_gpu_rewrite_cpu_mirror_readback_voxels",
+                    gpu.cpu_mirror_readback.voxels_done.clone(),
+                );
+                gpu.cpu_mirror_readback.voxels_staging = Some(voxels_staging);
+            } else {
+                gpu.cpu_mirror_readback
+                    .voxels_done
+                    .store(true, Ordering::Release);
+            }
+
+            gpu.cpu_mirror_readback.cursor_staging = None;
+            gpu.cpu_mirror_readback.stage = ReadbackStage::FullSetPending;
+            gpu.cpu_mirror_readback.stall_frames = 0;
+            bevy::log::info!(
+                "vox-gpu-rewrite Q3 readback: stage CursorPending → FullSetPending \
+                 (cursor read: {} voxels-u32s, {} blocks-u32s, {} chunks-pairs-u32s; \
+                 chunks_extent={}×{}×{})",
+                voxels_u32_count,
+                blocks_u32_count,
+                chunks_pair_count_u32,
+                chunks_extent.x,
+                chunks_extent.y,
+                chunks_extent.z,
+            );
+        }
+        ReadbackStage::FullSetPending => {
+            let chunks_ready =
+                gpu.cpu_mirror_readback.chunks_done.load(Ordering::Acquire);
+            let blocks_ready =
+                gpu.cpu_mirror_readback.blocks_done.load(Ordering::Acquire);
+            let voxels_ready =
+                gpu.cpu_mirror_readback.voxels_done.load(Ordering::Acquire);
+            if !(chunks_ready && blocks_ready && voxels_ready) {
+                gpu.cpu_mirror_readback.stall_frames += 1;
+                if gpu.cpu_mirror_readback.stall_frames >= READBACK_STALL_BUDGET_FRAMES {
+                    bevy::log::error!(
+                        "vox-gpu-rewrite Q3 readback: STALLED at stage FullSetPending \
+                         after {} frames (~10s @ 60fps). Pending: chunks={}, blocks={}, \
+                         voxels={}. Possible causes: device lost, render-graph \
+                         submission stuck. Forcing advance to Done (CPU mirror stays \
+                         empty).",
+                        READBACK_STALL_BUDGET_FRAMES,
+                        !chunks_ready,
+                        !blocks_ready,
+                        !voxels_ready,
+                    );
+                    gpu.cpu_mirror_populated = true;
+                    gpu.cpu_mirror_readback.stage = ReadbackStage::Done;
+                    gpu.cpu_mirror_readback.chunks_staging = None;
+                    gpu.cpu_mirror_readback.blocks_staging = None;
+                    gpu.cpu_mirror_readback.voxels_staging = None;
+                }
+                return;
+            }
+
+            // All three mapped — read the contents.
+            let chunks_pairs: Vec<u32> = {
+                let staging = gpu
+                    .cpu_mirror_readback
+                    .chunks_staging
+                    .as_ref()
+                    .expect("chunks_staging missing in FullSetPending stage")
+                    .clone();
+                let slice = staging.slice(..);
+                let data = slice.get_mapped_range();
+                let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+                drop(data);
+                staging.unmap();
+                out
+            };
+            let blocks_cpu: Vec<u32> = match gpu.cpu_mirror_readback.blocks_staging.as_ref() {
+                Some(staging) => {
+                    let staging = staging.clone();
+                    let slice = staging.slice(..);
+                    let data = slice.get_mapped_range();
+                    let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+                    drop(data);
+                    staging.unmap();
+                    out
+                }
+                None => Vec::new(),
+            };
+            let voxels_cpu: Vec<u32> = match gpu.cpu_mirror_readback.voxels_staging.as_ref() {
+                Some(staging) => {
+                    let staging = staging.clone();
+                    let slice = staging.slice(..);
+                    let data = slice.get_mapped_range();
+                    let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+                    drop(data);
+                    staging.unmap();
+                    out
+                }
+                None => Vec::new(),
+            };
+
+            let chunks_pair_count_u32 = gpu.cpu_mirror_readback.chunks_pair_count_u32;
+            if chunks_pairs.len() as u64 != chunks_pair_count_u32 {
+                bevy::log::warn!(
+                    "vox-gpu-rewrite Q3 readback: chunks_buffer read size mismatch \
+                     (got {} u32s, expected {})",
+                    chunks_pairs.len(),
+                    chunks_pair_count_u32,
+                );
+                gpu.cpu_mirror_populated = true;
+                gpu.cpu_mirror_readback.stage = ReadbackStage::Done;
+                gpu.cpu_mirror_readback.chunks_staging = None;
+                gpu.cpu_mirror_readback.blocks_staging = None;
+                gpu.cpu_mirror_readback.voxels_staging = None;
+                return;
+            }
+            let chunk_count = (chunks_pair_count_u32 / 2) as usize;
+            let mut chunks_cpu: Vec<u32> = Vec::with_capacity(chunk_count);
+            for i in 0..chunk_count {
+                chunks_cpu.push(chunks_pairs[i * 2]);
+            }
+
+            let chunks_len = chunks_cpu.len();
+            let blocks_len = blocks_cpu.len();
+            let voxels_len = voxels_cpu.len();
+
+            // Mutate the main-world `WorldData`.
+            let main_world: &mut bevy::ecs::world::World =
+                &mut **main_world.into_inner();
+            let Some(mut world_data) =
+                main_world.get_resource_mut::<crate::world::data::WorldData>()
+            else {
+                bevy::log::warn!(
+                    "vox-gpu-rewrite Q3 readback: main-world WorldData not present; \
+                     dropping captured CPU mirror data this frame"
+                );
+                gpu.cpu_mirror_populated = true;
+                gpu.cpu_mirror_readback.stage = ReadbackStage::Done;
+                gpu.cpu_mirror_readback.chunks_staging = None;
+                gpu.cpu_mirror_readback.blocks_staging = None;
+                gpu.cpu_mirror_readback.voxels_staging = None;
+                return;
+            };
+            world_data.chunks_cpu = chunks_cpu;
+            world_data.blocks_cpu = blocks_cpu;
+            world_data.voxels_cpu = voxels_cpu;
+            world_data.block_hashing = crate::aadf::block_hash::BlockHashingHandler::new();
+            world_data.seed_block_hashing();
+            drop(world_data);
+
+            gpu.cpu_mirror_populated = true;
+            gpu.cpu_mirror_readback.stage = ReadbackStage::Done;
+            gpu.cpu_mirror_readback.chunks_staging = None;
+            gpu.cpu_mirror_readback.blocks_staging = None;
+            gpu.cpu_mirror_readback.voxels_staging = None;
+            bevy::log::info!(
+                "vox-gpu-rewrite Q3 readback: stage FullSetPending → Done — CPU \
+                 mirror populated from GPU producer output: chunks_cpu.len() = {}, \
+                 blocks_cpu.len() = {}, voxels_cpu.len() = {}",
+                chunks_len,
+                blocks_len,
+                voxels_len,
+            );
+        }
+    }
 }
 
 /// `RenderSystems::PrepareResources` system — the empty Phase-C prepare seam.
@@ -1174,6 +1598,9 @@ pub fn prepare_construction(
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
+            // web-vox-async-loading Q4 — stash label for debug-only assertion
+            // in `populate_cpu_mirror_from_gpu_producer`.
+            gpu.hash_map_label = Some("naadf_hash_map_gpu_producer");
             // wgpu storage buffers with `mapped_at_creation: false` have
             // implementation-defined contents (uninitialised on some
             // backends). The open-addressing CAS loop in `chunk_calc.wgsl`
@@ -1209,6 +1636,7 @@ pub fn prepare_construction(
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&coeffs));
             gpu.hash_coefficients = Some(buf);
+            gpu.hash_coefficients_label = Some("naadf_hash_coefficients_gpu_producer");
             bind_groups.construction_world = None;
         }
         // block_voxel_count: 2 u32 cursors, seeded at `[32, 64]` per
@@ -1227,7 +1655,34 @@ pub fn prepare_construction(
         // calculable in its byte-equal compare. The production runtime is
         // not byte-compared at this point — it only needs to be functionally
         // correct, which `[64, 64]` already is.
-        if gpu.block_voxel_count.as_ref().map(|b| b.size()).unwrap_or(0) < 8 {
+        // web-vox-async-loading follow-up (2026-05-18) — re-allocate when
+        // the existing buffer is a W2 placeholder. The placeholder and the
+        // real gpu_producer buffer are byte-equivalent (both size=8, both
+        // seeded `[64, 64]`, both STORAGE|COPY_DST|COPY_SRC), so a pure
+        // size-check (`size() < 8`) treats the placeholder as already-good
+        // and leaves the `w2_placeholder` label in place. On the web async
+        // .vox path the embedded default-scene install precedes the .vox
+        // bytes by N frames — the W2 placeholder block in this `prepare`
+        // body therefore runs FIRST (during those N pre-`ModelData` frames)
+        // and stamps the placeholder label. When `ModelData` finally lands
+        // and `want_gpu_producer` flips true, the size-check skips
+        // reallocation and `populate_cpu_mirror_from_gpu_producer`'s Q4
+        // assertion fires on the lingering placeholder label. Re-checking
+        // the label catches this case and re-labels (no buffer churn —
+        // both buffers are identical, only `block_voxel_count_label`
+        // changes). The native `--vox-e2e` path doesn't see this because
+        // it routes through `GridPreset::Vox { path }` at Startup (no
+        // pre-`.vox` default-embedded install).
+        let needs_realloc = gpu
+            .block_voxel_count
+            .as_ref()
+            .map(|b| b.size())
+            .unwrap_or(0)
+            < 8
+            || gpu
+                .block_voxel_count_label
+                .is_some_and(|l| l.contains("w2_placeholder"));
+        if needs_realloc {
             let buf = render_device.create_buffer(&BufferDescriptor {
                 label: Some("naadf_block_voxel_count_gpu_producer"),
                 size: 8,
@@ -1236,6 +1691,7 @@ pub fn prepare_construction(
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&[64u32, 64u32]));
             gpu.block_voxel_count = Some(buf);
+            gpu.block_voxel_count_label = Some("naadf_block_voxel_count_gpu_producer");
             bind_groups.construction_world = None;
         }
         // segment_voxel_buffer: built CPU-side from `dense_voxel_types`. For
@@ -1288,6 +1744,7 @@ pub fn prepare_construction(
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&segment_data));
             gpu.segment_voxel_buffer = Some(buf);
+            gpu.segment_voxel_buffer_label = Some("naadf_segment_voxel_buffer_gpu_producer");
             bind_groups.construction_world = None;
         }
         let _ = world_chunk_count; // referenced for future segment-iteration sizing.
@@ -1529,23 +1986,40 @@ pub fn prepare_construction(
         //
         //    Full-world cubic (`WORLD_SIZE_IN_CHUNKS^3 * 2048 * 4` ≈ 134 GiB)
         //    is REJECTED — past every realistic wgpu cap.
-        if gpu.segment_voxel_buffer.is_none() {
-            const SEGMENT_CHUNKS: u64 =
-                (crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS as u64) * 4;
-            let size = SEGMENT_CHUNKS
-                * SEGMENT_CHUNKS
-                * SEGMENT_CHUNKS
-                * (generator_model::CHUNK_DATA_U32S as u64)
-                * 4;
+        // web-vox-async-loading follow-up (2026-05-18) — also re-allocate
+        // when the existing buffer is the W2 placeholder (size = 4 B, used
+        // only as a layout-required binding for `world_change.wgsl`). The
+        // web async .vox path runs the embedded-default install first
+        // (which leaves `dense_voxel_types = Vec::new()`, so the W2
+        // placeholder block fires and installs a 4 B placeholder buffer);
+        // when `ModelData` lands and this W5 block runs, an `is_none()`
+        // guard would see Some(placeholder) and skip the production
+        // 128 MiB allocation. The W5 dispatch then OOB-writes against the
+        // 4 B buffer and the chunk_calc shader produces garbage.
+        const SEGMENT_CHUNKS: u64 =
+            (crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS as u64) * 4;
+        let segment_voxel_buffer_full_size = SEGMENT_CHUNKS
+            * SEGMENT_CHUNKS
+            * SEGMENT_CHUNKS
+            * (generator_model::CHUNK_DATA_U32S as u64)
+            * 4;
+        let segment_needs_realloc = gpu
+            .segment_voxel_buffer
+            .as_ref()
+            .map(|b| b.size())
+            .unwrap_or(0)
+            < segment_voxel_buffer_full_size;
+        if segment_needs_realloc {
             let buf = render_device.create_buffer(&BufferDescriptor {
                 label: Some("naadf_segment_voxel_buffer_w5"),
-                size,
+                size: segment_voxel_buffer_full_size,
                 usage: BufferUsages::STORAGE
                     | BufferUsages::COPY_DST
                     | BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
             gpu.segment_voxel_buffer = Some(buf);
+            gpu.segment_voxel_buffer_label = Some("naadf_segment_voxel_buffer_w5");
             // Force rebuild of every bind group that binds this buffer.
             bind_groups.construction_world = None;
             bind_groups.construction_generator_model = None;
@@ -1888,11 +2362,20 @@ pub fn prepare_construction(
             let buf = render_device.create_buffer(&BufferDescriptor {
                 label: Some("naadf_block_voxel_count_w2_placeholder"),
                 size: 8, // 2 × u32 — `block_voxel_count[0..2]`
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                // COPY_SRC is required for `populate_cpu_mirror_from_gpu_producer`
+                // to copy the W5 atomic cursors out via `CopyBufferToBuffer`.
+                // Native wgpu validation was lenient with the flag missing;
+                // WebGPU's stricter validation rejects the encode and the
+                // follow-up `get_mapped_range` panics. See e2e/tests/
+                // vox-loading.spec.ts.
+                usage: BufferUsages::STORAGE
+                    | BufferUsages::COPY_DST
+                    | BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
             render_queue.write_buffer(&buf, 0, bytemuck::cast_slice(&[64u32, 64u32]));
             gpu.block_voxel_count = Some(buf);
+            gpu.block_voxel_count_label = Some("naadf_block_voxel_count_w2_placeholder");
         }
         if gpu.segment_voxel_buffer.is_none() {
             let buf = render_device.create_buffer(&BufferDescriptor {
@@ -1902,6 +2385,7 @@ pub fn prepare_construction(
                 mapped_at_creation: false,
             });
             gpu.segment_voxel_buffer = Some(buf);
+            gpu.segment_voxel_buffer_label = Some("naadf_segment_voxel_buffer_w2_placeholder");
         }
         if gpu.hash_map.is_none() {
             let buf = render_device.create_buffer(&BufferDescriptor {
@@ -1911,6 +2395,7 @@ pub fn prepare_construction(
                 mapped_at_creation: false,
             });
             gpu.hash_map = Some(buf);
+            gpu.hash_map_label = Some("naadf_hash_map_w2_placeholder");
         }
         if gpu.hash_coefficients.is_none() {
             let buf = render_device.create_buffer(&BufferDescriptor {
@@ -1920,6 +2405,7 @@ pub fn prepare_construction(
                 mapped_at_creation: false,
             });
             gpu.hash_coefficients = Some(buf);
+            gpu.hash_coefficients_label = Some("naadf_hash_coefficients_w2_placeholder");
         }
 
         if let (Some(params), Some(bvc), Some(segv), Some(hmap), Some(coeffs)) = (

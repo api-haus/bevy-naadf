@@ -49,7 +49,7 @@ use bevy::render::texture::GpuImage;
 use crate::render::atmosphere::AtmosphereGpu;
 use crate::render::extract::{
     ExtractedCameraData, ExtractedCameraHistory, ExtractedGiConfig, ExtractedMaterialSet,
-    WorldGpuStaging,
+    VoxelTypesRefresh, WorldGpuStaging,
 };
 use crate::render::gi::{GiBindGroups, GiGpu};
 use crate::render::gpu_types::{
@@ -189,10 +189,21 @@ const W2_BUFFER_HEADROOM_MUL: u64 = 2;
 /// (`naadf_world_change_node`), NOT this system; this system's GPU buffer
 /// allocation includes [`W2_BUFFER_HEADROOM_MUL`] headroom to accommodate
 /// the W2 dispatch's atomic-cursor appends without per-frame realloc.
+// Bevy systems legitimately exceed clippy's 7-argument ceiling once
+// `web-vox-color-divergence` (2026-05-18) added `voxel_types_refresh` for the
+// focused-refresh path.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_world_gpu(
     mut commands: Commands,
     staging: Option<Res<WorldGpuStaging>>,
-    existing: Option<Res<WorldGpu>>,
+    mut existing: Option<ResMut<WorldGpu>>,
+    // web-vox-color-divergence (2026-05-18) — focused-refresh hand-off from
+    // `stage_world_gpu_buildonce`. When `WorldGpu` is `Some` AND this is
+    // `Some`, the system re-uploads the palette to GPU, rebuilds
+    // `WorldGpu.bind_group`, removes `FrameGpu` so `prepare_frame_gpu` re-
+    // creates its bind groups (including `calc_new_taa_sample_bind_group`
+    // which binds `voxel_types`), and drops `VoxelTypesRefresh`.
+    voxel_types_refresh: Option<Res<VoxelTypesRefresh>>,
     pipelines: Res<NaadfPipelines>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
@@ -213,8 +224,109 @@ pub fn prepare_world_gpu(
     extracted_material_set: Option<Res<ExtractedMaterialSet>>,
     images: Res<RenderAssets<GpuImage>>,
 ) {
-    // Build-once: WorldGpu already exists → this system is forever done.
-    if existing.is_some() {
+    // Build-once: WorldGpu already exists → this system is forever done EXCEPT
+    // when `VoxelTypesRefresh` is pending (focused-refresh path, web-vox-color-
+    // divergence 2026-05-18). The refresh branch re-uploads the palette,
+    // rebuilds `WorldGpu.bind_group`, and removes `FrameGpu` to invalidate the
+    // downstream `calc_new_taa_sample_bind_group` that binds `voxel_types`.
+    if let Some(world_gpu) = existing.as_mut() {
+        if let Some(refresh) = voxel_types_refresh.as_deref() {
+            // ---- focused-refresh body (web-vox-color-divergence Step 5) ----
+            //
+            // 1. Re-pack the new palette to `Vec<GpuVoxelType>` (mirrors the
+            //    build-once site at `:380-388`).
+            let voxel_types_data: Vec<GpuVoxelType> = if refresh.types.is_empty() {
+                vec![GpuVoxelType { data: [0; 4] }]
+            } else {
+                refresh.types.iter().map(GpuVoxelType::from_voxel_type).collect()
+            };
+
+            // 2. Emit a `debug!` log so a future `RUST_LOG=bevy_naadf=debug`
+            //    run can confirm the refresh path fires exactly once per
+            //    palette change. Distinguishable from the build-once upload by
+            //    the `(refresh)` tag.
+            {
+                let preview: Vec<[u32; 4]> = voxel_types_data
+                    .iter()
+                    .take(5)
+                    .map(|e| e.data)
+                    .collect();
+                debug!(
+                    "[palette-upload] (refresh) prepare_world_gpu re-uploading \
+                     voxel_types to GPU (palette_len={}, first_5_raw={:?})",
+                    voxel_types_data.len(),
+                    preview,
+                );
+            }
+
+            // 3. Upload the new palette. `GrowableBuffer::upload_all` calls
+            //    `reserve_discard` which reallocates if the new length exceeds
+            //    the current capacity (the 13 → 257 default→Oasis transition
+            //    on web), and writes from offset 0 — wholesale replacement,
+            //    not append.
+            world_gpu.voxel_types.upload_all(
+                &voxel_types_data,
+                &render_device,
+                &render_queue,
+            );
+
+            // 4. Rebuild `WorldGpu.bind_group` with the (possibly new)
+            //    `voxel_types.buffer()` handle. SAFETY (schedule ordering):
+            //    this runs in `RenderSystems::PrepareResources`; the
+            //    consumer `prepare_frame_gpu` runs later in
+            //    `RenderSystems::PrepareBindGroups`, so the rebuilt
+            //    `bind_group` is the one downstream readers see.
+            //    The construction-side bind groups
+            //    (`ConstructionBindGroups`) DO NOT bind `voxel_types` —
+            //    verified by grep: every `world_gpu.` reference in
+            //    `crates/bevy_naadf/src/render/construction/mod.rs` is
+            //    `chunks_buffer`/`blocks`/`voxels`/`chunks_size_in_chunks`,
+            //    never `voxel_types`. So construction-side bind groups are
+            //    unaffected by this refresh.
+            let new_bind_group = render_device.create_bind_group(
+                "naadf_world_bind_group",
+                &pipeline_cache.get_bind_group_layout(&pipelines.world_layout),
+                &BindGroupEntries::sequential((
+                    world_gpu.chunks_buffer.as_entire_buffer_binding(),
+                    world_gpu.blocks.buffer().as_entire_buffer_binding(),
+                    world_gpu.voxels.buffer().as_entire_buffer_binding(),
+                    world_gpu.voxel_types.buffer().as_entire_buffer_binding(),
+                    world_gpu.world_meta.as_entire_buffer_binding(),
+                    world_gpu
+                        .entity_chunk_instances_placeholder
+                        .as_entire_buffer_binding(),
+                    world_gpu
+                        .entity_voxel_data_placeholder
+                        .as_entire_buffer_binding(),
+                    world_gpu
+                        .entity_instances_history_placeholder
+                        .as_entire_buffer_binding(),
+                )),
+            );
+            world_gpu.bind_group = new_bind_group;
+
+            // 5. Remove `FrameGpu` so `prepare_frame_gpu` rebuilds all of its
+            //    bind groups, including `calc_new_taa_sample_bind_group` which
+            //    binds `world_gpu.voxel_types.buffer()` at slot 3
+            //    (`prepare.rs:921`). Without this, the cached TAA bind group
+            //    would still reference the OLD buffer handle if `upload_all`
+            //    reallocated. SAFETY: `commands.remove_resource::<FrameGpu>()`
+            //    is queued and flushes at the `PrepareResources` →
+            //    `PrepareBindGroups` set boundary, so `prepare_frame_gpu`
+            //    sees the removal on its next run and falls through its
+            //    `existing.is_none()` path that rebuilds everything.
+            //    Cost: a one-shot per-pixel storage buffer rebuild
+            //    (`first_hit_data` + `first_hit_absorption` + `final_color` +
+            //    TAA accumulators); acceptable for ≤2 palette refreshes per
+            //    app lifetime.
+            commands.remove_resource::<FrameGpu>();
+
+            // 6. Single-use: drop the refresh resource so the next frame's
+            //    `prepare_world_gpu` runs in steady-state (the
+            //    `existing.is_some() && voxel_types_refresh.is_none()`
+            //    branch — early-return).
+            commands.remove_resource::<VoxelTypesRefresh>();
+        }
         return;
     }
     // Waiting for the extract-stage hand-off — staging populated by
@@ -513,6 +625,27 @@ pub fn prepare_world_gpu(
         };
         blocks.upload_all(&blocks_data, &render_device, &render_queue);
         voxels.upload_all(&voxels_data, &render_device, &render_queue);
+    }
+    // web-vox-color-divergence (2026-05-18) — one-shot palette upload trace.
+    // Logs the GPU upload event with palette length + first 5 packed entries.
+    // Demoted to `debug!` post-fix (Decision D-LOGS-DEBUG-NOT-TRACE); reachable
+    // via `RUST_LOG=bevy_naadf=debug` for future regression diagnosis. The
+    // matching `[palette-install]` logs in `voxel/grid.rs` and the
+    // `[palette-refresh]` log in `extract.rs` complete the trace.
+    // **DO NOT REMOVE** — this is the smoke detector for the
+    // `web-vox-color-divergence` regression class.
+    {
+        let preview: Vec<[u32; 4]> = voxel_types_data
+            .iter()
+            .take(5)
+            .map(|e| e.data)
+            .collect();
+        debug!(
+            "[palette-upload] prepare_world_gpu uploading voxel_types to GPU \
+             (palette_len={}, first_5_raw={:?})",
+            voxel_types_data.len(),
+            preview,
+        );
     }
     voxel_types.upload_all(&voxel_types_data, &render_device, &render_queue);
 

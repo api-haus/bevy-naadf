@@ -202,6 +202,11 @@ pub struct PbrVisualState {
     /// by the `--pbr-hard-edge` gate. Inlined for the same SystemParam
     /// arity reason as `debug_modes` above.
     pub hard_edge: super::pbr_hard_edge::PbrHardEdgeState,
+    /// `--vox-web-parity` parity gate capture sub-state. Inlined here to
+    /// keep the `e2e_driver` `SystemParam` count under Bevy 0.19's
+    /// `IntoSystemSet` arity ceiling (same pattern as `debug_modes` +
+    /// `hard_edge`).
+    pub vox_web_parity: super::vox_web_parity::VoxWebParityState,
 }
 
 // ---------------------------------------------------------------------------

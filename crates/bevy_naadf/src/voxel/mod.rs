@@ -9,8 +9,12 @@
 //! the C# traversal shader uses (`02-research.md` §1.1.2, divergence #3) so the
 //! eventual WGSL traversal port bit-matches the algorithm.
 
+pub mod async_vox;
 pub mod grid;
 pub mod vox_import;
+
+#[cfg(target_arch = "wasm32")]
+pub mod web_vox;
 
 use bevy::prelude::Vec3;
 

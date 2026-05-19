@@ -32,9 +32,12 @@ pub mod pbr_visual;
 pub mod readback;
 pub mod small_edit_repro;
 pub mod small_edit_visual;
+pub mod ssim;
+pub mod tracing_error_counter;
 pub mod vox_e2e;
 pub mod vox_gpu_construction;
 pub mod vox_gpu_oracle;
+pub mod vox_web_parity;
 
 use bevy::camera::Hdr;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -230,11 +233,11 @@ pub fn add_e2e_systems(app: &mut App) {
         .init_resource::<small_edit_repro::SmallEditReproState>()
         .init_resource::<vox_gpu_oracle::VoxGpuOracleState>()
         // `PbrVisualState` carries the `--pbr-visual` capture AND the
-        // embedded `PbrDebugModesState` + `PbrHardEdgeState` sub-resources
-        // for `--pbr-debug-modes` / `--pbr-hard-edge` (merged so the
-        // `e2e_driver` system stays under Bevy 0.19's `SystemParam`
-        // tuple-arity ceiling).
+        // embedded `PbrDebugModesState`, `PbrHardEdgeState`, and
+        // `VoxWebParityState` sub-resources (merged so the `e2e_driver`
+        // system stays under Bevy 0.19's `SystemParam` tuple-arity ceiling).
         .init_resource::<pbr_visual::PbrVisualState>()
+        .init_resource::<tracing_error_counter::TracingErrorCounter>()
         .add_systems(Startup, setup_e2e_camera)
         // The driver owns the deterministic camera motion — it writes the
         // camera `Transform` + `PositionSplit` during the `MOTION` / `SETTLE`
@@ -273,6 +276,12 @@ pub fn add_e2e_systems(app: &mut App) {
                 // PBR-raymarching `--pbr-visual` camera pin. Same ordering
                 // as the other pins.
                 pbr_visual::pin_pbr_visual_camera
+                    .after(oasis_edit_visual::pin_oasis_camera),
+                // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 —
+                // parity gate camera pin. Runs `.after(pin_oasis_camera)`
+                // for the same override reason `pin_vox_gpu_oracle_camera`
+                // does.
+                vox_web_parity::pin_vox_web_parity_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
                 .before(crate::camera::sync_position_split),

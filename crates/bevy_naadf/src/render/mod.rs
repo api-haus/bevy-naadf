@@ -45,6 +45,10 @@ use extract::{
     stage_world_gpu_buildonce, ExtractedCameraData, ExtractedCameraHistory,
     ExtractedDebugView, ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
 };
+// web-vox-color-divergence (2026-05-18) — `VoxelTypesRefresh` is consumed by
+// `prepare_world_gpu` via `crate::render::extract::VoxelTypesRefresh` path
+// import (mirrors how `WorldGpuStaging` is referenced). No `use` import here
+// because nothing in this module body references it directly.
 use gi::prepare_gi;
 // Phase B Batch 6 (`09-design-b.md` §11 Batch 6 steps 17-18): the `base/` TAA
 // path is rewired — `naadf_taa_reproject_node` (now the `base/` variant) +

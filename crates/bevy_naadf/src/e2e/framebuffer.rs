@@ -257,6 +257,22 @@ impl Framebuffer {
         ]
     }
 
+    /// Maximum-of-channel-means over `rect`. Returns the largest of
+    /// `(mean_R, mean_G, mean_B)`, each in `0.0..=255.0`. Useful for
+    /// "the frame has at least one colored channel above floor X" gates
+    /// where Rec.709 luminance is too lossy (a green-only frame has
+    /// `lum ≈ 180` but R+B near zero; a colorless dark-blue-gray frame has
+    /// `lum ≈ 10`).
+    ///
+    /// Added by `web-vox-color-divergence` (2026-05-18) Decision 4 to catch
+    /// the near-black-but-structurally-correct regression class the
+    /// luminance-only gate at `vox_e2e.rs:402-433` and the SSIM-only gate
+    /// at `vox_web_parity.rs:117-190` are blind to.
+    pub fn region_channel_max(&self, rect: Rect) -> f32 {
+        let m = self.region_mean(rect);
+        m[0].max(m[1]).max(m[2])
+    }
+
     /// Rec.709-ish luminance of an RGB(A) triple, channels in `0.0..=255.0`.
     pub fn luminance(rgba: [f32; 4]) -> f32 {
         0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
