@@ -43,16 +43,17 @@ pub use chunk_source::{
 pub use noise_dispatch::{
     build_noise_terrain_params, build_noise_terrain_shader_src,
     create_noise_terrain_params_buffer, extract_streaming_state,
-    noise_terrain_layout_descriptor, queue_noise_terrain_pipeline,
-    queue_noise_terrain_pipeline_with_handle, seed_noise_terrain_shader,
-    clear_streaming_bound_slots, upload_window_indirection, NoiseTerrainParams,
-    StreamingExtractRender, StreamingShaderHandle, NOISE_TERRAIN_SHADER_PATH,
-    NOISE_TERRAIN_SHADER_SRC,
+    noise_terrain_layout_descriptor, push_dispatched_once_ack,
+    queue_noise_terrain_pipeline, queue_noise_terrain_pipeline_with_handle,
+    seed_noise_terrain_shader, clear_streaming_bound_slots,
+    upload_window_indirection, NoiseTerrainParams, StreamingExtractRender,
+    StreamingShaderHandle, NOISE_TERRAIN_SHADER_PATH, NOISE_TERRAIN_SHADER_SRC,
 };
 pub use residency::{
-    assert_vram_budget_sufficient, compute_slab_total_mib, residency_driver,
-    segment_to_voxel_origin, target_origin_for_camera_seg, world_voxel_to_segment,
-    Residency, SlotIndex, WorldSegmentPos, SEGMENT_CHUNKS, SEGMENT_VOXELS,
+    apply_dispatch_acks, assert_vram_budget_sufficient, compute_slab_total_mib,
+    residency_driver, segment_to_voxel_origin, target_origin_for_camera_seg,
+    world_voxel_to_segment, Residency, SlotIndex, WorldSegmentPos, SEGMENT_CHUNKS,
+    SEGMENT_VOXELS,
 };
 pub use windowed_slot_map::{WindowedSlotMap, EMPTY_SLOT};
 
@@ -73,9 +74,23 @@ impl Plugin for StreamingPlugin {
         // handle (via the extract) and queue the noise_terrain pipeline
         // lazily once streaming is active.
         app.add_systems(Startup, seed_noise_terrain_shader);
+        // streaming-world Phase 2.13
+        // (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md`
+        // MUST-1) — drain the render→main ACK accumulator BEFORE the
+        // residency driver picks the frame's admissions. Slots that were
+        // dispatched by the previous frame's render-world producer enter
+        // `Residency::dispatched_once` here, and the filter at
+        // `residency.rs:502` then correctly excludes them from re-pick.
+        // Sequencing: `apply_dispatch_acks.before(residency_driver)`.
         // Main-world residency driver. `PreUpdate` so the per-frame
         // admissions/evictions are visible to the render extract that follows.
-        app.add_systems(PreUpdate, residency_driver);
+        app.add_systems(
+            PreUpdate,
+            (
+                apply_dispatch_acks,
+                residency_driver.after(apply_dispatch_acks),
+            ),
+        );
         // Production-side camera-position tracker (`03j` Phase 2.9 fix):
         // re-derives `Transform.translation` to window-local each tick from
         // a separately-tracked absolute world position, so the additive

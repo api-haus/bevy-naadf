@@ -533,8 +533,16 @@ pub fn e2e_driver(
     let noise_static_mode = app_args
         .as_deref()
         .is_some_and(|a| a.noise_static_mode);
+    // streaming-world Phase 2.13
+    // (`03r-diagnosis-cold-start-gap.md` MUST-2) — cold-start gate also
+    // routes into the OasisWarmup state machine, but its Apply phase
+    // skips the camera walk (the gate inspects the SPAWN-pose segments,
+    // which a walk would evict from the window).
+    let streaming_cold_start_mode = app_args
+        .as_deref()
+        .is_some_and(|a| a.streaming_cold_start_mode);
     if (oasis_mode || vox_gpu_construction_mode || streaming_window_mode
-        || noise_static_mode)
+        || noise_static_mode || streaming_cold_start_mode)
         && state.phase == E2ePhase::Warmup
         && state.phase_ticks == 0
     {
@@ -1029,6 +1037,16 @@ pub fn e2e_driver(
                 if vox_gpu_construction_mode {
                     let _ = &mut wd;
                     super::vox_gpu_construction::promote_camera_to_pose_b();
+                } else if streaming_cold_start_mode {
+                    // streaming-world Phase 2.13 — must check BEFORE
+                    // `streaming_window_mode` because the cold-start
+                    // gate's `apply_streaming_cold_start_defaults` keeps
+                    // `streaming_window_mode = true` (so the spawn-pose
+                    // camera pin still fires). The walk-skip branch
+                    // below for cold-start is the load-bearing one: do
+                    // NOT call `promote_camera_to_walk`; the snapshot
+                    // captures cold-start state at the spawn pose.
+                    let _ = &mut wd;
                 } else if streaming_window_mode {
                     // streaming-world Phase 2 — instead of applying a brush
                     // edit (the procedural world doesn't have anything to
@@ -1052,6 +1070,18 @@ pub fn e2e_driver(
                     // (a0b) branch; the OasisWaitPostEdit phase that
                     // follows is the actual settling time for TAA + GI to
                     // converge over the populated world.
+                    let _ = &mut wd;
+                } else if streaming_cold_start_mode {
+                    // streaming-world Phase 2.13 — no brush, no camera
+                    // walk. The cold-start gate inspects the SPAWN-pose
+                    // segments; walking would evict those segments before
+                    // the snapshot reads them. The OasisWaitPostEdit
+                    // phase that follows is the drain interval for the
+                    // chunks_buffer readback to land (the snapshot was
+                    // requested in `request_snapshot_after_warmup` when
+                    // the driver entered OasisShootBefore — synchronous
+                    // map_async + device.poll already completed by the
+                    // time the readback system finished its tick).
                     let _ = &mut wd;
                 } else {
                     super::oasis_edit_visual::apply_erase_brush(&mut wd);
@@ -1156,6 +1186,25 @@ pub fn e2e_driver(
                         .map(|msg| {
                             println!("e2e_render --vox-gpu-construction: {msg}");
                         })
+                    } else if streaming_cold_start_mode {
+                        // streaming-world Phase 2.13 — content-based
+                        // cold-start assertion. Must come BEFORE
+                        // `streaming_window_mode` because the cold-start
+                        // gate's defaults keep streaming_window_mode = true
+                        // (so the spawn-pose camera pin works); we route
+                        // here to read the chunks_buffer snapshot instead
+                        // of the residency-shift framebuffer compare.
+                        let _ = (&a, &b);
+                        let args_ref = app_args.as_deref().expect(
+                            "AppArgs must be present at OasisAssert in \
+                             streaming-cold-start mode",
+                        );
+                        super::streaming_cold_start::assert_streaming_cold_start_landed(
+                            args_ref,
+                        )
+                        .map(|msg| {
+                            println!("e2e_render --streaming-cold-start: {msg}");
+                        })
                     } else if streaming_window_mode {
                         // streaming-world Phase 2 — compute the residency-
                         // origin shift in X (Pose A snapshot vs current).
@@ -1214,6 +1263,15 @@ pub fn e2e_driver(
                             super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
                             super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
                             super::vox_gpu_construction::VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
+                        );
+                    } else if streaming_cold_start_mode {
+                        println!(
+                            "e2e_render: streaming-cold-start PASS — \
+                             cold-start admission drain produced \
+                             non-empty content in every camera-row \
+                             segment (dsq ≤ 2 ring at spawn pose); \
+                             Phase 2.13 deferred-`dispatched_once` ACK \
+                             pipeline holding."
                         );
                     } else if streaming_window_mode {
                         println!(

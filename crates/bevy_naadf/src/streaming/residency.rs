@@ -510,6 +510,56 @@ fn process_pending_admissions(residency: &mut Residency) {
 
     for (slot, world, _dsq) in candidates.into_iter().take(cap) {
         residency.admissions_this_frame.push((world, slot));
+        // streaming-world Phase 2.13
+        // (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md`
+        // MUST-1) — the previous `residency.dispatched_once.insert(slot)`
+        // call lived here. It was REMOVED because it fired BEFORE the
+        // render-world producer node had a chance to run; the producer's
+        // 11+ early-return guards (pipelines compiling, `WorldGpu` not
+        // yet allocated, bind groups not yet built, …) silently skipped
+        // the per-segment dispatch every frame they triggered, while the
+        // main-world filter at line 502 excluded the burned slots from
+        // re-pick forever (until eviction). Result: 4-24 camera-nearest
+        // slots stayed UNIFORM_EMPTY = sky, producing the visible
+        // cold-start gap at the camera spawn position (`03r` § Image-8
+        // segment identification).
+        //
+        // Fix: the render-world producer pushes the slot id onto
+        // `PENDING_DISPATCHED_ONCE_SLOTS` (`noise_dispatch.rs`) AFTER each
+        // successful `render_queue.submit`. The main-world
+        // `apply_dispatch_acks` system (PreUpdate, `.before(residency_driver)`)
+        // drains that accumulator into `dispatched_once`. A slot now
+        // only enters `dispatched_once` after the GPU work for it has
+        // been submitted — surviving the Frame-0 race.
+    }
+}
+
+/// streaming-world Phase 2.13
+/// (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md` MUST-1)
+/// — main-world `PreUpdate` system that drains the cross-world
+/// `PENDING_DISPATCHED_ONCE_SLOTS` accumulator and marks each ack'd slot
+/// Resident in `Residency::dispatched_once`. Runs `.before(residency_driver)`
+/// so the next residency tick's filter at
+/// [`process_pending_admissions`] sees fresh acks before it picks the
+/// frame's admissions.
+///
+/// Cheap: drains one `Vec<SlotIndex>` per frame (typically 0-4 entries at
+/// steady-state; up to ~24 across cold-start). Early-returns when the
+/// `Residency` resource is missing (non-streaming presets).
+pub fn apply_dispatch_acks(residency: Option<ResMut<Residency>>) {
+    let acks: Vec<SlotIndex> = match super::noise_dispatch::PENDING_DISPATCHED_ONCE_SLOTS
+        .lock()
+    {
+        Ok(mut acc) => std::mem::take(&mut *acc),
+        Err(_) => return,
+    };
+    if acks.is_empty() {
+        return;
+    }
+    let Some(mut residency) = residency else {
+        return;
+    };
+    for slot in acks {
         residency.dispatched_once.insert(slot);
     }
 }
@@ -684,9 +734,13 @@ mod tests {
     /// Phase 2.6 — migrated regression catcher (Phase 2.5's
     /// `slot_admissions_eventually_drain_to_resident`).
     ///
-    /// Asserts the count of "bound AND not-yet-dispatched" slots strictly
-    /// DECREASES each tick under the new model. Bound∧!dispatched ≡
-    /// Phase-2.5's `Generating`.
+    /// streaming-world Phase 2.13 update: `process_pending_admissions` no
+    /// longer auto-inserts into `dispatched_once`. The drain is now
+    /// produced by the render-world ACK accumulator; the unit-test
+    /// simulates that by inserting into `dispatched_once` after each
+    /// pick (the same effect `apply_dispatch_acks` would have on the
+    /// next frame). The original invariant (bound∧!dispatched strictly
+    /// decreases tick-over-tick under the ack pipeline) survives.
     #[test]
     fn slot_admissions_eventually_drain_to_resident() {
         let mut residency = Residency::empty(4);
@@ -722,6 +776,15 @@ mod tests {
                 "tick {tick}: process_pending_admissions picked {admitted}, \
                  expected min(4, generating={prev_count})",
             );
+            // Phase 2.13 — simulate the render-world ack arriving on the
+            // SAME tick (the production path runs `apply_dispatch_acks`
+            // at `PreUpdate` of the NEXT tick, but for this unit test
+            // we collapse the round-trip — the invariant is that an
+            // ack'd slot stops being picked, not that the round-trip
+            // takes a particular number of ticks).
+            for (_, slot) in &residency.admissions_this_frame {
+                residency.dispatched_once.insert(*slot);
+            }
             let now_count = count_generating(&residency);
             assert!(
                 now_count < prev_count,
@@ -739,5 +802,41 @@ mod tests {
             dispatched.insert(s.0);
         }
         assert_eq!(dispatched.len(), 12);
+    }
+
+    /// streaming-world Phase 2.13
+    /// (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md`
+    /// MUST-1) — `process_pending_admissions` no longer marks slots
+    /// Resident at pick time. The slot list it picks ends up in
+    /// `admissions_this_frame` only; `dispatched_once` stays empty
+    /// until the render-world ACK lands.
+    ///
+    /// Before Phase 2.13 the line `residency.dispatched_once.insert(slot)`
+    /// fired alongside the push to `admissions_this_frame`; this regression
+    /// catcher asserts that line is GONE.
+    #[test]
+    fn process_pending_admissions_does_not_mark_dispatched_once() {
+        let mut residency = Residency::empty(4);
+        for slot_i in 0..4u32 {
+            let s = residency.window.allocate().expect("slot");
+            residency
+                .window
+                .bind(WorldSegmentPos(IVec3::new(slot_i as i32, 0, 0)), s);
+        }
+        residency.last_camera_seg = Some(IVec3::ZERO);
+        assert_eq!(residency.dispatched_once.len(), 0);
+
+        process_pending_admissions(&mut residency);
+        assert_eq!(
+            residency.admissions_this_frame.len(),
+            4,
+            "expected 4 admissions picked"
+        );
+        assert_eq!(
+            residency.dispatched_once.len(),
+            0,
+            "Phase 2.13: dispatched_once must NOT be populated until the \
+             render-world ACK fires via PENDING_DISPATCHED_ONCE_SLOTS"
+        );
     }
 }

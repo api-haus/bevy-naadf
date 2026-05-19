@@ -31,6 +31,7 @@ pub mod readback;
 pub mod small_edit_repro;
 pub mod small_edit_visual;
 pub mod streaming_aadf_parity;
+pub mod streaming_cold_start;
 pub mod streaming_framebuffer_diff;
 pub mod vox_e2e;
 pub mod streaming_window;
@@ -285,6 +286,19 @@ pub fn add_e2e_systems(app: &mut App) {
                 // Inactive on non-parity gates (early-returns on
                 // `args.streaming_aadf_parity_mode = false`).
                 streaming_aadf_parity::request_snapshot_after_walk
+                    .after(streaming_window::pin_streaming_window_camera),
+                // streaming-world Phase 2.13
+                // (`03r-diagnosis-cold-start-gap.md` MUST-2) — request
+                // the chunks_buffer snapshot once the warmup completes
+                // and the driver enters the Oasis Shoot* / Apply / Wait
+                // phases. Reuses the parity gate's readback infrastructure
+                // (chunks_buffer + indirection table) but triggers
+                // EARLIER (warmup-complete vs walk-complete) so the
+                // snapshot captures cold-start state BEFORE any
+                // camera-walk eviction takes the camera-row segments
+                // out of the window. Inactive on non-cold-start gates
+                // (early-returns on `args.streaming_cold_start_mode = false`).
+                streaming_cold_start::request_snapshot_after_warmup
                     .after(streaming_window::pin_streaming_window_camera),
                 // streaming-world Phase 2.4 — pin the camera at the static
                 // preset's centre pose. Runs `.after(pin_oasis_camera)` for

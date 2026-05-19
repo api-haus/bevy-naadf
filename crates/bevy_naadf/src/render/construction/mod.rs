@@ -3111,7 +3111,30 @@ pub fn naadf_gpu_producer_node(
         // streaming-world Phase 2.11 — `world_gpu` is required by Items 2+3
         // (clear slot region + scoped W3 re-seed dispatch). Bail when it
         // isn't present yet (first-frame prepare-resources race).
-        let Some(world_gpu) = world_gpu.as_deref() else {
+        //
+        // streaming-world Phase 2.13 (`03r` SHOULD-2) — surface the
+        // condition once via `warn_once!`. Pre-Phase-2.13 this was a
+        // silent early-return, contributing to the cold-start gap by
+        // burning admission slots without anyone noticing. The warning
+        // is harmless during the legitimate 1-3 frame Frame-0 race; if
+        // it persists into steady-state that's the regression signal.
+        // Phase 2.13: bind so the guard runs but suppress unused — the
+        // SHOULD-1 removal of the per-admission `clear_buffer` was the
+        // sole consumer inside this branch. The `world_gpu` guard remains
+        // load-bearing as a producer-side readiness check (the bind-group
+        // build, params-buffer alloc, and `clear_streaming_bound_slots`
+        // ALL gate on `WorldGpu`; firing the producer before any of those
+        // produces garbage). Keep the early-return.
+        let Some(_world_gpu) = world_gpu.as_deref() else {
+            bevy::log::warn_once!(
+                "streaming-world Phase 2.13: producer node early-returned \
+                 because WorldGpu is not yet present (asynchronous \
+                 `prepare_world_gpu` 1-3 frame race). Expected once at \
+                 cold-start; persistent firing into steady-state is a \
+                 regression signal (`03r-diagnosis-cold-start-gap.md` \
+                 root cause — the dispatched-once accumulator now \
+                 survives this race, so a single occurrence is benign)."
+            );
             return;
         };
         //
@@ -3307,42 +3330,34 @@ pub fn naadf_gpu_producer_node(
                     label: Some("naadf_streaming_segment_encoder"),
                 },
             );
-            // streaming-world Phase 2.11
-            // (`docs/orchestrate/streaming-world/03n-diagnosis-aadf-building.md`
-            // punch-list item 3) — zero the slot's `chunks_buffer` region
-            // BEFORE chunk_calc writes new content. Reasons:
+            // streaming-world Phase 2.13
+            // (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md`
+            // SHOULD-1) — the Phase 2.11 per-admission `clear_buffer` that
+            // zeroed `slot.0 * 32 KiB` of chunks_buffer here is REMOVED.
+            // Two reasons it's now redundant:
             //
-            //   (a) An evicted slot's previous `chunks_buffer` bytes (state
-            //       + 5-bit AADFs) persist until chunk_calc overwrites them.
-            //       Between eviction and re-admission of THIS slot to a NEW
-            //       world segment, the indirection table points the new
-            //       local position at this slot — readers see stale data
-            //       until chunk_calc fires.
-            //   (b) Steady-state boundary crossings evict 32 slots and admit
-            //       32 new ones over ~8 frames at 4/frame. During those 8
-            //       frames the indirection points the new locals at slots
-            //       still carrying old segment data. W3 chain neighbour
-            //       reads through those slots would see stale AADFs.
+            //   (a) `PENDING_CLEAR_ON_BIND_SLOTS` (Phase 2.12) accumulates
+            //       every newly-bound slot across the cross-world
+            //       extract→drain handshake and the render-world
+            //       `clear_streaming_bound_slots` system zeroes them
+            //       BEFORE the producer's per-admission dispatch fires.
+            //       The accumulator survives the Frame-0 `WorldGpu`-not-
+            //       ready race window.
             //
-            // chunk_calc DOES overwrite every chunk in the slot
-            // (`chunk_calc.wgsl:447-470` — 4096 workgroups, one per chunk;
-            // writes `chunks[idx] = vec2<u32>(state, 0u)`), so post-
-            // chunk_calc the slot is clean. But the explicit pre-clear here
-            // forecloses any "stale data visible mid-encoder" subtle bug
-            // (e.g. if a future change adds a read between encoder start and
-            // chunk_calc dispatch). Cost: one ClearBuffer = ~50 us / segment
-            // for 4 admissions = 200 us / frame; negligible.
-            const CHUNKS_PER_SLOT: u32 = 4096;
-            const CHUNK_PAIR_BYTES: u64 = 8; // vec2<u32>
-            let slot_chunk_offset_bytes =
-                (slot.0 as u64) * (CHUNKS_PER_SLOT as u64) * CHUNK_PAIR_BYTES;
-            let slot_chunk_size_bytes =
-                (CHUNKS_PER_SLOT as u64) * CHUNK_PAIR_BYTES;
-            seg_encoder.clear_buffer(
-                &world_gpu.chunks_buffer,
-                slot_chunk_offset_bytes,
-                Some(slot_chunk_size_bytes),
-            );
+            //   (b) Phase 2.13's deferred-`dispatched_once` semantic
+            //       (MUST-1) makes "slot marked Resident before dispatch
+            //       lands" impossible — readers can't observe a
+            //       pre-dispatch slot any more, because such a slot is
+            //       still NOT in `dispatched_once` and so isn't
+            //       considered admitted from the residency driver's
+            //       perspective. The "stale data visible mid-encoder"
+            //       belt that Phase 2.11 added is no longer needed.
+            //
+            // chunk_calc DOES overwrite every chunk in the slot via 4096
+            // workgroups (`chunk_calc.wgsl:447-470` — writes
+            // `chunks[idx] = vec2<u32>(state, 0u)`), so post-chunk_calc
+            // the slot is clean even without an explicit pre-clear.
+            //
             // (a) Dispatch noise_terrain: writes `segment_voxel_buffer`.
             {
                 let mut pass = seg_encoder.begin_compute_pass(
@@ -3388,6 +3403,22 @@ pub fn naadf_gpu_producer_node(
                 CHUNKS_PER_SEGMENT,
             );
             render_queue.submit([seg_encoder.finish()]);
+            // streaming-world Phase 2.13
+            // (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md`
+            // MUST-1) — push slot id onto the cross-world ACK accumulator
+            // AFTER `render_queue.submit` lands. All 11+ early-return
+            // guards above (`p_noise_id`, `p_noise`, `noise_bg`,
+            // `noise_params_buf`, `bounds_params_buf`, `world_gpu`, …)
+            // have been cleared by this point — the submit is the GPU
+            // commit. Next frame's main-world `apply_dispatch_acks`
+            // (PreUpdate, `.before(residency_driver)`) drains the
+            // accumulator into `Residency::dispatched_once` so the
+            // residency filter at `residency.rs:502` correctly excludes
+            // the slot from re-pick. Pre-Phase-2.13 the
+            // `dispatched_once.insert` fired in `process_pending_admissions`
+            // BEFORE the producer had a chance to early-return on the
+            // Frame-0 race window — the cold-start gap diagnosed in `03r`.
+            crate::streaming::push_dispatched_once_ack(*slot);
             segments_dispatched += 1;
         }
 

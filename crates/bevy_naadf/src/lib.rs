@@ -443,6 +443,23 @@ pub struct AppArgs {
     /// 2.11 bug class (W3 chain baking long stale skips through yet-to-be-
     /// admitted zero-chunks).
     pub streaming_aadf_parity_mode: bool,
+    /// streaming-world Phase 2.13
+    /// (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md`
+    /// MUST-2) — runs the `--gate streaming-cold-start` e2e gate.
+    ///
+    /// When `true`, the e2e harness boots
+    /// `GridPreset::ProceduralStreaming` at the configured budget, warms
+    /// up for `STREAMING_COLD_START_WARMUP_FRAMES` ticks (well past the
+    /// 512/4 = 128-frame cold-start drain), and then captures a content
+    /// snapshot of the `chunks_buffer` + indirection table. The assertion
+    /// walks the camera-row segments (the segments diagnosed in
+    /// `03r-diagnosis-cold-start-gap.md` § Image-8 segment identification
+    /// as the load-bearing failure set under the pre-Phase-2.13 race)
+    /// and verifies each has ≥1 non-UNIFORM_EMPTY chunk — i.e. real
+    /// dispatched content. Catches the Phase 2.12 regression class the
+    /// loose-SSIM `streaming-framebuffer-diff` gate misses. See
+    /// `crate::e2e::streaming_cold_start`.
+    pub streaming_cold_start_mode: bool,
     /// streaming-world Phase 2.12
     /// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § A,
     /// MUST-3) — `true` when the e2e harness is running the **static
@@ -518,6 +535,7 @@ impl Default for AppArgs {
             vox_gpu_oracle_gpu_phase: false,
             streaming_window_mode: false,
             streaming_aadf_parity_mode: false,
+            streaming_cold_start_mode: false,
             streaming_framebuffer_static_phase: false,
             streaming_framebuffer_streaming_phase: false,
             noise_static_mode: false,

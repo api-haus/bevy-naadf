@@ -373,6 +373,57 @@ impl Default for StreamingExtractRender {
 pub static PENDING_CLEAR_ON_BIND_SLOTS: std::sync::Mutex<Vec<SlotIndex>> =
     std::sync::Mutex::new(Vec::new());
 
+/// streaming-world Phase 2.13
+/// (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md` MUST-1)
+/// — cross-world ACK accumulator for slot dispatches that the render-world
+/// producer has actually submitted.
+///
+/// **Direction**: render world (producer node) APPENDS post-`submit`; main
+/// world (`apply_dispatch_acks` in `PreUpdate`) DRAINS and inserts into
+/// `Residency::dispatched_once`. Mirrors `PENDING_CLEAR_ON_BIND_SLOTS`'s
+/// shape, but reverses the data flow.
+///
+/// **Why static**: same rationale as `PENDING_CLEAR_ON_BIND_SLOTS` — the
+/// render-world `naadf_gpu_producer_node` writes from inside the render
+/// graph's `Core3d::PostProcess` set; passing a `Resource` borrow into the
+/// node would require it on the node's `In<…>` query, which is not how
+/// the existing producer node is structured. A static `Mutex<Vec>` is the
+/// minimum-surface analogue.
+///
+/// **Why deferred**: pre-Phase-2.13, `process_pending_admissions` inserted
+/// slot ids into `Residency::dispatched_once` UNCONDITIONALLY at the moment
+/// it picked them (`residency.rs:513`). The render-world producer node has
+/// 11+ silent early-return paths covering "pipelines not yet compiled",
+/// "WorldGpu not yet allocated", "bind groups not yet built", "params
+/// buffers not yet allocated", etc. — every frame these fire, the main
+/// world has already burned the slot into `dispatched_once` without the
+/// dispatch firing. The filter at `residency.rs:502` then excludes those
+/// slots forever (until eviction), and the chunks_buffer regions stay at
+/// UNIFORM_EMPTY (the clear-on-bind state) — the cold-start gap diagnosed
+/// in `03r`.
+///
+/// **Steady-state behaviour**: in the steady state, every frame the
+/// producer dispatches `min(admissions_this_frame.len(),
+/// max_segments_per_frame)` segments and pushes their slot ids here; next
+/// frame's `apply_dispatch_acks` drains and inserts into
+/// `dispatched_once`. Re-pick is impossible because the filter excludes
+/// `dispatched_once` members. There is a single-frame window where a slot
+/// can be re-picked — see `03s-impl-cold-start-fix.md` § Pre-impl
+/// self-review Q1 for the race analysis (verdict: harmless, deterministic
+/// duplicate dispatch).
+pub static PENDING_DISPATCHED_ONCE_SLOTS: std::sync::Mutex<Vec<SlotIndex>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Producer-node helper: push a slot id onto `PENDING_DISPATCHED_ONCE_SLOTS`
+/// after a successful `render_queue.submit`. Public so
+/// `render/construction/mod.rs::naadf_gpu_producer_node` can call it from
+/// the streaming branch.
+pub fn push_dispatched_once_ack(slot: SlotIndex) {
+    if let Ok(mut acc) = PENDING_DISPATCHED_ONCE_SLOTS.lock() {
+        acc.push(slot);
+    }
+}
+
 pub fn extract_streaming_state(
     mut commands: Commands,
     main_world: ResMut<bevy::render::MainWorld>,

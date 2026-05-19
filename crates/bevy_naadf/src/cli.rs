@@ -287,6 +287,9 @@ fn apply_gate_defaults(args: &mut AppArgs, gate: Gate) {
         Gate::StreamingAadfParity => {
             crate::e2e::streaming_aadf_parity::apply_streaming_aadf_parity_defaults(args);
         }
+        Gate::StreamingColdStart => {
+            crate::e2e::streaming_cold_start::apply_streaming_cold_start_defaults(args);
+        }
         Gate::StreamingFramebufferDiff => {
             // Top-level subprocess orchestrator; short-circuited in main
             // BEFORE build_app (mirrors `Gate::VoxGpuOracle`). No defaults
@@ -398,6 +401,16 @@ pub enum Gate {
     /// distances that cross real terrain). Catches the Phase 2.11
     /// regression class (`03n-diagnosis-aadf-building.md` § Root cause).
     StreamingAadfParity,
+    /// streaming-world Phase 2.13
+    /// (`docs/orchestrate/streaming-world/03r-diagnosis-cold-start-gap.md`
+    /// MUST-2) — content-checking cold-start gate. Boots the streaming
+    /// preset, warms up past the 128-frame cold-start drain, captures
+    /// chunks_buffer + indirection, and asserts the 14 camera-row
+    /// segments (dsq ≤ 2 ring around the spawn pose at seg (8, 1, 8))
+    /// each have ≥1 non-UNIFORM_EMPTY chunk. Catches the cold-start
+    /// admission-race bug at the level of decoded chunk state, not
+    /// framebuffer SSIM.
+    StreamingColdStart,
     /// streaming-world Phase 2.12
     /// (`docs/orchestrate/streaming-world/02e-design-phase-2-12.md` § A,
     /// MUST-3) — observable-output gate. Spawns two subprocesses (static
@@ -468,6 +481,7 @@ impl Gate {
             Gate::Baseline => "baseline",
             Gate::StreamingWindow => "streaming-window",
             Gate::StreamingAadfParity => "streaming-aadf-parity",
+            Gate::StreamingColdStart => "streaming-cold-start",
             Gate::StreamingFramebufferDiff => "streaming-framebuffer-diff",
             Gate::StreamingFramebufferStatic => "streaming-framebuffer-static",
             Gate::StreamingFramebufferStreaming => "streaming-framebuffer-streaming",
