@@ -190,6 +190,16 @@ pub mod device_snapshot {
     /// `[aadf-probe]` convention so the Playwright filter is regex-cheap.
     pub const SENTINEL_PREFIX: &str = "[device-snapshot]";
 
+    /// Closing sentinel — Bevy's wasm32 `info!` formatter appends a
+    /// trailing `target:`/span-metadata payload AFTER the message text,
+    /// so the spec can't rely on "everything after `[device-snapshot]` is
+    /// JSON." The emitter now wraps the JSON between
+    /// `SENTINEL_PREFIX … END_SENTINEL` and the spec extracts the
+    /// substring between them. Added after a Playwright run captured
+    /// 5812 bytes for a 5730-byte JSON body — 82 bytes of trailing
+    /// tracing-formatter metadata broke `JSON.parse`.
+    pub const END_SENTINEL: &str = "[device-snapshot-end]";
+
     #[derive(Serialize, Debug, Clone)]
     pub struct DeviceSnapshot {
         pub schema_version: u32,
@@ -435,7 +445,7 @@ pub mod device_snapshot {
         // convention (the project's `RUST_LOG`/`LogPlugin` filter does not
         // include a custom-target allowlist, so untargeted info lines are
         // the path of guaranteed-reaches-console-on-web).
-        info!("{} {}", SENTINEL_PREFIX, json);
+        info!("{} {} {}", SENTINEL_PREFIX, json, END_SENTINEL);
 
         // 2) Native: write JSON to `target/diagnostics/device-snapshot-native.json`.
         //    On wasm32 std::fs is unavailable, so the wasm path relies on

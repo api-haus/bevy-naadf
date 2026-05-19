@@ -30,6 +30,11 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const DIAG_DIR = path.join(REPO_ROOT, "target", "diagnostics");
 const WEB_SNAPSHOT_PATH = path.join(DIAG_DIR, "device-snapshot-web.json");
 const SENTINEL = "[device-snapshot]";
+// Closing sentinel — Bevy's wasm32 info!() formatter appends trailing
+// tracing metadata after the message body, which broke JSON.parse when we
+// captured "everything after the start sentinel." Now we extract the
+// substring strictly between the two markers.
+const END_SENTINEL = "[device-snapshot-end]";
 
 test.describe("WASM device snapshot capture", () => {
   test.use({
@@ -50,17 +55,23 @@ test.describe("WASM device snapshot capture", () => {
     let snapshotLine: string | null = null;
     page.on("console", (msg: ConsoleMessage) => {
       const text = msg.text();
-      const idx = text.indexOf(SENTINEL);
-      if (idx >= 0 && snapshotLine === null) {
-        // Capture everything AFTER the sentinel + one space. Bevy's
-        // `info!` formatter prepends the level/target prefix; we strip
-        // everything up to and including the sentinel.
-        snapshotLine = text.substring(idx + SENTINEL.length).trim();
-        // eslint-disable-next-line no-console
-        console.log(
-          `[device-snapshot.spec] captured snapshot line (${snapshotLine.length} bytes)`,
-        );
+      const startIdx = text.indexOf(SENTINEL);
+      if (startIdx < 0 || snapshotLine !== null) return;
+      // Find the matching closing sentinel AFTER the start sentinel. The
+      // JSON body lives between them. Bevy's wasm32 `info!` appends
+      // tracing metadata after the message body, so "substring to
+      // end-of-line" yields JSON + ~80 bytes of formatter junk.
+      const afterStart = startIdx + SENTINEL.length;
+      const endIdx = text.indexOf(END_SENTINEL, afterStart);
+      if (endIdx < 0) {
+        // Start sentinel seen, end sentinel not yet — wait for next msg.
+        return;
       }
+      snapshotLine = text.substring(afterStart, endIdx).trim();
+      // eslint-disable-next-line no-console
+      console.log(
+        `[device-snapshot.spec] captured snapshot line (${snapshotLine.length} bytes)`,
+      );
     });
 
     await page.goto("/?ui=hide", { waitUntil: "commit" });
