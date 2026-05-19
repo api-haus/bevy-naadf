@@ -954,7 +954,9 @@ mod tests {
         // X as the pre-walk pose (which had origin (0, 0, 0)).
         let mut res = crate::streaming::Residency::empty(4);
         // Phase 2.6: origin is now mutated via the `WindowedSlotMap` API.
-        res.window.set_origin(IVec3::new(4, 0, 0));
+        // Phase 2.14.b — `set_origin` takes a per-eviction callback; this
+        // residency has no bound segments so the callback never fires.
+        res.window.set_origin(IVec3::new(4, 0, 0), |_, _| {});
 
         let pose_a_world = streaming_window_pose(false);
         let pose_b_world = streaming_window_pose(true);
@@ -991,7 +993,9 @@ mod tests {
         // The translation is stateless — re-running it with the same origin
         // produces the same result (no drift across repeated invocations).
         let mut res = crate::streaming::Residency::empty(4);
-        res.window.set_origin(IVec3::new(4, 0, 2));
+        // Phase 2.14.b — `set_origin` per-eviction callback never fires
+        // since no segments are bound.
+        res.window.set_origin(IVec3::new(4, 0, 2), |_, _| {});
         let world = streaming_window_pose(true);
         let once = translate_world_to_window_local(world, Some(&res));
         let twice = translate_world_to_window_local(world, Some(&res));

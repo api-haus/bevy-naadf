@@ -370,24 +370,30 @@ pub fn residency_driver(
     residency.last_camera_seg = Some(cam_seg_world.0);
 
     // Pass 1 — shift the origin and evict any pairs that fall outside the
-    // new window. `set_origin` returns the (world, slot) pairs that were
-    // unbound; we return their slots to the pool and record them as
-    // evictions for the per-frame delta.
-    let evicted = residency.window.set_origin(new_origin);
-    for (_w, slot) in &evicted {
-        residency.evictions_this_frame.push(*slot);
+    // new window. Phase 2.14.b — the atomic `set_origin` API fires a
+    // per-eviction callback while each slot is still tracked; the slot
+    // is internally pushed back to the free pool after the callback
+    // returns. The previous two-step `set_origin → free` pattern is
+    // gone (it left an in-flight state that violated I2).
+    //
+    // Split-borrow `residency` so the closure captures
+    // `evictions_this_frame` + `dispatched_once` independently from
+    // `window` (Rust allows disjoint-field borrows when the fields are
+    // named directly).
+    let Residency {
+        window,
+        evictions_this_frame,
+        dispatched_once,
+        ..
+    } = &mut *residency;
+    window.set_origin(new_origin, |_w, slot| {
+        // Record the eviction for the per-frame delta the renderer
+        // consumes via `ExtractResource`.
+        evictions_this_frame.push(slot);
         // Drop the dispatched-once marker so the slot can be re-dispatched
-        // after re-allocation.
-        residency.dispatched_once.remove(slot);
-    }
-    // Return evicted slots to the pool. (We could re-bind them to incoming
-    // admissions immediately, but the per-frame admission budget is small
-    // (`max_segments_per_frame = 4`) so the typical-case eviction count is
-    // also small — the round-trip through `free` + `allocate` costs one
-    // Vec push + pop per pair, negligible.)
-    for (_w, slot) in evicted {
-        residency.window.free(slot);
-    }
+        // after a future allocate_and_bind.
+        dispatched_once.remove(&slot);
+    });
 
     // Pass 2 — figure out which target segments are not yet resident; queue
     // them for admission (camera-distance first per D.11).
@@ -428,14 +434,21 @@ pub fn residency_driver(
     // slot.0`, so the renderer reads via the indirection table regardless of
     // which slot index `allocate()` chose. Slot identity is preserved across
     // origin shifts — no GPU memcpy on eviction.
+    //
+    // Phase 2.14.b — atomic API. `allocate_and_bind(w)` collapses the
+    // previous two-step `allocate() + bind(w, slot)` (which left a
+    // transient in-flight state between the two calls) into one atomic
+    // op. Returns `None` only when the pool is empty (the other two
+    // None-conditions — out-of-window, already-bound — are filtered out
+    // upstream by the `is_in_window` window bounds + the `resident` set
+    // diff at Pass 2).
     for w in pending {
-        let Some(slot) = residency.window.allocate() else {
+        let Some(slot) = residency.window.allocate_and_bind(w) else {
             // No empty slots left this frame — leave the rest for the next
             // tick (they'll re-enter `pending` because the target set still
             // includes them).
             break;
         };
-        residency.window.bind(w, slot);
         // streaming-world Phase 2.12 (`02e-design-phase-2-12.md` § B,
         // MUST-1) — record this bind in the clear-on-bind queue so the
         // render world zeroes the slot's `chunks_buffer` region BEFORE
@@ -712,10 +725,10 @@ mod tests {
         for sx in 0..WORLD_SIZE_IN_SEGMENTS.x as i32 {
             for sy in 0..WORLD_SIZE_IN_SEGMENTS.y as i32 {
                 for sz in 0..WORLD_SIZE_IN_SEGMENTS.z as i32 {
-                    let slot = residency.window.allocate().expect("slot");
-                    residency
+                    let slot = residency
                         .window
-                        .bind(WorldSegmentPos(IVec3::new(sx, sy, sz)), slot);
+                        .allocate_and_bind(WorldSegmentPos(IVec3::new(sx, sy, sz)))
+                        .expect("slot");
                     residency.dispatched_once.insert(slot);
                 }
             }
@@ -747,10 +760,10 @@ mod tests {
         // Plant 12 bound segments — more than 1 frame's budget so we
         // observe the drain over multiple cycles.
         for slot_i in 0..12u32 {
-            let s = residency.window.allocate().expect("slot");
-            residency
+            let _s = residency
                 .window
-                .bind(WorldSegmentPos(IVec3::new(slot_i as i32, 0, 0)), s);
+                .allocate_and_bind(WorldSegmentPos(IVec3::new(slot_i as i32, 0, 0)))
+                .expect("slot");
         }
         residency.last_camera_seg = Some(IVec3::ZERO);
 
@@ -818,10 +831,10 @@ mod tests {
     fn process_pending_admissions_does_not_mark_dispatched_once() {
         let mut residency = Residency::empty(4);
         for slot_i in 0..4u32 {
-            let s = residency.window.allocate().expect("slot");
-            residency
+            let _s = residency
                 .window
-                .bind(WorldSegmentPos(IVec3::new(slot_i as i32, 0, 0)), s);
+                .allocate_and_bind(WorldSegmentPos(IVec3::new(slot_i as i32, 0, 0)))
+                .expect("slot");
         }
         residency.last_camera_seg = Some(IVec3::ZERO);
         assert_eq!(residency.dispatched_once.len(), 0);
