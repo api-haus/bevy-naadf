@@ -22,8 +22,11 @@ The Bevy port loads **~2.5** modulo-wrapped instances of the Oasis `.vox` asset,
 - [x] Phase 1 — Parallel investigation (Bevy audit + C# reference) — read-only, parallel batch
 - [x] Phase 2 — Design
 - [x] Phase 3 — Implementation (build clean; 200 tests pass, 1 ignored; all design assumptions held)
-- [ ] Phase 4 — Review (optional — pending user decision)
-- [ ] Phase 5 — User visual confirmation (binary side-by-side vs C#)
+- [x] Phase 4a — Manual QA #1: 4×4 instance count visually confirmed ✓
+- [x] Phase 4b — Palette diagnostic (`06-palette-diagnostic.md`): off-by-one in synthetic slot-0 injection
+- [x] Phase 4c — Palette fix (`07-palette-fix-impl.md`): option α applied; gates green
+- [ ] Phase 5 — Manual QA #2: user re-verifies palette correctness (no blue palm trees)
+- [ ] Phase 6 — Review (optional)
 
 ## Verification rule
 User performs the visual side-by-side check on the binary. No new e2e gate added (user choice in Step 4 Q&A). Agents do NOT run `cargo run --bin bevy-naadf` as a verification step (project CLAUDE.md rule).

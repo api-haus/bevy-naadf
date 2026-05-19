@@ -39,11 +39,22 @@
 //! ## Output contract
 //!
 //! [`parse_cvox_bytes`] returns an [`ImportedVox`] — the same shape
-//! [`crate::voxel::vox_import::parse_vox_bytes`] produces. Index 0 of the
-//! returned `palette: Vec<VoxelType>` is the reserved empty placeholder
-//! (NAADF convention, mirroring the `.vox` import path at
-//! `vox_import.rs:967-969`); indices `1..=N` correspond 1:1 to the on-disk
-//! positional palette entries.
+//! [`crate::voxel::vox_import::parse_vox_bytes`] produces. The returned
+//! `palette: Vec<VoxelType>` has **exactly `typeCount` entries** — slot 0 is
+//! the on-disk placeholder that C# `CreateFromWorldData` writes
+//! unconditionally as the first compacted entry (`ModelData.cs:313-316`,
+//! id=`"_"` + all-zero colors), and slots `1..N-1` are the real types. The
+//! on-disk `dataChunk` / `dataBlock` / `dataVoxel` arrays index this palette
+//! **directly with no shift** (0 = placeholder, 1..N-1 = real types) — the
+//! `.cvox` format is self-contained.
+//!
+//! This is intentionally different from the `.vox` import path
+//! (`vox_import.rs:967-969`), which prepends a synthetic placeholder *and*
+//! shifts the data side by `+1` at `vox_import.rs:627`. The MagicaVoxel
+//! convention is "slot 0 = empty" with positional 0..255 indices; the NAADF
+//! `.cvox` convention is "slot 0 already encoded as placeholder on disk" —
+//! the parser must NOT add another. See
+//! `docs/orchestrate/oasis-vox-instance-count/06-palette-diagnostic.md`.
 
 use std::io::Read;
 
@@ -126,15 +137,27 @@ pub fn parse_cvox_bytes(bytes: &[u8]) -> Result<ImportedVox, CvoxImportError> {
 
     // --- Palette (ModelData.cs:212-216). Variable-width entries.
     //
-    // The Bevy palette has `palette.len() + 1` entries: slot 0 is the reserved
-    // empty placeholder (matches `.vox` import path at vox_import.rs:967-969),
-    // and slots `1..=type_count` are filled positionally from the on-disk
-    // entries — matching the C# `i+1` shift implicit in
-    // `VoxelTypeHandler.Clear` (line 165) which always seeds slot 0 with a
-    // placeholder before `ApplyVoxelType` allocates `renderIndex = 1, 2, ...`.
+    // The Bevy palette has **exactly `typeCount` entries**, read 1:1 from
+    // disk. C# `CreateFromWorldData` (`ModelData.cs:313-316`) writes a
+    // placeholder VoxelType (id="_", all-zero colors) as on-disk slot 0
+    // before any real types, then writes the compacted real palette into
+    // slots 1..N-1. The on-disk `dataChunk` / `dataBlock` / `dataVoxel`
+    // arrays index this palette directly with no shift (value 0 = the
+    // on-disk placeholder, values 1..N-1 = the real types).
+    //
+    // Do NOT prepend a synthetic `VoxelType::default()` here — that would
+    // shift every real-type lookup by -1, rendering each voxel with the
+    // previous palette slot's color (the "blue palm trees" bug). See
+    // `docs/orchestrate/oasis-vox-instance-count/06-palette-diagnostic.md`.
+    //
+    // This intentionally diverges from the `.vox` parser at
+    // `vox_import.rs:967-969` (which prepends a placeholder *and* shifts
+    // voxel data by +1 at `vox_import.rs:627`) because the on-disk format
+    // is different: MagicaVoxel uses raw 0-based palette indices and needs
+    // an explicit slot-0 reservation; NAADF `.cvox` already bakes the
+    // placeholder into on-disk slot 0.
     let type_count_usize = if type_count < 0 { 0 } else { type_count as usize };
-    let mut palette: Vec<VoxelType> = Vec::with_capacity(type_count_usize + 1);
-    palette.push(VoxelType::default());
+    let mut palette: Vec<VoxelType> = Vec::with_capacity(type_count_usize);
     for _ in 0..type_count_usize {
         palette.push(read_voxel_type(&mut cursor)?);
     }
@@ -506,10 +529,14 @@ mod tests {
 
         assert!(!imp.world.blocks.is_empty(), "data_block empty");
         assert!(!imp.world.voxels.is_empty(), "data_voxel empty");
-        // Slot 0 = reserved empty placeholder + at least 1 real entry.
+        // Palette has exactly `typeCount` entries read 1:1 from disk — slot 0
+        // is C#'s on-disk placeholder (`CreateFromWorldData` at
+        // `ModelData.cs:313-316`), slots 1..N-1 are the real types. The
+        // smallest valid `.cvox` has `typeCount = 1` (just the placeholder),
+        // so the lower bound is `>= 1`.
         assert!(
-            imp.palette.len() >= 2,
-            "palette should contain >= 1 real entry (got {})",
+            imp.palette.len() >= 1,
+            "palette should contain at least the on-disk slot-0 placeholder (got {})",
             imp.palette.len()
         );
     }
