@@ -135,6 +135,13 @@ pub struct ConstructionGpu {
     /// buffer (`15-design-c.md` §1.3, mirrors the Phase-B Batch-4
     /// `sample_refine_dispatch_layout` fix). W3.
     pub bound_dispatch_indirect: Option<Buffer>,
+    /// 2026-05-19 probe-1B — per-call probe history written by
+    /// `prepare_group_bounds`. 2048 entries × 4 u32 (= 32 KiB):
+    /// `[call_idx, qi_packed, found_size, _pad]`. `qi_packed =
+    /// (found_bound_size << 16) | found_xyz` for found queues; `0xFFFFFFFF`
+    /// for "no queue found" calls. Drained by `aadf_per_call_probe` which
+    /// emits one `[probe1-call]` info!() line per entry.
+    pub prepare_probe_history: Option<Buffer>,
     /// W3 — `GpuConstructionParams` uniform written once at startup with the
     /// fixed-for-the-world `size_in_chunks` / `group_size_in_groups` /
     /// `bound_group_queue_max_size` / `max_group_bound_dispatch`. Bound at
@@ -297,6 +304,14 @@ pub struct ConstructionGpu {
 /// per `feedback-e2e-gates-must-fail-fast.md`.
 pub const READBACK_STALL_BUDGET_FRAMES: u32 = 600;
 
+/// 2026-05-19 probe-1B — capacity (in entries) of the `prepare_probe_history`
+/// buffer. Each entry is 4 u32s = 16 B. 2048 entries × 16 B = 32 KiB. Calls
+/// beyond this drop silently (the WGSL guards `call_idx < capacity`).
+pub const PREPARE_PROBE_HISTORY_ENTRIES: u32 = 2048;
+/// `PREPARE_PROBE_HISTORY_ENTRIES * 4 u32 * 4 B = 32 KiB`.
+pub const PREPARE_PROBE_HISTORY_BYTES: u64 =
+    (PREPARE_PROBE_HISTORY_ENTRIES as u64) * 4 * 4;
+
 /// State machine stage for the cross-frame CPU mirror readback (Q3).
 ///
 /// The state machine runs once per `.vox` install (gated on
@@ -392,6 +407,9 @@ pub struct ConstructionBindGroups {
     /// indirect dispatch per the wgpu `STORAGE_READ_WRITE` × `INDIRECT` split
     /// (`15-design-c.md` §1.3). W3.
     pub bound_dispatch: Option<BindGroup>,
+    /// 2026-05-19 probe-1B — `prepare_probe_history` bind group (1 binding,
+    /// rw storage). `@group(3)` on the `prepare_group_bounds` pipeline only.
+    pub prepare_probe_history: Option<BindGroup>,
     /// W5 — `@group(0)` bind group for `generator_model.wgsl`'s
     /// `fill_chunk_data_with_model_data` entry point. 5 bindings:
     ///   binding 0 = `segment_voxel_buffer` (chunk_data_rw, the W1 buffer the
@@ -473,6 +491,13 @@ pub struct ConstructionPipelines {
     /// split mirrors Phase-B Batch-4's `sample_refine_dispatch_layout`
     /// (`15-design-c.md` §1.3 wgpu STORAGE_READ_WRITE × INDIRECT split).
     pub bound_dispatch_indirect_layout: BindGroupLayoutDescriptor,
+    /// 2026-05-19 probe-1B — `prepare_probe_history_layout` `@group(3)` for
+    /// the per-call probe-history buffer (1 binding, rw storage). Only
+    /// referenced by the `prepare_group_bounds` pipeline; the WGSL declares
+    /// the binding at file scope but `add_initial_groups_to_bound_queue` and
+    /// `compute_group_bounds` never touch it, so their Rust pipeline-layouts
+    /// omit this 4th group.
+    pub prepare_probe_history_layout: BindGroupLayoutDescriptor,
     /// W3 — `bounds_calc.wgsl::add_initial_groups_to_bound_queue`
     /// (regime-1 one-shot seed; the W1 startup driver should call it after
     /// `compute_block_bounds`).
@@ -564,6 +589,9 @@ impl FromWorld for ConstructionPipelines {
             bounds_calc::construction_bounds_layout_descriptor();
         let bound_dispatch_indirect_layout =
             bounds_calc::bound_dispatch_indirect_layout_descriptor();
+        // 2026-05-19 probe-1B — `@group(3)` for the per-call probe history.
+        let prepare_probe_history_layout =
+            bounds_calc::prepare_probe_history_layout_descriptor();
         let bounds_calc_pipeline_add_initial = bounds_calc::queue_add_initial_pipeline(
             &asset_server,
             pipeline_cache,
@@ -576,6 +604,7 @@ impl FromWorld for ConstructionPipelines {
             construction_bounds_world_layout.clone(),
             construction_bounds_layout.clone(),
             bound_dispatch_indirect_layout.clone(),
+            prepare_probe_history_layout.clone(),
         );
         let bounds_calc_pipeline_compute = bounds_calc::queue_compute_pipeline(
             &asset_server,
@@ -659,6 +688,7 @@ impl FromWorld for ConstructionPipelines {
             construction_bounds_world_layout,
             construction_bounds_layout,
             bound_dispatch_indirect_layout,
+            prepare_probe_history_layout,
             bounds_calc_pipeline_add_initial,
             bounds_calc_pipeline_prepare,
             bounds_calc_pipeline_compute,
@@ -1949,15 +1979,33 @@ pub fn prepare_construction(
             bytemuck::cast_slice(&[1u32, 1u32, 1u32, 0u32, 0u32]),
         );
 
+        // 2026-05-19 probe-1B — allocate `prepare_probe_history`. 2048
+        // entries × 4 u32 = 32 KiB. Zero-init (the WGSL write fills 4 u32
+        // per call; the CPU reader uses `call_idx == 0 && qi_packed == 0
+        // && found_size == 0` heuristic to detect "not yet called" only
+        // when the call counter says < N entries have fired).
+        let probe_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_prepare_probe_history"),
+            size: PREPARE_PROBE_HISTORY_BYTES,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // Explicitly zero-init via write_buffer — wgpu's `mapped_at_creation
+        // = false` does NOT guarantee zero-fill on web.
+        let zeros: Vec<u32> = vec![0u32; (PREPARE_PROBE_HISTORY_BYTES / 4) as usize];
+        render_queue.write_buffer(&probe_buf, 0, bytemuck::cast_slice(&zeros));
+
         gpu.bound_queue_info = Some(info_buf);
         gpu.bound_group_queues = Some(queues_buf);
         gpu.bound_group_masks = Some(masks_buf);
         gpu.bound_refined_info = Some(refined_buf);
         gpu.bound_dispatch_indirect = Some(indirect_buf);
+        gpu.prepare_probe_history = Some(probe_buf);
         // Force bind-group rebuild on the next branch.
         bind_groups.construction_bounds_world = None;
         bind_groups.construction_bounds = None;
         bind_groups.bound_dispatch = None;
+        bind_groups.prepare_probe_history = None;
     }
 
     // Build the per-frame `GpuConstructionParams` uniform once (build-once;
@@ -2053,6 +2101,21 @@ pub fn prepare_construction(
                 &BindGroupEntries::sequential((indirect.as_entire_buffer_binding(),)),
             );
             bind_groups.bound_dispatch = Some(bg);
+        }
+    }
+    // 2026-05-19 probe-1B — build the `prepare_probe_history` bind group for
+    // `@group(3)` on the prepare pipeline.
+    if bind_groups.prepare_probe_history.is_none() {
+        if let Some(probe) = gpu.prepare_probe_history.as_ref() {
+            let bgl = pipeline_cache.get_bind_group_layout(
+                &construction_pipelines.prepare_probe_history_layout,
+            );
+            let bg = render_device.create_bind_group(
+                "naadf_prepare_probe_history_bind_group",
+                &bgl,
+                &BindGroupEntries::sequential((probe.as_entire_buffer_binding(),)),
+            );
+            bind_groups.prepare_probe_history = Some(bg);
         }
     }
 
@@ -3688,6 +3751,208 @@ pub fn aadf_delayed_probe(
     probe.chunks_done.store(false, std::sync::atomic::Ordering::Release);
 }
 
+/// 2026-05-19 probe-1B — per-call probe readback state.
+///
+/// Replaces the prior `AadfDelayedProbe` for the per-call investigation. The
+/// existing `aadf_delayed_probe` was found NOT to fire on web within
+/// Playwright's settle window (no `[aadf-probe2]` lines ever land in web
+/// logs); this probe re-uses the same `map_async` + `AtomicBool` pattern
+/// that `populate_cpu_mirror_from_gpu_producer` uses (which IS proven to
+/// work on web) so the per-call history is guaranteed to surface on both
+/// targets.
+///
+/// The state machine mirrors Q3's readback flow: `Idle → ReadbackPending →
+/// Done`. On `cpu_mirror_populated`, wait `PROBE_TRIGGER_FRAMES` frames so
+/// the regime-2 loop has had time to run, then issue a copy of the
+/// `prepare_probe_history` buffer to a staging buffer + `map_async`. Once
+/// the callback fires, decode every non-sentinel entry and emit one
+/// `[probe1-call] call_idx=N qi=N found_size=N` info!() line per entry.
+#[derive(Resource, Default)]
+pub struct AadfPerCallProbe {
+    /// Frames elapsed since `cpu_mirror_populated` flipped to true.
+    pub frames_since_mirror: u32,
+    /// Per-call readback state machine.
+    pub stage: PerCallProbeStage,
+    /// Staging buffer for `prepare_probe_history`.
+    pub staging: Option<Buffer>,
+    /// `AtomicBool` set by the `map_async` callback.
+    pub done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Frames spent in the current non-terminal stage. Used by the stall
+    /// budget (same `READBACK_STALL_BUDGET_FRAMES` as the Q3 mirror readback).
+    pub stall_frames: u32,
+}
+
+/// 2026-05-19 probe-1B — per-call probe state-machine stages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PerCallProbeStage {
+    /// Initial state — waiting for trigger conditions
+    /// (`cpu_mirror_populated && frames_since_mirror >= PROBE_TRIGGER_FRAMES`).
+    #[default]
+    Idle,
+    /// `copy_buffer_to_buffer` + `map_async` issued; waiting for callback.
+    ReadbackPending,
+    /// Drained + logged. Stays here for the rest of the run.
+    Done,
+}
+
+/// 2026-05-19 probe-1B — number of frames post-`cpu_mirror_populated` to
+/// wait before draining the probe history. Picked low enough that the
+/// regime-2 loop hasn't exhausted convergence yet, but high enough that
+/// several rounds have fired. Native typically does ~165 prepare calls by
+/// frame 30 (per the probe-1A native log); we want to see the live state.
+pub const PROBE_TRIGGER_FRAMES: u32 = 30;
+
+/// 2026-05-19 probe-1B — per-call probe drain. Single-shot per run.
+///
+/// Registered in `ExtractSchedule` next to `aadf_delayed_probe`. Reads
+/// `gpu.prepare_probe_history` via `map_async` and emits one
+/// `[probe1-call] call_idx=N qi=N found_size=N` info!() line per non-empty
+/// entry. The `[aadf-probe2]` token prefix piggybacks on the existing
+/// Playwright spec filter at `e2e/tests/vox-horizon-parity.spec.ts:225-237`
+/// so the lines reach Playwright's stdout pipe.
+pub fn aadf_per_call_probe(
+    mut probe: ResMut<AadfPerCallProbe>,
+    gpu: Option<Res<ConstructionGpu>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+) {
+    use bevy::render::render_resource::{MapMode, PollType};
+    use std::sync::atomic::Ordering;
+
+    let Some(gpu) = gpu else { return; };
+    if matches!(probe.stage, PerCallProbeStage::Done) { return; }
+    if !gpu.cpu_mirror_populated { return; }
+    probe.frames_since_mirror = probe.frames_since_mirror.saturating_add(1);
+
+    // Drive `map_async` callbacks on native; no-op on web (JS event loop
+    // drives them).
+    let _ = render_device.poll(PollType::Poll);
+
+    match probe.stage {
+        PerCallProbeStage::Done => {}
+        PerCallProbeStage::Idle => {
+            if probe.frames_since_mirror < PROBE_TRIGGER_FRAMES { return; }
+            let Some(src) = gpu.prepare_probe_history.as_ref() else { return; };
+            let size = PREPARE_PROBE_HISTORY_BYTES;
+            let staging = render_device.create_buffer(&BufferDescriptor {
+                label: Some("aadf_per_call_probe_staging"),
+                size,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = render_device.create_command_encoder(
+                &CommandEncoderDescriptor { label: Some("aadf_per_call_probe_enc") },
+            );
+            enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+            render_queue.submit([enc.finish()]);
+            probe.done.store(false, Ordering::Release);
+            let done_for_cb = probe.done.clone();
+            staging.slice(..).map_async(MapMode::Read, move |r| {
+                if r.is_err() {
+                    bevy::log::error!(
+                        "[aadf-probe2] probe-1B map_async callback received Err"
+                    );
+                }
+                done_for_cb.store(true, Ordering::Release);
+            });
+            probe.staging = Some(staging);
+            probe.stage = PerCallProbeStage::ReadbackPending;
+            probe.stall_frames = 0;
+            bevy::log::info!(
+                "[aadf-probe2] [probe1-call-meta] readback ISSUED at frames_since_mirror={} \
+                 (size={} B, capacity={} entries)",
+                probe.frames_since_mirror, size, PREPARE_PROBE_HISTORY_ENTRIES,
+            );
+        }
+        PerCallProbeStage::ReadbackPending => {
+            if !probe.done.load(Ordering::Acquire) {
+                probe.stall_frames += 1;
+                if probe.stall_frames >= READBACK_STALL_BUDGET_FRAMES {
+                    bevy::log::error!(
+                        "[aadf-probe2] [probe1-call-meta] STALLED at ReadbackPending \
+                         after {} frames — map_async callback never fired. Forcing \
+                         advance to Done.",
+                        READBACK_STALL_BUDGET_FRAMES,
+                    );
+                    probe.stage = PerCallProbeStage::Done;
+                    probe.staging = None;
+                }
+                return;
+            }
+            // Mapped — decode and emit.
+            let Some(staging) = probe.staging.take() else {
+                probe.stage = PerCallProbeStage::Done;
+                return;
+            };
+            let bytes: Vec<u8> = staging.slice(..).get_mapped_range().to_vec();
+            staging.unmap();
+            let total_u32s = bytes.len() / 4;
+            let read_u32 = |i: usize| -> u32 {
+                u32::from_le_bytes(bytes[i*4..(i+1)*4].try_into().unwrap())
+            };
+            let mut entries_emitted = 0u32;
+            let mut max_call_idx_seen = 0u32;
+            // Walk entries until we hit a "not yet written" sentinel run.
+            // Entry layout: [call_idx, qi_packed, found_size, _pad]. A
+            // never-written entry is all-zero (write_buffer zero-init).
+            // Distinguish "call 0 wrote here" from "never written" by
+            // requiring at least one of {call_idx, qi_packed, found_size}
+            // to be non-zero, OR call_idx is the index itself (slot N
+            // always contains call_idx=N if written). The WGSL writes
+            // call_idx as the first field, so for slot N we expect
+            // `read_u32(N*4) == N` if written. Skip slots where the
+            // recorded call_idx doesn't equal the slot index (= not yet
+            // called).
+            //
+            // Edge case: slot 0 is genuinely zero for call_idx=0. We
+            // ALWAYS emit slot 0 if found_size or qi_packed are set; we
+            // also emit slot 0 even if all-zero IF we know prepare called
+            // at least once. The "track last_emitted_call_idx" pattern in
+            // the brief isn't needed because we drain in one shot.
+            for entry_idx in 0..(total_u32s / 4) {
+                let off = entry_idx * 4;
+                let call_idx = read_u32(off);
+                let qi_packed = read_u32(off + 1);
+                let found_size = read_u32(off + 2);
+                // Filter "not yet written" entries. Slot N is written iff
+                // call_idx == N. (entry_idx is the slot index because
+                // `prev_calls * 4` is the entry-offset in u32s.)
+                let written = call_idx == (entry_idx as u32) && (
+                    call_idx != 0 || qi_packed != 0 || found_size != 0 ||
+                    // entry 0 with all-zero is ambiguous; check next slot.
+                    (entry_idx == 0 && total_u32s >= 8 && read_u32(4) == 1)
+                );
+                if !written { continue; }
+                // qi_packed: 0xFFFFFFFF == "no queue found"; else
+                // (bound_size << 16) | xyz. Surface BOTH the packed
+                // representation (for direct compare) and the decoded
+                // (size, axis) pair (for human inspection).
+                if qi_packed == 0xFFFFFFFF {
+                    bevy::log::info!(
+                        "[aadf-probe2] [probe1-call] call_idx={} qi=NONE found_size={}",
+                        call_idx, found_size,
+                    );
+                } else {
+                    let bound_size = qi_packed >> 16;
+                    let axis = qi_packed & 0xFFFF;
+                    bevy::log::info!(
+                        "[aadf-probe2] [probe1-call] call_idx={} qi=size{}_ax{} found_size={}",
+                        call_idx, bound_size, axis, found_size,
+                    );
+                }
+                entries_emitted += 1;
+                max_call_idx_seen = max_call_idx_seen.max(call_idx);
+            }
+            bevy::log::info!(
+                "[aadf-probe2] [probe1-call-meta] DRAIN COMPLETE: \
+                 entries_emitted={} max_call_idx_seen={} capacity={}",
+                entries_emitted, max_call_idx_seen, PREPARE_PROBE_HISTORY_ENTRIES,
+            );
+            probe.stage = PerCallProbeStage::Done;
+        }
+    }
+}
+
 impl Plugin for ConstructionPlugin {
     fn build(&self, app: &mut App) {
         // Read the main-world `AppArgs.construction_config` once at
@@ -3724,6 +3989,8 @@ impl Plugin for ConstructionPlugin {
             // 2026-05-19 horizon-parity AADF diagnostic — render-world
             // resource for the delayed bounds-info readback.
             .init_resource::<AadfDelayedProbe>()
+            // 2026-05-19 probe-1B — per-call probe readback resource.
+            .init_resource::<AadfPerCallProbe>()
             // Empty pipeline registry — W1..W5 add pipeline fields + a
             // proper `FromWorld` impl as they land.
             .init_gpu_resource::<ConstructionPipelines>()
@@ -3760,7 +4027,12 @@ impl Plugin for ConstructionPlugin {
                 (extract_world_changes, populate_cpu_mirror_from_gpu_producer),
             )
             // 2026-05-19 horizon-parity AADF diagnostic.
-            .add_systems(ExtractSchedule, aadf_delayed_probe);
+            .add_systems(ExtractSchedule, aadf_delayed_probe)
+            // 2026-05-19 probe-1B — per-call probe readback (drains the
+            // `prepare_probe_history` buffer once `cpu_mirror_populated +
+            // PROBE_TRIGGER_FRAMES`, emits one `[probe1-call]` info!() line
+            // per `prepare_group_bounds` call observed).
+            .add_systems(ExtractSchedule, aadf_per_call_probe);
     }
 }
 

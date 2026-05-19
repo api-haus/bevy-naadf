@@ -416,10 +416,14 @@ struct W3Fixture {
     bound_group_masks: Buffer,
     bound_refined_info: Buffer,
     bound_dispatch_indirect: Buffer,
+    // 2026-05-19 probe-1B — `@group(3)` per-call probe history buffer.
+    prepare_probe_history: Buffer,
     params_buffer: Buffer,
     world_bg: bevy::render::render_resource::BindGroup,
     bounds_bg: bevy::render::render_resource::BindGroup,
     dispatch_bg: bevy::render::render_resource::BindGroup,
+    // 2026-05-19 probe-1B — `@group(3)` bind group on the prepare pipeline.
+    probe_bg: bevy::render::render_resource::BindGroup,
     add_initial_pipeline: ComputePipeline,
     prepare_pipeline: ComputePipeline,
     compute_pipeline: ComputePipeline,
@@ -500,6 +504,20 @@ fn build_w3_fixture(
     let world_layout = construction_bounds_world_layout_descriptor();
     let bounds_layout = construction_bounds_layout_descriptor();
     let dispatch_layout = bound_dispatch_indirect_layout_descriptor();
+    // 2026-05-19 probe-1B — `@group(3)` per-call probe history layout.
+    let probe_layout =
+        super::prepare_probe_history_layout_descriptor();
+
+    // 2026-05-19 probe-1B — small probe history buffer for tests (2048
+    // entries × 16 B = 32 KiB; matches production capacity).
+    let prepare_probe_history = device.create_buffer(&BufferDescriptor {
+        label: Some("w3_prepare_probe_history"),
+        size: 2048 * 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let probe_zeros: Vec<u32> = vec![0u32; 2048 * 4];
+    queue.write_buffer(&prepare_probe_history, 0, bytemuck::cast_slice(&probe_zeros));
 
     let (id_add, id_prep, id_comp) = {
         let render_app = app.get_sub_app(RenderApp).unwrap();
@@ -515,6 +533,7 @@ fn build_w3_fixture(
             world_layout.clone(),
             bounds_layout.clone(),
             dispatch_layout.clone(),
+            probe_layout.clone(),
             shader_handle.clone(),
         );
         let c = queue_compute_pipeline_with_handle(
@@ -559,6 +578,13 @@ fn build_w3_fixture(
         &dispatch_bgl,
         &BindGroupEntries::sequential((bound_dispatch_indirect.as_entire_buffer_binding(),)),
     );
+    // 2026-05-19 probe-1B — `@group(3)` bind group for the prepare pipeline.
+    let probe_bgl = cache.get_bind_group_layout(&probe_layout);
+    let probe_bg = device.create_bind_group(
+        "w3_probe_bg",
+        &probe_bgl,
+        &BindGroupEntries::sequential((prepare_probe_history.as_entire_buffer_binding(),)),
+    );
 
     let _ = Cow::<'_, str>::from("w3");
 
@@ -569,10 +595,12 @@ fn build_w3_fixture(
         bound_group_masks,
         bound_refined_info,
         bound_dispatch_indirect,
+        prepare_probe_history,
         params_buffer,
         world_bg,
         bounds_bg,
         dispatch_bg,
+        probe_bg,
         add_initial_pipeline,
         prepare_pipeline,
         compute_pipeline,
@@ -645,6 +673,7 @@ fn bounds_calc_convergence_matches_cpu_oracle() {
             &fixture.world_bg,
             &fixture.bounds_bg,
             &fixture.dispatch_bg,
+            &fixture.probe_bg,
             &fixture.bound_dispatch_indirect,
             200,
             None,
@@ -747,6 +776,7 @@ fn bounds_queue_no_overrun() {
             &fixture.world_bg,
             &fixture.bounds_bg,
             &fixture.dispatch_bg,
+            &fixture.probe_bg,
             &fixture.bound_dispatch_indirect,
             200,
             None,
@@ -863,6 +893,7 @@ fn bounds_per_axis_atomic_correctness() {
             &fixture.world_bg,
             &fixture.bounds_bg,
             &fixture.dispatch_bg,
+            &fixture.probe_bg,
             &fixture.bound_dispatch_indirect,
             5,
             None,

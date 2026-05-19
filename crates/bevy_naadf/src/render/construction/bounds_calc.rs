@@ -128,6 +128,35 @@ pub fn bound_dispatch_indirect_layout_descriptor() -> BindGroupLayoutDescriptor 
     )
 }
 
+/// 2026-05-19 probe-1B — `prepare_probe_history_layout` `@group(3)` (1 binding:
+/// the per-call probe history buffer, write-side only — but the wgpu binding
+/// type is `storage` rw because WGSL declares it as `read_write`). Only the
+/// `prepare_group_bounds` pipeline includes this group; the other entry points
+/// (`add_initial_groups_to_bound_queue` and `compute_group_bounds`) leave the
+/// binding declared in WGSL but unreferenced from their entry-point bodies,
+/// and their Rust pipeline-layouts omit this 4th group entirely.
+///
+/// Storage-buffer count check (per wasm `max_storage_buffers_per_shader_stage =
+/// 16`): `prepare_group_bounds` previously bound 1 (chunks) + 4 (bound_queue
+/// family) + 1 (bound_dispatch_indirect) = 6 storage buffers. With this 4th
+/// group: 6 + 1 = **7 storage buffers**, well under the 16 cap. The
+/// `params` uniform in group 0 binding 1 does not count against the storage
+/// cap.
+///
+/// Bind-group count check (per wasm `max_bind_groups = 4`): the prepare
+/// pipeline already used 3 bind groups (0, 1, 2). Adding group 3 puts the
+/// pipeline at **4 bind groups = exactly at the wasm limit** — legal per
+/// WebGPU spec (the limit is inclusive).
+pub fn prepare_probe_history_layout_descriptor() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
+        "naadf_prepare_probe_history_bind_group_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (storage_buffer_sized(false, None),),
+        ),
+    )
+}
+
 // ─── Pipeline queueing ────────────────────────────────────────────────────────
 
 /// Queue the `add_initial_groups_to_bound_queue` pipeline against the W3
@@ -157,15 +186,16 @@ pub fn queue_add_initial_pipeline_with_handle(
     })
 }
 
-/// Queue the `prepare_group_bounds` pipeline. Binds all 3 groups (writes to
-/// `bound_refined_info` in `@group(1)` AND to `bound_dispatch_indirect` in
-/// `@group(2)`).
+/// Queue the `prepare_group_bounds` pipeline. Binds all 4 groups (writes to
+/// `bound_refined_info` in `@group(1)`, `bound_dispatch_indirect` in
+/// `@group(2)`, and the probe-1B `prepare_probe_history` in `@group(3)`).
 pub fn queue_prepare_pipeline(
     asset_server: &AssetServer,
     pipeline_cache: &PipelineCache,
     world_layout: BindGroupLayoutDescriptor,
     bounds_layout: BindGroupLayoutDescriptor,
     dispatch_layout: BindGroupLayoutDescriptor,
+    probe_layout: BindGroupLayoutDescriptor,
 ) -> CachedComputePipelineId {
     let shader = asset_server.load(BOUNDS_CALC_SHADER);
     queue_prepare_pipeline_with_handle(
@@ -173,6 +203,7 @@ pub fn queue_prepare_pipeline(
         world_layout,
         bounds_layout,
         dispatch_layout,
+        probe_layout,
         shader,
     )
 }
@@ -182,11 +213,12 @@ pub fn queue_prepare_pipeline_with_handle(
     world_layout: BindGroupLayoutDescriptor,
     bounds_layout: BindGroupLayoutDescriptor,
     dispatch_layout: BindGroupLayoutDescriptor,
+    probe_layout: BindGroupLayoutDescriptor,
     shader: Handle<Shader>,
 ) -> CachedComputePipelineId {
     pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("naadf_bounds_calc_prepare_pipeline".into()),
-        layout: vec![world_layout, bounds_layout, dispatch_layout],
+        layout: vec![world_layout, bounds_layout, dispatch_layout, probe_layout],
         shader,
         entry_point: Some(Cow::from("prepare_group_bounds")),
         ..default()
@@ -278,6 +310,7 @@ pub fn dispatch_regime_2_rounds(
     world_bind_group: &bevy::render::render_resource::BindGroup,
     bounds_bind_group: &bevy::render::render_resource::BindGroup,
     dispatch_bind_group: &bevy::render::render_resource::BindGroup,
+    probe_bind_group: &bevy::render::render_resource::BindGroup,
     indirect_buffer: &bevy::render::render_resource::Buffer,
     n_rounds: u32,
     compute_workgroups_override: Option<u32>,
@@ -293,6 +326,8 @@ pub fn dispatch_regime_2_rounds(
             pass.set_bind_group(0, world_bind_group, &[]);
             pass.set_bind_group(1, bounds_bind_group, &[]);
             pass.set_bind_group(2, dispatch_bind_group, &[]);
+            // 2026-05-19 probe-1B — group 3 = `prepare_probe_history`.
+            pass.set_bind_group(3, probe_bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         // Pass 2: `compute_group_bounds` — indirect off the dispatch buffer
@@ -379,13 +414,17 @@ pub fn naadf_bounds_compute_node(
         return;
     }
 
-    // Pull the three bind groups + the indirect buffer.
+    // Pull the four bind groups + the indirect buffer. The probe bind group
+    // is required by the prepare pipeline's 4-layout list.
     let Some(bounds_world_bg) = construction_bind_groups.construction_bounds_world.as_ref()
     else { return; };
     let Some(bounds_bg) = construction_bind_groups.construction_bounds.as_ref() else {
         return;
     };
     let Some(dispatch_bg) = construction_bind_groups.bound_dispatch.as_ref() else {
+        return;
+    };
+    let Some(probe_bg) = construction_bind_groups.prepare_probe_history.as_ref() else {
         return;
     };
     let Some(indirect_buffer) = construction_gpu.bound_dispatch_indirect.as_ref() else {
@@ -431,6 +470,8 @@ pub fn naadf_bounds_compute_node(
                 pass.set_bind_group(0, bounds_world_bg, &[]);
                 pass.set_bind_group(1, bounds_bg, &[]);
                 pass.set_bind_group(2, dispatch_bg, &[]);
+                // 2026-05-19 probe-1B — group 3 = `prepare_probe_history`.
+                pass.set_bind_group(3, probe_bg, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
             // compute pass — direct dispatch with the construction
@@ -511,6 +552,7 @@ pub fn naadf_bounds_compute_node(
         bounds_world_bg,
         bounds_bg,
         dispatch_bg,
+        probe_bg,
         indirect_buffer,
         n_rounds,
         compute_workgroups_override,
