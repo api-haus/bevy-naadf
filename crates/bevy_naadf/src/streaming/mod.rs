@@ -32,6 +32,14 @@ pub mod residency;
 pub mod sliding_window;
 pub mod windowed_slot_map;
 
+// streaming-world Phase 2.14.e — composition tests exercise the now-isolated
+// primitives (`WindowedSlotMap` atomic API + `compute_window_delta` +
+// `Residency` dispatch-ACK tracking + `StreamingDiagnostics`) together
+// against synthetic camera-walk traces. No Bevy `App`, no GPU, no render
+// world. See `04e-impl-composition-tests.md`.
+#[cfg(test)]
+mod composition_tests;
+
 use bevy::prelude::*;
 use bevy::render::{ExtractSchedule, Render, RenderApp, RenderSystems};
 
