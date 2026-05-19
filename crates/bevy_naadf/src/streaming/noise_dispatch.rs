@@ -424,6 +424,44 @@ pub fn push_dispatched_once_ack(slot: SlotIndex) {
     }
 }
 
+/// streaming-world Phase 2.14.d — observability surface for
+/// [`super::residency::StreamingDiagnostics`].
+///
+/// Returns the current depth of `PENDING_CLEAR_ON_BIND_SLOTS` (the cross-world
+/// accumulator that the main-world residency_driver APPENDS to on bind, and
+/// that the render-world `clear_streaming_bound_slots` DRAINS once `WorldGpu`
+/// is available). A non-zero depth at frame N >> 0 signals one of:
+/// - cold-start in progress (the initial 512 binds are still draining);
+/// - `WorldGpu` initialization stalled (the drainer cannot run);
+/// - a new burst of binds just landed (steady-state shift).
+///
+/// Cheap O(1) under the existing Mutex. If the lock is poisoned (a panicking
+/// holder), returns 0 — diagnostics are best-effort and must not propagate
+/// poisoning.
+pub fn pending_clear_on_bind_count() -> usize {
+    match PENDING_CLEAR_ON_BIND_SLOTS.lock() {
+        Ok(acc) => acc.len(),
+        Err(_) => 0,
+    }
+}
+
+/// streaming-world Phase 2.14.d — observability surface for
+/// [`super::residency::StreamingDiagnostics`].
+///
+/// Returns the current depth of `PENDING_DISPATCHED_ONCE_SLOTS` (the
+/// cross-world ACK accumulator that the render-world producer APPENDS to
+/// post-submit, and that the main-world `apply_dispatch_acks` DRAINS each
+/// `PreUpdate`). A non-zero depth indicates ACKs in flight that haven't yet
+/// been merged into `Residency::dispatched_once`.
+///
+/// Cheap O(1) under the existing Mutex. Lock poisoning returns 0 (best-effort).
+pub fn pending_dispatch_ack_count() -> usize {
+    match PENDING_DISPATCHED_ONCE_SLOTS.lock() {
+        Ok(acc) => acc.len(),
+        Err(_) => 0,
+    }
+}
+
 pub fn extract_streaming_state(
     mut commands: Commands,
     main_world: ResMut<bevy::render::MainWorld>,

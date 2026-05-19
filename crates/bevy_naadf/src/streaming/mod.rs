@@ -44,7 +44,8 @@ pub use chunk_source::{
 pub use noise_dispatch::{
     build_noise_terrain_params, build_noise_terrain_shader_src,
     create_noise_terrain_params_buffer, extract_streaming_state,
-    noise_terrain_layout_descriptor, push_dispatched_once_ack,
+    noise_terrain_layout_descriptor, pending_clear_on_bind_count,
+    pending_dispatch_ack_count, push_dispatched_once_ack,
     queue_noise_terrain_pipeline, queue_noise_terrain_pipeline_with_handle,
     seed_noise_terrain_shader, clear_streaming_bound_slots,
     upload_window_indirection, NoiseTerrainParams, StreamingExtractRender,
@@ -53,8 +54,8 @@ pub use noise_dispatch::{
 pub use residency::{
     apply_dispatch_acks, assert_vram_budget_sufficient, compute_slab_total_mib,
     residency_driver, segment_to_voxel_origin, target_origin_for_camera_seg,
-    world_voxel_to_segment, Residency, SlotIndex, WorldSegmentPos, SEGMENT_CHUNKS,
-    SEGMENT_VOXELS,
+    world_voxel_to_segment, Residency, SlotIndex, StreamingDiagnostics,
+    WorldSegmentPos, SEGMENT_CHUNKS, SEGMENT_VOXELS,
 };
 pub use sliding_window::{compute_window_delta, WindowDelta};
 pub use windowed_slot_map::{WindowedSlotMap, EMPTY_SLOT};

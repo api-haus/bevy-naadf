@@ -208,6 +208,196 @@ impl Residency {
     pub fn is_cold_start_complete(&self) -> bool {
         (self.dispatched_once.len() as u32) == Self::total_slots()
     }
+
+    // ---------------------------------------------------------------------
+    // streaming-world Phase 2.14.d — `StreamingDiagnostics` analytical surface
+    //
+    // The user's redirect that drove this phase:
+    //   "the case with unfulfilled slots in the middle must be catched
+    //    analytically — the system must know if it HAS unfulfilled slots in
+    //    the middle at startup, not via screenshots"
+    //
+    // These methods give callers (e.g. a future periodic-logging system in
+    // Phase 2.14.f, the existing e2e gates, regression tests) a programmatic
+    // way to ask: "is the current camera window fully fulfilled, and if not,
+    // which segments are missing?" without screenshot diffing.
+    //
+    // Scope per audit at `04-audit-primitives.md` § "Proposed
+    // StreamingDiagnostics surface":
+    // - `diagnostics()`        — full snapshot, O(window_size).
+    // - `slot_counters()`      — cheap O(1) tuple for hot-path readers.
+    // - `unfulfilled_camera_window_segments()` — analytical scan, O(window_size).
+    // ---------------------------------------------------------------------
+
+    /// Cheap O(1) tuple `(free, bound, in_flight, dispatched_once)` for
+    /// hot-path observability without the unfulfilled-window scan.
+    ///
+    /// `in_flight` is structurally 0 under the Phase 2.14.b atomic API
+    /// (`WindowedSlotMap::{allocate_and_bind, free_segment}` + callback-based
+    /// `set_origin`). It is computed as `capacity - free - bound` so that a
+    /// future regression that re-introduces a non-atomic mutator surfaces
+    /// here immediately. If you see a non-zero value in production, that's a
+    /// regression in `WindowedSlotMap` — the atomic API guarantees no slot
+    /// is missing from both `free_list` and `world_to_slot`.
+    pub fn slot_counters(&self) -> (u32, u32, u32, u32) {
+        let capacity = self.window.capacity();
+        let free = self.window.free_count();
+        let bound = self.window.iter_bound().count() as u32;
+        // Saturating subtraction guards against a transient inconsistency
+        // during a debug read (diagnostics are best-effort telemetry).
+        let in_flight = capacity.saturating_sub(free).saturating_sub(bound);
+        let dispatched_once = self.dispatched_once.len() as u32;
+        (free, bound, in_flight, dispatched_once)
+    }
+
+    /// O(window_size) scan returning every camera-window segment that is
+    /// unfulfilled — either:
+    /// - not currently bound to a slot, OR
+    /// - bound to a slot whose dispatch ACK has not yet landed.
+    ///
+    /// Both failure modes look identical from the renderer's perspective:
+    /// the camera-window position has no current `chunks_buffer` content
+    /// (or stale content from a prior eviction). The unfulfilled set
+    /// captures both cases.
+    ///
+    /// Per the Q&A (Q3 "Full 512"), the scan covers the entire current
+    /// window. Callers wanting to filter to the camera-near ring (e.g.
+    /// `dsq ≤ 2` for the cold-start gate) do so on the returned `Vec`.
+    ///
+    /// Iteration order matches the existing X-fastest convention used by
+    /// `super::sliding_window::compute_window_delta` and
+    /// `WindowedSlotMap::pack` — `for lz / for ly / for lx`. Test
+    /// `diagnostics_partial_bind_some_unfulfilled` pins the exact
+    /// expected segment positions, so the order is observable.
+    pub fn unfulfilled_camera_window_segments(&self) -> Vec<WorldSegmentPos> {
+        let origin = self.window.origin();
+        let ws = self.window.window_size();
+        let mut out: Vec<WorldSegmentPos> =
+            Vec::with_capacity((ws.x * ws.y * ws.z) as usize);
+        for lz in 0..ws.z as i32 {
+            for ly in 0..ws.y as i32 {
+                for lx in 0..ws.x as i32 {
+                    let seg = WorldSegmentPos(origin + IVec3::new(lx, ly, lz));
+                    let dispatched = match self.window.lookup_slot(seg) {
+                        Some(slot) => self.dispatched_once.contains(&slot),
+                        None => false,
+                    };
+                    if !dispatched {
+                        out.push(seg);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Compute the full `StreamingDiagnostics` snapshot on demand.
+    ///
+    /// O(window_size) for the unfulfilled scan + O(1) for the counter
+    /// queries. At the streaming preset's fixed 16×2×16 = 512 window, this
+    /// is trivially cheap (a single linear scan over 512 hashmap lookups
+    /// + 512 HashSet contains-queries).
+    ///
+    /// Per Q2 ("lowest surface — Residency method"), this is a method
+    /// rather than a stored Resource — recomputing on demand avoids a stale
+    /// mirror, and the cost is negligible at this window size.
+    pub fn diagnostics(&self) -> StreamingDiagnostics {
+        let (free, bound, in_flight, dispatched_once) = self.slot_counters();
+        // `generating = bound - dispatched_once`. Saturating-sub guards
+        // against a transient race in case a future caller queries
+        // diagnostics from a non-PreUpdate context where `dispatched_once`
+        // could momentarily exceed `bound`. The actual production driver
+        // path keeps these consistent, but diagnostics are best-effort.
+        let generating = bound.saturating_sub(dispatched_once);
+        let unfulfilled = self.unfulfilled_camera_window_segments();
+        let ws = self.window.window_size();
+        let total = ws.x * ws.y * ws.z;
+        StreamingDiagnostics {
+            free_slots: free,
+            bound_slots: bound,
+            in_flight_slots: in_flight,
+            dispatched_once_slots: dispatched_once,
+            generating_slots: generating,
+            pending_clear_on_bind: super::noise_dispatch::pending_clear_on_bind_count(),
+            pending_dispatch_acks: super::noise_dispatch::pending_dispatch_ack_count(),
+            frame_counter: self.frame_counter,
+            cold_start_complete: self.is_cold_start_complete(),
+            camera_window_segments_total: total,
+            camera_window_segments_unfulfilled: unfulfilled.len() as u32,
+            unfulfilled_camera_window_segments: unfulfilled,
+        }
+    }
+}
+
+/// streaming-world Phase 2.14.d — analytical snapshot of the residency
+/// layer. Built on demand by [`Residency::diagnostics`].
+///
+/// The user's binding requirement: the streaming system must be able to
+/// answer "do I have unfulfilled slots in the middle?" programmatically,
+/// not via screenshot inspection. This struct is that answer's return
+/// type.
+///
+/// Layout per audit at `04-audit-primitives.md` § "Proposed
+/// StreamingDiagnostics surface":
+///
+/// - **Counters** (every-frame cheap, O(1) to compute): `free_slots`,
+///   `bound_slots`, `in_flight_slots`, `dispatched_once_slots`,
+///   `generating_slots`, `pending_clear_on_bind`, `pending_dispatch_acks`,
+///   `frame_counter`.
+/// - **Analytical** (one-shot at startup / on shift, O(window_size)):
+///   `cold_start_complete`, `camera_window_segments_total`,
+///   `camera_window_segments_unfulfilled`,
+///   `unfulfilled_camera_window_segments`.
+///
+/// `in_flight_slots` is structurally 0 under the Phase 2.14.b atomic
+/// `WindowedSlotMap` API — kept here as a regression sentinel. Any
+/// non-zero value indicates a `WindowedSlotMap` mutator has reintroduced
+/// the in-flight escape that the atomic API was designed to close.
+#[derive(Debug, Clone)]
+pub struct StreamingDiagnostics {
+    // -------- Cheap counters (O(1)) --------------------------------------
+    /// Slots currently in the free pool (`WindowedSlotMap::free_count`).
+    pub free_slots: u32,
+    /// Slots currently bound to a world segment (`WindowedSlotMap::iter_bound().count()`).
+    pub bound_slots: u32,
+    /// Slots accounted neither as free nor as bound. Should always be 0
+    /// under the Phase 2.14.b atomic API; kept as a regression sentinel.
+    pub in_flight_slots: u32,
+    /// Slots whose dispatch ACK has landed (in `Residency::dispatched_once`).
+    pub dispatched_once_slots: u32,
+    /// Slots bound but not yet ACK'd (`bound - dispatched_once`,
+    /// saturating). At cold-start this is 512 → 0; in steady-state shift
+    /// it briefly grows then drains.
+    pub generating_slots: u32,
+    /// Depth of `noise_dispatch::PENDING_CLEAR_ON_BIND_SLOTS`. Non-zero
+    /// when binds are queued for the render-world clear that hasn't
+    /// drained yet (cold-start while `WorldGpu` is being built, mainly).
+    pub pending_clear_on_bind: usize,
+    /// Depth of `noise_dispatch::PENDING_DISPATCHED_ONCE_SLOTS`. Non-zero
+    /// when ACKs have been submitted by the render world but haven't been
+    /// merged by main-world `apply_dispatch_acks` yet (~1 frame steady).
+    pub pending_dispatch_acks: usize,
+    /// Per-frame counter from `Residency::frame_counter`. Mostly diagnostic
+    /// — useful for "this snapshot is from frame N" reporting.
+    pub frame_counter: u64,
+
+    // -------- Analytical (O(window_size)) --------------------------------
+    /// True iff every slot in the window has been dispatched at least once
+    /// — i.e. `dispatched_once.len() == total_slots()`. Same predicate as
+    /// `Residency::is_cold_start_complete`.
+    pub cold_start_complete: bool,
+    /// Total segments in the current camera window
+    /// (= `window_size.x * y * z` = 512 at default settings).
+    pub camera_window_segments_total: u32,
+    /// Count of camera-window segments that are NOT fulfilled. Zero iff
+    /// every window position has a bound slot whose dispatch has been
+    /// ACK'd. Non-zero at cold-start (decreases as admissions drain).
+    pub camera_window_segments_unfulfilled: u32,
+    /// Explicit list of unfulfilled camera-window segments (positions in
+    /// world-segment coords). Useful for the user-facing "where exactly
+    /// are the holes" question without needing a framebuffer capture.
+    /// Length matches `camera_window_segments_unfulfilled`.
+    pub unfulfilled_camera_window_segments: Vec<WorldSegmentPos>,
 }
 
 /// Convert a world-voxel `IVec3` position to a `WorldSegmentPos` via
@@ -855,5 +1045,301 @@ mod tests {
             "Phase 2.13: dispatched_once must NOT be populated until the \
              render-world ACK fires via PENDING_DISPATCHED_ONCE_SLOTS"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // streaming-world Phase 2.14.d — StreamingDiagnostics tests.
+    //
+    // Eight tests covering the analytical surface added in this phase.
+    // The two Mutex-touching tests
+    // (`pending_*_count_reflects_state`) share a single serialization
+    // guard so they can run alongside other unit tests without leaking
+    // state through the static cross-world accumulators.
+    // -----------------------------------------------------------------
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Serialization guard for the cross-world accumulator tests below.
+    /// `cargo test` runs tests on multiple threads by default; the
+    /// `PENDING_CLEAR_ON_BIND_SLOTS` / `PENDING_DISPATCHED_ONCE_SLOTS`
+    /// statics in `noise_dispatch` are process-globals, so any test that
+    /// observes their depth must lock this guard to avoid cross-test
+    /// interference.
+    static CROSS_WORLD_ACC_TEST_GUARD: StdMutex<()> = StdMutex::new(());
+
+    /// Drain both cross-world accumulators. Best-effort: poisoned locks
+    /// are reset by replacing the inner Vec on success only.
+    fn drain_cross_world_accumulators() {
+        if let Ok(mut acc) = super::super::noise_dispatch::PENDING_CLEAR_ON_BIND_SLOTS
+            .lock()
+        {
+            acc.clear();
+        }
+        if let Ok(mut acc) = super::super::noise_dispatch::PENDING_DISPATCHED_ONCE_SLOTS
+            .lock()
+        {
+            acc.clear();
+        }
+    }
+
+    /// T1 — `diagnostics_on_empty_residency_reports_all_unfulfilled`.
+    /// Fresh Residency: every counter at the empty pole, every camera
+    /// window segment is unfulfilled.
+    #[test]
+    fn diagnostics_on_empty_residency_reports_all_unfulfilled() {
+        let residency = Residency::empty(4);
+        let cap = residency.window.capacity();
+        let d = residency.diagnostics();
+        assert_eq!(d.free_slots, cap, "free slots should equal capacity");
+        assert_eq!(d.bound_slots, 0);
+        assert_eq!(d.in_flight_slots, 0);
+        assert_eq!(d.dispatched_once_slots, 0);
+        assert_eq!(d.generating_slots, 0);
+        assert!(!d.cold_start_complete);
+        assert_eq!(d.camera_window_segments_total, cap);
+        assert_eq!(d.camera_window_segments_unfulfilled, cap);
+        assert_eq!(
+            d.unfulfilled_camera_window_segments.len(),
+            cap as usize,
+            "every window segment must report as unfulfilled"
+        );
+    }
+
+    /// T2 — `diagnostics_fully_fulfilled_reports_none_unfulfilled`.
+    /// After binding every window cell + populating `dispatched_once`,
+    /// the unfulfilled set is empty and cold-start reports complete.
+    #[test]
+    fn diagnostics_fully_fulfilled_reports_none_unfulfilled() {
+        let mut residency = Residency::empty(4);
+        for sz in 0..WORLD_SIZE_IN_SEGMENTS.z as i32 {
+            for sy in 0..WORLD_SIZE_IN_SEGMENTS.y as i32 {
+                for sx in 0..WORLD_SIZE_IN_SEGMENTS.x as i32 {
+                    let w = WorldSegmentPos(IVec3::new(sx, sy, sz));
+                    let slot = residency
+                        .window
+                        .allocate_and_bind(w)
+                        .expect("bind window segment");
+                    residency.dispatched_once.insert(slot);
+                }
+            }
+        }
+        let d = residency.diagnostics();
+        assert!(d.cold_start_complete);
+        assert_eq!(d.bound_slots, residency.window.capacity());
+        assert_eq!(d.dispatched_once_slots, residency.window.capacity());
+        assert_eq!(d.generating_slots, 0);
+        assert_eq!(d.camera_window_segments_unfulfilled, 0);
+        assert!(d.unfulfilled_camera_window_segments.is_empty());
+    }
+
+    /// T3 — `diagnostics_partial_bind_some_unfulfilled`. Bind some,
+    /// dispatch a subset. The unfulfilled list contains everything NOT
+    /// in `dispatched_once` (i.e. bound-but-not-dispatched AND
+    /// unbound-in-window).
+    #[test]
+    fn diagnostics_partial_bind_some_unfulfilled() {
+        let mut residency = Residency::empty(4);
+        // Bind 16 segments (one row of x=[0,16) at y=0, z=0).
+        let mut bound_segments: Vec<(WorldSegmentPos, SlotIndex)> = Vec::new();
+        for sx in 0..16i32 {
+            let w = WorldSegmentPos(IVec3::new(sx, 0, 0));
+            let slot = residency.window.allocate_and_bind(w).expect("bind");
+            bound_segments.push((w, slot));
+        }
+        // Dispatch only 5 of the 16.
+        for (_, slot) in &bound_segments[..5] {
+            residency.dispatched_once.insert(*slot);
+        }
+
+        let d = residency.diagnostics();
+        let cap = residency.window.capacity();
+        assert_eq!(d.bound_slots, 16);
+        assert_eq!(d.dispatched_once_slots, 5);
+        assert_eq!(d.generating_slots, 11, "16 bound minus 5 dispatched = 11");
+
+        // Unfulfilled count: every window segment EXCEPT the 5 dispatched.
+        // (Total window count - dispatched count.)
+        let expected_unfulfilled = cap - 5;
+        assert_eq!(d.camera_window_segments_unfulfilled, expected_unfulfilled);
+        assert_eq!(
+            d.unfulfilled_camera_window_segments.len(),
+            expected_unfulfilled as usize,
+        );
+
+        // Verify the 5 dispatched segments are NOT in the unfulfilled list.
+        let unfulfilled: HashSet<WorldSegmentPos> = d
+            .unfulfilled_camera_window_segments
+            .iter()
+            .copied()
+            .collect();
+        for (w, _) in &bound_segments[..5] {
+            assert!(
+                !unfulfilled.contains(w),
+                "dispatched segment {w:?} must not appear in unfulfilled set"
+            );
+        }
+        // Verify the other 11 bound-but-not-dispatched segments ARE in
+        // the unfulfilled list (bound but not dispatched = unfulfilled).
+        for (w, _) in &bound_segments[5..] {
+            assert!(
+                unfulfilled.contains(w),
+                "bound-but-not-dispatched segment {w:?} must appear as unfulfilled"
+            );
+        }
+    }
+
+    /// T4 — `diagnostics_after_set_origin_window_segments_reflect_new_origin`.
+    /// After a `set_origin` shift, the unfulfilled set is over the
+    /// NEW window range only; segments outside the new window must NOT
+    /// appear.
+    #[test]
+    fn diagnostics_after_set_origin_window_segments_reflect_new_origin() {
+        let mut residency = Residency::empty(4);
+        // Bind a few segments at the original origin (0, 0, 0).
+        for sx in 0..4i32 {
+            let w = WorldSegmentPos(IVec3::new(sx, 0, 0));
+            let _slot = residency.window.allocate_and_bind(w).expect("bind");
+        }
+        // Shift the window by +1 on X. Segment (0, 0, 0) evicts; (1, 0, 0)
+        // through (3, 0, 0) stay bound at new local positions.
+        residency.window.set_origin(IVec3::new(1, 0, 0), |_w, _s| {});
+        assert_eq!(residency.window.origin(), IVec3::new(1, 0, 0));
+
+        let d = residency.diagnostics();
+        let cap = residency.window.capacity();
+        assert_eq!(d.camera_window_segments_total, cap);
+
+        // Every segment in the unfulfilled list MUST lie within the new
+        // window AABB [new_origin, new_origin + window_size).
+        let new_origin = IVec3::new(1, 0, 0);
+        let ws = residency.window.window_size();
+        for seg in &d.unfulfilled_camera_window_segments {
+            let p = seg.0;
+            assert!(
+                p.x >= new_origin.x
+                    && p.x < new_origin.x + ws.x as i32
+                    && p.y >= new_origin.y
+                    && p.y < new_origin.y + ws.y as i32
+                    && p.z >= new_origin.z
+                    && p.z < new_origin.z + ws.z as i32,
+                "unfulfilled segment {seg:?} must lie within new window AABB \
+                 [{new_origin:?}, +{ws:?})",
+            );
+        }
+        // Segment (0, 0, 0) was evicted — it must NOT appear.
+        let evicted = WorldSegmentPos(IVec3::new(0, 0, 0));
+        assert!(
+            !d.unfulfilled_camera_window_segments.contains(&evicted),
+            "evicted segment {evicted:?} must NOT appear (outside new window)"
+        );
+    }
+
+    /// T5 — `slot_counters_o1_matches_diagnostics`. The cheap O(1)
+    /// tuple agrees with the corresponding fields of the O(window_size)
+    /// snapshot.
+    #[test]
+    fn slot_counters_o1_matches_diagnostics() {
+        let mut residency = Residency::empty(4);
+        for sx in 0..8i32 {
+            let w = WorldSegmentPos(IVec3::new(sx, 0, 0));
+            let slot = residency.window.allocate_and_bind(w).expect("bind");
+            if sx < 3 {
+                residency.dispatched_once.insert(slot);
+            }
+        }
+        let counters = residency.slot_counters();
+        let d = residency.diagnostics();
+        assert_eq!(
+            counters,
+            (
+                d.free_slots,
+                d.bound_slots,
+                d.in_flight_slots,
+                d.dispatched_once_slots,
+            ),
+            "slot_counters tuple must match the corresponding diagnostics fields",
+        );
+    }
+
+    /// T6 — `unfulfilled_camera_window_segments_within_window_only`. Every
+    /// returned segment is inside `[origin, origin + window_size)`. No
+    /// out-of-window position is ever returned.
+    #[test]
+    fn unfulfilled_camera_window_segments_within_window_only() {
+        let mut residency = Residency::empty(4);
+        // Bind a couple of segments + dispatch one.
+        let w0 = WorldSegmentPos(IVec3::new(0, 0, 0));
+        let w1 = WorldSegmentPos(IVec3::new(1, 0, 0));
+        let slot0 = residency.window.allocate_and_bind(w0).expect("bind");
+        let _slot1 = residency.window.allocate_and_bind(w1).expect("bind");
+        residency.dispatched_once.insert(slot0);
+
+        let origin = residency.window.origin();
+        let ws = residency.window.window_size();
+        let unfulfilled = residency.unfulfilled_camera_window_segments();
+        for seg in &unfulfilled {
+            let p = seg.0;
+            assert!(
+                p.x >= origin.x
+                    && p.x < origin.x + ws.x as i32
+                    && p.y >= origin.y
+                    && p.y < origin.y + ws.y as i32
+                    && p.z >= origin.z
+                    && p.z < origin.z + ws.z as i32,
+                "unfulfilled segment {seg:?} outside window [{origin:?}, +{ws:?})",
+            );
+        }
+        // Total of unfulfilled + dispatched must equal window size.
+        assert_eq!(
+            unfulfilled.len() as u32 + 1,
+            residency.window.capacity(),
+            "unfulfilled count + 1 dispatched must equal capacity"
+        );
+    }
+
+    /// T7 — `pending_clear_on_bind_count_reflects_state`. Push, observe,
+    /// drain. Serialized against the other cross-world accumulator test
+    /// via `CROSS_WORLD_ACC_TEST_GUARD`.
+    #[test]
+    fn pending_clear_on_bind_count_reflects_state() {
+        let _guard = CROSS_WORLD_ACC_TEST_GUARD
+            .lock()
+            .expect("serialization guard");
+        drain_cross_world_accumulators();
+        assert_eq!(super::super::noise_dispatch::pending_clear_on_bind_count(), 0);
+
+        // Push 3 slots onto the accumulator.
+        {
+            let mut acc = super::super::noise_dispatch::PENDING_CLEAR_ON_BIND_SLOTS
+                .lock()
+                .expect("lock");
+            acc.push(SlotIndex(0));
+            acc.push(SlotIndex(1));
+            acc.push(SlotIndex(2));
+        }
+        assert_eq!(super::super::noise_dispatch::pending_clear_on_bind_count(), 3);
+
+        drain_cross_world_accumulators();
+        assert_eq!(super::super::noise_dispatch::pending_clear_on_bind_count(), 0);
+    }
+
+    /// T8 — `pending_dispatch_ack_count_reflects_state`. Same shape as T7,
+    /// but for `PENDING_DISPATCHED_ONCE_SLOTS`.
+    #[test]
+    fn pending_dispatch_ack_count_reflects_state() {
+        let _guard = CROSS_WORLD_ACC_TEST_GUARD
+            .lock()
+            .expect("serialization guard");
+        drain_cross_world_accumulators();
+        assert_eq!(super::super::noise_dispatch::pending_dispatch_ack_count(), 0);
+
+        // Push 3 slots via the public helper.
+        super::super::noise_dispatch::push_dispatched_once_ack(SlotIndex(10));
+        super::super::noise_dispatch::push_dispatched_once_ack(SlotIndex(20));
+        super::super::noise_dispatch::push_dispatched_once_ack(SlotIndex(30));
+        assert_eq!(super::super::noise_dispatch::pending_dispatch_ack_count(), 3);
+
+        drain_cross_world_accumulators();
+        assert_eq!(super::super::noise_dispatch::pending_dispatch_ack_count(), 0);
     }
 }
