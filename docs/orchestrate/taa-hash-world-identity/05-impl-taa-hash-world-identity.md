@@ -543,3 +543,68 @@ shift-affected band. Not in scope for this brief.
    = LSB). Follow-up, not blocking.
 
 
+---
+
+# Iteration 2 — pcg_hash refinement (2026-05-19)
+
+## Why this iteration
+
+Iteration 1 built cleanly and passed all 5 deterministic e2e gates (Phase C),
+but the user's live visual hard-gate review (Phase D) showed the noisy-splotch
+artifact persists after origin shifts. Root cause confirmed as Iteration-1
+`## Independent review` Finding 8: the 4+4+4+1-parity packing collides on
+32-voxel single-axis shifts (`(x+32) & 0xF == x & 0xF`, and the 1-bit parity
+flips back to original under +32 since `(x+32) >> 4 = (x >> 4) + 2`).
+32-voxel shifts are extremely common inside the 64-voxel-wide streaming
+window. User picked (2026-05-19) — replace the additive packing with a
+`pcg_hash`-based avalanche over the full `vec3<i32>` voxel coord, mask low
+13 bits. PCG is a full 32-bit avalanche, so any single-axis shift propagates
+to all retained bits — eliminating the axis-aligned collision class entirely.
+
+## Diff landed
+
+- `crates/bevy_naadf/src/assets/shaders/taa.wgsl`:
+  - Added `#import "shaders/ray_tracing_common.wgsl"::pcg_hash` next to the
+    existing `taa_common` import block. `pcg_hash` is already exported there
+    (used by `init_rand`); other shaders (`naadf_global_illum.wgsl`,
+    `sample_refine.wgsl`, …) already import from `ray_tracing_common.wgsl`,
+    so this is the established naga-oil pattern.
+  - Replaced the body of `taa_data_id_lo13` (signature unchanged —
+    `(first_hit_pos: vec3<f32>, cam_pos_int: vec3<i32>) -> u32`). New body:
+    chained `pcg_hash` over `u32(voxel_pos.x)`, then over
+    `h ^ u32(voxel_pos.y)`, then over `h ^ u32(voxel_pos.z)`, masked with
+    `0x1FFFu`. Both call sites at Site 2 and Site 3 still go through this
+    helper — canonical-derivation property preserved.
+  - Comment block above the helper updated to document the new derivation
+    and the collision-class fix.
+
+No other files touched. `taa_common.wgsl` extension and `taa_compress_sample`
+signature from Iteration 1 are unchanged; both Rust unit tests in
+`crates/bevy_naadf/src/render/taa.rs` are unchanged (they test
+`taa_hash_from_data` avalanche, not the `data_id_lo13` derivation, so they
+remain valid invariants).
+
+## Verification
+
+| # | Command | Result | Notes |
+|---|---|---|---|
+| 1 | `cargo build --workspace` | **PASS** | already-up-to-date 0.32 s (shader change only — Rust deps unchanged; shaders compile at runtime and are validated by gates 3-5) |
+| 2 | `cargo test --workspace --lib` | **PASS** | 291 passed, 0 failed (baseline 291; tests unchanged) |
+| 3 | `e2e_render --gate streaming-cold-start` | **PASS** | 14/14 camera-row segments OK (dsq ≤ 2 ring at spawn pose); shaders compiled cleanly with new `pcg_hash` import |
+| 4 | `e2e_render --gate streaming-window` | **PASS** (re-run) | mean Δ=46.37 (floor 3.00); luminance var=2376.31 (floor 800); origin shift X=4 (floor 4); max frame=19.0 ms (cap 50); non-sky=0.781 (floor 0.300). First run hit a 250 ms first-frame pipeline-compile hitch (the `pcg_hash` import widened the naga-oil module graph for `reproject_old_samples` / `calc_new_taa_sample`, both now also depending on `ray_tracing_common.wgsl`). Re-run within budget — confirmed first-run-only cold compile cost, unrelated to the hash change semantics. |
+| 5 | `e2e_render --gate oasis-edit-visual` | **PASS** | rect Δ=18.08 (floor 8.00); full-frame Δ=4.26 — within the same envelope as Iteration 1 (18.01 / 4.27). Pinned camera, no origin shift → no behaviour change expected here, confirmed. |
+
+## Notes for the user's visual recheck
+
+Walk the camera in a single-axis direction through the procedural-streaming
+world. The Iteration-1 residual artifact (noisy splotches on shadowed regions
+that persisted on every 32-voxel-aligned origin shift) should now be gone —
+every voxel shift, including the previously colliding +32 single-axis class,
+now produces a 13-bit ID that avalanches to a different 16-bit-masked output
+with overwhelming probability. If a residual blink is still visible on
+specific camera-shift patterns, the most-likely remaining cause would be
+Finding 6 / 7 (NaN propagation at screen-edge `pos`, or first-frame `pos`
+quantisation jitter); the next debugging step there would be a new e2e gate
+that captures a frame-pair across an origin shift and computes per-pixel
+variance in the shadowed band, rather than the current heuristic gates.
+

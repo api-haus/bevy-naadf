@@ -85,6 +85,7 @@
     taa_decompress_sample, taa_compress_sample, taa_hash_from_data,
     taa_neighbor_offsets, TAA_SAMPLE_RING_DEPTH,
 }
+#import "shaders/ray_tracing_common.wgsl"::pcg_hash
 
 // --- struct decls (mirror `gpu_types::GpuTaaParams` / `GpuCameraHistorySlot`)
 //
@@ -190,27 +191,37 @@ struct GpuCameraHistorySlot {
 // `newCam_int - oldCam_int` and the hash would over-reject every origin-
 // shifted pixel — the opposite-but-also-wrong failure mode).
 //
-// Bit layout (13 bits, packed into `taa_hash_from_data`'s pre-mix bits 2..14):
-//   bits 0..3   = u32(voxel_pos.x) & 0xF                    (x low nibble)
-//   bits 4..7   = (u32(voxel_pos.y) & 0xF) << 4u            (y low nibble)
-//   bits 8..11  = (u32(voxel_pos.z) & 0xF) << 8u            (z low nibble)
-//   bit  12     = parity(u32(voxel_pos.x >> 4u) ^
-//                        u32(voxel_pos.y >> 4u) ^
-//                        u32(voxel_pos.z >> 4u)) << 12u     (16-voxel-block parity)
+// Derivation (Iteration 2, 2026-05-19 — replaces the additive 4+4+4+1-parity
+// packing that was the first-pass landing):
 //
-// 4096 unique IDs inside any 16x16x16 neighbourhood (no collisions there).
-// Bit 12 forces a hash flip across 16-voxel block boundaries on any axis. After
-// the two-round avalanche mix in `taa_hash_from_data`, the 16-bit-masked
-// output spreads the 8192-input space across `2^16` codes; ~99/100 random
-// inputs produce distinct outputs (the bound the Rust unit test asserts).
+//   1. Build a world-absolute integer voxel coord
+//      `vec3<i32>(floor(first_hit_pos + vec3<f32>(cam_pos_int)))`.
+//   2. Avalanche all three components through `pcg_hash`
+//      (`ray_tracing_common.wgsl:19`). Each PCG round mixes the prior accumulator
+//      with the next axis (XOR-then-hash), so single-axis shifts of any size —
+//      including the 32-voxel single-axis shifts that the first-pass additive
+//      packing collided on (`05-impl-taa-hash-world-identity.md` Iteration-1
+//      `## Independent review` Finding 8) — propagate to all 32 output bits.
+//   3. Mask to the low 13 bits to slot into `taa_hash_from_data`'s pre-mix bits
+//      2..14 (bits 0/1/15+ are claimed by `is_diffuse`/`entity`/`specular_normals`).
+//
+// The 13-bit input space (8192 IDs) is then spread across `2^16` codes by the
+// two-round mix inside `taa_hash_from_data`; ~99/100 random inputs produce
+// distinct masked outputs (the bound the Rust unit test asserts). Crucially —
+// unlike the first-pass packing — there is no axis-aligned input that maps the
+// same low-bit field to the same output: `pcg_hash` is a full 32-bit avalanche,
+// so a +32 shift in `x` changes ALL 13 retained bits with overwhelming
+// probability.
 fn taa_data_id_lo13(first_hit_pos: vec3<f32>, cam_pos_int: vec3<i32>) -> u32 {
     let voxel_pos = vec3<i32>(floor(first_hit_pos + vec3<f32>(cam_pos_int)));
-    let lo_nibbles =
-          (u32(voxel_pos.x) & 0xFu)
-        | ((u32(voxel_pos.y) & 0xFu) << 4u)
-        | ((u32(voxel_pos.z) & 0xFu) << 8u);
-    let hi_parity = (u32(voxel_pos.x >> 4) ^ u32(voxel_pos.y >> 4) ^ u32(voxel_pos.z >> 4)) & 0x1u;
-    return lo_nibbles | (hi_parity << 12u);
+    // Avalanche all three components into a single u32, take low 13 bits.
+    // Eliminates the axis-aligned collision classes that the prior
+    // 4+4+4+parity packing exhibited (32-voxel single-axis shifts
+    // collided to the same ID; see impl log Iteration-1 Finding 8).
+    var h: u32 = pcg_hash(u32(voxel_pos.x));
+    h = pcg_hash(h ^ u32(voxel_pos.y));
+    h = pcg_hash(h ^ u32(voxel_pos.z));
+    return h & 0x1FFFu;
 }
 
 // --- the reproject + accumulation pass -------------------------------------

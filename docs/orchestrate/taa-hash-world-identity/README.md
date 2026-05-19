@@ -26,8 +26,16 @@ Mode: **consolidated** (user-confirmed at Step 4 Q&A 2026-05-19)
 - [x] Phase B — checkpoint commit + consolidated dispatch
 - [x] Phase C — verification: 5 commands per handoff §Verification (all 5 PASS, single-attempt; baseline 289 → 291 unit tests after 2 new world-identity primitive guards)
 - [x] Phase D — user hard-gate review: live visual check shows blink persists. Root cause confirmed as `## Independent review` Finding 8 (4+4+4+1 packing collides on 32-voxel single-axis shifts, very common in 64-voxel-wide streaming window).
-- [ ] Phase E — refinement dispatch: replace `taa_data_id_lo13` body with `pcg_hash` avalanche over `vec3<i32>` voxel coord. Re-run all 5 gates.
-- [ ] Phase F — second user hard-gate review (live visual check on the refinement).
+- [x] Phase E — refinement dispatch: `taa_data_id_lo13` body replaced with `pcg_hash` avalanche over `vec3<i32>` voxel coord (signature unchanged). Imported `pcg_hash` from `ray_tracing_common.wgsl`. All 5 gates PASS (cold-start, streaming-window after one re-run for first-frame pipeline-compile hitch, oasis-edit-visual, build, lib tests 291/291). Iteration-2 section appended to `05-impl-taa-hash-world-identity.md`.
+- [x] Phase F — second user hard-gate review: live visual check shows "pretty much same blinking". The pcg_hash avalanche should have fully eliminated Finding 8's collision class; that it didn't move the artefact strongly suggests our root-cause story (hash collision) is wrong.
+- [ ] Phase G — diagnostic investigator dispatch (read-only). Map the full TAA reproject + history-accumulation flow. Test 4 hypotheses against actual code: (1) hash-reject path not load-bearing where assumed (other accumulation path?); (2) artifact isn't TAA reproject (denoiser? variance buffer?); (3) hash encode/decode mismatch; (4) `params.cam_pos_int` vs `cnts_params.cam_pos_int` frame-skew.
+- [x] Phase H — synthesis: hash was never the bug. Actual root cause is `CameraHistory.positions[]` storing window-local PositionSplit values that jump by ±256 voxels/axis on origin shift, breaking `cam_pos_from_cur_int` deltas → screen-pos and 0.2%-dist rejects fire on all post-shift history (hash test never reached). Same bug also wipes ReSTIR-GI sample ring. Two secondary bugs flagged: 8-neighbour hash fallback broken post-fix; `data_id_lo13` mis-labelled "world-anchored".
+- [ ] Phase I — instrumentation dispatch: add `info!` logging `positions[K] - positions[K-1]` across origin shifts to empirically confirm the 256-voxel jump.
+- [ ] Phase J — user live run + log capture, then redirect to structural fix design.
+
+## Iteration 3 decision (2026-05-19)
+
+Approach: instrument-first to confirm the diagnostic. Then design the structural fix (rebase `CameraHistory.positions[]` on origin shift) bundled with the two secondary bug fixes.
 
 ## Iteration 2 decision (2026-05-19)
 
