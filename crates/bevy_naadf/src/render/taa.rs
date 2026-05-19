@@ -189,6 +189,7 @@ pub fn update_camera_history(
     camera: Single<(&Camera, &Transform, &PositionSplit), With<PositionSplit>>,
     args: Res<crate::AppArgs>,
     mut history: ResMut<CameraHistory>,
+    residency: Option<Res<crate::streaming::residency::Residency>>,
 ) {
     let (camera, transform, position_split) = *camera;
 
@@ -211,6 +212,80 @@ pub fn update_camera_history(
     let view_proj_inv = view_proj.inverse();
 
     let slot = taa_index as usize;
+    // streaming-world TAA-hash diagnostic instrumentation (one-shot,
+    // per origin-shift). Reads `positions[K-1]` (still untouched — the
+    // previous frame wrote a DIFFERENT ring slot) BEFORE we overwrite
+    // `positions[K]`. The heuristic — magnitude > 64 voxels on any axis —
+    // fires on origin-shift frames (segment-aligned jumps of ≥ 256/axis)
+    // and not on normal camera movement (≤ a few voxels/axis). Logs the
+    // before/after split, the observed delta, and the expected delta
+    // implied by the residency-origin change since the previous frame
+    // (consumed via the optional `Residency` resource so non-streaming
+    // presets see a graceful `unknown` instead of a misleading zero).
+    // Diagnostic spec: `docs/orchestrate/taa-hash-world-identity/
+    // 06-diagnostic-investigation.md` § "Recommended next action" item 1.
+    let prev_slot = taa_index_of(history.frame_count.wrapping_sub(1)) as usize;
+    let positions_k_prev = history.positions[prev_slot];
+    let positions_k_new = *position_split;
+    if history.frame_count >= 1 {
+        let delta_pos_int = positions_k_new.pos_int - positions_k_prev.pos_int;
+        let shifted = delta_pos_int.x.abs() > 64
+            || delta_pos_int.y.abs() > 64
+            || delta_pos_int.z.abs() > 64;
+        if shifted {
+            let expected = residency
+                .as_ref()
+                .map(|r| {
+                    // `position_split` is window-local; on an origin shift
+                    // it jumps by `-(new_origin - old_origin) * SEGMENT_VOXELS`.
+                    // We can't read `old_origin` here directly, but we CAN
+                    // back-derive it from the observed window-local delta —
+                    // OR equivalently report the *current* origin and the
+                    // implied per-axis segment shift. We do the latter:
+                    // the implied origin delta (in segments) is
+                    // `-delta_pos_int / SEGMENT_VOXELS` (integer division),
+                    // and the expected window-local delta from that origin
+                    // delta is `-(implied_delta) * SEGMENT_VOXELS`.
+                    let seg = crate::streaming::residency::SEGMENT_VOXELS;
+                    let implied_origin_delta = IVec3::new(
+                        -delta_pos_int.x / seg,
+                        -delta_pos_int.y / seg,
+                        -delta_pos_int.z / seg,
+                    );
+                    let expected_window_delta = -implied_origin_delta * seg;
+                    (r.origin(), implied_origin_delta, expected_window_delta)
+                });
+            match expected {
+                Some((cur_origin, implied_origin_delta, expected_window_delta)) => {
+                    bevy::log::info!(
+                        "camera-history shift instrumentation: \
+                         positions[K]={:?} positions[K-1]={:?} \
+                         delta_voxels={:?} \
+                         expected_delta_from_origin_shift={:?} \
+                         current_origin={:?} implied_origin_delta_segments={:?}",
+                        positions_k_new.pos_int,
+                        positions_k_prev.pos_int,
+                        delta_pos_int,
+                        expected_window_delta,
+                        cur_origin,
+                        implied_origin_delta,
+                    );
+                }
+                None => {
+                    bevy::log::info!(
+                        "camera-history shift instrumentation: \
+                         positions[K]={:?} positions[K-1]={:?} \
+                         delta_voxels={:?} \
+                         expected_delta_from_origin_shift=unknown (no Residency)",
+                        positions_k_new.pos_int,
+                        positions_k_prev.pos_int,
+                        delta_pos_int,
+                    );
+                }
+            }
+        }
+    }
+
     // `*position_split` is current — `sync_position_split` runs before this.
     history.positions[slot] = *position_split;
     history.view_proj[slot] = view_proj;

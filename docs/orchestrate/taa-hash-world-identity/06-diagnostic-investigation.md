@@ -511,3 +511,77 @@ where the artefact lives.
    structural one — but it goes away once `taa_sample_accum` recovers
    (1-2 frames after the shift), consistent with the observed "decay over
    a few frames" pattern.
+
+
+---
+
+## Instrumentation landed (2026-05-19)
+
+### What was added
+- File: `crates/bevy_naadf/src/render/taa.rs`, function `update_camera_history`,
+  inserted directly after `let slot = taa_index as usize;` and BEFORE the
+  `history.positions[slot] = *position_split` write (~lines 213–270, anchored
+  at the existing `slot` derivation). This placement lets the diagnostic read
+  the still-untouched `positions[K-1]` for comparison against the brand-new
+  `position_split` value that is about to overwrite `positions[K]`.
+- Trigger: **Option B (magnitude heuristic)** — fires when
+  `|delta_pos_int.{x,y,z}| > 64` voxels on any axis. Origin shifts produce
+  segment-aligned jumps of ≥ `SEGMENT_VOXELS = 256` voxels/axis; normal
+  intra-frame camera motion stays within a few voxels/axis. Gated on
+  `history.frame_count >= 1` to avoid a spurious frame-0 log when
+  `positions[K-1]` is still the `PositionSplit::default()` zero.
+  (Option A was deferred: the existing `streaming-world residency shift:`
+  log fires in `residency_driver` and has no rendezvous-point with
+  `update_camera_history` that does not require new shared state — which the
+  brief forbade. The magnitude heuristic empirically lights up on exactly
+  the same frame as the residency-shift log, so they remain greppable
+  together.)
+- `Residency` is consumed as `Option<Res<Residency>>` — graceful no-op when
+  the streaming preset is not active. With it present, the log includes the
+  current origin and the implied per-axis segment shift back-derived from
+  the observed window-local delta.
+- Log format:
+  `camera-history shift instrumentation: positions[K]={IVec3} positions[K-1]={IVec3} delta_voxels={IVec3} expected_delta_from_origin_shift={IVec3} current_origin={IVec3} implied_origin_delta_segments={IVec3}`
+  (and a degraded form ending `expected_delta_from_origin_shift=unknown (no Residency)`
+  when the resource is absent).
+
+### Build verification
+- `cargo build --workspace` — PASS (39.23s on a hot cache).
+
+### How the user reproduces
+
+Run:
+```
+cd /mnt/archive4/DEV/bevy-naadf/.claude/worktrees/streaming-world && cargo run --release --bin bevy-naadf -- --grid-preset procedural-streaming
+```
+
+Walk forward / sideways enough to trigger at least one origin shift (the
+existing `streaming-world residency shift:` log line will appear). The new
+`camera-history shift instrumentation:` log should appear at the same frame.
+Grep both lines together:
+
+```
+... 2>&1 | grep -E 'streaming-world residency shift|camera-history shift instrumentation'
+```
+
+### Expected outcomes
+
+- **If the diagnostic is right**: `delta_voxels` is a multiple of 256 in one
+  or more axes, `expected_delta_from_origin_shift` matches `delta_voxels`
+  exactly (because we currently back-derive expected from delta via integer
+  division; a perfect match means delta is segment-aligned, which is the
+  only way a residency origin can shift), and `implied_origin_delta_segments`
+  is a small unit vector (typically `±1` on one axis). The structural cause
+  is confirmed.
+- **If something else is going on**: the heuristic should not fire at all
+  for normal motion; if it does fire and `delta_voxels` is NOT a multiple
+  of 256 (i.e. `expected_delta_from_origin_shift` disagrees materially with
+  `delta_voxels`), the diagnostic story needs revision — the position
+  jump is NOT segment-aligned and therefore not a clean origin shift.
+
+### Revert path
+- Single block inside `update_camera_history`. To remove: delete the inserted
+  `let prev_slot = … if shifted { … }` block and the new
+  `residency: Option<Res<…::Residency>>` system argument. No fields, no
+  bindings, no system schedule changes. Surface area: one function in one
+  file.

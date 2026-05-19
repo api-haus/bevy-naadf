@@ -30,12 +30,20 @@ Mode: **consolidated** (user-confirmed at Step 4 Q&A 2026-05-19)
 - [x] Phase F — second user hard-gate review: live visual check shows "pretty much same blinking". The pcg_hash avalanche should have fully eliminated Finding 8's collision class; that it didn't move the artefact strongly suggests our root-cause story (hash collision) is wrong.
 - [ ] Phase G — diagnostic investigator dispatch (read-only). Map the full TAA reproject + history-accumulation flow. Test 4 hypotheses against actual code: (1) hash-reject path not load-bearing where assumed (other accumulation path?); (2) artifact isn't TAA reproject (denoiser? variance buffer?); (3) hash encode/decode mismatch; (4) `params.cam_pos_int` vs `cnts_params.cam_pos_int` frame-skew.
 - [x] Phase H — synthesis: hash was never the bug. Actual root cause is `CameraHistory.positions[]` storing window-local PositionSplit values that jump by ±256 voxels/axis on origin shift, breaking `cam_pos_from_cur_int` deltas → screen-pos and 0.2%-dist rejects fire on all post-shift history (hash test never reached). Same bug also wipes ReSTIR-GI sample ring. Two secondary bugs flagged: 8-neighbour hash fallback broken post-fix; `data_id_lo13` mis-labelled "world-anchored".
-- [ ] Phase I — instrumentation dispatch: add `info!` logging `positions[K] - positions[K-1]` across origin shifts to empirically confirm the 256-voxel jump.
-- [ ] Phase J — user live run + log capture, then redirect to structural fix design.
+- [x] Phase I — instrumentation dispatch: `info!` added at `crates/bevy_naadf/src/render/taa.rs:253` inside `update_camera_history`, magnitude heuristic (|delta|>64).
+- [x] Phase J — user live run: **5/5 shifts confirmed**. Observed delta_voxels = (−250 to −255, ~0, 0) for each shift; predicted `(old−new)×256` = (−256, 0, 0). Variance is camera intra-frame motion (1−6 voxels). Diagnostic confirmed: window-local PositionSplit jumps by 256 voxels/axis on origin shift, breaking `cam_pos_from_cur_int` deltas across the entire camera-history ring.
+- [x] Phase K — distributed architect dispatch: design at `02-design.md`. Key choices: rebase lives in main-world `update_camera_history` (option-zero wiring, no new cross-world plumbing); `GpuTaaParams._pad{2,3,4}` repurposed for `residency_origin_voxels: IVec3` (struct stays 192 bytes; `sample_age` packs into `vec4<i32>.w` in WGSL); new `streaming-taa-shift-noise` gate with shadowed-band temporal variance threshold 3.0; instrumentation log REMOVED post-fix.
+- [x] Phase L — user design-approval: APPROVED to proceed to fresh-eyes review.
+- [x] Phase M — fresh-eyes reviewer: 6 PASS / 2 PARTIAL (criterion 4 — `var_baseline` formulation is spatial-not-temporal, threshold unmeasured; criterion 6 — design §Plumbing has meandering layout reasoning, §4.a is canonical). Verdict: fix-then-ship with two amendments.
+- [x] Phase N — user reconciliation: ACCEPT both amendments — implementer applies (1) temporal `var_baseline` capture N+5..N+8 and (2) sentinel-bytes Rust/WGSL offset round-trip test alongside the design's §4.a canonical layout.
+- [ ] Phase O — checkpoint + implementer dispatch (applies design, runs all gates incl. new streaming-taa-shift-noise which must FAIL pre-fix and PASS post-fix).
+- [ ] Phase P — final user hard-gate visual check (confirm blink gone live).
 
-## Iteration 3 decision (2026-05-19)
+## Iteration 3 decisions (2026-05-19)
 
-Approach: instrument-first to confirm the diagnostic. Then design the structural fix (rebase `CameraHistory.positions[]` on origin shift) bundled with the two secondary bug fixes.
+- **Mode**: distributed (design → review → impl). Rust render-pipeline scheduling change has higher blast radius than consolidated-mode's ideal eligibility; two prior iterations missed the actual root cause despite line-grounded plans, so an independent design review before code lands is worth the latency.
+- **E2E gate `streaming-taa-shift-noise`**: bundled in. Closes the analytical-surface gap that let two failed iterations pass green. Must FAIL pre-fix, PASS post-fix.
+- **Hash iterations**: keep iteration 2 (pcg_hash). Bundle into the structural fix the work of making `data_id_lo13` truly world-absolute (add `residency.origin × SEGMENT_VOXELS`); current impl is mis-labelled world-anchored but is window-local-anchored.
 
 ## Iteration 2 decision (2026-05-19)
 
