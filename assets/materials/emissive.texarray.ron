@@ -1,0 +1,79 @@
+// Emissive 2D-array — RGB = emissive HDR colour, A unused. sRGB. Only the
+// Emissive-base-class voxels sample this; for PBR layers every slot uses
+// the black 1×1 placeholder so the texture exists but the sample is zero.
+// Layer order matches diffuse / normal / mrh.
+(
+    format: Rgba8UnormSrgb,
+    elements: [
+        // layer 0 — fabric (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 1 — gravelrock (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 2 — pavement (has emissive.png).
+        (
+            r: (input: "materials/pavement/emissive.png",    channel: R),
+            g: (input: "materials/pavement/emissive.png",    channel: G),
+            b: (input: "materials/pavement/emissive.png",    channel: B),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 3 — metal_02 (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 4 — metal_pattern_01 (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 5 — bark_04 (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 6 — snow_01 (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 7 — grass_05 (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 8 — stone_wall_04 (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+        // layer 9 — ground_tiles_08 (no emissive).
+        (
+            r: (input: "materials/_placeholder/black_1.png", channel: R),
+            g: (input: "materials/_placeholder/black_1.png", channel: R),
+            b: (input: "materials/_placeholder/black_1.png", channel: R),
+            a: (input: "materials/_placeholder/black_1.png", channel: R),
+        ),
+    ],
+)
