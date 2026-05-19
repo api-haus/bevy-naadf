@@ -367,6 +367,12 @@ pub fn residency_driver(
     }
 
     let new_origin = target_origin_for_camera_seg(cam_seg_world.0);
+    // Capture the pre-shift origin for the Phase 2.14.c
+    // `compute_window_delta` call at Pass 2. After Pass 1's `set_origin`
+    // runs, `residency.origin()` returns `new_origin`; the primitive
+    // accepts both as parameters for API symmetry (the impl currently
+    // ignores `old_origin`, but the parameter is part of the contract).
+    let old_origin = residency.origin();
     residency.last_camera_seg = Some(cam_seg_world.0);
 
     // Pass 1 — shift the origin and evict any pairs that fall outside the
@@ -397,31 +403,29 @@ pub fn residency_driver(
 
     // Pass 2 — figure out which target segments are not yet resident; queue
     // them for admission (camera-distance first per D.11).
+    //
+    // Phase 2.14.c — the "iterate the new window + filter against
+    // currently-bound" computation lives in
+    // [`super::sliding_window::compute_window_delta`] as a pure primitive.
+    // We drop the `evict` half here (Pass 1's callback-driven
+    // `set_origin` already evicted the relevant slots); we only need
+    // `admit`. The primitive's iteration order is `for lz / for ly /
+    // for lx` (X-fastest) — byte-identical to the pre-extraction loop
+    // shape that downstream slot-assignment + the e2e `oasis-edit-visual`
+    // pixel-diff gate (Phase 2.14.g) implicitly depend on.
     let cam_seg = cam_seg_world.0;
-    // Collect bound segments into a HashSet for the `not contains` filter.
     let resident: std::collections::HashSet<WorldSegmentPos> = residency
         .window
         .iter_bound()
         .map(|(w, _)| w)
         .collect();
-    // Build the target set: every world-segment whose local coord is in
-    // `[0, w)` for each axis.
-    let mut pending: Vec<WorldSegmentPos> =
-        Vec::with_capacity(Residency::total_slots() as usize);
-    for lz in 0..WORLD_SIZE_IN_SEGMENTS.z {
-        for ly in 0..WORLD_SIZE_IN_SEGMENTS.y {
-            for lx in 0..WORLD_SIZE_IN_SEGMENTS.x {
-                let world_seg = WorldSegmentPos(IVec3::new(
-                    new_origin.x + lx as i32,
-                    new_origin.y + ly as i32,
-                    new_origin.z + lz as i32,
-                ));
-                if !resident.contains(&world_seg) {
-                    pending.push(world_seg);
-                }
-            }
-        }
-    }
+    let delta = super::sliding_window::compute_window_delta(
+        WorldSegmentPos(old_origin),
+        WorldSegmentPos(new_origin),
+        residency.window.window_size(),
+        &resident,
+    );
+    let mut pending: Vec<WorldSegmentPos> = delta.admit;
     pending.sort_by_key(|w| {
         let d = w.0 - cam_seg;
         d.x * d.x + d.y * d.y + d.z * d.z

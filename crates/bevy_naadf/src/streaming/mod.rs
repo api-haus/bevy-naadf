@@ -29,6 +29,7 @@ pub mod noise_dispatch;
 pub mod noise_fastnoiselite;
 pub mod noise_fastnoiselite_cpu_oracle;
 pub mod residency;
+pub mod sliding_window;
 pub mod windowed_slot_map;
 
 use bevy::prelude::*;
@@ -55,6 +56,7 @@ pub use residency::{
     world_voxel_to_segment, Residency, SlotIndex, WorldSegmentPos, SEGMENT_CHUNKS,
     SEGMENT_VOXELS,
 };
+pub use sliding_window::{compute_window_delta, WindowDelta};
 pub use windowed_slot_map::{WindowedSlotMap, EMPTY_SLOT};
 
 /// Phase-2 `StreamingPlugin` — wires:
