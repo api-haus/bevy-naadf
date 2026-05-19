@@ -193,6 +193,31 @@ impl Default for ConstructionConfig {
 /// asserts + the entity-history-ring allocation in `prepare_construction`.
 pub const DEFAULT_MAX_ENTITY_INSTANCES: u32 = 16384;
 
+/// 2026-05-19 web-vox ray-termination fix — wasm32 cap on
+/// `max_group_bound_dispatch`. The wasm regime-2 path direct-dispatches
+/// `compute_group_bounds` (see
+/// [`crate::render::construction::bounds_calc::dispatch_regime_2_rounds`] —
+/// bypasses wgpu's broken-on-Dawn STORAGE→INDIRECT barrier). The
+/// dispatched workgroup count comes from this cap; the shader's
+/// `is_group_active = group_id.x < count` early-bail keeps non-active
+/// workgroups cheap.
+///
+/// **4096** — empirically the sweet spot. Larger (32_768) regressed SSIM
+/// from 0.94 → 0.69 (suspected: atomic contention in `compute_group_bounds`
+/// re-enqueue at scale, OR Dawn watchdog effects on the larger dispatch).
+/// Smaller would slow convergence further. Re-baseline if a deeper fix
+/// for the underlying WebGPU regime-2 issue lands.
+///
+/// **Trade-off:** wasm convergence takes more frames (queue[0] = 32_768 →
+/// 32_768 / 4_096 = 8 rounds to drain; cascade through ~32 bound-size
+/// levels = ~50 frames ≈ 0.85 s at 60 fps). Within the SSIM gate's 10 s
+/// settle but visible in live use at startup.
+///
+/// **Steady-state bail cost** at 4_096: 5 rounds/frame × 4_096 workgroups
+/// × 64 threads = 1.3 M bail-out threads/frame; ~0.5 ms on modern iGPU.
+#[cfg(target_arch = "wasm32")]
+pub const WASM_MAX_GROUP_BOUND_DISPATCH: u32 = 4096;
+
 impl From<&crate::AppArgs> for ConstructionConfig {
     /// Mirror `TaaRingConfig::depth = args.taa_ring_depth` pattern: read the
     /// embedded `construction_config` straight out of `AppArgs`.
@@ -202,8 +227,19 @@ impl From<&crate::AppArgs> for ConstructionConfig {
     /// `Copy`. Later workstreams (W1 / W4) extend `AppArgs` with CLI flags
     /// that mutate specific fields; the `From<&AppArgs>` lift stays the
     /// single seam between the main-world args and the render-side resource.
+    ///
+    /// **2026-05-19 web-vox ray-termination fix** — on wasm32, clamps
+    /// `max_group_bound_dispatch` to [`WASM_MAX_GROUP_BOUND_DISPATCH`]. See
+    /// that const's docblock for the rationale + perf budget.
     fn from(args: &crate::AppArgs) -> Self {
-        args.construction_config
+        #[allow(unused_mut)]
+        let mut cfg = args.construction_config;
+        #[cfg(target_arch = "wasm32")]
+        {
+            cfg.max_group_bound_dispatch =
+                cfg.max_group_bound_dispatch.min(WASM_MAX_GROUP_BOUND_DISPATCH);
+        }
+        cfg
     }
 }
 

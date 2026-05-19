@@ -14,6 +14,7 @@ pub mod aadf;
 pub mod app_mode;
 pub mod baked_material;
 pub mod camera;
+pub mod diagnostics;
 pub mod e2e;
 pub mod editor;
 pub mod hud;
@@ -427,6 +428,14 @@ pub struct AppArgs {
     /// spawns this as a subprocess; the compare phase SSIM-asserts the two
     /// captured PNGs are dissimilar.
     pub vox_web_parity_loaded_phase: bool,
+    /// 2026-05-19 — when `true`, boots the e2e harness with
+    /// `GridPreset::Vox { path: oasis.cvox }` through the production W5 GPU
+    /// producer chain, pins the camera at the C#-faithful horizon pose
+    /// (`InitialCameraPose::from_world_voxels(WORLD_SIZE_IN_VOXELS)`), and
+    /// captures `vox_horizon_native.png` at a 1280×720 window — the
+    /// resolution the Playwright cross-target SSIM gate compares against.
+    /// See [`crate::e2e::vox_horizon_parity`].
+    pub vox_horizon_native_phase: bool,
 }
 
 impl Default for AppArgs {
@@ -448,6 +457,7 @@ impl Default for AppArgs {
             vox_gpu_oracle_gpu_phase: false,
             vox_web_parity_skybox_phase: false,
             vox_web_parity_loaded_phase: false,
+            vox_horizon_native_phase: false,
         }
     }
 }
@@ -498,6 +508,24 @@ impl WindowConfig {
             // [`WindowConfig::e2e_resize_test`] (resizable: true) instead.
             resizable: false,
             title: "bevy-naadf e2e_render",
+            name: None,
+        }
+    }
+
+    /// The e2e window for the horizon-parity gate (2026-05-19). 1280×720 —
+    /// large enough that the long-distance raymarch covers the full
+    /// framebuffer (the standard 256×256 e2e window is too small to make
+    /// horizon-line ray-termination regressions visible), matched to the
+    /// Playwright spec's `viewport: { width: 1280, height: 720 }` so the
+    /// cross-target PNGs SSIM-compare without resize.
+    fn e2e_horizon() -> Self {
+        Self {
+            resolution: Some((
+                crate::e2e::vox_horizon_parity::HORIZON_WIDTH as f32,
+                crate::e2e::vox_horizon_parity::HORIZON_HEIGHT as f32,
+            )),
+            resizable: false,
+            title: "bevy-naadf e2e_render vox-horizon-native",
             name: None,
         }
     }
@@ -742,12 +770,23 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     if cfg.add_free_camera {
         app.add_plugins(FreeCameraPlugin).add_systems(
             Update,
-            (camera::toggle_dlss, camera::sync_position_split),
+            (
+                camera::toggle_dlss,
+                camera::apply_initial_camera_pose_changes,
+                camera::sync_position_split,
+            )
+                .chain(),
         );
     } else {
         // No `FreeCameraPlugin`, so `sync_position_split` still needs to run
         // once (it is a pure function of the `Transform` → deterministic).
         app.add_systems(Update, camera::sync_position_split);
+    }
+
+    // Press-P diagnostics dump — production only. Skipped under the e2e
+    // harness (non-interactive; resources it probes may be absent there).
+    if !cfg.add_e2e_systems {
+        app.add_plugins(diagnostics::DiagnosticsPlugin);
     }
 
     // Load the embedded Roboto Regular font into Assets<Font> and store the
@@ -795,6 +834,14 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     .add_systems(
         Update,
         voxel::web_vox::apply_pending_vox
+            .after(voxel::async_vox::poll_pending_vox_parse),
+    )
+    // 2026-05-19 — `?pose=horizon` URL-param camera pin. Runs every frame
+    // when the override resource is present; bypasses FreeCamera input so
+    // the cross-target SSIM gate's WASM-side capture is deterministic.
+    .add_systems(
+        Update,
+        voxel::web_vox::pin_web_horizon_camera
             .after(voxel::async_vox::poll_pending_vox_parse),
     );
 
@@ -902,6 +949,16 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
                 )
                     .chain(),
             );
+
+        // 2026-05-19 cross-target SSIM gate support — when the
+        // `UiHiddenOverride` resource is inserted (web: by the
+        // `?ui=hide` URL param via `web_vox::startup_fetch_default_vox`;
+        // native: by anyone who wants UI off), hide all three UI roots
+        // every frame. Lives outside the cfg-gated wasm32-only branch
+        // because the system is target-agnostic; only the resource
+        // inserter (the `?ui=hide` URL-param resolver) is wasm-only.
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(Update, voxel::web_vox::hide_ui);
     }
 
     app
@@ -947,6 +1004,12 @@ pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
             title: "bevy-naadf e2e_render small-edit-repro",
             name: None,
         };
+    }
+    // 2026-05-19 — horizon-parity gate needs a 1280×720 window so the
+    // long-distance raymarch fills the framebuffer (the default 256×256
+    // is too small to surface horizon-line ray-termination regressions).
+    if args.vox_horizon_native_phase {
+        cfg.window = WindowConfig::e2e_horizon();
     }
     let app = build_app_with_args(cfg, args);
     e2e::run_with_app(app)

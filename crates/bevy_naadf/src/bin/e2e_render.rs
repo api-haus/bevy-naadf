@@ -128,6 +128,12 @@ fn main() -> ExitCode {
         args.iter().any(|a| a == "--vox-web-parity-skybox");
     let vox_web_parity_loaded_mode =
         args.iter().any(|a| a == "--vox-web-parity-loaded");
+    // 2026-05-19 — horizon-parity gate (cross-target native ↔ WASM SSIM at
+    // the C# default pose). Native-side single capture; the Playwright spec
+    // shells out to this binary's `--ssim-compare … --ssim-min …` to assert
+    // similarity against its own WASM canvas screenshot. See
+    // `crate::e2e::vox_horizon_parity`.
+    let vox_horizon_native_mode = args.iter().any(|a| a == "--vox-horizon-native");
     // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — `--ssim-compare`
     // short-circuit. Exits without booting a Bevy app. Used by both the
     // top-level `--vox-web-parity` mode (out-of-process SSIM compare) AND
@@ -348,6 +354,13 @@ fn main() -> ExitCode {
         // `vox_web_parity_loaded.png`. Asserts zero `tracing::error!`
         // events fired during the run.
         bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_loaded_phase()
+    } else if vox_horizon_native_mode {
+        // 2026-05-19 — horizon-parity native capture. Loads oasis.cvox via
+        // the W5 GPU producer chain, pins the C#-faithful horizon pose,
+        // captures `vox_horizon_native.png` at 1280×720. The Playwright
+        // spec shells out to `--ssim-compare` to assert structural
+        // similarity against its WASM canvas screenshot.
+        bevy_naadf::e2e::vox_horizon_parity::run_vox_horizon_native_phase()
     } else if vox_gpu_construction_mode {
         // `--vox-gpu-construction` — load the Oasis fixture through the
         // production W5 GPU producer chain (vox-gpu-rewrite W5.5). Loads

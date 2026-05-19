@@ -77,7 +77,15 @@ web:
     done
     # `setsid` detaches Chrome into its own session so Ctrl-C on the dev
     # server does not also signal the browser.
-    setsid {{chrome}} --new-window "$url" >/dev/null 2>&1 &
+    # `--enable-unsafe-webgpu --enable-webgpu-developer-features` mirror the
+    # Playwright config (`e2e/playwright.config.ts:44-48`) so live dev and
+    # the SSIM gate exercise the same WebGPU surface; the dev-features flag
+    # also surfaces Dawn validation errors as page errors.
+    setsid {{chrome}} \
+        --new-window \
+        --enable-unsafe-webgpu \
+        --enable-webgpu-developer-features \
+        "$url" >/dev/null 2>&1 &
     wait "$trunk_pid"
 
 # Build the WebGPU (wasm32) artifact into crates/bevy_naadf/dist without serving.
@@ -87,6 +95,43 @@ web-build:
 # Build the optimised (release) WebGPU artifact into crates/bevy_naadf/dist.
 web-build-release:
     cd {{naadf_dir}} && trunk build --release
+
+# Serve a pre-built `dist/` with miniserve + the COOP/COEP headers wasm-bindgen-rayon
+# needs for SharedArrayBuffer, then open Chrome. No file watching, no live reload —
+# escape hatch for when `trunk serve` blows up on the inotify limit. Run
+# `just web-build` (or `web-build-release`) first; rerun it when you want a refresh.
+# Requires miniserve: `cargo install miniserve`.
+web-static: web-build-release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{naadf_dir}}
+    if [[ ! -f dist/index.html ]]; then
+        echo "dist/ is empty — run \`just web-build\` or \`just web-build-release\` first." >&2
+        exit 1
+    fi
+    url="http://{{web_host}}:{{web_port}}"
+    echo "miniserve dist → $url   (static, no watch, COOP/COEP enabled)"
+    miniserve dist \
+        --index index.html \
+        --interfaces {{web_host}} \
+        --port {{web_port}} \
+        --header "Cross-Origin-Opener-Policy: same-origin" \
+        --header "Cross-Origin-Embedder-Policy: require-corp" &
+    serve_pid=$!
+    trap 'kill "$serve_pid" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 150); do
+        if curl -sf -o /dev/null "$url"; then break; fi
+        sleep 0.2
+    done
+    # `--enable-unsafe-webgpu --enable-webgpu-developer-features` mirror the
+    # Playwright config (`e2e/playwright.config.ts:44-48`) so live dev and
+    # the SSIM gate exercise the same WebGPU surface.
+    setsid {{chrome}} \
+        --new-window \
+        --enable-unsafe-webgpu \
+        --enable-webgpu-developer-features \
+        "$url" >/dev/null 2>&1 &
+    wait "$serve_pid"
 
 # ── voxel_noise (FastNoise2 — native API + Emscripten C-ABI module) ─────────
 

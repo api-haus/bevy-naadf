@@ -34,6 +34,7 @@ pub mod tracing_error_counter;
 pub mod vox_e2e;
 pub mod vox_gpu_construction;
 pub mod vox_gpu_oracle;
+pub mod vox_horizon_parity;
 pub mod vox_web_parity;
 
 use bevy::camera::Hdr;
@@ -269,6 +270,11 @@ pub fn add_e2e_systems(app: &mut App) {
                 // for the same override reason `pin_vox_gpu_oracle_camera`
                 // does.
                 vox_web_parity::pin_vox_web_parity_camera
+                    .after(oasis_edit_visual::pin_oasis_camera),
+                // 2026-05-19 — horizon-parity gate camera pin (C# default
+                // pose). Same override-the-birdseye ordering as the parity
+                // pin above.
+                vox_horizon_parity::pin_vox_horizon_camera
                     .after(oasis_edit_visual::pin_oasis_camera),
             )
                 .before(crate::camera::sync_position_split),

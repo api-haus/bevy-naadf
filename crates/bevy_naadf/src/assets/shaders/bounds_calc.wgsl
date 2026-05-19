@@ -72,7 +72,7 @@ struct ConstructionParams {
     segment_size_in_chunks: u32,
     max_group_bound_dispatch: u32,
     chunk_offset: vec3<u32>,
-    _pad2: u32,
+    dispatch_offset: u32,
     frame_index: u32,
     changed_chunk_count: u32,
     changed_block_count: u32,
@@ -294,23 +294,24 @@ fn prepare_group_bounds() {
         bound_refined_info[1] = group_amount;
         bound_refined_info[2] = found_bound_size | (found_xyz << 16u);
 
-        // Update queue head for next frame: advance `start`, decrement `size`
-        // by the slice we just claimed. `boundsCalc.fx:84-87`.
         let qi = BOUND_INFO_GROUPS + found_bound_size * 3u + found_xyz;
         bound_queue_info[qi].start =
             (found_start + group_amount) % params.bound_group_queue_max_size;
-        // `atomicStore` on `size` to keep the field's declared atomic
-        // discipline; we are the single writer this frame.
         atomicStore(&bound_queue_info[qi].size, found_size - group_amount);
     } else {
         bound_refined_info[1] = 0u;
     }
-
-    // `boundsCalc.fx:92` — `boundGroupQueueDispatchCount.Store(0, max(1, n))`
-    // The `max(1, …)` ensures the indirect dispatch always launches at least
-    // one workgroup so the no-op work-item case still issues a (trivial)
-    // dispatch — `compute_group_bounds` sees `count = 0` and bails internally.
     bound_dispatch_indirect[0] = max(1u, group_amount);
+
+    // 2026-05-19 horizon-parity diagnostic — write what this prepare call
+    // decided. [3]=found_bound_size, [4]=found_xyz, [5]=found_size_atomicload.
+    bound_refined_info[3] = found_bound_size;
+    bound_refined_info[4] = found_xyz;
+    bound_refined_info[5] = found_size;
+    // [7] = monotonic prepare-call counter (load-add-store, single-thread
+    // workgroup = no contention concern).
+    let prev_calls = bound_refined_info[7];
+    bound_refined_info[7] = prev_calls + 1u;
 }
 
 // ─── Entry point 3: compute_group_bounds — fx:118-193 ─────────────────────────
@@ -406,6 +407,18 @@ fn compute_group_bounds(
         // was computed alongside the load above (same chunk-pos).
         chunks[chunk_idx] = vec2<u32>(cur_chunk, entity_y);
         atomicStore(&any_bounds_increase, 1u);
+        // 2026-05-19 horizon-parity diagnostic — count per-thread real
+        // expansions. Slot [6] accumulates across all compute rounds; the
+        // probe2 readback compares to the expected (count × 64 threads ×
+        // axes-expanded).
+        // Thread-0 contention here is many-workgroup, NOT single — but
+        // atomicAdd needs atomic<u32>. Keep slot [6] non-atomic; we'll
+        // accept under-count from races. The presence of any nonzero
+        // value already tells us "compute did SOME expansions". Exact
+        // count isn't critical for this diagnostic.
+        if (local_index == 0u) {
+            bound_refined_info[6] = bound_refined_info[6] + 1u;
+        }
     }
 
     workgroupBarrier();

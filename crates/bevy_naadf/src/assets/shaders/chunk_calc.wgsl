@@ -80,9 +80,20 @@ struct ConstructionParams {
     hash_map_size: u32,
     segment_size_in_chunks: u32,
     max_group_bound_dispatch: u32,
-    // Row 3 (offset 48): chunk_offset (vec3) + pad to 16.
+    // Row 3 (offset 48): chunk_offset (vec3) + dispatch_offset.
     chunk_offset: vec3<u32>,
-    _pad2: u32,
+    // 2026-05-19 web-vox bounds-chain split — added scalar at offset 60
+    // (former `_pad2` padding slot). `compute_voxel_bounds` /
+    // `compute_block_bounds` add this to their `block_index` so the host
+    // can split the 134M-workgroup voxel-bounds dispatch into smaller
+    // batches on web (the symptom this fixes is the bug where Dawn appears
+    // to lose roughly half of a single massive dispatch's invocations,
+    // leaving distant voxels with AADF bits = 0 and rays stepping at
+    // ~4 voxels/iter there). On native this stays 0 (single big
+    // dispatch). All non-bounds-chain shaders read this as 0 too — it is
+    // not a generic dispatch-base offset, it is specific to the bounds
+    // chain.
+    dispatch_offset: u32,
     // Row 4 (offset 64): 4 × u32.
     frame_index: u32,
     changed_chunk_count: u32,
@@ -458,7 +469,12 @@ fn compute_voxel_bounds(
     @builtin(num_workgroups) num_workgroups_in: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
 ) {
-    let block_index = group_id.x
+    // 2026-05-19 — `params.dispatch_offset` lets the host split the bounds
+    // chain into multiple smaller dispatches on web. Host loops increment
+    // `dispatch_offset` by the per-batch size and re-submits; the shader
+    // sees a contiguous block_index across batches. Native sets it to 0.
+    let block_index = params.dispatch_offset
+        + group_id.x
         + group_id.y * num_workgroups_in.x
         + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
     let voxel_index = block_index * 64u + local_index;
@@ -510,7 +526,9 @@ fn compute_block_bounds(
     @builtin(num_workgroups) num_workgroups_in: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
 ) {
-    let chunk_index = group_id.x
+    // 2026-05-19 — see `compute_voxel_bounds` for `dispatch_offset` rationale.
+    let chunk_index = params.dispatch_offset
+        + group_id.x
         + group_id.y * num_workgroups_in.x
         + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
     let block_index = chunk_index * 64u + local_index;

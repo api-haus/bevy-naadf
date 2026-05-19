@@ -76,7 +76,7 @@ struct ConstructionParams {
     segment_size_in_chunks: u32,
     max_group_bound_dispatch: u32,
     chunk_offset: vec3<u32>,
-    _pad2: u32,
+    dispatch_offset: u32,
     frame_index: u32,
     changed_chunk_count: u32,
     changed_block_count: u32,

@@ -248,6 +248,28 @@ pub fn dispatch_add_initial_groups(
 /// W3 regime-2 helper: run `n_rounds` of {prepare → indirect compute} inside
 /// the given encoder. Mirrors NAADF's `WorldBoundHandler.Update` loop
 /// (`WorldBoundHandler.cs:113-120`).
+///
+/// **`compute_workgroups_override`** (2026-05-19 web-vox ray-termination fix):
+/// when `Some(n)`, the regime-2 compute pass is dispatched **directly** with
+/// `n` workgroups (1D) instead of via `dispatch_workgroups_indirect`. This is
+/// the WebGPU workaround for a wgpu/Dawn ordering bug where the STORAGE→
+/// INDIRECT barrier between `prepare_group_bounds` (which writes
+/// `bound_dispatch_indirect[0]`) and the indirect `compute_group_bounds`
+/// dispatch is not honoured — Dawn reads stale indirect args and dispatches
+/// only the seeded `[1, 1, 1]`, leaving the chunk-AADF acceleration
+/// permanently unbuilt and causing rays to step chunk-by-chunk (120 ×
+/// 16 voxels = ~30 % of the production-world depth before exhaustion).
+///
+/// On native (`None`): unchanged — indirect dispatch reads `count` written
+/// by `prepare_group_bounds` and dispatches exactly that many workgroups.
+///
+/// On web (`Some(n)`): direct dispatch of `n` workgroups; the shader's
+/// existing `is_group_active = group_id.x < count` early-bail at
+/// `bounds_calc.wgsl:331` short-circuits the wasted workgroups. `n` must
+/// equal the `max_group_bound_dispatch` value uploaded to the params
+/// uniform so prepare's `min(max_group_bound_dispatch, found_size)` cannot
+/// claim more groups than the direct dispatch can drain (claimed-but-not-
+/// drained groups would be silently lost from the queue).
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_regime_2_rounds(
     encoder: &mut CommandEncoder,
@@ -258,6 +280,7 @@ pub fn dispatch_regime_2_rounds(
     dispatch_bind_group: &bevy::render::render_resource::BindGroup,
     indirect_buffer: &bevy::render::render_resource::Buffer,
     n_rounds: u32,
+    compute_workgroups_override: Option<u32>,
 ) {
     for _ in 0..n_rounds {
         // Pass 1: `prepare_group_bounds` — single-thread.
@@ -273,8 +296,9 @@ pub fn dispatch_regime_2_rounds(
             pass.dispatch_workgroups(1, 1, 1);
         }
         // Pass 2: `compute_group_bounds` — indirect off the dispatch buffer
-        // `prepare_group_bounds` just wrote. wgpu's automatic
-        // STORAGE→INDIRECT barrier serialises the access.
+        // `prepare_group_bounds` just wrote on native (wgpu's automatic
+        // STORAGE→INDIRECT barrier serialises the access), OR direct with
+        // a fixed workgroup count on web (bypasses the buggy Dawn barrier).
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("naadf_bounds_calc_compute_pass"),
@@ -283,7 +307,14 @@ pub fn dispatch_regime_2_rounds(
             pass.set_pipeline(compute_pipeline);
             pass.set_bind_group(0, world_bind_group, &[]);
             pass.set_bind_group(1, bounds_bind_group, &[]);
-            pass.dispatch_workgroups_indirect(indirect_buffer, 0);
+            match compute_workgroups_override {
+                Some(n) => {
+                    pass.dispatch_workgroups(n.max(1), 1, 1);
+                }
+                None => {
+                    pass.dispatch_workgroups_indirect(indirect_buffer, 0);
+                }
+            }
         }
     }
 }
@@ -315,6 +346,10 @@ pub fn naadf_bounds_compute_node(
     construction_bind_groups: Option<Res<ConstructionBindGroups>>,
     construction_gpu: Option<Res<ConstructionGpu>>,
     construction_config: Option<Res<ConstructionConfig>>,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+    render_device: Res<bevy::render::renderer::RenderDevice>,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+    render_queue: Res<bevy::render::renderer::RenderQueue>,
 ) {
     let Some(construction_pipelines) = construction_pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
@@ -367,6 +402,104 @@ pub fn naadf_bounds_compute_node(
 
     let n_rounds = construction_config.n_bounds_rounds.max(1);
 
+    // 2026-05-19 horizon-parity AADF — on wasm, submit each {prepare,
+    // compute} round as its own command buffer so atomic writes to
+    // `bound_queue_info[qi].size` from compute's re-enqueue path are
+    // guaranteed visible to the next round's prepare's `atomicLoad`.
+    // Within one encoder Dawn's automatic STORAGE→STORAGE barrier across
+    // compute passes does not appear to propagate atomic ops; separate
+    // submits force a full GPU sync that does. Native uses one encoder
+    // for all rounds (Vulkan's barrier handling propagates correctly).
+    #[cfg(target_arch = "wasm32")]
+    {
+        for _ in 0..n_rounds {
+            let mut round_encoder = render_device.create_command_encoder(
+                &bevy::render::render_resource::CommandEncoderDescriptor {
+                    label: Some("naadf_bounds_calc_round_wasm"),
+                },
+            );
+            // prepare pass — single-thread scan that writes
+            // `bound_refined_info` + `bound_dispatch_indirect`.
+            {
+                let mut pass = round_encoder.begin_compute_pass(
+                    &bevy::render::render_resource::ComputePassDescriptor {
+                        label: Some("naadf_bounds_calc_prepare_pass_wasm"),
+                        timestamp_writes: None,
+                    },
+                );
+                pass.set_pipeline(prepare_pipeline);
+                pass.set_bind_group(0, bounds_world_bg, &[]);
+                pass.set_bind_group(1, bounds_bg, &[]);
+                pass.set_bind_group(2, dispatch_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            // compute pass — direct dispatch with the construction
+            // config's `max_group_bound_dispatch` workgroups (wasm clamp
+            // = 4096); the shader's `is_group_active = group_id.x < count`
+            // early-bail covers wasted workgroups.
+            {
+                let mut pass = round_encoder.begin_compute_pass(
+                    &bevy::render::render_resource::ComputePassDescriptor {
+                        label: Some("naadf_bounds_calc_compute_pass_wasm"),
+                        timestamp_writes: None,
+                    },
+                );
+                pass.set_pipeline(compute_pipeline);
+                pass.set_bind_group(0, bounds_world_bg, &[]);
+                pass.set_bind_group(1, bounds_bg, &[]);
+                pass.dispatch_workgroups(
+                    construction_config.max_group_bound_dispatch.max(1),
+                    1,
+                    1,
+                );
+            }
+            // Submit this round in its own command buffer so the GPU
+            // fences the atomic writes to `bound_queue_info[].size`
+            // (compute's re-enqueue) BEFORE the next round's prepare
+            // reads them. Without this, Dawn's automatic STORAGE→STORAGE
+            // barrier across compute passes within one encoder does not
+            // propagate atomic ops, leaving subsequent rounds reading
+            // stale queue sizes and freezing AADF expansion at level 1.
+            render_queue.submit([round_encoder.finish()]);
+        }
+        return;
+    }
+
+    // 2026-05-19 horizon-parity AADF diagnostic — one-shot log of the
+    // construction-config values reaching the regime-2 node (verifies the
+    // wasm clamp on `max_group_bound_dispatch` actually flows here from
+    // `From<&AppArgs> for ConstructionConfig`).
+    {
+        static LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            bevy::log::info!(
+                "[aadf-probe] regime-2 config: n_bounds_rounds={} \
+                 max_group_bound_dispatch={} (the wasm clamp ceiling is 4096)",
+                n_rounds,
+                construction_config.max_group_bound_dispatch,
+            );
+        }
+    }
+
+    // 2026-05-19 web-vox ray-termination fix — on WebGPU, the STORAGE→INDIRECT
+    // barrier between `prepare_group_bounds` (writes `bound_dispatch_indirect`)
+    // and the indirect `compute_group_bounds` dispatch is not honoured by
+    // wgpu's Dawn backend: Dawn reads the seeded `[1,1,1]` indirect args
+    // instead of the post-prepare write, so `compute_group_bounds` dispatches
+    // exactly 1 workgroup per round, the chunk-AADF acceleration never
+    // builds, and rays step chunk-by-chunk (120 × 16 = ~1920 voxels ≈ 30 %
+    // of the 4096-voxel world). Workaround: dispatch DIRECTLY with the
+    // `max_group_bound_dispatch` workgroup count (clamped to a wasm-friendly
+    // value via [`From<&AppArgs> for ConstructionConfig`] so the bail-out
+    // cost on the shader's existing `is_group_active = group_id.x < count`
+    // early-exit stays sub-ms in steady state). On native this is `None` →
+    // unchanged indirect dispatch (the native path's barrier works).
+    #[cfg(target_arch = "wasm32")]
+    let compute_workgroups_override = Some(construction_config.max_group_bound_dispatch);
+    #[cfg(not(target_arch = "wasm32"))]
+    let compute_workgroups_override: Option<u32> = None;
+
     let diagnostics = render_context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let encoder = render_context.command_encoder();
@@ -380,6 +513,7 @@ pub fn naadf_bounds_compute_node(
         dispatch_bg,
         indirect_buffer,
         n_rounds,
+        compute_workgroups_override,
     );
     time_span.end(render_context.command_encoder());
 }

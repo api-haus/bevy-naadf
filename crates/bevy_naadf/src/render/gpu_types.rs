@@ -604,12 +604,20 @@ pub struct GpuConstructionParams {
     /// `maxGroupBoundDispatch` — the regime-2 throttle. NAADF default `512 * 64`
     /// (`WorldBoundHandler.cs:25`). Mirrored from `ConstructionConfig`.
     pub max_group_bound_dispatch: u32,
-    // Row 3 (offset 48): chunkOffset (vec3) + pad to 16.
+    // Row 3 (offset 48): chunkOffset (vec3) + dispatch_offset.
     /// `chunkOffsetX/Y/Z` — per-segment chunk offset for the regime-1 dispatch
     /// loop. C# `WorldData.cs:138-151`.
     pub chunk_offset: [u32; 3],
-    /// std140 padding to the next 16-byte row.
-    pub _pad2: u32,
+    /// 2026-05-19 web-vox bounds-chain split — added scalar at offset 60
+    /// (former `_pad2` padding slot). The bounds-chain compute shaders
+    /// (`compute_voxel_bounds`, `compute_block_bounds` in `chunk_calc.wgsl`)
+    /// add this value to their `block_index` so the host can split the
+    /// 134M-workgroup dispatch into smaller batches without WebGPU's
+    /// per-dispatch upper bound becoming a practical hard cap. Set to 0 by
+    /// all other consumers (kept padding semantics on the non-split paths
+    /// — see `chunk_calc.wgsl::ConstructionParams.dispatch_offset`'s
+    /// docblock).
+    pub dispatch_offset: u32,
     // Row 4 (offset 64): 4 × u32.
     /// Monotonic frame counter — shared with `GpuRenderParams.frame_count` /
     /// `GpuTaaParams.frame_count`; populated identically.

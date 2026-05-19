@@ -553,17 +553,25 @@ pub fn install_imported_vox(
         crate::WORLD_SIZE_IN_SEGMENTS.z,
     );
 
-    // C# camera spawn: literal (500, 200, 40) voxels in the fixed
-    // 4096×512×4096 world (WorldRender.cs:48-49). `from_world_voxels` scales
-    // proportionally for the fixed world size — see camera/mod.rs:54-64.
-    let world_voxels = [
-        WORLD_SIZE_IN_VOXELS.x,
-        WORLD_SIZE_IN_VOXELS.y,
-        WORLD_SIZE_IN_VOXELS.z,
-    ];
-    commands.insert_resource(crate::camera::InitialCameraPose::from_world_voxels(
-        world_voxels,
-    ));
+    // 2026-05-19 — initial camera spawn pose now matches the cross-target
+    // SSIM gate's pose constants so a `just web-static` / `just web` /
+    // native release boot lands at the SAME camera the Playwright
+    // `vox-horizon-parity.spec.ts` screenshots. Lets the user directly
+    // A/B compare the live render against the gate's captured PNGs
+    // without first re-poking the FreeCamera into position.
+    //
+    // The previously-used `InitialCameraPose::from_world_voxels` C#
+    // proportional pose (`(2000, 800, 160)` for the 4096×512×4096 world)
+    // is preserved on its function — only the call site here is
+    // overridden. If a future user needs the C#-faithful spawn for
+    // comparison against C# NAADF, restore the
+    // `from_world_voxels(world_voxels)` call and remove this block.
+    let _ = WORLD_SIZE_IN_VOXELS;
+    commands.insert_resource(crate::camera::InitialCameraPose(bevy::prelude::Transform {
+        translation: crate::e2e::vox_horizon_parity::HORIZON_CAMERA_POS,
+        rotation: crate::e2e::vox_horizon_parity::HORIZON_CAMERA_ROT,
+        scale: bevy::prelude::Vec3::ONE,
+    }));
 
     // W5.1 — convert ConstructedWorld → ModelData. The `chunks/blocks/voxels`
     // u32 buffers `vox_import` produces are byte-identical to NAADF's

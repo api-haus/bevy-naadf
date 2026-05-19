@@ -1445,6 +1445,107 @@ pub fn populate_cpu_mirror_from_gpu_producer(
             world_data.voxels_cpu = voxels_cpu;
             world_data.block_hashing = crate::aadf::block_hash::BlockHashingHandler::new();
             world_data.seed_block_hashing();
+
+            // 2026-05-19 horizon-parity AADF diagnostic — sample chunks +
+            // blocks at distances along the cross-target SSIM gate's
+            // camera view-ray and log AADF skip-bit decode for each.
+            // Native + WASM both pass through this code (same readback);
+            // the Playwright spec filters `[aadf-probe]` lines from
+            // console output + native stdout, persists them to disk so
+            // the orchestrator can diff native vs WASM without
+            // copy-pasting log tails.
+            //
+            // Camera (cross-target gate pose):
+            //   pos     = (3880, 497, 3514) voxels
+            //   forward = (-0.924, -0.241, -0.297)
+            //
+            // Chunk word encoding (bits 30-31 = state; bits 0-29 = AADF
+            // skip-distances for empty chunks, encoded as 6 × 5-bit
+            // fields = (mx, px, my, py, mz, pz)).
+            {
+                let chunks_cpu = &world_data.chunks_cpu;
+                let blocks_cpu = &world_data.blocks_cpu;
+                let voxels_cpu = &world_data.voxels_cpu;
+                let scx = world_data.size_in_chunks.x as usize;
+                let scy = world_data.size_in_chunks.y as usize;
+                let scz = world_data.size_in_chunks.z as usize;
+                bevy::log::info!(
+                    "[aadf-probe] world chunks {}×{}×{} \
+                     chunks_cpu.len()={} blocks_cpu.len()={} voxels_cpu.len()={}",
+                    scx, scy, scz,
+                    chunks_cpu.len(),
+                    blocks_cpu.len(),
+                    voxels_cpu.len(),
+                );
+                let cam = [3880.0_f32, 497.0_f32, 3514.0_f32];
+                let fwd = [-0.924_f32, -0.241_f32, -0.297_f32];
+                for &dist in &[0.0_f32, 500.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0] {
+                    let pxw = cam[0] + fwd[0] * dist;
+                    let pyw = cam[1] + fwd[1] * dist;
+                    let pzw = cam[2] + fwd[2] * dist;
+                    if pxw < 0.0 || pyw < 0.0 || pzw < 0.0 {
+                        bevy::log::info!(
+                            "[aadf-probe] dist={} pos=({:.0},{:.0},{:.0}) OUT_OF_WORLD_NEGATIVE",
+                            dist as u32, pxw, pyw, pzw,
+                        );
+                        continue;
+                    }
+                    let cx = (pxw as u32) / 16;
+                    let cy = (pyw as u32) / 16;
+                    let cz = (pzw as u32) / 16;
+                    if cx >= scx as u32 || cy >= scy as u32 || cz >= scz as u32 {
+                        bevy::log::info!(
+                            "[aadf-probe] dist={} pos=({:.0},{:.0},{:.0}) chunk=({},{},{}) OUT_OF_WORLD",
+                            dist as u32, pxw, pyw, pzw, cx, cy, cz,
+                        );
+                        continue;
+                    }
+                    let chunk_idx =
+                        cx as usize + cy as usize * scx + cz as usize * scx * scy;
+                    let chunk_word = chunks_cpu[chunk_idx];
+                    let state = (chunk_word >> 30) & 0x3;
+                    let mxd = chunk_word & 0x1F;
+                    let pxd = (chunk_word >> 5) & 0x1F;
+                    let myd = (chunk_word >> 10) & 0x1F;
+                    let pyd = (chunk_word >> 15) & 0x1F;
+                    let mzd = (chunk_word >> 20) & 0x1F;
+                    let pzd = (chunk_word >> 25) & 0x1F;
+                    let state_name = match state {
+                        0 => "EMPTY",
+                        1 => "FULL",
+                        _ => "MIXED",
+                    };
+                    bevy::log::info!(
+                        "[aadf-probe] dist={} pos=({:.0},{:.0},{:.0}) chunk=({},{},{}) \
+                         word=0x{:08x} state={} chunk_aadf=[mx={} px={} my={} py={} mz={} pz={}]",
+                        dist as u32, pxw, pyw, pzw, cx, cy, cz,
+                        chunk_word, state_name, mxd, pxd, myd, pyd, mzd, pzd,
+                    );
+                    // For mixed chunks, peek at the first block's 2-bit
+                    // AADF skip-distances + state. block_base is the
+                    // 30-bit pointer in bits 0-29 of chunk_word.
+                    if state >= 2 {
+                        let block_base = chunk_word & 0x3FFFFFFF;
+                        if (block_base as usize) < blocks_cpu.len() {
+                            let block_word = blocks_cpu[block_base as usize];
+                            let bstate = (block_word >> 30) & 0x3;
+                            let bmx = block_word & 0x3;
+                            let bpx = (block_word >> 2) & 0x3;
+                            let bmy = (block_word >> 4) & 0x3;
+                            let bpy = (block_word >> 6) & 0x3;
+                            let bmz = (block_word >> 8) & 0x3;
+                            let bpz = (block_word >> 10) & 0x3;
+                            bevy::log::info!(
+                                "[aadf-probe]   block[{}] word=0x{:08x} state={} \
+                                 block_aadf=[mx={} px={} my={} py={} mz={} pz={}]",
+                                block_base, block_word, bstate,
+                                bmx, bpx, bmy, bpy, bmz, bpz,
+                            );
+                        }
+                    }
+                }
+                let _ = voxels_cpu;
+            }
             drop(world_data);
 
             gpu.cpu_mirror_populated = true;
@@ -1811,9 +1912,21 @@ pub fn prepare_construction(
         });
         // Zero-init.
 
+        // 2026-05-19 horizon-parity diagnostic — extended from 3 u32 to 16 u32.
+        // [0..3] = original {start, count, packed_size_axis} prepare writes.
+        // [3..6] = diagnostic: prepare logs {found_bound_size, found_xyz,
+        //         found_size_atomic_load} every call. Lets the AADF probe2
+        //         readback show WHICH queue prepare is picking vs what the
+        //         queue ACTUALLY holds, surfacing whether atomic visibility
+        //         across compute passes is broken on Dawn.
+        // [6]    = diagnostic: atomicAdd counter; compute_group_bounds
+        //         increments this once per workgroup that does real work
+        //         (is_group_active=true + chunk_state==EMPTY). Lets us see
+        //         per-round actual-work count vs prepare's chosen count.
+        // [7..16] = reserved for future debug.
         let refined_buf = render_device.create_buffer(&BufferDescriptor {
             label: Some("naadf_bound_refined_info"),
-            size: 3 * 4,
+            size: 16 * 4,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -1873,7 +1986,7 @@ pub fn prepare_construction(
             segment_size_in_chunks: 4,
             max_group_bound_dispatch: construction_config.max_group_bound_dispatch,
             chunk_offset: [0, 0, 0],
-            _pad2: 0,
+            dispatch_offset: 0,
             frame_index: 0,
             changed_chunk_count: 0,
             changed_block_count: 0,
@@ -2305,7 +2418,7 @@ pub fn prepare_construction(
                 segment_size_in_chunks: 4,
                 max_group_bound_dispatch: construction_config.max_group_bound_dispatch,
                 chunk_offset: [0, 0, 0],
-                _pad2: 0,
+                dispatch_offset: 0,
                 frame_index: 0,
                 changed_chunk_count: events.changed_chunk_count,
                 changed_block_count: events.changed_block_count,
@@ -3012,7 +3125,7 @@ pub fn naadf_gpu_producer_node(
                         segment_size_in_chunks: segment_chunks,
                         max_group_bound_dispatch: config.max_group_bound_dispatch,
                         chunk_offset: group_offset_in_chunks,
-                        _pad2: 0,
+                        dispatch_offset: 0,
                         frame_index: 0,
                         changed_chunk_count: 0,
                         changed_block_count: 0,
@@ -3105,6 +3218,14 @@ pub fn naadf_gpu_producer_node(
         let voxel_dispatch = chunk_calc::split_3d_dispatch(voxel_workgroups);
         let block_dispatch = chunk_calc::split_3d_dispatch(block_workgroups);
 
+        // 2026-05-19 — bounds chain runs as a single dispatch on both
+        // native and web. (An earlier wasm-only split-dispatch experiment
+        // tested whether Dawn was losing invocations from the large 134M
+        // dispatch; SSIM moved by 0.02 at 16M batches and noise at 1M
+        // batches → confirmed the dispatch completes fine. The
+        // `params.dispatch_offset` field stays plumbed in case it's
+        // useful for future batching needs; both shaders read it as 0.)
+        let _ = (&render_device, &render_queue, bounds_params_buf);
         chunk_calc::dispatch_compute_voxel_bounds(
             encoder,
             p_voxel,
@@ -3268,6 +3389,257 @@ pub fn run_gpu_construction_startup(args: Res<crate::AppArgs>) {
 /// (`render/mod.rs:73-86`).
 pub struct ConstructionPlugin;
 
+/// 2026-05-19 horizon-parity AADF diagnostic — render-world resource that
+/// drives a one-shot delayed readback of the W3 regime-2 bound_queue_info
+/// buffer (96 × 8 B = 768 B) AND a fresh sample of chunks[] AT A LATER
+/// FRAME than the initial cpu_mirror snapshot. The original
+/// `populate_cpu_mirror_from_gpu_producer` snapshots chunks RIGHT AFTER the
+/// W5 producer chain finishes — too early for regime-2 to have converged.
+/// This probe waits N frames AFTER cpu_mirror_populated, then re-reads
+/// chunks + bound_queue_info to capture the post-convergence state.
+#[derive(Resource, Default)]
+pub struct AadfDelayedProbe {
+    /// Frames elapsed since cpu_mirror_populated flipped to true.
+    pub frames_since_mirror: u32,
+    /// `false` until the delayed readback has been ISSUED.
+    pub readback_issued: bool,
+    /// `false` until the delayed readback has been LOGGED.
+    pub logged: bool,
+    /// Which probe-pass this is (0 = at frame 30, 1 = at frame 500). The
+    /// probe fires once at each, resets between.
+    pub pass: u32,
+    /// Staging buffer for bound_queue_info (small — 768 B).
+    pub info_staging: Option<Buffer>,
+    pub info_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Staging buffer for chunks[] (16 MiB at production scale).
+    pub chunks_staging: Option<Buffer>,
+    pub chunks_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Staging buffer for `bound_refined_info` (16 u32 = 64 B). Holds the
+    /// per-call diagnostic from prepare_group_bounds + the per-workgroup
+    /// "did expansion" counter from compute_group_bounds (2026-05-19
+    /// horizon-parity diagnostic).
+    pub refined_staging: Option<Buffer>,
+    pub refined_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 2026-05-19 — delayed AADF probe: waits 300 frames (~5 s @ 60 fps) post
+/// cpu-mirror-population so the W3 regime-2 background loop has had time
+/// to converge, then reads chunks[] AND bound_queue_info back to the CPU
+/// and logs:
+///   1. Sample chunks along the cross-target gate's camera view-ray with
+///      decoded chunk-AADF skip bits — the LATE state (vs the
+///      EARLY-state probe at cpu-mirror population time).
+///   2. `bound_queue_info[size][axis].size` for all 96 entries. Pins
+///      whether the regime-2 loop drained queue[0] (and re-enqueued to
+///      queue[1+]) or got stuck somewhere.
+pub fn aadf_delayed_probe(
+    mut probe: ResMut<AadfDelayedProbe>,
+    gpu: Option<Res<ConstructionGpu>>,
+    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+) {
+    use bevy::render::render_resource::MapMode;
+    use std::sync::atomic::Ordering;
+
+    let Some(gpu) = gpu else { return; };
+    if !gpu.cpu_mirror_populated { return; }
+    if probe.pass >= 2 { return; }
+    probe.frames_since_mirror = probe.frames_since_mirror.saturating_add(1);
+    // pass 0 fires at frame 30 (early-convergence snapshot — also the
+    // only one native typically reaches before exiting). pass 1 fires at
+    // frame 500 (near-screenshot-time on web, lets us see if web
+    // converges by then).
+    let trigger_frame = if probe.pass == 0 { 30 } else { 200 };
+    if probe.frames_since_mirror < trigger_frame { return; }
+    let Some(world_gpu) = world_gpu else { return; };
+
+    if !probe.readback_issued {
+        let Some(info_src) = gpu.bound_queue_info.as_ref() else { return; };
+        let Some(refined_src) = gpu.bound_refined_info.as_ref() else { return; };
+        let chunks_src = &world_gpu.chunks_buffer;
+
+        let info_size = 32u64 * 3 * 8; // 32 size-levels × 3 axes × 8 B (GpuBoundQueueInfo)
+        let chunks_size = (world_gpu.chunks_size_in_chunks.x as u64)
+            * (world_gpu.chunks_size_in_chunks.y as u64)
+            * (world_gpu.chunks_size_in_chunks.z as u64)
+            * 8;
+
+        let info_staging = render_device.create_buffer(&BufferDescriptor {
+            label: Some("aadf_delayed_probe_info_staging"),
+            size: info_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let chunks_staging = render_device.create_buffer(&BufferDescriptor {
+            label: Some("aadf_delayed_probe_chunks_staging"),
+            size: chunks_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let refined_size = 16u64 * 4;
+        let refined_staging = render_device.create_buffer(&BufferDescriptor {
+            label: Some("aadf_delayed_probe_refined_staging"),
+            size: refined_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = render_device.create_command_encoder(
+            &CommandEncoderDescriptor { label: Some("aadf_delayed_probe_enc") },
+        );
+        enc.copy_buffer_to_buffer(info_src, 0, &info_staging, 0, info_size);
+        enc.copy_buffer_to_buffer(chunks_src, 0, &chunks_staging, 0, chunks_size);
+        enc.copy_buffer_to_buffer(refined_src, 0, &refined_staging, 0, refined_size);
+        render_queue.submit([enc.finish()]);
+
+        let info_done = probe.info_done.clone();
+        info_staging.slice(..).map_async(MapMode::Read, move |r| {
+            if r.is_err() {
+                bevy::log::error!("[aadf-probe2] info map_async failed");
+            }
+            info_done.store(true, Ordering::Release);
+        });
+        let chunks_done = probe.chunks_done.clone();
+        chunks_staging.slice(..).map_async(MapMode::Read, move |r| {
+            if r.is_err() {
+                bevy::log::error!("[aadf-probe2] chunks map_async failed");
+            }
+            chunks_done.store(true, Ordering::Release);
+        });
+        let refined_done = probe.refined_done.clone();
+        refined_staging.slice(..).map_async(MapMode::Read, move |r| {
+            if r.is_err() {
+                bevy::log::error!("[aadf-probe2] refined map_async failed");
+            }
+            refined_done.store(true, Ordering::Release);
+        });
+
+        probe.info_staging = Some(info_staging);
+        probe.chunks_staging = Some(chunks_staging);
+        probe.refined_staging = Some(refined_staging);
+        probe.readback_issued = true;
+        bevy::log::info!(
+            "[aadf-probe2 pass={}] readback ISSUED at frame {} (chunks_size={} B, info_size={} B)",
+            probe.pass, probe.frames_since_mirror, chunks_size, info_size,
+        );
+        return;
+    }
+
+    // Issued — poll the device + wait for both callbacks.
+    let _ = render_device.poll(bevy::render::render_resource::PollType::Poll);
+    if !probe.info_done.load(Ordering::Acquire) { return; }
+    if !probe.chunks_done.load(Ordering::Acquire) { return; }
+    if !probe.refined_done.load(Ordering::Acquire) { return; }
+
+    // All three mapped — decode + log + free.
+    let Some(info_staging) = probe.info_staging.take() else { return; };
+    let Some(chunks_staging) = probe.chunks_staging.take() else { return; };
+    let Some(refined_staging) = probe.refined_staging.take() else { return; };
+
+    let info_bytes_arc: Vec<u8> = info_staging.slice(..).get_mapped_range().to_vec();
+    let chunks_bytes_arc: Vec<u8> = chunks_staging.slice(..).get_mapped_range().to_vec();
+    let refined_bytes: Vec<u8> = refined_staging.slice(..).get_mapped_range().to_vec();
+    info_staging.unmap();
+    chunks_staging.unmap();
+    refined_staging.unmap();
+
+    // 2026-05-19 — decode bound_refined_info (16 u32).
+    // [3]=found_bound_size, [4]=found_xyz, [5]=found_size_atomicload,
+    // [6]=expansion_workgroup_counter, [7]=prepare_call_counter.
+    let refined_u32 = |i: usize| -> u32 {
+        u32::from_le_bytes(refined_bytes[i*4..(i+1)*4].try_into().unwrap())
+    };
+    let pass_tag_r = probe.pass;
+    bevy::log::info!(
+        "[aadf-probe2 pass={}] bound_refined_info: last_picked={{size={} axis={}}} \
+         last_size_loaded={} expansion_workgroups_total={} prepare_calls_total={} \
+         [0..3]=(start={},count={},packed_size_axis={})",
+        pass_tag_r,
+        refined_u32(3),
+        refined_u32(4),
+        refined_u32(5),
+        refined_u32(6),
+        refined_u32(7),
+        refined_u32(0),
+        refined_u32(1),
+        refined_u32(2),
+    );
+
+    // Decode bound_queue_info (96 entries × 8 B each: start u32, size u32).
+    let pass_tag = probe.pass;
+    bevy::log::info!(
+        "[aadf-probe2 pass={}] post-convergence bound_queue_info SIZE per (bound_size, axis):",
+        pass_tag,
+    );
+    for size_level in 0u32..32 {
+        let mut row = format!("[aadf-probe2 pass={}]   size={:2}: ", pass_tag, size_level);
+        for axis in 0u32..3 {
+            let qi = (size_level * 3 + axis) as usize;
+            let off = qi * 8;
+            let sz = u32::from_le_bytes(
+                info_bytes_arc[off + 4..off + 8].try_into().unwrap(),
+            );
+            row.push_str(&format!(
+                "{}={:5} ",
+                ["X", "Y", "Z"][axis as usize],
+                sz,
+            ));
+        }
+        bevy::log::info!("{}", row);
+    }
+
+    // Decode chunks at the camera-view-ray sample positions (same sample
+    // table as the EARLY probe — directly comparable).
+    let scx = world_gpu.chunks_size_in_chunks.x as usize;
+    let scy = world_gpu.chunks_size_in_chunks.y as usize;
+    let scz = world_gpu.chunks_size_in_chunks.z as usize;
+    // chunks_buffer is `array<vec2<u32>>` (W4 widening). Stride = 8 B.
+    let read_chunk_x = |cx: u32, cy: u32, cz: u32| -> u32 {
+        let i = (cx as usize)
+            + (cy as usize) * scx
+            + (cz as usize) * scx * scy;
+        let off = i * 8;
+        u32::from_le_bytes(chunks_bytes_arc[off..off + 4].try_into().unwrap())
+    };
+    let cam = [3880.0_f32, 497.0_f32, 3514.0_f32];
+    let fwd = [-0.924_f32, -0.241_f32, -0.297_f32];
+    for &dist in &[0.0_f32, 500.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0] {
+        let pxw = cam[0] + fwd[0] * dist;
+        let pyw = cam[1] + fwd[1] * dist;
+        let pzw = cam[2] + fwd[2] * dist;
+        if pxw < 0.0 || pyw < 0.0 || pzw < 0.0 { continue; }
+        let cx = (pxw as u32) / 16;
+        let cy = (pyw as u32) / 16;
+        let cz = (pzw as u32) / 16;
+        if cx >= scx as u32 || cy >= scy as u32 || cz >= scz as u32 { continue; }
+        let word = read_chunk_x(cx, cy, cz);
+        let state = (word >> 30) & 0x3;
+        let mxd = word & 0x1F;
+        let pxd = (word >> 5) & 0x1F;
+        let myd = (word >> 10) & 0x1F;
+        let pyd = (word >> 15) & 0x1F;
+        let mzd = (word >> 20) & 0x1F;
+        let pzd = (word >> 25) & 0x1F;
+        let st = match state { 0 => "EMPTY", 1 => "FULL", _ => "MIXED" };
+        bevy::log::info!(
+            "[aadf-probe2 pass={}] dist={} chunk=({},{},{}) word=0x{:08x} state={} \
+             chunk_aadf=[mx={} px={} my={} py={} mz={} pz={}]",
+            pass_tag, dist as u32, cx, cy, cz, word, st, mxd, pxd, myd, pyd, mzd, pzd,
+        );
+    }
+
+    bevy::log::info!(
+        "[aadf-probe2 pass={}] DONE — logged post-convergence state",
+        pass_tag,
+    );
+
+    // Reset for the next pass (or end if pass 1 just completed).
+    probe.pass += 1;
+    probe.readback_issued = false;
+    probe.info_done.store(false, std::sync::atomic::Ordering::Release);
+    probe.chunks_done.store(false, std::sync::atomic::Ordering::Release);
+}
+
 impl Plugin for ConstructionPlugin {
     fn build(&self, app: &mut App) {
         // Read the main-world `AppArgs.construction_config` once at
@@ -3301,6 +3673,9 @@ impl Plugin for ConstructionPlugin {
         render_app
             // Mirror the main-world construction config into the render sub-app.
             .insert_resource(construction_config)
+            // 2026-05-19 horizon-parity AADF diagnostic — render-world
+            // resource for the delayed bounds-info readback.
+            .init_resource::<AadfDelayedProbe>()
             // Empty pipeline registry — W1..W5 add pipeline fields + a
             // proper `FromWorld` impl as they land.
             .init_gpu_resource::<ConstructionPipelines>()
@@ -3335,7 +3710,9 @@ impl Plugin for ConstructionPlugin {
             .add_systems(
                 ExtractSchedule,
                 (extract_world_changes, populate_cpu_mirror_from_gpu_producer),
-            );
+            )
+            // 2026-05-19 horizon-parity AADF diagnostic.
+            .add_systems(ExtractSchedule, aadf_delayed_probe);
     }
 }
 
@@ -3666,7 +4043,7 @@ pub fn validate_gpu_construction() -> Result<usize, String> {
         segment_size_in_chunks,
         max_group_bound_dispatch: 0,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        dispatch_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,
@@ -4618,7 +4995,7 @@ pub fn validate_gpu_construction_production_scale() -> Result<String, String> {
         segment_size_in_chunks: segment_chunks,
         max_group_bound_dispatch: 0,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        dispatch_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,
@@ -4752,7 +5129,7 @@ pub fn validate_gpu_construction_production_scale() -> Result<String, String> {
                     segment_size_in_chunks: segment_chunks,
                     max_group_bound_dispatch: 0,
                     chunk_offset,
-                    _pad2: 0,
+                    dispatch_offset: 0,
                     frame_index: 0,
                     changed_chunk_count: 0,
                     changed_block_count: 0,
@@ -5406,7 +5783,7 @@ fn run_one_fixture_byte_diff(
         segment_size_in_chunks,
         max_group_bound_dispatch: 0,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        dispatch_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,
@@ -6000,7 +6377,7 @@ fn run_one_fixture_multiseg_byte_diff(
                     segment_size_in_chunks,
                     max_group_bound_dispatch: 0,
                     chunk_offset,
-                    _pad2: 0,
+                    dispatch_offset: 0,
                     frame_index: 0,
                     changed_chunk_count: 0,
                     changed_block_count: 0,
@@ -6746,7 +7123,7 @@ fn run_one_tiled_byte_diff(
                     segment_size_in_chunks: seg,
                     max_group_bound_dispatch: 0,
                     chunk_offset: off,
-                    _pad2: 0,
+                    dispatch_offset: 0,
                     frame_index: 0,
                     changed_chunk_count: 0,
                     changed_block_count: 0,
@@ -7211,7 +7588,7 @@ fn run_oasis_segment_byte_diff(
             .max(group_size_in_chunks[2]),
         max_group_bound_dispatch: 0,
         chunk_offset: [0, 0, 0],
-        _pad2: 0,
+        dispatch_offset: 0,
         frame_index: 0,
         changed_chunk_count: 0,
         changed_block_count: 0,
@@ -8351,7 +8728,7 @@ mod tests {
             group_offset_in_chunks,
             group_size_in_chunks_x: group_size_in_chunks[0],
             group_size_in_chunks_y: group_size_in_chunks[1],
-            _pad2: 0,
+            dispatch_offset: 0,
             _pad3: 0,
             _pad4: 0,
         };
@@ -8775,7 +9152,7 @@ mod tests_w1 {
             segment_size_in_chunks,
             max_group_bound_dispatch: 0,
             chunk_offset: [0, 0, 0],
-            _pad2: 0,
+            dispatch_offset: 0,
             frame_index: 0,
             changed_chunk_count: 0,
             changed_block_count: 0,
@@ -9457,7 +9834,7 @@ mod tests_w4 {
             max_entity_instances: 64,
             _pad0: 0,
             _pad1: 0,
-            _pad2: 0,
+            dispatch_offset: 0,
             // Web-WebGPU migration: chunks is `array<vec2<u32>>`; the kernel
             // flattens chunk_pos with `size_in_chunks` as the stride basis.
             size_in_chunks,

@@ -558,7 +558,9 @@ pub fn e2e_driver(
     // sub-phase flag is set. Camera pose is owned by
     // `super::vox_web_parity::pin_vox_web_parity_camera`.
     let vox_web_parity_mode = app_args.as_deref().is_some_and(|a| {
-        a.vox_web_parity_skybox_phase || a.vox_web_parity_loaded_phase
+        a.vox_web_parity_skybox_phase
+            || a.vox_web_parity_loaded_phase
+            || a.vox_horizon_native_phase
     });
     if vox_web_parity_mode
         && state.phase == E2ePhase::Warmup
@@ -1597,7 +1599,12 @@ pub fn e2e_driver(
                         let is_loaded = app_args
                             .as_deref()
                             .is_some_and(|a| a.vox_web_parity_loaded_phase);
-                        let filename = if is_skybox {
+                        let is_horizon = app_args
+                            .as_deref()
+                            .is_some_and(|a| a.vox_horizon_native_phase);
+                        let filename = if is_horizon {
+                            super::vox_horizon_parity::HORIZON_NATIVE_PNG
+                        } else if is_skybox {
                             super::vox_web_parity::PARITY_SKYBOX_PNG
                         } else if is_loaded {
                             super::vox_web_parity::PARITY_LOADED_PNG

@@ -183,6 +183,118 @@ pub fn resolve_skybox_only_param() -> bool {
     stripped.split('&').any(|p| p == "skybox=1")
 }
 
+/// 2026-05-19 — detect the `?pose=horizon` URL query parameter. When
+/// present, a Bevy `Update` system pins the camera at the user-captured
+/// pose (`HORIZON_CAMERA_POS` + `HORIZON_CAMERA_ROT` in
+/// `crate::e2e::vox_horizon_parity`) every frame, overriding any
+/// FreeCamera input. Used by the Playwright cross-target SSIM gate so
+/// the WASM canvas screenshot is captured at the exact same pose the
+/// native gate captures.
+pub fn resolve_horizon_pose_param() -> bool {
+    let Some(window) = web_sys::window() else { return false; };
+    let search = window.location().search().unwrap_or_default();
+    let Some(stripped) = search.strip_prefix('?') else { return false; };
+    stripped.split('&').any(|p| p == "pose=horizon")
+}
+
+/// 2026-05-19 — detect the `?ui=hide` URL query parameter. When present,
+/// the in-canvas Bevy UI (editor brush palette, settings overlay,
+/// diagnostics HUD) is despawned every frame so the cross-target SSIM
+/// gate compares pure 3D framebuffers (native runs in `AppConfig::e2e`
+/// which has no UI; the live web build has UI on, contaminating SSIM).
+pub fn resolve_ui_hide_param() -> bool {
+    let Some(window) = web_sys::window() else { return false; };
+    let search = window.location().search().unwrap_or_default();
+    let Some(stripped) = search.strip_prefix('?') else { return false; };
+    stripped.split('&').any(|p| p == "ui=hide")
+}
+
+/// 2026-05-19 — marker resource that hides the in-canvas Bevy UI every
+/// frame. Inserted on web when `?ui=hide` is in the URL; on native the
+/// `e2e_render` binary already runs under `AppConfig::e2e` (no UI), so
+/// the asymmetry the cross-target SSIM gate sees is between
+/// `bevy-naadf`-windowed (UI on, both native + web) and `e2e_render`
+/// (UI off). The resource is target-agnostic — only the URL-param
+/// resolver lives in this web-only module because the param plumbing
+/// reads `window.location`.
+#[derive(Resource, Default)]
+pub struct UiHiddenOverride;
+
+/// 2026-05-19 — marker resource inserted at startup when
+/// `?pose=horizon` is present. Read by [`pin_web_horizon_camera`] every
+/// frame.
+#[derive(Resource, Default)]
+pub struct WebHorizonPoseOverride;
+
+/// 2026-05-19 — `Update` system that hides the in-canvas Bevy UI when
+/// [`UiHiddenOverride`] is present. Sets `Visibility::Hidden` on the
+/// `EditorHudRoot`, `SettingsRoot`, and `HudText` entities; child UI nodes
+/// inherit the hidden visibility, so the entire UI tree stops rendering
+/// without breaking layout or input wiring (which keeps the un-overridden
+/// case byte-identical). Cheap: hits 3 entities per frame, sets
+/// `Visibility` once each.
+pub fn hide_ui(
+    override_resource: Option<Res<UiHiddenOverride>>,
+    mut editor_hud: Query<&mut Visibility, With<crate::editor::hud::EditorHudRoot>>,
+    mut settings_root: Query<
+        &mut Visibility,
+        (
+            With<crate::settings::SettingsRoot>,
+            Without<crate::editor::hud::EditorHudRoot>,
+        ),
+    >,
+    mut diag_hud: Query<
+        &mut Visibility,
+        (
+            With<crate::hud::HudText>,
+            Without<crate::editor::hud::EditorHudRoot>,
+            Without<crate::settings::SettingsRoot>,
+        ),
+    >,
+) {
+    if override_resource.is_none() {
+        return;
+    }
+    for mut v in editor_hud.iter_mut() {
+        *v = Visibility::Hidden;
+    }
+    for mut v in settings_root.iter_mut() {
+        *v = Visibility::Hidden;
+    }
+    for mut v in diag_hud.iter_mut() {
+        *v = Visibility::Hidden;
+    }
+}
+
+/// 2026-05-19 — `Update` system that pins the live camera at the
+/// user-captured horizon pose when [`WebHorizonPoseOverride`] is present.
+/// Bypasses FreeCamera input so the SSIM gate's WASM-side capture is
+/// deterministic.
+pub fn pin_web_horizon_camera(
+    override_resource: Option<Res<WebHorizonPoseOverride>>,
+    camera: Option<
+        Single<(&mut Transform, &mut crate::camera::position_split::PositionSplit), With<Camera3d>>,
+    >,
+) {
+    if override_resource.is_none() {
+        return;
+    }
+    let Some(mut camera) = camera else { return; };
+    // Same constants as the native gate
+    // (`crate::e2e::vox_horizon_parity::{HORIZON_CAMERA_POS,
+    // HORIZON_CAMERA_ROT}`).
+    let pose = Transform {
+        translation: crate::e2e::vox_horizon_parity::HORIZON_CAMERA_POS,
+        rotation: crate::e2e::vox_horizon_parity::HORIZON_CAMERA_ROT,
+        scale: Vec3::ONE,
+    };
+    let (transform, position_split) = &mut *camera;
+    **transform = pose;
+    **position_split = crate::camera::position_split::PositionSplit::from_world(
+        pose.translation,
+    );
+}
+
 async fn fetch_vox_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
     let resp_value =
@@ -297,6 +409,29 @@ pub fn startup_fetch_default_vox(mut commands: Commands) {
         commands.insert_resource(crate::voxel::grid::WebSkyboxOverride);
         hide_loading_overlay();
         return;
+    }
+
+    // 2026-05-19 — `?pose=horizon` URL param: pin the camera at the C#
+    // default horizon pose every frame (bypasses FreeCamera) so the
+    // cross-target SSIM gate captures the WASM canvas at the exact same
+    // pose the native `--vox-horizon-native` gate captures.
+    if resolve_horizon_pose_param() {
+        info!(
+            "web_vox: ?pose=horizon detected — pinning camera at C# default \
+             horizon pose (2000, 800, 160) → (2000, 800, 161)"
+        );
+        commands.insert_resource(WebHorizonPoseOverride);
+    }
+
+    // 2026-05-19 — `?ui=hide` URL param: hide the in-canvas Bevy UI
+    // (editor brush palette, settings overlay, diagnostics HUD) so the
+    // cross-target SSIM gate compares pure 3D framebuffers. The live web
+    // build has UI on (`add_hud = true`); the native gate runs under
+    // `AppConfig::e2e` which has `add_hud = false`. Without this flag the
+    // SSIM compare tolerates the UI mismatch (false-passing the gate).
+    if resolve_ui_hide_param() {
+        info!("web_vox: ?ui=hide detected — UI will be hidden every frame");
+        commands.insert_resource(UiHiddenOverride);
     }
 
     let url = resolve_startup_vox_url();

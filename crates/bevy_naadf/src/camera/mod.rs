@@ -157,6 +157,61 @@ pub fn default_free_camera() -> FreeCamera {
     }
 }
 
+/// 2026-05-19 — re-apply [`InitialCameraPose`] to the live camera entity
+/// when the resource changes after `Startup`.
+///
+/// **Why this exists.** On web, `setup_test_grid` runs at `Startup` with
+/// `GridPreset::Default` (the .vox is HTTP-fetched async) and installs a
+/// default-scene `InitialCameraPose` for an empty-world view; `setup_camera`
+/// reads it and spawns the camera at that pose. Later, when
+/// `voxel::web_vox::apply_pending_vox` lands the fetched `.vox` and calls
+/// `install_imported_vox`, it inserts a NEW `InitialCameraPose` matching
+/// the loaded world — but `setup_camera` ran once at `Startup` and never
+/// re-fires, so the camera stays at the empty-world pose. Without this
+/// system the boot pose visibly differs from the post-install pose
+/// (`just web-static` lands at (2027, 7, 2033) instead of the loaded
+/// world's intended spawn).
+///
+/// Skipped when [`FreeCamera`] has visibly moved the camera (any non-zero
+/// translation/rotation delta from the most recent `InitialCameraPose`
+/// re-apply): once the user moves around, a subsequent .vox swap should
+/// not yank them back to spawn.
+pub fn apply_initial_camera_pose_changes(
+    initial_pose: Option<Res<InitialCameraPose>>,
+    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
+    mut last_applied: Local<Option<Transform>>,
+) {
+    let Some(initial_pose) = initial_pose else { return; };
+    if !initial_pose.is_changed() { return; }
+    let new_pose = initial_pose.0;
+    // Don't snap a user-moved camera back to spawn. Compare the current
+    // camera Transform against the last pose this system applied
+    // (`Startup` write counts as the first). If they match, FreeCamera
+    // hasn't moved yet — safe to apply the new pose. If they differ, the
+    // user has flown around; preserve their position.
+    let (cam_transform, cam_position_split) = &mut *camera;
+    if let Some(last) = *last_applied {
+        let translation_drift = (cam_transform.translation - last.translation).length_squared();
+        let rotation_drift = cam_transform.rotation.angle_between(last.rotation);
+        if translation_drift > 1.0 || rotation_drift > 0.01 {
+            return;
+        }
+    }
+    **cam_transform = new_pose;
+    **cam_position_split = PositionSplit::from_world(new_pose.translation);
+    *last_applied = Some(new_pose);
+    info!(
+        "camera::apply_initial_camera_pose_changes: re-applied InitialCameraPose \
+         pos=({:.2}, {:.2}, {:.2}), forward=({:.3}, {:.3}, {:.3})",
+        new_pose.translation.x,
+        new_pose.translation.y,
+        new_pose.translation.z,
+        new_pose.forward().x,
+        new_pose.forward().y,
+        new_pose.forward().z,
+    );
+}
+
 /// `D` toggles DLSS Ray Reconstruction on/off. Dormant in Phase A — the NAADF
 /// render path is not wired to DLSS yet, this is kept for Phase B.
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
