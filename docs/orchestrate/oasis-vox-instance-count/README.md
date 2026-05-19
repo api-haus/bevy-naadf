@@ -19,10 +19,10 @@ The Bevy port loads **~2.5** modulo-wrapped instances of the Oasis `.vox` asset,
 
 ## Phase checklist
 
-- [ ] Phase 1 — Parallel investigation (Bevy audit + C# reference) — read-only, parallel batch
-- [ ] Phase 2 — Design
-- [ ] Phase 3 — Implementation
-- [ ] Phase 4 — Review
+- [x] Phase 1 — Parallel investigation (Bevy audit + C# reference) — read-only, parallel batch
+- [x] Phase 2 — Design
+- [x] Phase 3 — Implementation (build clean; 200 tests pass, 1 ignored; all design assumptions held)
+- [ ] Phase 4 — Review (optional — pending user decision)
 - [ ] Phase 5 — User visual confirmation (binary side-by-side vs C#)
 
 ## Verification rule

@@ -18,10 +18,15 @@
 //!
 //! ## CLI flags
 //!
-//! - `--vox <path>` — load a MagicaVoxel `.vox` file at startup. The model is
-//!   sparse-walked + auto-tiled into the fixed `(256, 32, 256)`-chunk world
-//!   (matches C# `generatorModel.fx`); load failures log + fall back to the
-//!   embedded primitive scene. Minimal `std::env::args` parsing — no `clap`.
+//! - `--vox <path>` — load a voxel file at startup. The file format is
+//!   auto-detected from the first 4 magic bytes (see
+//!   `voxel/voxel_dispatch.rs`): MagicaVoxel `.vox` (`"VOX "`) or NAADF
+//!   `.cvox` (`"PK\x03\x04"` ZIP local file header). The flag name + path
+//!   shape stay unchanged for source-stability; the parser routing happens
+//!   on file content, not the path extension. The model is auto-tiled into
+//!   the fixed `(256, 32, 256)`-chunk world (matches C# `generatorModel.fx`);
+//!   load failures log + fall back to the embedded primitive scene. Minimal
+//!   `std::env::args` parsing — no `clap`.
 
 use bevy::prelude::AppExit;
 use bevy_naadf::{build_app_with_args, AppArgs, AppConfig, GridPreset};

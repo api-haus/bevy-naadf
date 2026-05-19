@@ -71,10 +71,15 @@ pub enum GridPreset {
     /// emissive box.
     #[default]
     Default,
-    /// Load a MagicaVoxel `.vox` file from disk (path relative to repo root or
-    /// absolute). The file is read once at `Startup`; failure logs an error
-    /// and falls back to [`GridPreset::Default`] so the e2e harness still has
-    /// a renderable world. See `voxel/vox_import.rs`.
+    /// Load a voxel file from disk (path relative to repo root or absolute).
+    /// The file is read once at `Startup` and the actual parser is selected
+    /// from the first 4 magic bytes: MagicaVoxel `.vox` (`"VOX "`) or NAADF
+    /// `.cvox` (`"PK\x03\x04"`) — see `voxel/voxel_dispatch.rs`. Failure
+    /// logs an error and falls back to [`GridPreset::Default`] so the e2e
+    /// harness still has a renderable world. The variant name stays as `Vox`
+    /// for source-stability — both formats land into the same install path
+    /// (`grid::install_vox_in_fixed_world`) which is parser-agnostic. See
+    /// `voxel/vox_import.rs` + `voxel/cvox_import.rs`.
     Vox {
         path: std::path::PathBuf,
     },

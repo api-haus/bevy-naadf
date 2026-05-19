@@ -87,6 +87,16 @@ ron = "0.12"
 # these majors, so neither adds a second copy.
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# zip = ZIP archive reader for the NAADF `.cvox` format (a ZIP-wrapped custom
+# binary; see `voxel/cvox_import.rs`). The `.cvox` container holds a single
+# DEFLATE-compressed entry named `"data"` whose body is a fixed-width
+# little-endian binary header + three flat `u32` arrays
+# (`dataChunk`/`dataBlock`/`dataVoxel`) — see `ModelData.cs:181-258` for the
+# C# source-of-truth. `default-features = false` drops the AES, BZIP2, ZSTD,
+# and time-stamp features we don't need; only the `deflate` codec is required
+# (the only codec `System.IO.Compression.ZipArchive.CreateEntry` uses).
+# Pure-rust, no native deps; wasm-compatible.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Native-only support for the texture-array Basis pipeline (`src/texture_array/`,
 # `src/bin/bake.rs`):

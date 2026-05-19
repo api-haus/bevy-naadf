@@ -500,8 +500,16 @@ pub fn install_vox_bytes_in_fixed_world(
 /// to `install_imported_vox` via a Bevy `Task<...>` polled in an `Update`
 /// system.
 pub fn parse_to_imported_vox(bytes: &[u8]) -> Result<vox_import::ImportedVox, String> {
-    let data = dot_vox::load_bytes(bytes).map_err(|e| format!("parse error: {e}"))?;
-    vox_import::parse_dot_vox_data(&data).map_err(|e| e.to_string())
+    // oasis-vox-instance-count (2026-05-19) — single magic-byte dispatch
+    // entry point. The first 4 bytes select between the MagicaVoxel `.vox`
+    // parser and the NAADF `.cvox` parser; both produce the same
+    // `ImportedVox` shape so every downstream consumer
+    // (`install_vox_bytes_in_fixed_world`, the async parse tasks, the
+    // drag-and-drop path, the web fetch path) inherits dispatch through
+    // this shim with no further changes. See
+    // `crates/bevy_naadf/src/voxel/voxel_dispatch.rs` +
+    // `docs/orchestrate/oasis-vox-instance-count/03-design.md`.
+    crate::voxel::voxel_dispatch::parse_voxel_bytes(bytes).map_err(|e| e.to_string())
 }
 
 /// Install a parsed [`vox_import::ImportedVox`] into the live Bevy `World`
@@ -648,12 +656,16 @@ pub fn install_imported_vox(
 
 /// Native (desktop) drag-and-drop entry point. Winit emits
 /// [`bevy::window::FileDragAndDrop::DroppedFile`] with a `PathBuf` whenever the
-/// user drops a file onto a window; this system filters to `.vox` files, reads
-/// the bytes via `std::fs::read`, and feeds them into
+/// user drops a file onto a window; this system filters to voxel files (`.vox`,
+/// `.cvox`), reads the bytes via `std::fs::read`, and feeds them into
 /// [`install_vox_bytes_in_fixed_world`] — the same install path used by the
-/// startup loader and (on web) the HTTP-fetch / browser-DnD paths.
+/// startup loader and (on web) the HTTP-fetch / browser-DnD paths. The actual
+/// format routing (MagicaVoxel `.vox` vs NAADF `.cvox`) happens further
+/// downstream in [`parse_to_imported_vox`] via magic-byte dispatch
+/// (`voxel/voxel_dispatch.rs`); this listener's extension check is only a
+/// UX-level "is this even a voxel file?" filter.
 ///
-/// Non-`.vox` drops are ignored with an info log; `.vox` drops with a read
+/// Non-voxel drops are ignored with an info log; voxel drops with a read
 /// error are logged as `error!` but the current scene is left intact (the
 /// install function's own fall-back-to-default behaviour only kicks in for
 /// successful reads that fail to *parse*).
@@ -688,14 +700,26 @@ pub fn native_vox_drop_listener(
                     path_buf.display(),
                     window
                 );
-                let is_vox = path_buf
+                // oasis-vox-instance-count (2026-05-19) — accept BOTH
+                // MagicaVoxel `.vox` and NAADF `.cvox`. The downstream
+                // `spawn_native_vox_parse` reads bytes + funnels them
+                // through `parse_to_imported_vox` → the magic-byte
+                // dispatch in `voxel/voxel_dispatch.rs`, so the actual
+                // routing happens on file *content*, not extension. This
+                // extension filter is only the UX-level "did the user
+                // drop a voxel file at all?" gate; it stays
+                // case-insensitive to match the prior `.vox` behaviour.
+                let is_voxel = path_buf
                     .extension()
                     .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("vox"))
+                    .map(|e| {
+                        let lower = e.to_ascii_lowercase();
+                        lower == "vox" || lower == "cvox"
+                    })
                     .unwrap_or(false);
-                if !is_vox {
+                if !is_voxel {
                     info!(
-                        "drag-drop: ignoring non-.vox file ({})",
+                        "drag-drop: ignoring non-voxel file ({})",
                         path_buf.display()
                     );
                     continue;
