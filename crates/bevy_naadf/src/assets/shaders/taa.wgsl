@@ -171,6 +171,48 @@ struct GpuCameraHistorySlot {
 // are imported from `render_pipeline_common.wgsl` (Phase B Batch 1 promoted the
 // shared helpers out of this file — `09-design-b.md` §5.2).
 
+// --- world-identity discriminator for the TAA hash --------------------------
+//
+// CANONICAL DERIVATION — `taa_data_id_lo13` is called from BOTH
+// `reproject_old_samples` (the read site that compares stored frame-(N-1)
+// hashes against current frame-N hashes) AND `calc_new_taa_sample` (the write
+// site that stores this frame's hash for the next frame to read). A drift
+// between the two derivations is silent hash-reject corruption — keep both
+// call sites going through THIS helper.
+//
+// Derives a 13-bit world-anchored voxel-cell discriminator at the first-hit
+// point. `FirstHitResult.pos` is camera-int-relative
+// (`render_pipeline_common.wgsl:375` — `r.pos = cam_pos_frac`, with ray-segment
+// offsets accumulated; `cam_pos_int` is NOT added back). Adding
+// `vec3<f32>(cam_pos_int)` here converts to world-absolute integer voxel
+// coordinates so the SAME world voxel produces the SAME 13-bit ID across
+// origin shifts (otherwise the post-shift `pos` would be offset by
+// `newCam_int - oldCam_int` and the hash would over-reject every origin-
+// shifted pixel — the opposite-but-also-wrong failure mode).
+//
+// Bit layout (13 bits, packed into `taa_hash_from_data`'s pre-mix bits 2..14):
+//   bits 0..3   = u32(voxel_pos.x) & 0xF                    (x low nibble)
+//   bits 4..7   = (u32(voxel_pos.y) & 0xF) << 4u            (y low nibble)
+//   bits 8..11  = (u32(voxel_pos.z) & 0xF) << 8u            (z low nibble)
+//   bit  12     = parity(u32(voxel_pos.x >> 4u) ^
+//                        u32(voxel_pos.y >> 4u) ^
+//                        u32(voxel_pos.z >> 4u)) << 12u     (16-voxel-block parity)
+//
+// 4096 unique IDs inside any 16x16x16 neighbourhood (no collisions there).
+// Bit 12 forces a hash flip across 16-voxel block boundaries on any axis. After
+// the two-round avalanche mix in `taa_hash_from_data`, the 16-bit-masked
+// output spreads the 8192-input space across `2^16` codes; ~99/100 random
+// inputs produce distinct outputs (the bound the Rust unit test asserts).
+fn taa_data_id_lo13(first_hit_pos: vec3<f32>, cam_pos_int: vec3<i32>) -> u32 {
+    let voxel_pos = vec3<i32>(floor(first_hit_pos + vec3<f32>(cam_pos_int)));
+    let lo_nibbles =
+          (u32(voxel_pos.x) & 0xFu)
+        | ((u32(voxel_pos.y) & 0xFu) << 4u)
+        | ((u32(voxel_pos.z) & 0xFu) << 8u);
+    let hi_parity = (u32(voxel_pos.x >> 4) ^ u32(voxel_pos.y >> 4) ^ u32(voxel_pos.z >> 4)) & 0x1u;
+    return lo_nibbles | (hi_parity << 12u);
+}
+
 // --- the reproject + accumulation pass -------------------------------------
 @compute @workgroup_size(64, 1, 1)
 fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -259,8 +301,12 @@ fn reproject_old_samples(@builtin(global_invocation_id) global_id: vec3<u32>) {
         valid_normals_spec |= (1u << ((cur_first_hit_specular_normals >> 3u) & 0x7u)) << 7u;
         valid_normals_spec |= (1u << ((cur_first_hit_specular_normals >> 6u) & 0x7u)) << 14u;
 
+        // Phase-B world-identity hash extension — see `taa_data_id_lo13` doc.
+        // `cam_pos_int` is the local at line 182 (`params.cam_pos_int.xyz`).
+        let cur_data_id_lo13 = taa_data_id_lo13(cur_first_hit_result.pos, cam_pos_int);
         let cur_hash = taa_hash_from_data(
             cur_first_hit_is_diffuse, cur_first_hit_specular_normals, cur_first_hit_entity,
+            cur_data_id_lo13,
         ) & 0xFFFFu;
         if (i == 0u) {
             valid_hash_center = cur_hash;
@@ -454,9 +500,14 @@ fn calc_new_taa_sample(@builtin(global_invocation_id) global_id: vec3<u32>) {
     } else {
         dist = unpack2x16float(first_hit.w & 0x7FFFu).x;
     }
+    // Phase-B world-identity hash extension — same derivation as the reproject
+    // pass at Site 2 (must be byte-equivalent or the hash reject corrupts
+    // silently). `cam_pos_int` is the local at line 407 (`cnts_params.cam_pos_int.xyz`).
+    let data_id_lo13 = taa_data_id_lo13(first_hit_result.pos, cam_pos_int);
     let sample_comp = taa_compress_sample(
         dist, light, first_hit_result.normal_tang & 0x7u, is_diffuse,
         specular_normals, extra_data8, first_hit.x & 0x3FFFu,
+        data_id_lo13,
     );
     // The sample ring — HLSL `% 32` → `% TAA_SAMPLE_RING_DEPTH` (the
     // configurable ring depth, default 32 — `taa_common.wgsl`).

@@ -504,3 +504,79 @@ fn create_screen_buffers(
     });
     (taa_samples, taa_sample_accum, taa_dist_min_max)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Primitive-level guard tests for the TAA hash world-identity extension
+    //! (`docs/orchestrate/taa-hash-world-identity/`). Per global memory
+    //! `feedback-primitives-then-analytical-invariants.md`: the hash function
+    //! is itself a primitive, so we test it independently of the GPU.
+    //!
+    //! The WGSL source of truth lives at
+    //! `crates/bevy_naadf/src/assets/shaders/taa_common.wgsl:taa_hash_from_data`.
+    //! `cpu_taa_hash_from_data` below is a byte-faithful Rust port — if you
+    //! change one, change both.
+    //!
+    //! IMPORTANT: this is the SAME `taa_hash_from_data` arithmetic as the
+    //! WGSL — `u32::wrapping_mul` matches WGSL's two's-complement u32
+    //! multiplication overflow behaviour, and `>>` on u32 is logical right
+    //! shift on both sides.
+
+    /// Pure-Rust port of the Phase-B-extended WGSL `taa_hash_from_data`
+    /// (`assets/shaders/taa_common.wgsl`). KEEP IN SYNC.
+    fn cpu_taa_hash_from_data(
+        is_diffuse: u32,
+        specular_normals: u32,
+        entity: u32,
+        data_id_lo13: u32,
+    ) -> u32 {
+        let mut hash = is_diffuse
+            | (entity << 1)
+            | ((data_id_lo13 & 0x1FFF) << 2)
+            | (specular_normals << 15);
+        hash ^= hash >> 17;
+        hash = hash.wrapping_mul(0xed5ad4bb);
+        hash ^= hash >> 11;
+        hash = hash.wrapping_mul(0xac4c1b51);
+        hash
+    }
+
+    /// User Q&A decision 3 (`docs/orchestrate/taa-hash-world-identity/01-context.md`):
+    /// ≥99/100 distinct `data_id_lo13` inputs MUST produce distinct 16-bit-
+    /// masked outputs. The avalanche mix in `taa_hash_from_data` makes near-
+    /// zero collisions overwhelmingly likely at this input size (birthday-
+    /// paradox collision rate ≈ 100*99/2/65536 ≈ 0.075 expected collisions),
+    /// so 99/100 is a deliberately conservative floor.
+    #[test]
+    fn taa_hash_world_identity_distinguishes_voxel_ids() {
+        let mut outs = std::collections::HashSet::new();
+        for id in 0..100u32 {
+            let h = cpu_taa_hash_from_data(0, 0, 0, id) & 0xFFFF;
+            outs.insert(h);
+        }
+        assert!(
+            outs.len() >= 99,
+            "expected >=99 distinct 16-bit outputs over 100 inputs, got {}",
+            outs.len()
+        );
+    }
+
+    /// Guard against regression to the Phase-A "this collapses to a single
+    /// constant value for every hit pixel" regime
+    /// (`assets/shaders/taa_common.wgsl` old header note). With
+    /// `data_id_lo13` varying between two world voxel IDs, the hash MUST
+    /// vary even when all other inputs (`is_diffuse`, `specular_normals`,
+    /// `entity`) are zero — which is exactly the shadowed-all-diffuse-no-
+    /// entity-no-specular regime where the streaming-world artifact was
+    /// observed.
+    #[test]
+    fn taa_hash_world_identity_id_zero_differs_from_id_one() {
+        let h0 = cpu_taa_hash_from_data(0, 0, 0, 0) & 0xFFFF;
+        let h1 = cpu_taa_hash_from_data(0, 0, 0, 1) & 0xFFFF;
+        assert_ne!(
+            h0, h1,
+            "Phase-A regression: hash collapses to a constant when only \
+             `data_id_lo13` varies (h0={h0:#x}, h1={h1:#x})"
+        );
+    }
+}

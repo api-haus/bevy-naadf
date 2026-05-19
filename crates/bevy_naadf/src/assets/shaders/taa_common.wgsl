@@ -41,13 +41,31 @@ const taa_neighbor_offsets: array<vec2<i32>, 9> = array<vec2<i32>, 9>(
     vec2<i32>(1, 1),
 );
 
-// `getHashFromData` — the surface-classification hash (HLSL
-// `commonTaa.fxh:20-28`). In Phase A's plane-0-only, entity-free, all-diffuse
-// world this collapses to a single constant value for every hit pixel — but it
-// is ported faithfully (it is cheap and Phase B needs it varying). Used by the
-// reproject pass's hash reject test.
-fn taa_hash_from_data(is_diffuse: u32, specular_normals: u32, entity: u32) -> u32 {
-    var hash = is_diffuse | (entity << 1u) | (specular_normals << 15u);
+// `getHashFromData` — the surface-classification + world-identity hash (HLSL
+// `commonTaa.fxh:20-28`, port-extended for procedural streaming + edits).
+//
+// Phase B extension (2026-05-19 — `docs/orchestrate/taa-hash-world-identity/`):
+// the hash now also mixes a 13-bit world-anchored voxel-cell discriminator
+// `data_id_lo13` into bits 2..14 of the pre-mix word. Bits previously: bit 0 =
+// `is_diffuse`, bit 1 = `entity` LSB, bit 15 = `specular_normals` LSB. Bits
+// 2..14 were unused — the Phase-A "this collapses to a single constant value
+// for every hit pixel" header note no longer applies; with `data_id_lo13`
+// varying per world voxel cell, the hash now invalidates TAA history on
+// origin shifts and voxel edits. `data_id_lo13` is derived at both call sites
+// via the canonical `taa_data_id_lo13(...)` helper in `taa.wgsl` (the write
+// site in `taa_compress_sample` and the read site in `reproject_old_samples`
+// MUST use the same derivation; a mismatch is silent hash-reject corruption).
+// Used by the reproject pass's hash reject test.
+fn taa_hash_from_data(
+    is_diffuse: u32,
+    specular_normals: u32,
+    entity: u32,
+    data_id_lo13: u32,
+) -> u32 {
+    var hash = is_diffuse
+        | (entity << 1u)
+        | ((data_id_lo13 & 0x1FFFu) << 2u)
+        | (specular_normals << 15u);
     hash = hash ^ (hash >> 17u);
     hash = hash * 0xed5ad4bbu;
     hash = hash ^ (hash >> 11u);
@@ -85,6 +103,9 @@ fn taa_compress_sample(
     specular_normals: u32,
     extra_data: u32,
     entity: u32,
+    // Phase-B world-identity discriminator — derived via the canonical
+    // `taa_data_id_lo13(...)` helper in `taa.wgsl` (see file-header note).
+    data_id_lo13: u32,
 ) -> vec2<u32> {
     // `f32tof16(dist)` — WGSL has no f16 scalar builtin; pack into the low half.
     let dist_comp = pack2x16float(vec2<f32>(dist, 0.0)) & 0xFFFFu;
@@ -104,7 +125,7 @@ fn taa_compress_sample(
         + (255.0 - 12.0 * log2(100.0));
     let color_comp = min(vec3<u32>(255u), vec3<u32>(max(color_comp_f, vec3<f32>(0.0))));
 
-    let hash = taa_hash_from_data(is_diffuse, specular_normals, entity);
+    let hash = taa_hash_from_data(is_diffuse, specular_normals, entity, data_id_lo13);
 
     var sample_comp = vec2<u32>(0u, 0u);
     sample_comp.x = dist_comp | ((hash & 0xFFFFu) << 16u);
