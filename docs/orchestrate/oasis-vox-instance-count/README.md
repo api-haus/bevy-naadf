@@ -25,7 +25,9 @@ The Bevy port loads **~2.5** modulo-wrapped instances of the Oasis `.vox` asset,
 - [x] Phase 4a — Manual QA #1: 4×4 instance count visually confirmed ✓
 - [x] Phase 4b — Palette diagnostic (`06-palette-diagnostic.md`): off-by-one in synthetic slot-0 injection
 - [x] Phase 4c — Palette fix (`07-palette-fix-impl.md`): option α applied; gates green
-- [ ] Phase 5 — Manual QA #2: user re-verifies palette correctness (no blue palm trees)
+- [x] Phase 4d — Web/CI audit (`08-web-ci-audit.md`): 5 mechanical edits, 0 runtime changes (dispatch shim already covers wasm path)
+- [x] Phase 4e — Web/CI impl (`09-web-ci-impl.md`): 5 edits landed; build + test + wasm-check all green
+- [ ] Phase 5 — Manual QA #2: user re-verifies (a) native palette correctness, (b) web/CI .cvox shipping after push
 - [ ] Phase 6 — Review (optional)
 
 ## Verification rule

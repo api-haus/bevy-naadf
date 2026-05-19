@@ -40,6 +40,7 @@ const MIME_TYPES = {
   ".toml": "text/plain",
   ".meta": "text/plain",
   ".vox": "application/octet-stream",
+  ".cvox": "application/octet-stream",
 };
 
 const server = createServer((req, res) => {

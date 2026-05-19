@@ -38,12 +38,14 @@ use wasm_bindgen::JsCast;
 // upstream documented setup.
 pub use wasm_bindgen_rayon::init_thread_pool;
 
-/// R2 key + URL for the default `.vox` model fetched on startup. The R2 proxy
+/// R2 key + URL for the default voxel model fetched on startup. The R2 proxy
 /// worker (`workers/r2-proxy/src/index.js`) serves any key under the
 /// `bevy-naadf-assets` bucket with `Cross-Origin-Resource-Policy: cross-origin`
 /// so this cross-origin fetch succeeds from the Pages-served HTML.
+/// Format dispatch is magic-byte-based (`voxel_dispatch::parse_voxel_bytes`),
+/// so `.cvox` bytes are handled transparently by the same fetch → parse path.
 const DEFAULT_VOX_URL: &str =
-    "https://bevy-naadf-assets.yura415.workers.dev/models/oasis_hard_cover.vox";
+    "https://bevy-naadf-assets.yura415.workers.dev/models/oasis.cvox";
 
 thread_local! {
     /// Single-slot inbox shared by the HTTP-fetch task and the drag-drop

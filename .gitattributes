@@ -1,3 +1,4 @@
 assets/**/*.png filter=lfs diff=lfs merge=lfs -text
 assets/**/*.ron text
 *.vox filter=lfs diff=lfs merge=lfs -text
+*.cvox filter=lfs diff=lfs merge=lfs -text

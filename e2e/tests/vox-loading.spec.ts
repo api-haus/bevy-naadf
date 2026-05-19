@@ -332,7 +332,7 @@ test.describe.serial("Web .vox loading", () => {
     // copy of the Oasis fixture served by `serve.mjs` under
     // `/test-fixtures/`. The default URL targets the live R2 bucket which
     // may not have the right key uploaded.
-    await page.goto("/?vox=/test-fixtures/oasis_hard_cover.vox", {
+    await page.goto("/?vox=/test-fixtures/oasis.cvox", {
       waitUntil: "commit",
     });
 
