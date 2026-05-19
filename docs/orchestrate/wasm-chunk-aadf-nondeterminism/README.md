@@ -21,27 +21,43 @@ distance varies run-to-run.
 | File | Owner | Status |
 |------|-------|--------|
 | `00-handoff-verbatim.md` | orchestrator (copied) | [x] |
-| `00-reuse-audit.md` | `delegate-auditor` | [ ] |
-| `02-diagnosis.md` | `general-purpose` (diagnose-first) | [ ] |
-| `01-context.md` | orchestrator (post-Q&A) | [ ] |
-| `03-design.md` | `delegate-architect` | [ ] |
-| `04-impl.md` | `general-purpose` (implementer) | [ ] |
-| `05-review.md` | `delegate-reviewer` | [ ] |
+| `01-diagnostics-design.md` | `general-purpose` (research + design) | [ ] |
+| `02-diagnostics-impl.md` | `general-purpose` (implementer) | [ ] |
+| `03-diagnosis.md` | `general-purpose` (diagnose-first, fresh eyes) | [ ] |
+| `04-context.md` | orchestrator (post-diagnosis Q&A) | [ ] |
+| `05-fix-design.md` | `delegate-architect` | [ ] |
+| `06-fix-impl.md` | `general-purpose` (implementer) | [ ] |
+| `07-review.md` | `delegate-reviewer` | [ ] |
 
 ## Agent groups
 
-- **research** — owns `00-reuse-audit.md` (existing diagnostic/probe/sync
-  infrastructure in this codebase) + `02-diagnosis.md` (diagnose-first
-  investigator: fresh-eyes diagnosis with the prior hypothesis class dropped
+- **diagnostics** — owns `01-diagnostics-design.md` (map of wgpu's adapter/
+  device introspection surface, catalog of Chrome/Dawn/WebGPU vs Vulkan/
+  WebGPU semantic divergences, concrete logging-package design) +
+  `02-diagnostics-impl.md` (the implementation log + a pointer to the
+  collected diagnostic-data artifacts on disk for both native and web).
+- **diagnose-first** — owns `03-diagnosis.md` (fresh-eyes diagnosis grounded
+  in the collected diagnostic data + code; prior hypothesis class is dropped
   as a bias source).
-- **design** — owns `03-design.md` (fix design grounded in the confirmed
-  diagnosis; cites file:line for every proposed change).
-- **impl** — owns `04-impl.md` (implementation + gate runs, including a
-  stability verification across 3+ Playwright runs to demonstrate the fix
+- **fix-design** — owns `05-fix-design.md` (fix design grounded in the
+  confirmed diagnosis; cites file:line for every proposed change).
+- **fix-impl** — owns `06-fix-impl.md` (implementation + gate runs, including
+  a stability verification across 3+ Playwright runs to demonstrate the fix
   holds under the non-determinism the prior session saw).
-- **review** — owns `05-review.md` (fresh-eyes verification against the
-  success criteria; reviewer reads ONLY `05-review.md`, never the design
-  rationale or full context).
+- **review** — owns `07-review.md` (fresh-eyes verification against success
+  criteria; reviewer reads ONLY `07-review.md`, never the design rationale
+  or full context).
+
+## Why no reuse audit
+
+The user redirected at orchestration-start: "reuse auditor for diagnostic
+round isnt viable." For diagnose-first work the load-bearing first move is
+collecting fresh diagnostic data, not surveying existing code for reuse —
+the prior session already had reuse-shaped knowledge of the codebase and
+still produced contradictory hypotheses. The audit-shaped question is
+implicit in the diagnostic-package design phase (the design agent must
+identify and integrate with existing probe/diagnostic hooks rather than
+inventing parallel ones).
 
 ## Execution mode
 
@@ -58,12 +74,14 @@ Distributed. Step 2.5 disqualified consolidated mode:
 
 ## Phase checklist
 
-- [ ] Reuse audit (delegate-auditor)
-- [ ] Diagnose-first investigation (general-purpose, read-only)
+- [ ] Diagnostic-package research + design (read-only)
+- [ ] Diagnostic-package implementation + data collection (native + web)
+- [ ] Hard gate — present collected diagnostic data to user
+- [ ] Diagnose-first investigation grounded in collected data (read-only)
 - [ ] Synthesis + architectural Q&A with user
-- [ ] `01-context.md` written
-- [ ] Design (delegate-architect)
-- [ ] Implementation (general-purpose)
+- [ ] `04-context.md` written
+- [ ] Fix design (delegate-architect)
+- [ ] Fix implementation (general-purpose)
 - [ ] Stability verification (3+ gate runs)
 - [ ] Fresh-eyes review (delegate-reviewer)
 - [ ] User visual confirmation
