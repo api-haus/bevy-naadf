@@ -37,8 +37,13 @@
 //   **The `.y` channel is preserved on every chunk write here**; this is the
 //   load-bearing W2 contract per the W2 brief.
 // - HLSL `InterlockedAdd(boundQueueInfo[...].size, 1, original)` →
-//   WGSL `atomicAdd(&bound_queue_info[idx].size, 1u)`. The `BoundQueueInfo.size`
-//   field is declared `atomic<u32>` (W3 contract — `bounds_calc.wgsl`).
+//   WGSL `atomicAdd(&bound_queue_sizes[idx], 1u)`. 2026-05-19 web fix: the
+//   `BoundQueueInfo { start, size: atomic<u32> }` packed struct (W3 contract)
+//   was split into two top-level flat arrays
+//   (`bound_queue_starts: array<u32>` + `bound_queue_sizes: array<atomic<u32>>`)
+//   to restore cross-pass atomic visibility on Dawn/WebGPU. See
+//   `bounds_calc.wgsl` for the load-bearing W3 details — the layout is shared
+//   here through `@group(2) = construction_bounds_layout`.
 // - HLSL `groupshared uint cachedCell[64];` (`boundsCommon.fxh:13`) is inlined
 //   here under the same `cached_cell` name, identical layout to
 //   `chunk_calc.wgsl` / `bounds_common.wgsl`. The inline duplication matches W1's
@@ -57,12 +62,10 @@
 
 // ─── Struct ports ─────────────────────────────────────────────────────────────
 
-// `boundsCalc.fx:13-20` `BoundQueueInfo` — shared with W3 (the
-// `construction_bounds_layout` `@group(2)` here is the same layout W3 owns).
-struct BoundQueueInfo {
-    start: u32,
-    size: atomic<u32>,
-};
+// `boundsCalc.fx:13-20` `BoundQueueInfo` — shared with W3. 2026-05-19 web fix
+// split the packed struct into two top-level flat arrays
+// (`bound_queue_starts` + `bound_queue_sizes`) for cross-pass atomic
+// visibility on Dawn/WebGPU. The struct is no longer needed in WGSL.
 
 // Construction-side params uniform (shared with W1's `chunk_calc.wgsl` and
 // W3's `bounds_calc.wgsl`; `15-design-c.md` §1.8, §5.1 — `GpuConstructionParams`).
@@ -136,18 +139,22 @@ var<storage, read> changed_blocks_dynamic: array<u32>;
 @group(1) @binding(3)
 var<storage, read> changed_voxels_dynamic: array<u32>;
 
-// `@group(2)` = `construction_bounds_layout` — re-use of W3's
-// `bound_queue_info` / `bound_group_queues` / `bound_group_masks` /
-// `bound_refined_info`. Only `apply_group_change` consumes group (2); the other
-// 3 entry points still bind it (the pipeline-vs-layout match is per-pipeline).
+// `@group(2)` = `construction_bounds_layout` — re-use of W3's bound-queue
+// family. 2026-05-19 web fix: `bound_queue_info` split into
+// `bound_queue_starts` (binding 0) + `bound_queue_sizes` (binding 4); the
+// other 3 bindings keep their slots. Only `apply_group_change` consumes
+// group (2); the other 3 entry points still bind it (the pipeline-vs-layout
+// match is per-pipeline).
 @group(2) @binding(0)
-var<storage, read_write> bound_queue_info: array<BoundQueueInfo>;
+var<storage, read_write> bound_queue_starts: array<u32>;
 @group(2) @binding(1)
 var<storage, read_write> bound_group_queues: array<u32>;
 @group(2) @binding(2)
 var<storage, read_write> bound_group_masks: array<atomic<u32>>;
 @group(2) @binding(3)
 var<storage, read_write> bound_refined_info: array<u32>;
+@group(2) @binding(4)
+var<storage, read_write> bound_queue_sizes: array<atomic<u32>>;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -412,10 +419,10 @@ fn apply_group_change(
             atomicOr(&bound_group_masks[mask_idx], 1u << next_bound_size);
             // Atomic-add the queue size; we get the prior `originalQueueSize`.
             let qi = next_bound_size * 3u + xyz;
-            let original_queue_size = atomicAdd(&bound_queue_info[qi].size, 1u);
+            let original_queue_size = atomicAdd(&bound_queue_sizes[qi], 1u);
             // Read the start cursor (unchanged this dispatch; only
             // `prepare_group_bounds` advances it).
-            let queue_start_index = bound_queue_info[qi].start;
+            let queue_start_index = bound_queue_starts[qi];
             let max_size = params.bound_group_queue_max_size;
             let queue_index =
                 (next_bound_size * 3u + xyz) * max_size

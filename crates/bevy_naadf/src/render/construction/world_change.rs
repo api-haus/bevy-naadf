@@ -354,7 +354,7 @@ pub fn dispatch_apply_group_change(
 /// 4. Dispatch `apply_group_change` (if `changed_group_count > 0`).
 ///
 /// The order matches `ChangeHandler.cs:203-249`: chunk → block → voxel →
-/// group. The group pass writes to `bound_queue_info` / `bound_group_queues`,
+/// group. The group pass writes to `bound_queue_sizes` / `bound_queue_starts` / `bound_group_queues`,
 /// which the W3 regime-2 node consumes next frame.
 ///
 /// The dispatched count for each pass comes from `ConstructionEvents` (mirrored
@@ -681,7 +681,10 @@ mod tests {
         let cv = mk_storage("w2_changed_voxels", 256);
 
         // bounds buffers — minimum sizes.
-        let bqi = mk_storage("w2_bqi", 96 * 2);
+        // 2026-05-19 wasm-chunk-aadf-determinism — `bound_queue_info` split
+        // into `bound_queue_starts` (u32) + `bound_queue_sizes` (atomic<u32>).
+        let bqs_starts = mk_storage("w2_bq_starts", 96);
+        let bqs_sizes = mk_storage("w2_bq_sizes", 96);
         let bgq = mk_storage("w2_bgq", 96);
         let bgm = mk_storage("w2_bgm", 16);
         let bri = mk_storage("w2_bri", 3);
@@ -771,14 +774,16 @@ mod tests {
                 cv.as_entire_buffer_binding(),
             )),
         );
+        // 2026-05-19 web fix — 5 bindings: starts/queues/masks/refined/sizes.
         let bounds_bg = device.create_bind_group(
             "w2_bounds_bg",
             &bgl_bounds,
             &BindGroupEntries::sequential((
-                bqi.as_entire_buffer_binding(),
+                bqs_starts.as_entire_buffer_binding(),
                 bgq.as_entire_buffer_binding(),
                 bgm.as_entire_buffer_binding(),
                 bri.as_entire_buffer_binding(),
+                bqs_sizes.as_entire_buffer_binding(),
             )),
         );
 
@@ -789,7 +794,8 @@ mod tests {
             chunks_buffer,
             blocks_buf,
             voxels_buf,
-            bqi,
+            bqs_starts,
+            bqs_sizes,
             bgm,
             params_buf,
             cc_buf: cc,
@@ -816,7 +822,10 @@ mod tests {
         chunks_buffer: bevy::render::render_resource::Buffer,
         blocks_buf: bevy::render::render_resource::Buffer,
         voxels_buf: bevy::render::render_resource::Buffer,
-        bqi: bevy::render::render_resource::Buffer,
+        // 2026-05-19 wasm-chunk-aadf-determinism — `bound_queue_info` split
+        // into two flat buffers (starts u32, sizes atomic<u32>).
+        bqs_starts: bevy::render::render_resource::Buffer,
+        bqs_sizes: bevy::render::render_resource::Buffer,
         bgm: bevy::render::render_resource::Buffer,
         params_buf: bevy::render::render_resource::Buffer,
         cc_buf: bevy::render::render_resource::Buffer,
@@ -1069,10 +1078,10 @@ mod tests {
     }
 
     /// `apply_group_change` writes into the W3 bound-queue family
-    /// (`bound_queue_info` / `bound_group_queues` / `bound_group_masks`).
-    /// After a single edit at group (0,0,0) with reset-completely flag, the
-    /// X/Y/Z size-0 queues each gain one entry, and the group's mask gets
-    /// bit-0 set on all 3 axes.
+    /// (`bound_queue_starts` / `bound_queue_sizes` / `bound_group_queues` /
+    /// `bound_group_masks`). After a single edit at group (0,0,0) with
+    /// reset-completely flag, the X/Y/Z size-0 queues each gain one entry,
+    /// and the group's mask gets bit-0 set on all 3 axes.
     #[test]
     fn edit_re_enqueues_bound_queue() {
         // For this test the world must be at least 4 chunks per axis (bound
@@ -1092,10 +1101,12 @@ mod tests {
         fx.queue
             .write_buffer(&fx.cg_buf, 0, bytemuck::cast_slice(&changed_groups));
 
-        // Seed `bound_queue_info` to all zero (queues empty before the
-        // re-enqueue).
-        let seed: Vec<[u32; 2]> = vec![[0u32, 0]; 32 * 3];
-        fx.queue.write_buffer(&fx.bqi, 0, bytemuck::cast_slice(&seed));
+        // 2026-05-19 wasm-chunk-aadf-determinism — seed `bound_queue_starts`
+        // + `bound_queue_sizes` to all zero (queues empty before the
+        // re-enqueue). Replaces a single packed (start, size) seed.
+        let zero_seed: Vec<u32> = vec![0u32; 32 * 3];
+        fx.queue.write_buffer(&fx.bqs_starts, 0, bytemuck::cast_slice(&zero_seed));
+        fx.queue.write_buffer(&fx.bqs_sizes, 0, bytemuck::cast_slice(&zero_seed));
         // Seed `bound_group_masks` to zero (no axis enqueued yet).
         let mask_seed: Vec<u32> = vec![0u32; 16];
         fx.queue.write_buffer(&fx.bgm, 0, bytemuck::cast_slice(&mask_seed));
@@ -1133,13 +1144,13 @@ mod tests {
         );
         fx.queue.submit([encoder.finish()]);
 
-        // Read back bound_queue_info — the size-0 X/Y/Z entries should each
-        // be 1 (one group re-enqueued per axis).
-        let bqi = read_u32_buf(&fx.device, &fx.queue, &fx.bqi, 32 * 3 * 2);
-        // bqi[(0*3 + xyz) * 2 + 1] is the .size of the size-0 axis-xyz queue.
-        let size_0_x = bqi[(0 * 3 + 0) * 2 + 1];
-        let size_0_y = bqi[(0 * 3 + 1) * 2 + 1];
-        let size_0_z = bqi[(0 * 3 + 2) * 2 + 1];
+        // Read back bound_queue_sizes — the size-0 X/Y/Z entries should each
+        // be 1 (one group re-enqueued per axis). 2026-05-19
+        // wasm-chunk-aadf-determinism — flat sizes buffer (one u32 per qi).
+        let sizes = read_u32_buf(&fx.device, &fx.queue, &fx.bqs_sizes, 32 * 3);
+        let size_0_x = sizes[0 * 3 + 0];
+        let size_0_y = sizes[0 * 3 + 1];
+        let size_0_z = sizes[0 * 3 + 2];
         assert_eq!(size_0_x, 1, "X size-0 queue should have 1 group");
         assert_eq!(size_0_y, 1, "Y size-0 queue should have 1 group");
         assert_eq!(size_0_z, 1, "Z size-0 queue should have 1 group");

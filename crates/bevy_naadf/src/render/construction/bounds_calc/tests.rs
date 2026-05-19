@@ -411,7 +411,13 @@ fn build_test_chunk_world() -> ([u32; 3], Vec<u32>, Vec<bool>) {
 struct W3Fixture {
     // Web-WebGPU migration: chunks is `array<vec2<u32>>` storage buffer.
     chunks_buffer: Buffer,
-    bound_queue_info: Buffer,
+    // 2026-05-19 wasm-chunk-aadf-determinism — `bound_queue_info` was split
+    // into two top-level flat buffers (`bound_queue_starts: array<u32>` +
+    // `bound_queue_sizes: array<atomic<u32>>`) so Tint emits the proven-
+    // working `array<atomic<u32>>` lowering for the cross-pass-atomic `size`
+    // field on Dawn/WebGPU.
+    bound_queue_starts: Buffer,
+    bound_queue_sizes: Buffer,
     bound_group_queues: Buffer,
     bound_group_masks: Buffer,
     bound_refined_info: Buffer,
@@ -456,6 +462,10 @@ fn build_w3_fixture(
     });
     queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&paired_chunks));
 
+    // 2026-05-19 wasm-chunk-aadf-determinism — split the C# packed
+    // `BoundQueueInfo { start, size }` struct into two flat buffers
+    // (`bound_queue_starts` + `bound_queue_sizes`). The `GpuBoundQueueInfo`
+    // type is still used CPU-side to construct the seed values.
     let mut info_seed: Vec<GpuBoundQueueInfo> = Vec::with_capacity(32 * 3);
     for i in 0..32u32 {
         for _xyz in 0..3u32 {
@@ -465,8 +475,12 @@ fn build_w3_fixture(
             });
         }
     }
-    let info_u32: &[u32] = bytemuck::cast_slice(&info_seed);
-    let bound_queue_info = create_storage_u32(device, queue, "w3_info", info_u32);
+    let starts_seed: Vec<u32> = info_seed.iter().map(|s| s.start).collect();
+    let sizes_seed: Vec<u32> = info_seed.iter().map(|s| s.size).collect();
+    let bound_queue_starts =
+        create_storage_u32(device, queue, "w3_starts", &starts_seed);
+    let bound_queue_sizes =
+        create_storage_u32(device, queue, "w3_sizes", &sizes_seed);
 
     let queue_init = vec![0u32; (32 * 3 * bound_group_count) as usize];
     let bound_group_queues = create_storage_u32(device, queue, "w3_queues", &queue_init);
@@ -563,14 +577,16 @@ fn build_w3_fixture(
             params_buffer.as_entire_buffer_binding(),
         )),
     );
+    // 2026-05-19 web fix — 5 bindings: starts/queues/masks/refined/sizes.
     let bounds_bg = device.create_bind_group(
         "w3_bounds_bg",
         &bounds_bgl,
         &BindGroupEntries::sequential((
-            bound_queue_info.as_entire_buffer_binding(),
+            bound_queue_starts.as_entire_buffer_binding(),
             bound_group_queues.as_entire_buffer_binding(),
             bound_group_masks.as_entire_buffer_binding(),
             bound_refined_info.as_entire_buffer_binding(),
+            bound_queue_sizes.as_entire_buffer_binding(),
         )),
     );
     let dispatch_bg = device.create_bind_group(
@@ -590,7 +606,8 @@ fn build_w3_fixture(
 
     Some(W3Fixture {
         chunks_buffer,
-        bound_queue_info,
+        bound_queue_starts,
+        bound_queue_sizes,
         bound_group_queues,
         bound_group_masks,
         bound_refined_info,
@@ -727,7 +744,8 @@ fn bounds_calc_convergence_matches_cpu_oracle() {
 
     // Reference fixture fields to keep them alive (preserve GPU resources).
     let _ = (
-        &fixture.bound_queue_info,
+        &fixture.bound_queue_starts,
+        &fixture.bound_queue_sizes,
         &fixture.bound_group_queues,
         &fixture.bound_group_masks,
         &fixture.bound_refined_info,
@@ -790,7 +808,10 @@ fn bounds_queue_no_overrun() {
         &fixture.bound_group_queues,
         (32 * 3 * fixture.bound_group_count) as u64,
     );
-    let info_u32 = readback_u32(&device, &queue, &fixture.bound_queue_info, 32 * 3 * 2);
+    // 2026-05-19 wasm-chunk-aadf-determinism — `bound_queue_info` split into
+    // `bound_queue_starts` (u32 flat) + `bound_queue_sizes` (atomic<u32> flat).
+    let starts_u32 = readback_u32(&device, &queue, &fixture.bound_queue_starts, 32 * 3);
+    let sizes_u32 = readback_u32(&device, &queue, &fixture.bound_queue_sizes, 32 * 3);
     let masks_u32 = readback_u32(
         &device,
         &queue,
@@ -800,9 +821,9 @@ fn bounds_queue_no_overrun() {
 
     for i in 0..32 {
         for xyz in 0..3 {
-            let qi = (i * 3 + xyz) * 2;
-            let _start = info_u32[qi];
-            let qsize = info_u32[qi + 1];
+            let qi = (i * 3 + xyz) as usize;
+            let _start = starts_u32[qi];
+            let qsize = sizes_u32[qi];
             assert!(
                 qsize <= fixture.bound_group_count,
                 "queue (size={}, axis={}) overran: {} > bound_group_count {}",
@@ -823,7 +844,8 @@ fn bounds_queue_no_overrun() {
     );
 
     let _ = (
-        &fixture.bound_queue_info,
+        &fixture.bound_queue_starts,
+        &fixture.bound_queue_sizes,
         &fixture.bound_group_queues,
         &fixture.bound_group_masks,
         &fixture.bound_refined_info,
@@ -918,7 +940,8 @@ fn bounds_per_axis_atomic_correctness() {
     eprintln!("W3 atomic: masks post 5 rounds = {:?}", masks_post_5);
 
     let _ = (
-        &fixture.bound_queue_info,
+        &fixture.bound_queue_starts,
+        &fixture.bound_queue_sizes,
         &fixture.bound_group_queues,
         &fixture.bound_group_masks,
         &fixture.bound_refined_info,

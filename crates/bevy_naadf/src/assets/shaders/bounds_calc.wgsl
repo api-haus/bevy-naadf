@@ -8,11 +8,11 @@
 //      regime-1 startup: seed every 4³-chunk group into the size-0 X / Y / Z
 //      queues. Dispatched once at startup after W1's `compute_block_bounds`.
 //   2. `prepare_group_bounds`  (`numthreads(1,1,1)`)  — regime-2 picker:
-//      single-thread scan of `bound_queue_info[0..32*3]` for the first
+//      single-thread scan of `bound_queue_sizes[0..32*3]` for the first
 //      non-empty queue, slice up to `max_group_bound_dispatch` items into
-//      `bound_refined_info`, advance the queue start cursor, write the
-//      `compute_group_bounds` indirect-dispatch count into
-//      `bound_dispatch_indirect[0]`.
+//      `bound_refined_info`, advance the queue start cursor in
+//      `bound_queue_starts[qi]`, write the `compute_group_bounds`
+//      indirect-dispatch count into `bound_dispatch_indirect[0]`.
 //   3. `compute_group_bounds`  (`numthreads(4,4,4)`)  — regime-2 worker: 64
 //      chunks per group processed in parallel; each empty chunk expands its
 //      5-bit AADF by one cell along the queue's axis (`addBoundsGroup` +
@@ -44,20 +44,32 @@
 //   140-144, 164-168` are omitted: this is the non-`#ifdef-ENTITIES` path.
 // - HLSL `InterlockedAdd(boundQueueInfo[...].size, 1, originalSize)`
 //   (`boundsCalc.fx:185`) becomes WGSL
-//   `atomicAdd(&bound_queue_info[idx].size_atomic, 1u)`. Per the same
-//   pattern W1 uses for `block_voxel_count`'s atomic cursors: declare the
-//   `size` field as `atomic<u32>`.
+//   `atomicAdd(&bound_queue_sizes[idx], 1u)`. Per the same pattern W1 uses
+//   for `block_voxel_count`'s atomic cursors: declare the size buffer as
+//   `array<atomic<u32>>`. 2026-05-19 web-fix: was originally a
+//   `BoundQueueInfo { start, size: atomic<u32> }` packed struct; on Dawn/
+//   WebGPU the cross-pass atomic-visibility of `atomicAdd` writes to OTHER
+//   slots of `bound_queue_info[].size` was broken — `atomicLoad` from a
+//   later pass would see 0 for queues populated by `atomicAdd` from a
+//   prior pass. Splitting into two flat top-level arrays
+//   (`bound_queue_starts: array<u32>` + `bound_queue_sizes: array<atomic<u32>>`)
+//   adopts the proven-working `bound_group_masks` lowering shape and
+//   restores cross-pass visibility. Algorithm unchanged; layout differs
+//   from C# NAADF's packed `RWStructuredBuffer<BoundQueueInfo>` — user-
+//   approved divergence (faithful-port exception for WebGPU-port
+//   correctness, same class as the existing chunks-buffer split).
 // - HLSL `groupshared bool anyBoundsIncrease = false;` (`boundsCalc.fx:34`)
 //   becomes WGSL `var<workgroup> any_bounds_increase: atomic<u32>` — WGSL
 //   doesn't allow `bool` in workgroup storage cleanly; we use `0u`/`1u`. The
 //   variable is set but the GPU shader never reads it back (it is a
 //   diagnostic in the C# code path — same here).
 //
-// `boundsCalc.fx:13-20` `BoundQueueInfo` struct port:
-struct BoundQueueInfo {
-    start: u32,
-    size: atomic<u32>,
-};
+// `boundsCalc.fx:13-20` `BoundQueueInfo` was a packed `{start, size}` struct
+// in C#. 2026-05-19 wasm-chunk-aadf-determinism fix: split into two top-level
+// flat arrays (`bound_queue_starts` + `bound_queue_sizes`) so Tint emits the
+// `array<atomic<u32>>` lowering with the same `Coherent`/`MakeAvailable+
+// MakeVisible` decorations that `bound_group_masks` already uses correctly.
+// The struct is no longer needed in WGSL.
 
 // Construction-side params uniform (shared with W1's `chunk_calc.wgsl`;
 // see `15-design-c.md` §1.8, §5.1 — `GpuConstructionParams`). The
@@ -99,14 +111,24 @@ var<storage, read_write> chunks: array<vec2<u32>>;
 var<uniform> params: ConstructionParams;
 
 // `@group(1)` = `construction_bounds_layout` — the W3 bound-queue family.
+// 2026-05-19 web fix — `bound_queue_info` is split into `bound_queue_starts`
+// (binding 0, non-atomic; written only by `prepare_group_bounds` which runs
+// `@workgroup_size(1, 1, 1)` so no contention) + `bound_queue_sizes` (binding
+// 4, `array<atomic<u32>>`; written by both `prepare_group_bounds` via
+// `atomicStore` and `compute_group_bounds` via `atomicAdd`). The split adopts
+// the proven-working `bound_group_masks` lowering shape so Tint emits the
+// correct `Coherent`/`MakeAvailable+MakeVisible` decorations, restoring
+// cross-pass atomic visibility on Dawn/WebGPU.
 @group(1) @binding(0)
-var<storage, read_write> bound_queue_info: array<BoundQueueInfo>;
+var<storage, read_write> bound_queue_starts: array<u32>;
 @group(1) @binding(1)
 var<storage, read_write> bound_group_queues: array<u32>;
 @group(1) @binding(2)
 var<storage, read_write> bound_group_masks: array<atomic<u32>>;
 @group(1) @binding(3)
 var<storage, read_write> bound_refined_info: array<u32>;
+@group(1) @binding(4)
+var<storage, read_write> bound_queue_sizes: array<atomic<u32>>;
 
 // `@group(2)` = `bound_dispatch_indirect_layout` — single-binding rw storage
 // for the indirect-dispatch counter, mirrors the Phase-B Batch-4
@@ -289,8 +311,8 @@ fn prepare_group_bounds() {
     for (var i: u32 = 0u; i < 32u && !found; i = i + 1u) {
         for (var xyz: u32 = 0u; xyz < 3u; xyz = xyz + 1u) {
             let qi = BOUND_INFO_GROUPS + i * 3u + xyz;
-            let start = bound_queue_info[qi].start;
-            let size = atomicLoad(&bound_queue_info[qi].size);
+            let start = bound_queue_starts[qi];
+            let size = atomicLoad(&bound_queue_sizes[qi]);
             if (size > 0u) {
                 found = true;
                 found_bound_size = i;
@@ -310,9 +332,9 @@ fn prepare_group_bounds() {
         bound_refined_info[2] = found_bound_size | (found_xyz << 16u);
 
         let qi = BOUND_INFO_GROUPS + found_bound_size * 3u + found_xyz;
-        bound_queue_info[qi].start =
+        bound_queue_starts[qi] =
             (found_start + group_amount) % params.bound_group_queue_max_size;
-        atomicStore(&bound_queue_info[qi].size, found_size - group_amount);
+        atomicStore(&bound_queue_sizes[qi], found_size - group_amount);
     } else {
         bound_refined_info[1] = 0u;
     }
@@ -328,11 +350,12 @@ fn prepare_group_bounds() {
     let prev_calls = bound_refined_info[7];
     bound_refined_info[7] = prev_calls + 1u;
 
-    // 2026-05-19 probe1 — per-round ring buffer of `atomicLoad(&bound_queue_info[qi].size)`
+    // 2026-05-19 probe1 — per-round ring buffer of `atomicLoad(&bound_queue_sizes[qi])`
     // values across the LAST 8 prepare calls. Slots [8..16) form a round-robin
     // history of `found_size` (the value that prepare's `atomicLoad` actually
     // observed from the immediately-preceding compute pass's `atomicAdd`
-    // re-enqueues — `bounds_calc.wgsl:439`).
+    // re-enqueues). 2026-05-19 web fix split `bound_queue_info` → flat
+    // `bound_queue_sizes: array<atomic<u32>>` for Tint cross-pass-visibility.
     //
     // Wiring (Option C — variant of A using the already-existing non-atomic
     // counter): `prepare_group_bounds` runs `@workgroup_size(1, 1, 1)`, so the
@@ -506,10 +529,10 @@ fn compute_group_bounds(
         if (!already_in_queue) {
             let qi = BOUND_INFO_GROUPS + next_bound_size * 3u + bound_xyz;
             // Atomic-add the queue size; we get the prior `originalQueueSize`.
-            let original_size = atomicAdd(&bound_queue_info[qi].size, 1u);
+            let original_size = atomicAdd(&bound_queue_sizes[qi], 1u);
             // Read the start cursor (unchanged this frame; only `prepare`
             // updates it).
-            let queue_start_index = bound_queue_info[qi].start;
+            let queue_start_index = bound_queue_starts[qi];
             let next_max = params.bound_group_queue_max_size;
             let next_base = (next_bound_size * 3u + bound_xyz) * next_max;
             let next_slot = (queue_start_index + original_size) % next_max;

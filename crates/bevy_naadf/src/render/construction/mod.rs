@@ -86,7 +86,7 @@ pub use config::ConstructionConfig;
 ///
 /// - **W1** (Algorithm 1): `segment_voxel_buffer`, `block_voxel_count`,
 ///   `hash_map`, `hash_coefficients`.
-/// - **W3** (background AADF queue): `bound_queue_info`, `bound_group_queues`,
+/// - **W3** (background AADF queue): `bound_queue_starts` + `bound_queue_sizes`, `bound_group_queues`,
 ///   `bound_group_masks`, `bound_refined_info`, `bound_dispatch_indirect`.
 /// - **W2** (editing): `changed_groups_dynamic`, `changed_chunks_dynamic`,
 ///   `changed_blocks_dynamic`, `changed_voxels_dynamic`.
@@ -119,9 +119,19 @@ pub struct ConstructionGpu {
     pub hash_coefficients: Option<Buffer>,
 
     // === W3 — Bound-queue family (`boundsCalc.fx` family) ===================
-    /// `boundQueueInfo` (`WorldBoundHandler.cs:44`) — 32*3 × BoundQueueInfo.
-    /// Fixed-size. W3.
-    pub bound_queue_info: Option<Buffer>,
+    /// `boundQueueInfo.start` (`WorldBoundHandler.cs:44`) — 32*3 × u32 of the
+    /// per-queue start cursor. 2026-05-19 wasm-chunk-aadf-determinism fix:
+    /// the C# `RWStructuredBuffer<BoundQueueInfo>` packed `(start, size)`
+    /// struct was split into two top-level flat buffers so Tint emits the
+    /// proven-working `array<atomic<u32>>` lowering for the cross-pass
+    /// atomic `size` field on Dawn/WebGPU. Algorithm unchanged; user-approved
+    /// faithful-port divergence (layout-only, same class as the existing
+    /// chunks-buffer split). Fixed-size. W3.
+    pub bound_queue_starts: Option<Buffer>,
+    /// `boundQueueInfo.size` — 32*3 × atomic<u32> of the per-queue element
+    /// count. 2026-05-19 wasm-chunk-aadf-determinism split — see
+    /// `bound_queue_starts` above. Fixed-size. W3.
+    pub bound_queue_sizes: Option<Buffer>,
     /// `boundGroupQueues` (`WorldBoundHandler.cs:46`) — `32*3*boundGroupCount`
     /// u32s. Fixed-size for the test grid. W3.
     pub bound_group_queues: Option<Buffer>,
@@ -482,8 +492,11 @@ pub struct ConstructionPipelines {
     /// 8-binding layout). See `bounds_calc::construction_bounds_world_layout_descriptor`.
     pub construction_bounds_world_layout: BindGroupLayoutDescriptor,
     /// W3 — `construction_bounds_layout` `@group(1)` for the bound-queue
-    /// family (`bound_queue_info` / `bound_group_queues` / `bound_group_masks`
-    /// / `bound_refined_info`, 4 bindings).
+    /// family (`bound_queue_starts` / `bound_group_queues` / `bound_group_masks`
+    /// / `bound_refined_info` / `bound_queue_sizes`, 5 bindings — widened from
+    /// 4 by the 2026-05-19 wasm-chunk-aadf-determinism fix that split the
+    /// packed `bound_queue_info { start, size }` struct into two top-level
+    /// flat buffers).
     pub construction_bounds_layout: BindGroupLayoutDescriptor,
     /// W3 — `bound_dispatch_indirect_layout` `@group(2)` for the
     /// indirect-dispatch counter write-side (1 binding). The same buffer is
@@ -1879,7 +1892,11 @@ pub fn prepare_construction(
     // === W3 — bound-queue family + bind groups ===============================
     //
     // Fixed-size allocation per `WorldBoundHandler.cs:44-47`:
-    //   - boundQueueInfo:  32 × 3 × BoundQueueInfo (8 B) — 768 B.
+    //   - bound_queue_starts: 32 × 3 × u32 — 384 B. (2026-05-19 web fix
+    //     split from `boundQueueInfo`'s packed `(start, size)` struct.)
+    //   - bound_queue_sizes:  32 × 3 × atomic<u32> — 384 B. (other half of
+    //     the split; declared `array<atomic<u32>>` on the WGSL side to
+    //     restore cross-pass atomic visibility on Dawn/WebGPU.)
     //   - boundGroupQueues: 32 × 3 × boundGroupCount × u32 — `96 * boundGroupCount` B.
     //   - boundGroupMasks:  boundGroupCount × 3 × u32 — `12 * boundGroupCount` B.
     //                       (We flatten the C# `Uint3` into 3 atomic<u32> slots
@@ -1900,19 +1917,34 @@ pub fn prepare_construction(
         world_gpu.chunks_size_in_chunks.z,
     ]);
 
-    if gpu.bound_queue_info.is_none() {
+    if gpu.bound_queue_starts.is_none() {
         // wgpu rejects zero-size buffers; clamp every size to ≥1 element.
         let bgc = bound_group_count.max(1) as u64;
-        let info_buf = render_device.create_buffer(&BufferDescriptor {
-            label: Some("naadf_bound_queue_info"),
-            size: 32 * 3 * std::mem::size_of::<crate::render::gpu_types::GpuBoundQueueInfo>()
-                as u64,
+        // 2026-05-19 wasm-chunk-aadf-determinism fix: the C# `BoundQueueInfo
+        // { start: u32, size: u32 }` packed struct is split into two top-
+        // level flat buffers (`bound_queue_starts` + `bound_queue_sizes`)
+        // so Tint emits the proven-working `array<atomic<u32>>` lowering
+        // on Dawn/WebGPU for the cross-pass-atomic `size` field. Each
+        // buffer holds 32 (sizes) × 3 (axes) = 96 × u32 = 384 B.
+        const BOUND_QUEUE_BUFFER_BYTES: u64 = 32 * 3 * 4;
+        let starts_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_bound_queue_starts"),
+            size: BOUND_QUEUE_BUFFER_BYTES,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let sizes_buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_bound_queue_sizes"),
+            size: BOUND_QUEUE_BUFFER_BYTES,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         // Seed: `boundQueueInfoNew[i*3+xyz] = {start: 0, size: i == 0 ? boundGroupCount : 0}`
         // — `WorldBoundHandler.cs:55-64`. The size-0 X/Y/Z queues hold every
-        // group at startup; all higher bound sizes start empty.
+        // group at startup; all higher bound sizes start empty. The
+        // `GpuBoundQueueInfo` struct is still used for CPU-side seed
+        // construction (it's just a (start, size) pair); we split into the
+        // two flat arrays here at upload time.
         let mut info_seed: Vec<crate::render::gpu_types::GpuBoundQueueInfo> =
             Vec::with_capacity(32 * 3);
         for i in 0..32u32 {
@@ -1923,7 +1955,11 @@ pub fn prepare_construction(
                 });
             }
         }
-        render_queue.write_buffer(&info_buf, 0, bytemuck::cast_slice(&info_seed));
+        let starts_seed: Vec<u32> =
+            info_seed.iter().map(|s| s.start).collect();
+        let sizes_seed: Vec<u32> = info_seed.iter().map(|s| s.size).collect();
+        render_queue.write_buffer(&starts_buf, 0, bytemuck::cast_slice(&starts_seed));
+        render_queue.write_buffer(&sizes_buf, 0, bytemuck::cast_slice(&sizes_seed));
 
         let queues_buf = render_device.create_buffer(&BufferDescriptor {
             label: Some("naadf_bound_group_queues"),
@@ -1995,7 +2031,8 @@ pub fn prepare_construction(
         let zeros: Vec<u32> = vec![0u32; (PREPARE_PROBE_HISTORY_BYTES / 4) as usize];
         render_queue.write_buffer(&probe_buf, 0, bytemuck::cast_slice(&zeros));
 
-        gpu.bound_queue_info = Some(info_buf);
+        gpu.bound_queue_starts = Some(starts_buf);
+        gpu.bound_queue_sizes = Some(sizes_buf);
         gpu.bound_group_queues = Some(queues_buf);
         gpu.bound_group_masks = Some(masks_buf);
         gpu.bound_refined_info = Some(refined_buf);
@@ -2070,22 +2107,27 @@ pub fn prepare_construction(
         }
     }
     if bind_groups.construction_bounds.is_none() {
-        if let (Some(info), Some(queues), Some(masks), Some(refined)) = (
-            gpu.bound_queue_info.as_ref(),
+        if let (Some(starts), Some(queues), Some(masks), Some(refined), Some(sizes)) = (
+            gpu.bound_queue_starts.as_ref(),
             gpu.bound_group_queues.as_ref(),
             gpu.bound_group_masks.as_ref(),
             gpu.bound_refined_info.as_ref(),
+            gpu.bound_queue_sizes.as_ref(),
         ) {
             let bgl = pipeline_cache
                 .get_bind_group_layout(&construction_pipelines.construction_bounds_layout);
+            // 2026-05-19 web fix — 5 bindings: `bound_queue_starts` (0) /
+            // `bound_group_queues` (1) / `bound_group_masks` (2) /
+            // `bound_refined_info` (3) / `bound_queue_sizes` (4).
             let bg = render_device.create_bind_group(
                 "naadf_construction_bounds_bind_group",
                 &bgl,
                 &BindGroupEntries::sequential((
-                    info.as_entire_buffer_binding(),
+                    starts.as_entire_buffer_binding(),
                     queues.as_entire_buffer_binding(),
                     masks.as_entire_buffer_binding(),
                     refined.as_entire_buffer_binding(),
+                    sizes.as_entire_buffer_binding(),
                 )),
             );
             bind_groups.construction_bounds = Some(bg);
@@ -3453,13 +3495,14 @@ pub fn run_gpu_construction_startup(args: Res<crate::AppArgs>) {
 pub struct ConstructionPlugin;
 
 /// 2026-05-19 horizon-parity AADF diagnostic — render-world resource that
-/// drives a one-shot delayed readback of the W3 regime-2 bound_queue_info
-/// buffer (96 × 8 B = 768 B) AND a fresh sample of chunks[] AT A LATER
+/// drives a one-shot delayed readback of the W3 regime-2 bound_queue_sizes
+/// buffer (96 × 4 B = 384 B — post wasm-chunk-aadf-determinism split that
+/// replaced the packed (start, size) struct buffer) AND a fresh sample of chunks[] AT A LATER
 /// FRAME than the initial cpu_mirror snapshot. The original
 /// `populate_cpu_mirror_from_gpu_producer` snapshots chunks RIGHT AFTER the
 /// W5 producer chain finishes — too early for regime-2 to have converged.
 /// This probe waits N frames AFTER cpu_mirror_populated, then re-reads
-/// chunks + bound_queue_info to capture the post-convergence state.
+/// chunks + bound_queue_sizes to capture the post-convergence state.
 #[derive(Resource, Default)]
 pub struct AadfDelayedProbe {
     /// Frames elapsed since cpu_mirror_populated flipped to true.
@@ -3471,7 +3514,8 @@ pub struct AadfDelayedProbe {
     /// Which probe-pass this is (0 = at frame 30, 1 = at frame 500). The
     /// probe fires once at each, resets between.
     pub pass: u32,
-    /// Staging buffer for bound_queue_info (small — 768 B).
+    /// Staging buffer for bound_queue_sizes (small — 384 B post the
+    /// 2026-05-19 wasm-chunk-aadf-determinism layout split).
     pub info_staging: Option<Buffer>,
     pub info_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Staging buffer for chunks[] (16 MiB at production scale).
@@ -3487,12 +3531,12 @@ pub struct AadfDelayedProbe {
 
 /// 2026-05-19 — delayed AADF probe: waits 300 frames (~5 s @ 60 fps) post
 /// cpu-mirror-population so the W3 regime-2 background loop has had time
-/// to converge, then reads chunks[] AND bound_queue_info back to the CPU
+/// to converge, then reads chunks[] AND bound_queue_sizes back to the CPU
 /// and logs:
 ///   1. Sample chunks along the cross-target gate's camera view-ray with
 ///      decoded chunk-AADF skip bits — the LATE state (vs the
 ///      EARLY-state probe at cpu-mirror population time).
-///   2. `bound_queue_info[size][axis].size` for all 96 entries. Pins
+///   2. `bound_queue_sizes[size][axis]` for all 96 entries. Pins
 ///      whether the regime-2 loop drained queue[0] (and re-enqueued to
 ///      queue[1+]) or got stuck somewhere.
 pub fn aadf_delayed_probe(
@@ -3518,11 +3562,14 @@ pub fn aadf_delayed_probe(
     let Some(world_gpu) = world_gpu else { return; };
 
     if !probe.readback_issued {
-        let Some(info_src) = gpu.bound_queue_info.as_ref() else { return; };
+        // 2026-05-19 wasm-chunk-aadf-determinism — `bound_queue_info` was
+        // split into `bound_queue_starts` + `bound_queue_sizes`. The probe
+        // diagnostic only needs the size half; we read that buffer alone.
+        let Some(info_src) = gpu.bound_queue_sizes.as_ref() else { return; };
         let Some(refined_src) = gpu.bound_refined_info.as_ref() else { return; };
         let chunks_src = &world_gpu.chunks_buffer;
 
-        let info_size = 32u64 * 3 * 8; // 32 size-levels × 3 axes × 8 B (GpuBoundQueueInfo)
+        let info_size = 32u64 * 3 * 4; // 32 size-levels × 3 axes × 4 B (u32 size only)
         let chunks_size = (world_gpu.chunks_size_in_chunks.x as u64)
             * (world_gpu.chunks_size_in_chunks.y as u64)
             * (world_gpu.chunks_size_in_chunks.z as u64)
@@ -3609,7 +3656,7 @@ pub fn aadf_delayed_probe(
     // 2026-05-19 — decode bound_refined_info (16 u32).
     // [3]=found_bound_size, [4]=found_xyz, [5]=found_size_atomicload,
     // [6]=expansion_workgroup_counter, [7]=prepare_call_counter,
-    // [8..16) = probe1 ring buffer of `atomicLoad(&bound_queue_info[qi].size)`
+    // [8..16) = probe1 ring buffer of `atomicLoad(&bound_queue_sizes[qi])`
     // observations (one per `prepare_group_bounds` call, ring index =
     // `prev_calls % 8`).
     let refined_u32 = |i: usize| -> u32 {
@@ -3632,7 +3679,7 @@ pub fn aadf_delayed_probe(
     );
 
     // 2026-05-19 probe1 — per-round ring decode. Slot `8 + (k % 8)` holds the
-    // `atomicLoad(&bound_queue_info[qi].size)` value observed by the
+    // `atomicLoad(&bound_queue_sizes[qi])` value observed by the
     // `prepare_group_bounds` call whose `prev_calls` counter was `k`. With
     // `prepare_calls_total = N`, the most recent reading lives at slot
     // `8 + ((N - 1) % 8)` and the slot ordering wraps every 8 calls. The
@@ -3676,19 +3723,22 @@ pub fn aadf_delayed_probe(
         ring[7],
     );
 
-    // Decode bound_queue_info (96 entries × 8 B each: start u32, size u32).
+    // 2026-05-19 wasm-chunk-aadf-determinism — decode `bound_queue_sizes`
+    // (96 entries × 4 B each: u32 size only). The pre-fix layout had a
+    // packed (start, size) struct at 8 B stride; the fix split the buffer
+    // and this probe now reads the sizes-only flat array.
     let pass_tag = probe.pass;
     bevy::log::info!(
-        "[aadf-probe2 pass={}] post-convergence bound_queue_info SIZE per (bound_size, axis):",
+        "[aadf-probe2 pass={}] post-convergence bound_queue_sizes per (bound_size, axis):",
         pass_tag,
     );
     for size_level in 0u32..32 {
         let mut row = format!("[aadf-probe2 pass={}]   size={:2}: ", pass_tag, size_level);
         for axis in 0u32..3 {
             let qi = (size_level * 3 + axis) as usize;
-            let off = qi * 8;
+            let off = qi * 4;
             let sz = u32::from_le_bytes(
-                info_bytes_arc[off + 4..off + 8].try_into().unwrap(),
+                info_bytes_arc[off..off + 4].try_into().unwrap(),
             );
             row.push_str(&format!(
                 "{}={:5} ",

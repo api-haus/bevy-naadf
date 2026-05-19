@@ -20,9 +20,16 @@
 //!     dedicated narrow layout (a) lets the W3 prepare system run without
 //!     W1's hash buffers existing, (b) cuts the bind-group descriptor count
 //!     from 8 to 2.
-//!   - `construction_bounds_layout`       `@group(1)` — 4 bindings: the
-//!     bound-queue family `bound_queue_info` / `bound_group_queues` /
-//!     `bound_group_masks` / `bound_refined_info`. All rw storage.
+//!   - `construction_bounds_layout`       `@group(1)` — 5 bindings: the
+//!     bound-queue family `bound_queue_starts` / `bound_group_queues` /
+//!     `bound_group_masks` / `bound_refined_info` / `bound_queue_sizes`. All
+//!     rw storage. 2026-05-19 wasm-chunk-aadf-determinism fix split the
+//!     original packed `bound_queue_info: array<BoundQueueInfo {start, size}>`
+//!     into two top-level flat arrays (`bound_queue_starts: array<u32>` +
+//!     `bound_queue_sizes: array<atomic<u32>>`) so Tint emits the proven-
+//!     working `array<atomic<u32>>` lowering for the cross-pass atomic
+//!     `size` field. See `assets/shaders/bounds_calc.wgsl` header for the
+//!     full motivation.
 //!   - `bound_dispatch_indirect_layout`   `@group(2)` — 1 binding:
 //!     `bound_dispatch_indirect` rw storage. **Separated** because the same
 //!     buffer is also consumed by `dispatch_workgroups_indirect` as
@@ -88,24 +95,38 @@ pub fn construction_bounds_world_layout_descriptor() -> BindGroupLayoutDescripto
     )
 }
 
-/// `construction_bounds_layout` `@group(1)` (4 bindings: the bound-queue
-/// family). Per `15-design-c.md` §1.3.
+/// `construction_bounds_layout` `@group(1)` (5 bindings: the bound-queue
+/// family). Per `15-design-c.md` §1.3. 2026-05-19 wasm-chunk-aadf-determinism
+/// fix: the original C# `BoundQueueInfo { start, size }` packed struct (1
+/// binding) was split into two top-level flat buffers (`bound_queue_starts`
+/// at binding 0 + `bound_queue_sizes` at binding 4) so Tint emits the same
+/// `array<atomic<u32>>` lowering shape `bound_group_masks` already uses
+/// correctly on Dawn/WebGPU. This adopts the proven-working cross-pass
+/// atomic-visibility pattern for the `size` field that holds the regime-2
+/// re-enqueue count. Layout count widened 4 → 5; well under the wasm
+/// `max_storage_buffers_per_shader_stage` cap (≥ 8 per device snapshots).
 pub fn construction_bounds_layout_descriptor() -> BindGroupLayoutDescriptor {
     BindGroupLayoutDescriptor::new(
         "naadf_construction_bounds_bind_group_layout",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                // bound_queue_info_rw — `array<BoundQueueInfo>` (rw storage,
-                // with the `size` field declared `atomic<u32>` on the WGSL
-                // side; the wgpu binding type is the same `storage_buffer_sized`).
+                // bound_queue_starts_rw — `array<u32>` (rw, non-atomic;
+                // written only by `prepare_group_bounds` at
+                // `@workgroup_size(1, 1, 1)`).
                 storage_buffer_sized(false, None),
                 // bound_group_queues_rw — `array<u32>` (rw).
                 storage_buffer_sized(false, None),
                 // bound_group_masks_rw — `array<atomic<u32>>` (rw, atomic on
                 // the WGSL side).
                 storage_buffer_sized(false, None),
-                // bound_refined_info_rw — `array<u32>` (3 elements; rw).
+                // bound_refined_info_rw — `array<u32>` (16 elements; rw).
+                storage_buffer_sized(false, None),
+                // bound_queue_sizes_rw — `array<atomic<u32>>` (rw, atomic on
+                // the WGSL side; written by `prepare_group_bounds` via
+                // `atomicStore` and `compute_group_bounds` via `atomicAdd`).
+                // 2026-05-19 web fix — adopts the `bound_group_masks` shape
+                // for Tint cross-pass atomic-visibility.
                 storage_buffer_sized(false, None),
             ),
         ),
@@ -443,7 +464,7 @@ pub fn naadf_bounds_compute_node(
 
     // 2026-05-19 horizon-parity AADF — on wasm, submit each {prepare,
     // compute} round as its own command buffer so atomic writes to
-    // `bound_queue_info[qi].size` from compute's re-enqueue path are
+    // `bound_queue_sizes[qi]` from compute's re-enqueue path are
     // guaranteed visible to the next round's prepare's `atomicLoad`.
     // Within one encoder Dawn's automatic STORAGE→STORAGE barrier across
     // compute passes does not appear to propagate atomic ops; separate
@@ -495,7 +516,7 @@ pub fn naadf_bounds_compute_node(
                 );
             }
             // Submit this round in its own command buffer so the GPU
-            // fences the atomic writes to `bound_queue_info[].size`
+            // fences the atomic writes to `bound_queue_sizes[]`
             // (compute's re-enqueue) BEFORE the next round's prepare
             // reads them. Without this, Dawn's automatic STORAGE→STORAGE
             // barrier across compute passes within one encoder does not
