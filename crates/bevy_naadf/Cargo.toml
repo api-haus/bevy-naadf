@@ -107,7 +107,7 @@ thiserror = "2"
 # (`std/src/sys/time/unsupported.rs:35`). The `diagnostics.rs` device snapshot
 # captures `captured_at_unix_seconds` and the wasm32 path triggers the panic
 # without this. Also satisfies `just lint-wasm-compat`.
-web_time = "1"
+web-time = "1"
 # wgpu — direct dep so `src/diagnostics.rs`'s device-snapshot module can name
 # `wgpu::Adapter` / `wgpu::DownlevelCapabilities` / `wgpu::Features` /
 # `wgpu::Limits` / `wgpu::AdapterInfo` without going through Bevy's partial

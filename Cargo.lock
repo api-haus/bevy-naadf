@@ -418,6 +418,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-rayon",
  "web-sys",
+ "web-time",
  "wgpu",
  "zip",
 ]
