@@ -73,6 +73,12 @@ pub struct ContinuousToggle;
 #[derive(Component)]
 pub struct HoverInfoText;
 
+/// Marker for the PBR-debug overlay Text entity (top-left). Shows
+/// "Debug: <mode name>" when `DebugViewState.mode != Off`; hidden
+/// otherwise. See [`update_debug_view_hud`].
+#[derive(Component)]
+pub struct DebugViewHudText;
+
 /// Marker for the palette viewport (Node with `overflow_x = scroll`). Holds
 /// the swatch strip as a single child.
 #[derive(Component)]
@@ -292,6 +298,52 @@ pub fn setup_editor_hud(mut commands: Commands, dev_font: Res<DevFont>) {
             ..default()
         },
     ));
+
+    // Top-left PBR-debug overlay. Hidden until `DebugViewState.mode != Off`
+    // (`update_debug_view_hud` toggles visibility).
+    commands.spawn((
+        DebugViewHudText,
+        Text::default(),
+        TextColor(Color::srgba(1.0, 0.85, 0.30, 1.0)),
+        TextFont {
+            font: dev_font.0.clone(),
+            font_size: FontSize::Px(13.0),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.60)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(12.0),
+            left: px(12.0),
+            padding: px(8.0).all(),
+            display: Display::None,
+            ..default()
+        },
+    ));
+}
+
+/// `Update` system — show the top-left "Debug: <mode>" overlay when the
+/// PBR rendering debugger is engaged. See
+/// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+/// debugger".
+pub fn update_debug_view_hud(
+    state: Option<Res<crate::debug_view::DebugViewState>>,
+    mut overlay: Query<(&mut Text, &mut Node), With<DebugViewHudText>>,
+) {
+    let Some(state) = state else { return };
+    let Ok((mut text, mut node)) = overlay.single_mut() else { return };
+    if state.mode == crate::debug_view::DebugViewMode::Off {
+        node.display = Display::None;
+        text.0.clear();
+    } else {
+        node.display = Display::Flex;
+        text.0.clear();
+        let _ = write!(
+            text.0,
+            "Debug: {}   [F1: toggle | [ / ]: cycle]",
+            state.mode.label(),
+        );
+    }
 }
 
 fn spawn_h_row(commands: &mut Commands, gap_px: f32) -> Entity {
@@ -554,11 +606,11 @@ pub fn refresh_palette_swatches(
 
     for (idx, vt) in voxel_types.types.iter().enumerate().skip(1) {
         let id = VoxelTypeId(idx as u16);
-        let color = Color::linear_rgb(
-            vt.color_base.x.clamp(0.0, 1.0),
-            vt.color_base.y.clamp(0.0, 1.0),
-            vt.color_base.z.clamp(0.0, 1.0),
-        );
+        // Post-PBR-raymarching pivot: the per-VoxelType "user-picked colour"
+        // is `albedo_tint` (the sampled albedo multiplier). The swatch shows
+        // the tint — sRGB byte → linear `[0,1]` via Bevy's `Color::srgb_u8`,
+        // which converts to linear internally.
+        let color = Color::srgb_u8(vt.albedo_tint[0], vt.albedo_tint[1], vt.albedo_tint[2]);
         let swatch = commands
             .spawn((
                 PaletteSwatch(id),

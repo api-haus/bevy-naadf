@@ -66,7 +66,7 @@ use crate::aadf::construct::{
     encode_block_voxels, encode_chunk_blocks, BlockClass, ChunkClass, ConstructedWorld,
 };
 use crate::voxel::{
-    MaterialBase, MaterialLayer, VoxelType, VoxelTypeId, AADF_MAX_CHUNK, CELL_CHILDREN, CELL_DIM,
+    MaterialBase, VoxelType, VoxelTypeId, AADF_MAX_CHUNK, CELL_CHILDREN, CELL_DIM,
 };
 
 /// Side of a chunk in voxels (= `CELL_DIM² = 16`).
@@ -969,8 +969,11 @@ fn vox_palette_to_voxel_types(
     out.push(VoxelType::default());
 
     for (i, color) in palette.iter().enumerate() {
-        let srgb = Vec3::new(color.r as f32, color.g as f32, color.b as f32) / 255.0;
-        let linear = Vec3::new(srgb.x.powf(2.2), srgb.y.powf(2.2), srgb.z.powf(2.2));
+        // VOX palette colour is already sRGB byte — feed it straight in as
+        // the per-voxel-type tint (`albedo_tint` is sRGB-byte in the GPU
+        // packer; the shader maps it to linear `[0,1]` on decode — see
+        // PBR-raymarching design § B note on `albedo_tint` semantics).
+        let albedo_tint = [color.r, color.g, color.b];
 
         let (emit, flux) = materials
             .iter()
@@ -988,14 +991,16 @@ fn vox_palette_to_voxel_types(
         let (material_base, color_layered) = if emission > 0.0 {
             (MaterialBase::Emissive, Vec3::new(emission, 0.0, 0.0))
         } else {
-            (MaterialBase::Diffuse, Vec3::ZERO)
+            (MaterialBase::Pbr, Vec3::ZERO)
         };
 
         out.push(VoxelType {
-            color_base: linear,
             material_base,
-            material_layer: MaterialLayer::None,
-            roughness: 1.0,
+            // Layer 0 — fabric. A single neutral textured material works for
+            // VOX models where the per-voxel colour comes from the palette
+            // (i.e. lives in `albedo_tint` here).
+            material_layer_index: 0,
+            albedo_tint,
             color_layered,
         });
     }
@@ -1197,7 +1202,7 @@ mod tests {
 
         assert_eq!(imp.palette[21].material_base, MaterialBase::Emissive);
         assert!(imp.palette[21].color_layered.x > 0.0);
-        assert_eq!(imp.palette[11].material_base, MaterialBase::Diffuse);
+        assert_eq!(imp.palette[11].material_base, MaterialBase::Pbr);
     }
 
     // -- Test 3 --------------------------------------------------------------

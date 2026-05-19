@@ -39,9 +39,8 @@
 #import "shaders/render_pipeline_common.wgsl"::{
     VoxelType, SampleValid, FirstHitResult,
     decompress_voxel_type, get_ray_dir, get_hit_data_from_planes,
-    get_reflectance_fresnel,
     HIT_NOTHING, HIT_UNDEFINED, ENTITY_FREE,
-    SURFACE_EMISSIVE, SURFACE_SPECULAR_ROUGH, SURFACE_SPECULAR_MIRROR,
+    SURFACE_PBR, SURFACE_EMISSIVE,
 }
 #import "shaders/ray_tracing.wgsl"::{
     RayResult, shoot_ray,
@@ -54,8 +53,29 @@
 #import "shaders/atmosphere.wgsl"::{
     AtmosphereParams, AtmoLight, apply_atmosphere, atmosphere_oct_index,
 }
-#import "shaders/world_data.wgsl"::voxel_types
+#import "shaders/world_data.wgsl"::{
+    voxel_types,
+    pbr_diffuse_ao, pbr_normal, pbr_mrh, pbr_emissive, pbr_sampler,
+}
 #import "shaders/common.wgsl"::PI
+#import "shaders/pbr_sampling.wgsl"::{
+    triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
+    triplanar_sample_pom, triplanar_sample_normal_pom, pom_compute,
+    select_layer_variant, eval_pbr, PbrEval,
+    ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
+}
+// `triplanar_sample_normal` is imported above and called below to sample the
+// perturbed (normal-mapped) surface normal so the BRDF sees the bump detail
+// instead of the axis-aligned geometric face normal.
+//
+// The first-hit surface re-sample (`:250-280`) uses the POM-displaced UV
+// (via `pom_compute` + `_pom` sample variants) to stay consistent with the
+// first-hit pass's POM-shaded direct contribution. WITHOUT this match the
+// final pixel composites un-POM shading from the GI pass on top of POM
+// shading from the first-hit pass → visible moiré / "double-surface"
+// artifact (`05-diagnostic.md` § "POM seam-artifact diagnose+fix"). The
+// secondary GI bounce samples STAY un-POM — POM is first-hit-surface only
+// per design § F.4 + cost budget.
 
 // --- @group(1) — the GI-specific bindings -----------------------------------
 
@@ -221,7 +241,60 @@ fn calc_global_ilum(
 
     let first_hit_type_index = first_hit.z & 0x7FFFu;
     let first_hit_type: VoxelType = decompress_voxel_type(voxel_types[first_hit_type_index]);
-    let ior = first_hit_type.color_base;
+
+    // Sample the first-hit surface's PBR material parameters at the
+    // reconstructed virtual hit position. Used both for the primary-surface
+    // BRDF interaction (initial bounce direction + throughput) and for the
+    // `extra_data` compression below (the prior C# code packed
+    // `first_hit_type.roughness * 254.5`; we pack the sampled-roughness
+    // equivalent so the spatial-resampling pass keeps its
+    // is_diffuse/is_specular discrimination).
+    let first_hit_world_pos =
+        vec3<f32>(cam_pos_int) + first_hit_result.pos;
+    let first_hit_blend = triplanar_blend_weights(first_hit_result.normal);
+    let first_hit_layer = select_layer_variant(
+        first_hit_type.material_layer_index,
+        first_hit_type.variant_span,
+        vec3<i32>(floor(first_hit_world_pos)),
+    );
+    // POM-displaced UV on the dominant plane. MUST be computed via the
+    // canonical `pom_compute` with the same inputs the first-hit pass used
+    // (`naadf_first_hit.wgsl:290-294`): same `world_pos`, same `ray_dir`
+    // (the first-hit pass's `ray_dir` post any mirror reflections matches
+    // `first_hit_result.ray_dir` here), same `blend_weights`, same
+    // `layer`. Without this match the GI sun-direct shading below would
+    // sample the texture at the geometric UV while the first-hit pass
+    // shaded it at the POM-displaced UV → moiré
+    // (`05-diagnostic.md` H2 root cause).
+    let first_hit_pom = pom_compute(
+        pbr_mrh, pbr_sampler,
+        first_hit_world_pos, first_hit_result.ray_dir, first_hit_blend, first_hit_layer,
+    );
+    let first_hit_displaced_uv  = first_hit_pom.displaced_uv;
+    let first_hit_dominant_axis = first_hit_pom.dominant_axis;
+    let first_hit_mrh = triplanar_sample_pom(
+        pbr_mrh, pbr_sampler,
+        first_hit_world_pos, first_hit_blend, first_hit_layer,
+        first_hit_dominant_axis, first_hit_displaced_uv,
+    );
+    let first_hit_metallic = first_hit_mrh.r;
+    let first_hit_roughness_sampled = first_hit_mrh.g;
+    let first_hit_diffuse_ao = triplanar_sample_pom(
+        pbr_diffuse_ao, pbr_sampler,
+        first_hit_world_pos, first_hit_blend, first_hit_layer,
+        first_hit_dominant_axis, first_hit_displaced_uv,
+    );
+    let first_hit_albedo = first_hit_diffuse_ao.rgb
+        * first_hit_type.albedo_tint * first_hit_diffuse_ao.a;
+    // Perturbed (normal-mapped) surface normal at the reconstructed first
+    // hit. Replaces `first_hit_result.normal` in every BRDF call below
+    // (initial bounce VNDF, throughput eval_pbr). The geometric normal stays
+    // in use only for geometric tests (ray offset, ≤0 cos cull).
+    let first_hit_perturbed_normal = triplanar_sample_normal_pom(
+        pbr_normal, pbr_sampler,
+        first_hit_world_pos, first_hit_blend, first_hit_result.normal,
+        first_hit_layer, first_hit_dominant_axis, first_hit_displaced_uv,
+    );
 
     // A primary-ray miss (voxelTypeRaw == 0) is never queued by `rayQueueCalc`,
     // but the indirect dispatch tail lanes read a zero-cleared `ray_queue` slot
@@ -248,31 +321,61 @@ fn calc_global_ilum(
     var hit_emitter_directly = false;
     let entity_sample = ENTITY_FREE;
 
-    // --- primary-surface BRDF interaction (renderGlobalIllum.fx:97-116) -----
-    if (material_state == SURFACE_SPECULAR_MIRROR) {
-        cur_dir = reflect(cur_dir, first_hit_result.normal);
-    } else if (material_state == SURFACE_SPECULAR_ROUGH) {
-        // `do { ... } while (dot(curDir, n) <= 0 && count++ < 2)`.
+    // --- primary-surface BRDF interaction — unified PBR (`02-design.md` § E)
+    // After the pivot every PBR surface uses one sampling strategy:
+    //   * `roughness < ROUGH_SPECULAR_DIFFUSE_THRESHOLD` → VNDF importance
+    //     sample around the view reflection (fine-roughness specular).
+    //   * Above the threshold → uniform-hemisphere sample (Lambertian-like).
+    // Emissive surfaces shouldn't reach the GI bounce branch (the first-hit
+    // pass terminates on them), but if they do, treat as Lambertian.
+    let first_hit_is_specular =
+        material_state == SURFACE_PBR
+        && first_hit_roughness_sampled < ROUGH_SPECULAR_DIFFUSE_THRESHOLD;
+    if (first_hit_is_specular) {
         var rough_normal = vec3<f32>(0.0, 0.0, 0.0);
         var count: i32 = 0;
         loop {
+            // VNDF sample around the perturbed normal so normal-map bumps
+            // bias the reflection direction (and thus the bounce sample).
             rough_normal = sample_vndf_isotropic(
-                next_rand2(&rand), -cur_dir, first_hit_type.roughness, first_hit_result.normal,
+                next_rand2(&rand), -cur_dir,
+                first_hit_roughness_sampled, first_hit_perturbed_normal,
             );
             cur_dir = reflect(cur_dir, rough_normal);
+            // Geometric ≤0 cull stays on the geometric face normal so a
+            // perturbed-but-still-self-occluded bounce gets re-rolled.
             if (!(dot(cur_dir, first_hit_result.normal) <= 0.0 && count < 2)) {
                 break;
             }
             count = count + 1;
         }
-        let gi = geometry_term(
-            first_hit_type.roughness,
-            clamp(dot(cur_dir, first_hit_result.normal), 0.0, 1.0),
+        // Per-bounce throughput: `eval_pbr` returns the full BRDF; we already
+        // sampled the VNDF (importance-sampled around `rough_normal`), so the
+        // remaining factor is `geometry_term * F` (the VNDF pdf cancels D and
+        // the `4 n·l n·v` denom). Reuse `eval_pbr`'s F0 to keep the metallic
+        // tint baked into the throughput. BRDF uses the perturbed normal so
+        // the metallic tint × normal-map shading is visible in the bounce.
+        let pbr = eval_pbr(
+            cur_dir, -ray_dir, first_hit_perturbed_normal,
+            first_hit_albedo, first_hit_metallic, first_hit_roughness_sampled,
         );
-        let f = get_reflectance_fresnel(ior, dot(cur_dir, rough_normal));
-        extra_absorption = gi * f;
+        let gi = geometry_term(
+            first_hit_roughness_sampled,
+            clamp(dot(cur_dir, first_hit_perturbed_normal), 0.0, 1.0),
+        );
+        // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp `extra_absorption`
+        // to a sane per-channel ceiling. `gi * pbr.fresnel` can spike when the
+        // geometry term is large (near n·v=0) and fresnel approaches 1 — the
+        // per-pixel spike amplifies the secondary bounce's throughput
+        // inconsistently across adjacent pixels, contributing to the splotch
+        // boundary effect via persistent reservoir accumulation.
+        extra_absorption = min(gi * pbr.fresnel, vec3<f32>(8.0));
     } else {
-        cur_dir = get_uniform_hemisphere_sample(next_rand2(&rand), first_hit_result.normal, 0.0);
+        // Uniform-hemisphere sample around the perturbed normal — Lambertian
+        // diffuse benefits from normal-map detail too.
+        cur_dir = get_uniform_hemisphere_sample(
+            next_rand2(&rand), first_hit_perturbed_normal, 0.0,
+        );
     }
     let sample_dir = cur_dir;
     var sample_dist: f32 = 0.0;
@@ -332,13 +435,51 @@ fn calc_global_ilum(
         let voxel_type: VoxelType = decompress_voxel_type(voxel_types[ray_result.hit_type]);
         material_state = voxel_type.material_base;
 
-        // Apply albedo (diffuse / emissive only — `materialState <= 1`).
-        if (material_state <= SURFACE_EMISSIVE) {
-            cur_absorption = cur_absorption * voxel_type.color_base;
+        // PBR-raymarching pivot: sample the hit material's texture-array
+        // parameters. Triplanar on the hit world position; the variant hash
+        // takes the integer voxel position.
+        let hit_world_pos = vec3<f32>(new_pos_int) + new_pos_frac;
+        let hit_blend = triplanar_blend_weights(ray_result.normal);
+        let hit_layer = select_layer_variant(
+            voxel_type.material_layer_index,
+            voxel_type.variant_span,
+            ray_result.voxel_pos,
+        );
+        var sampled_albedo = vec3<f32>(1.0);
+        var sampled_metallic: f32 = 0.0;
+        var sampled_roughness: f32 = 1.0;
+        // Perturbed normal at the bounce hit. Initialised to the geometric
+        // normal so the Emissive fast-path (skipping the PBR sample below)
+        // still has a sensible value for any geometric tests that follow.
+        var bounce_perturbed_normal = ray_result.normal;
+        if (material_state == SURFACE_PBR) {
+            let mrh = triplanar_sample(
+                pbr_mrh, pbr_sampler, hit_world_pos, hit_blend, hit_layer,
+            );
+            sampled_metallic = mrh.r;
+            sampled_roughness = mrh.g;
+            let diffuse_ao = triplanar_sample(
+                pbr_diffuse_ao, pbr_sampler, hit_world_pos, hit_blend, hit_layer,
+            );
+            sampled_albedo = diffuse_ao.rgb * voxel_type.albedo_tint * diffuse_ao.a;
+            // Diffuse colour transport on the throughput
+            // (`(1-metallic)*albedo`). Mirrors the C# `materialState <= 1`
+            // pre-multiply, but with the metallic split applied for energy
+            // conservation (`02-design.md` § E).
+            cur_absorption = cur_absorption
+                * ((vec3<f32>(1.0) - vec3<f32>(sampled_metallic)) * sampled_albedo);
+            // Sample the perturbed normal so the BRDF sees the bump detail
+            // on every GI bounce (not just primary visibility).
+            bounce_perturbed_normal = triplanar_sample_normal(
+                pbr_normal, pbr_sampler,
+                hit_world_pos, hit_blend, ray_result.normal, hit_layer,
+            );
         }
+        // Emissive: no colour transport (the emissive contribution adds to
+        // `radiance`, not multiplied into throughput).
 
-        // --- sun sample (renderGlobalIllum.fx:156-187) ----------------------
-        if (material_state <= SURFACE_SPECULAR_ROUGH) {
+        // --- sun sample — unified PBR (`02-design.md` § E call-site map) ----
+        if (material_state == SURFACE_PBR) {
             if (!is_first_diffuse_hit) {
                 sample_normal_comp = ray_result.normal_comp & 0x7u;
                 // (`#ifdef ENTITIES entitySample = rayResult.entity` — omitted.)
@@ -346,32 +487,36 @@ fn calc_global_ilum(
             }
 
             let sun_dir_rand = get_uniform_hemisphere_sample(
-                vec2<f32>(next_rand(&rand), next_rand(&rand)), gi_params.sky_sun_dir.xyz, 0.9999,
+                vec2<f32>(next_rand(&rand), next_rand(&rand)),
+                gi_params.sky_sun_dir.xyz, 0.9999,
             );
-            // HLSL `float3 fac = saturate(...) * 2` — the scalar is broadcast to
-            // a `float3` (the rough-specular branch multiplies it by the `vec3`
-            // Fresnel `F`, and `radiance += ... * fac` is all `vec3`).
-            var fac = vec3<f32>(clamp(dot(ray_result.normal, sun_dir_rand), 0.0, 1.0) * 2.0);
+            // `eval_pbr` returns the energy-conserving BRDF value at this
+            // (sun_dir, view_dir, normal) triple. The C# `fac = 2 * cosTheta`
+            // weight is preserved (it folds the hemisphere-sample pdf into
+            // the integrand — `2 = 2π/π` for the canonical cosine-weighted
+            // estimator). Result is a `vec3` (diffuse + specular).
+            //
+            // Surface normal here is the PERTURBED normal so the sun-shading
+            // varies with the normal map; the cos(θ_l) weight uses the same
+            // perturbed normal for consistency.
+            // SPLOTCH FIX (post-`2b5fa80`): companion to spatial_resampling's
+            // sun-tap unification. Drop the `pbr.f * 2*cos` weight (which
+            // switched between ~0.1x diffuse and up-to-16x specular via the
+            // `is_specular` boundary at `sampled_roughness < 0.5`) and use a
+            // unified Lambertian `2*cos` against the GEOMETRIC face normal.
+            // The geometric normal removes the high-frequency per-pixel
+            // perturbed-normal modulation of the cos projection that the
+            // bounce surface contributes to the temporal ring, which then
+            // resurfaces in the per-pixel splotch at the first-hit pass.
+            // The metallic/specular highlight on bounce surfaces lives in
+            // the throughput chain (`cur_absorption *= (1-metallic)*albedo`
+            // for diffuse + `min(gi*f, 4)` for specular bounce). `eval_pbr`
+            // does not advance the RNG state, so dropping the call is safe
+            // for sample-stream parity.
+            let fac = vec3<f32>(2.0 * clamp(dot(ray_result.normal, sun_dir_rand), 0.0, 1.0));
 
-            if (material_state == SURFACE_SPECULAR_ROUGH) {
-                let gi = geometry_term(voxel_type.roughness, dot(sun_dir_rand, ray_result.normal));
-                let go = geometry_term(voxel_type.roughness, dot(-cur_dir, ray_result.normal));
-                let half_dir = normalize(sun_dir_rand + -cur_dir);
-                let nh = dot(ray_result.normal, half_dir);
-                let r2 = voxel_type.roughness * voxel_type.roughness;
-                let denom = nh * nh * (r2 - 1.0) + 1.0;
-                let d = r2 / (PI * denom * denom);
-                let f = get_reflectance_fresnel(voxel_type.color_base, dot(sun_dir_rand, ray_result.normal));
-                let norm_max_d = voxel_type.roughness * 500.0 + 1.0;
-                let norm_d = norm_max_d - norm_max_d / ((1.0 / norm_max_d) * d + 1.0);
-                fac = fac * (0.5 * norm_d * gi * go * f)
-                    / (4.0 * 1.0 * dot(-cur_dir, ray_result.normal));
-            }
-
-            // The single sun-shadow ray (was `MAX_RAY_STEPS_SUN_SECONDARY`
-            // const; now `gi_params.max_ray_steps_sun_secondary` runtime knob —
-            // `21-design-quality-panel.md`). The defensive `max(_, 1u)` clamp
-            // mirrors Dispatch A's `sun_shadow_taps` clamp.
+            // The single sun-shadow ray (`gi_params.max_ray_steps_sun_secondary`
+            // runtime knob — `21-design-quality-panel.md`).
             if (dot(sun_dir_rand, ray_result.normal) > 0.0) {
                 var temp: RayResult;
                 let sun_blocked = shoot_ray(
@@ -380,33 +525,42 @@ fn calc_global_ilum(
                     &temp,
                 );
                 if (!sun_blocked) {
-                    radiance += cur_absorption * gi_params.sun_color.xyz * fac * 1.0;
+                    radiance += cur_absorption * gi_params.sun_color.xyz * fac;
                 }
             }
         }
 
-        // Emissive surfaces add `colorLayer.r` * absorption.
+        // Emissive fast-path (`02-design.md` § H) — sample the emissive
+        // array, multiply by per-VoxelType HDR `color_layered`, add.
         if (material_state == SURFACE_EMISSIVE) {
             hit_emitter_directly = bounce == 0u;
-            radiance += cur_absorption * voxel_type.color_layer.r;
+            let emissive_sample = triplanar_sample(
+                pbr_emissive, pbr_sampler, hit_world_pos, hit_blend, hit_layer,
+            ).rgb;
+            radiance += cur_absorption * emissive_sample * voxel_type.color_layered;
         }
 
-        // --- surface-effect bounce (renderGlobalIllum.fx:197-225) -----------
+        // --- surface-effect bounce — unified PBR (`02-design.md` § E) ------
+        // The C# 3-way fork (mirror / rough-spec / diffuse) collapses to:
+        //   * fine-roughness PBR → VNDF importance sample around the view
+        //     reflection; throughput *= `geometry_term * F`.
+        //   * coarse-roughness PBR / emissive → uniform-hemisphere sample;
+        //     throughput *= `2 * cos_theta` (Lambertian-equivalent).
         var rough_break = false;
-        if (material_state == SURFACE_SPECULAR_MIRROR) {
-            new_dir = reflect(cur_dir, ray_result.normal);
-            cur_absorption *= get_reflectance_fresnel(
-                voxel_type.color_base, dot(new_dir, ray_result.normal),
-            );
-        } else if (material_state == SURFACE_SPECULAR_ROUGH) {
+        let bounce_is_specular = material_state == SURFACE_PBR
+            && sampled_roughness < ROUGH_SPECULAR_DIFFUSE_THRESHOLD;
+        if (bounce_is_specular) {
             var rough_normal = vec3<f32>(0.0, 0.0, 0.0);
             var count: i32 = 0;
             new_dir = cur_dir;
             loop {
+                // VNDF importance sample around the perturbed normal so the
+                // normal-map bumps bias the next-bounce direction.
                 rough_normal = sample_vndf_isotropic(
-                    next_rand2(&rand), -new_dir, voxel_type.roughness, ray_result.normal,
+                    next_rand2(&rand), -new_dir, sampled_roughness, bounce_perturbed_normal,
                 );
                 new_dir = reflect(new_dir, rough_normal);
+                // Geometric ≤0 cull stays on the geometric face normal.
                 if (!(dot(new_dir, ray_result.normal) <= 0.0 && count < 2)) {
                     break;
                 }
@@ -416,15 +570,26 @@ fn calc_global_ilum(
                 rough_break = true;
             } else {
                 let gi = geometry_term(
-                    voxel_type.roughness,
-                    clamp(dot(new_dir, ray_result.normal), 0.0, 1.0),
+                    sampled_roughness,
+                    clamp(dot(new_dir, bounce_perturbed_normal), 0.0, 1.0),
                 );
-                let f = get_reflectance_fresnel(voxel_type.color_base, dot(new_dir, rough_normal));
-                cur_absorption *= gi * f;
+                // F0 with metallic split — preserves the metallic tint in
+                // the reflected bounce's throughput.
+                let f_base = mix(vec3<f32>(0.04), sampled_albedo, sampled_metallic);
+                let voh = clamp(dot(new_dir, rough_normal), 0.0, 1.0);
+                let f = f_base + (vec3<f32>(1.0) - f_base) * pow(1.0 - voh, 5.0);
+                // LIGHT INTEGRATION splotch fix (post-`46e50cd`): clamp
+                // throughput per channel. `gi * f` can spike at near-grazing
+                // angles; an unbounded per-bounce throughput propagates
+                // extreme radiance through the temporal ring.
+                cur_absorption *= min(gi * f, vec3<f32>(4.0));
             }
         } else {
-            new_dir = get_uniform_hemisphere_sample(next_rand2(&rand), ray_result.normal, 0.0);
-            cur_absorption *= clamp(dot(ray_result.normal, new_dir), 0.0, 1.0) * 2.0;
+            // Lambertian hemisphere sample around the perturbed normal.
+            new_dir = get_uniform_hemisphere_sample(
+                next_rand2(&rand), bounce_perturbed_normal, 0.0,
+            );
+            cur_absorption *= clamp(dot(bounce_perturbed_normal, new_dir), 0.0, 1.0) * 2.0;
         }
         if (rough_break) {
             break;
@@ -500,9 +665,14 @@ fn calc_global_ilum(
     let shared_total = atomicLoad(&shared_res_count);
 
     // `extraData` — 8-bit roughness for a rough-specular first hit, else 0.
+    // Post-PBR-raymarching: "rough-specular" = PBR + sampled-roughness in the
+    // fine-roughness range (below `ROUGH_SPECULAR_DIFFUSE_THRESHOLD`); we
+    // pack the SAMPLED roughness so the spatial-resampling pass keeps its
+    // `is_diffuse`/`is_specular` discrimination intact (`02-design.md` § J).
     var extra_data: u32 = 0u;
-    if (first_hit_type.material_base == SURFACE_SPECULAR_ROUGH) {
-        extra_data = 1u + u32(first_hit_type.roughness * 254.5);
+    if (first_hit_type.material_base == SURFACE_PBR
+        && first_hit_roughness_sampled < ROUGH_SPECULAR_DIFFUSE_THRESHOLD) {
+        extra_data = 1u + u32(first_hit_roughness_sampled * 254.5);
     }
 
     if (lane_active && is_valid) {

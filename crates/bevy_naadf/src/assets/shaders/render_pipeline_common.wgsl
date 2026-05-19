@@ -33,11 +33,12 @@ const HIT_UNDEFINED: u32 = 0u;
 // `first_hit_data.x` entity field is this value.
 const ENTITY_FREE: u32 = 0x3FFFu;
 
-// Base material classes (HLSL `SURFACE_*`).
-const SURFACE_DIFFUSE: u32 = 0u;
+// Base material classes — post-PBR-raymarching pivot. Collapsed from the C#
+// 4-value `SURFACE_*` set to a 1-bit `{ PBR=0, Emissive=1 }`. The
+// `SURFACE_SPECULAR_*` and `SURFACE_DIFFUSE` distinctions move to runtime
+// texture-driven `metallic` / `roughness` reads in `pbr_sampling.wgsl`.
+const SURFACE_PBR: u32 = 0u;
 const SURFACE_EMISSIVE: u32 = 1u;
-const SURFACE_SPECULAR_ROUGH: u32 = 2u;
-const SURFACE_SPECULAR_MIRROR: u32 = 3u;
 
 // Normal lookup table indexed by the 3-bit normal index of a plane code
 // (HLSL `static const float3 NORMAL[8]`).
@@ -88,31 +89,66 @@ struct SampleValid {
     data_b: vec4<u32>,
 }
 
-// --- voxel-type material (commonRenderPipeline.fxh) -------------------------
+// --- voxel-type material (post-PBR-raymarching pivot) -----------------------
 
-// Decompressed voxel-type material entry (HLSL `struct VoxelType`).
+// Decompressed voxel-type material entry. The four physical-material
+// parameters (albedo RGB, metallic, roughness, height) move to texture-array
+// samples; only the 1-bit base flag + the texture-array layer index +
+// per-VoxelType tint/emissive bits live here. See
+// `docs/orchestrate/pbr-raymarching/02-design.md` § B for the bit layout.
 struct VoxelType {
+    // 0 = PBR, 1 = Emissive (see `SURFACE_PBR` / `SURFACE_EMISSIVE` above).
     material_base: u32,
-    material_layer: u32,
-    color_base: vec3<f32>,
-    color_layer: vec3<f32>,
-    roughness: f32,
+    // 0..4095 — index into the `MaterialSet` texture arrays.
+    material_layer_index: u32,
+    // 1, 2, 4, 8, ..128 — decoded from the `variant_span_log2` 3-bit field.
+    variant_span: u32,
+    // sRGB-byte → `[0,1]` linear-on-linear-albedo multiplier (Bevy
+    // `StandardMaterial` convention).
+    albedo_tint: vec3<f32>,
+    // Emissive HDR multiplier (PBR voxels: ignored).
+    color_layered: vec3<f32>,
 }
 
-// `decompressVoxelType` — unpack a 128-bit material entry (HLSL
-// `decompressVoxelType(uint4 comp)`). The 6 colour channels + roughness are
-// `f16`s packed two per `u32`; `unpack2x16float` is the WGSL `f16tof32` pair.
+// PBR-raymarching mask/shift constants — mirror Rust `gpu_types.rs`
+// `VOXEL_GPU_*` (kept in lock-step; the runtime test
+// `gpu_voxel_type_packs_pbr_layout` exercises them).
+const VOXEL_GPU_BASE_MASK: u32     = 0x1u;
+const VOXEL_GPU_LAYER_SHIFT: u32   = 1u;
+const VOXEL_GPU_LAYER_MASK: u32    = 0x1FFEu;       // 0xFFF << 1
+const VOXEL_GPU_VARIANT_SHIFT: u32 = 13u;
+const VOXEL_GPU_VARIANT_MASK: u32  = 0xE000u;       // 0x7 << 13
+const VOXEL_GPU_TINT_R_SHIFT: u32  = 16u;
+const VOXEL_GPU_TINT_R_MASK: u32   = 0x00FF0000u;
+
+// `decompress_voxel_type` — unpack a 128-bit material entry per the PBR
+// bit-layout (`02-design.md` § B). The 3 emissive `color_layered`
+// components are f16 (packed in `comp.z` / `comp.w`).
 fn decompress_voxel_type(comp: vec4<u32>) -> VoxelType {
     var ty: VoxelType;
-    ty.material_base = comp.x & 0x3u;
-    ty.material_layer = (comp.x >> 2u) & 0x3u;
-    let cy = unpack2x16float(comp.y);
-    let cz = unpack2x16float(comp.z);
-    let cw = unpack2x16float(comp.w);
-    ty.color_base = vec3<f32>(cy.x, cy.y, cz.x);
-    ty.color_layer = vec3<f32>(cz.y, cw.x, cw.y);
-    // roughness is the high half-word of comp.x.
-    ty.roughness = unpack2x16float(comp.x).y;
+    ty.material_base = comp.x & VOXEL_GPU_BASE_MASK;
+    ty.material_layer_index =
+        (comp.x & VOXEL_GPU_LAYER_MASK) >> VOXEL_GPU_LAYER_SHIFT;
+    let variant_log2 =
+        (comp.x & VOXEL_GPU_VARIANT_MASK) >> VOXEL_GPU_VARIANT_SHIFT;
+    ty.variant_span = 1u << variant_log2;
+
+    // Albedo tint: 3 × sRGB bytes packed into bits 16..24 of `data[0]` +
+    // bits 0..8 / 8..16 of `data[1]`.
+    let tint_r = (comp.x & VOXEL_GPU_TINT_R_MASK) >> VOXEL_GPU_TINT_R_SHIFT;
+    let tint_g =  comp.y         & 0xFFu;
+    let tint_b = (comp.y >> 8u)  & 0xFFu;
+    // Treat the bytes as linear multipliers in `[0,1]` (the sampled albedo
+    // is already linear after `Rgba8UnormSrgb` decode — multiplicative tint
+    // on linear-space colour is the Bevy `StandardMaterial` convention).
+    ty.albedo_tint =
+        vec3<f32>(f32(tint_r), f32(tint_g), f32(tint_b)) / 255.0;
+
+    // Color-layered (emissive HDR multiplier): f16 packed in `comp.z` and
+    // `comp.w` (low half-word).
+    let cl_xy = unpack2x16float(comp.z);
+    let cl_zw = unpack2x16float(comp.w);
+    ty.color_layered = vec3<f32>(cl_xy.x, cl_xy.y, cl_zw.x);
     return ty;
 }
 
@@ -140,8 +176,8 @@ struct GpuCamera {
 //
 // Again no explicit padding — WGSL's `vec3` 16-byte slotting + `vec2` 8-byte
 // alignment reproduce the padded Rust `#[repr(C)]` layout: the four `u32`s sit
-// at 0/4/8/12, `taa_index`/`flags`/`max_ray_steps_primary`/`pad0b` at
-// 16/20/24/28, `sky_sun_dir` slots to 32, `sun_color` to 48, `taa_jitter` to
+// at 0/4/8/12, `taa_index`/`flags`/`max_ray_steps_primary`/`debug_view_mode`
+// at 16/20/24/28, `sky_sun_dir` slots to 32, `sun_color` to 48, `taa_jitter` to
 // 64, `bounding_box_min` to 80, `bounding_box_max` to 96 — total 112 bytes.
 // `max_ray_steps_primary` (offset 24) was `pad0a`, formerly `exposure` /
 // `tone_mapping_fac` — the custom final-blit tonemap constants. The
@@ -165,7 +201,10 @@ struct GpuRenderParams {
     // Default 120 = pre-dispatch const bit-equivalent. Consumer clamps
     // `max(_, 1u)` defensively.
     max_ray_steps_primary: u32,
-    pad0b: u32,
+    // PBR rendering debugger mode index — see
+    // `crate::debug_view::DebugViewMode` + `pbr_sampling.wgsl::debug_view_override`.
+    // Layout-preserving repurpose of `_pad0b`.
+    debug_view_mode: u32,
 
     sky_sun_dir: vec3<f32>,
     sun_color: vec3<f32>,

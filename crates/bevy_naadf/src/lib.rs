@@ -14,9 +14,11 @@ pub mod aadf;
 pub mod app_mode;
 pub mod baked_material;
 pub mod camera;
+pub mod debug_view;
 pub mod e2e;
 pub mod editor;
 pub mod hud;
+pub mod material_set;
 pub mod render;
 pub mod settings;
 pub mod texture_array;
@@ -410,6 +412,30 @@ pub struct AppArgs {
     /// capture a single screenshot to `oracle_gpu.png`, then exit. See
     /// [`crate::e2e::vox_gpu_oracle`].
     pub vox_gpu_oracle_gpu_phase: bool,
+    /// PBR-raymarching `--pbr-visual` mode — when `true`, the e2e driver
+    /// pins a fixed side-on pose looking at the metallic pillar in the
+    /// default test grid, captures a single screenshot, and asserts the
+    /// three PBR signal checks (specular highlight luminance, textured-
+    /// albedo variation, metallic F0 colour-pull). See
+    /// [`crate::e2e::pbr_visual`] and `02-design.md` § I.
+    pub pbr_visual_mode: bool,
+    /// PBR rendering-debugger `--pbr-debug-modes` mode — when `true`, the
+    /// e2e driver iterates every non-zero
+    /// [`crate::debug_view::DebugViewMode`], captures a per-mode
+    /// framebuffer, and asserts each capture is non-degenerate (mean +
+    /// std-dev floors). See [`crate::e2e::pbr_debug_modes`] +
+    /// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+    /// debugger".
+    pub pbr_debug_modes_mode: bool,
+    /// PBR splotch-artifact `--pbr-hard-edge` mode — when `true`, the e2e
+    /// driver captures a single screenshot at the metallic-pillar pose and
+    /// scans a cobblestone-interior rect for HARD 1-pixel luminance jumps
+    /// (per user spec: jumps that match the splotch artifact signature
+    /// while ignoring natural self-shadowed gradient dips). See
+    /// [`crate::e2e::pbr_hard_edge`] +
+    /// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "LIGHT
+    /// INTEGRATION splotch diagnose+fix (post-`46e50cd`)".
+    pub pbr_hard_edge_mode: bool,
     /// web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — when `true`,
     /// boots the e2e harness with `GridPreset::Empty` (skybox baseline) and
     /// captures a single screenshot to `vox_web_parity_skybox.png`. The
@@ -441,6 +467,9 @@ impl Default for AppArgs {
             vox_gpu_construction_mode: false,
             vox_gpu_oracle_cpu_phase: false,
             vox_gpu_oracle_gpu_phase: false,
+            pbr_visual_mode: false,
+            pbr_debug_modes_mode: false,
+            pbr_hard_edge_mode: false,
             vox_web_parity_skybox_phase: false,
             vox_web_parity_loaded_phase: false,
         }
@@ -728,6 +757,18 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // `AssetProcessor` resource exists — i.e. in the `bake` binary's
             // `AssetMode::Processed` app, not here. See `crate::texture_array`.
             texture_array::TextureArrayPlugin,
+            // PBR-raymarching: load the four `.texarray.ron` material arrays
+            // into a `MaterialSet` resource at startup; `extract_material_set`
+            // ferries the four handles into the render world, and
+            // `prepare_world_gpu` binds them at world `@group(0)` slots 8..12
+            // once their `GpuImage`s are uploaded (`02-design.md` § C).
+            material_set::MaterialSetPlugin,
+            // PBR rendering debugger — runtime-switchable per-channel
+            // BRDF visualisation. Installs `DebugViewState` resource +
+            // F1 / `[` / `]` key cycling. Production cost when mode == 0:
+            // one uniform load + one compare per pixel (DCE'd by the WGSL
+            // compiler). See `crate::debug_view`.
+            debug_view::DebugViewPlugin,
         ));
 
     // The fly camera + runtime DLSS toggle — production only. The e2e config
@@ -888,6 +929,10 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
                     editor::hud::drag_palette_scrollbar,
                     editor::hud::update_palette_scrollbar,
                     editor::hud::update_editor_hud,
+                    // PBR rendering debugger overlay (top-left) — visible
+                    // only when `DebugViewState.mode != Off`. See
+                    // `crate::debug_view`.
+                    editor::hud::update_debug_view_hud,
                     // Brush input — only active while playing.
                     editor::apply_edit_tool.run_if(in_state(AppMode::Playing)),
                     // Settings overlay input — only active while in settings.
@@ -940,6 +985,23 @@ pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
             )),
             resizable: false,
             title: "bevy-naadf e2e_render small-edit-repro",
+            name: None,
+        };
+    }
+    // `--pbr-hard-edge` runs at 768×768 — much larger than the standard
+    // 256×256 e2e window so each cobblestone voxel renders at ~256 px and
+    // the splotch artifact can actually manifest in the analysis rect.
+    // The original 256×256 gate's blind spot was zoomed-out aerial of
+    // tiny tiles where individual cobblestone splotches were physically
+    // sub-pixel. See `crate::e2e::pbr_hard_edge` module docs.
+    if args.pbr_hard_edge_mode {
+        cfg.window = WindowConfig {
+            resolution: Some((
+                crate::e2e::pbr_hard_edge::PBR_HARD_EDGE_WIDTH as f32,
+                crate::e2e::pbr_hard_edge::PBR_HARD_EDGE_HEIGHT as f32,
+            )),
+            resizable: false,
+            title: "bevy-naadf e2e_render pbr-hard-edge",
             name: None,
         };
     }

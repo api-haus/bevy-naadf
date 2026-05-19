@@ -40,9 +40,10 @@ use bevy::render::{
 
 use atmosphere::prepare_atmosphere;
 use extract::{
-    extract_camera, extract_camera_history, extract_gi_config, extract_taa_config,
-    stage_model_data_buildonce, stage_world_gpu_buildonce, ExtractedCameraData,
-    ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
+    extract_camera, extract_camera_history, extract_debug_view, extract_gi_config,
+    extract_material_set, extract_taa_config, stage_model_data_buildonce,
+    stage_world_gpu_buildonce, ExtractedCameraData, ExtractedCameraHistory,
+    ExtractedDebugView, ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
 };
 // web-vox-color-divergence (2026-05-18) — `VoxelTypesRefresh` is consumed by
 // `prepare_world_gpu` via `crate::render::extract::VoxelTypesRefresh` path
@@ -144,6 +145,9 @@ impl Plugin for NaadfRenderPlugin {
             .init_resource::<ExtractedCameraHistory>()
             .init_resource::<ExtractedTaaConfig>()
             .init_resource::<ExtractedGiConfig>()
+            // PBR rendering debugger — render-world mirror of
+            // `crate::debug_view::DebugViewState`. See `crate::debug_view`.
+            .init_resource::<ExtractedDebugView>()
             // Pipelines + bind-group layouts — `FromWorld`, built once in
             // `RenderStartup` (after the render device exists).
             .init_gpu_resource::<NaadfPipelines>()
@@ -160,6 +164,8 @@ impl Plugin for NaadfRenderPlugin {
                     extract_camera_history,
                     extract_taa_config,
                     extract_gi_config,
+                    extract_material_set,
+                    extract_debug_view,
                 ),
             )
             // Prepare: create + upload GPU resources, build bind groups,

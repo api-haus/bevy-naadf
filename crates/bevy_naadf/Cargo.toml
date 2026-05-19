@@ -70,6 +70,14 @@ image = { version = "=0.25.10", default-features = false, features = [
 # (sky-bleed, voxel-type corruption, palette OOB) that would drop SSIM far
 # below 1.0. Pure-Rust dep, no native compile.
 image-compare = "0.5"
+# imageproc = Canny edge detection + image processing primitives, consumed by
+# the `--pbr-hard-edge` gate (`src/e2e/pbr_hard_edge.rs`). The gate detects
+# sharp 1-pixel luminance discontinuities (HSV Value drops >30% in one pixel
+# with adjacent pixels stable), distinguishing splotch artifacts from natural
+# self-shadowed gradient dips. See `docs/orchestrate/pbr-raymarching/
+# 05-diagnostic.md` § "LIGHT INTEGRATION splotch". Pure-Rust dep, no native
+# compile; matched to `image = 0.25.x`.
+imageproc = "0.25"
 # tracing / tracing-subscriber — direct deps so the e2e
 # `tracing_error_counter` module can implement a `Layer<Registry>` via the
 # Bevy 0.19 `LogPlugin::custom_layer` hook (web-vox-async-loading Step 8 /

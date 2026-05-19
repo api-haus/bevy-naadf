@@ -41,12 +41,13 @@ use bevy::prelude::*;
 use bevy::render::camera::ExtractedCamera;
 use bevy::render::render_resource::{
     binding_types::{
-        storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized,
+        sampler, storage_buffer_read_only_sized, storage_buffer_sized,
+        texture_2d_array, uniform_buffer_sized,
     },
     BindGroup, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
     CachedComputePipelineId, CachedRenderPipelineId, ColorTargetState, ColorWrites,
     ComputePipelineDescriptor, FragmentState, PipelineCache, RenderPipelineDescriptor,
-    ShaderStages, TextureFormat, VertexState,
+    SamplerBindingType, ShaderStages, TextureFormat, TextureSampleType, VertexState,
 };
 use bevy::render::renderer::RenderDevice;
 use bevy::render::view::ExtractedView;
@@ -322,18 +323,29 @@ impl FromWorld for NaadfPipelines {
                     // construction sub-graph's `read_write` access (the
                     // WebGPU spec forbids `read_write` storage textures on
                     // `Rg32Uint`).
-                    storage_buffer_read_only_sized(false, None), // chunks: array<vec2<u32>>
+                    storage_buffer_read_only_sized(false, None), // 0 chunks: array<vec2<u32>>
                     // blocks / voxels / voxel_types are `var<storage, read>` in
                     // `world_data.wgsl` — read-only in every render pass.
-                    storage_buffer_read_only_sized(false, None), // blocks: array<u32>
-                    storage_buffer_read_only_sized(false, None), // voxels: array<u32>
-                    storage_buffer_read_only_sized(false, None), // voxel_types: array<vec4<u32>>
-                    uniform_buffer_sized(false, Some(world_meta_size)),
+                    storage_buffer_read_only_sized(false, None), // 1 blocks: array<u32>
+                    storage_buffer_read_only_sized(false, None), // 2 voxels: array<u32>
+                    storage_buffer_read_only_sized(false, None), // 3 voxel_types: array<vec4<u32>>
+                    uniform_buffer_sized(false, Some(world_meta_size)), // 4 world_meta
                     // W4 wave-3 — entity track (read-only in render passes).
                     // Placeholder-or-real semantics: see module doc above.
-                    storage_buffer_read_only_sized(false, None), // entity_chunk_instances: array<EntityChunkInstance>
-                    storage_buffer_read_only_sized(false, None), // entity_voxel_data: array<u32>
-                    storage_buffer_read_only_sized(false, None), // entity_instances_history: array<vec4<u32>>
+                    storage_buffer_read_only_sized(false, None), // 5 entity_chunk_instances
+                    storage_buffer_read_only_sized(false, None), // 6 entity_voxel_data
+                    storage_buffer_read_only_sized(false, None), // 7 entity_instances_history
+                    // === PBR-raymarching texture arrays (slots 8..12) ===
+                    // See `docs/orchestrate/pbr-raymarching/02-design.md` § C
+                    // for the bind-group integration. The four arrays are
+                    // sampled triplanar in `pbr_sampling.wgsl`; one shared
+                    // linear-repeat sampler suffices (all four arrays use the
+                    // same `bake_texture_array` sampler descriptor).
+                    texture_2d_array(TextureSampleType::Float { filterable: true }), // 8  pbr_diffuse_ao
+                    texture_2d_array(TextureSampleType::Float { filterable: true }), // 9  pbr_normal
+                    texture_2d_array(TextureSampleType::Float { filterable: true }), // 10 pbr_mrh
+                    texture_2d_array(TextureSampleType::Float { filterable: true }), // 11 pbr_emissive
+                    sampler(SamplerBindingType::Filtering),                          // 12 pbr_sampler
                 ),
             ),
         );

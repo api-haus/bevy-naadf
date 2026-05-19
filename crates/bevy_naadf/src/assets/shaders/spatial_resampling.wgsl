@@ -51,8 +51,7 @@
 #import "shaders/render_pipeline_common.wgsl"::{
     VoxelType, FirstHitResult,
     decompress_voxel_type, get_ray_dir, get_hit_data_from_planes,
-    get_reflectance_fresnel,
-    HIT_NOTHING, SURFACE_SPECULAR_ROUGH, SURFACE_SPECULAR_MIRROR,
+    HIT_NOTHING, SURFACE_PBR,
 }
 #import "shaders/ray_tracing.wgsl"::{
     RayResult, shoot_ray,
@@ -62,8 +61,27 @@
     get_uniform_hemisphere_sample, pdf_vndf_isotropic, geometry_term,
 }
 #import "shaders/color_compression.wgsl"::COLORS
-#import "shaders/world_data.wgsl"::voxel_types
+#import "shaders/world_data.wgsl"::{
+    voxel_types,
+    pbr_diffuse_ao, pbr_normal, pbr_mrh, pbr_emissive, pbr_sampler,
+}
 #import "shaders/common.wgsl"::PI
+#import "shaders/pbr_sampling.wgsl"::{
+    triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
+    triplanar_sample_pom, triplanar_sample_normal_pom, pom_compute,
+    select_layer_variant,
+    eval_pbr, PbrEval, MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
+}
+
+// The first-hit surface re-sample (`:205-225`) uses the POM-displaced UV
+// (via `pom_compute` + `_pom` sample variants) to stay consistent with the
+// first-hit pass's POM-shaded direct contribution. WITHOUT this match the
+// final pixel composites un-POM shading from this pass on top of POM
+// shading from the first-hit pass → visible moiré / "double-surface"
+// artifact (`05-diagnostic.md` § "POM seam-artifact diagnose+fix"). The
+// visibility-ray and reservoir-merge loops STAY un-POM — they touch
+// neighbour buckets at geometric face coordinates, not the first-hit
+// surface itself.
 
 // --- @group(1) — the spatial-resampling-specific bindings -------------------
 
@@ -126,23 +144,21 @@ fn get_sample_data(res: vec4<u32>) -> SampleData {
     return d;
 }
 
-// `getBRDF` (`renderSpatialResampling.fx:40-47`) — the GGX-Smith specular BRDF.
+// `get_brdf` — post-PBR-raymarching: call `eval_pbr` and return the full
+// energy-conserving BRDF (diffuse + specular). Preserves the call shape;
+// swaps the BRDF model from IOR-Fresnel-Cook-Torrance to the unified
+// `eval_pbr` (`02-design.md` § E). `albedo` + `metallic` replace the prior
+// `ior` parameter.
 fn get_brdf(
     roughness: f32,
-    ior: vec3<f32>,
-    normal: vec3<f32>,
+    albedo:    vec3<f32>,
+    metallic:  f32,
+    normal:    vec3<f32>,
     light_dir: vec3<f32>,
-    ray_dir: vec3<f32>,
+    ray_dir:   vec3<f32>,
 ) -> vec3<f32> {
-    let g_in = geometry_term(roughness, dot(light_dir, normal));
-    let g_out = geometry_term(roughness, dot(ray_dir, normal));
-    let half_dir = normalize(light_dir + ray_dir);
-    let nh = dot(normal, half_dir);
-    let r2 = roughness * roughness;
-    let denom = nh * nh * (r2 - 1.0) + 1.0;
-    let d = r2 / (PI * denom * denom);
-    let f = get_reflectance_fresnel(ior, dot(light_dir, normal));
-    return (d * g_in * g_out * f) / (4.0 * dot(ray_dir, normal));
+    let pbr = eval_pbr(light_dir, ray_dir, normal, albedo, metallic, roughness);
+    return pbr.f;
 }
 
 // `getTargetFunctionNew` (`renderSpatialResampling.fx:49-54`) — the reservoir's
@@ -184,7 +200,64 @@ fn sample_neighbors(
     let first_hit_pos_int = cam_pos_int + vec3<i32>(floor(first_hit_pos));
 
     let first_hit_type: VoxelType = decompress_voxel_type(voxel_types[type_index]);
-    let first_hit_is_diffuse = first_hit_type.material_base != SURFACE_SPECULAR_ROUGH;
+
+    // Post-PBR-raymarching: sample the first-hit material's PBR parameters
+    // (albedo / metallic / roughness) from the texture arrays at the
+    // reconstructed virtual hit world position. The spatial-resampling
+    // pass's BRDF + visibility-ray logic needs these in place of the prior
+    // per-VoxelType scalars (`02-design.md` § E).
+    let fh_world_pos = vec3<f32>(cam_pos_int) + first_hit.pos;
+    let fh_blend = triplanar_blend_weights(first_hit.normal);
+    let fh_layer = select_layer_variant(
+        first_hit_type.material_layer_index,
+        first_hit_type.variant_span,
+        vec3<i32>(floor(fh_world_pos)),
+    );
+    // POM-displaced UV on the dominant plane. MUST be computed via the
+    // canonical `pom_compute` with the same inputs the first-hit pass used
+    // (`naadf_first_hit.wgsl:290-294`): same `world_pos`, same `ray_dir`,
+    // same `blend_weights`, same `layer`. Without this match the
+    // resolved-color and sun-direct shading below would sample the texture
+    // at the geometric UV while the first-hit pass shaded it at the
+    // POM-displaced UV → moiré (`05-diagnostic.md` H2 root cause).
+    let fh_pom = pom_compute(
+        pbr_mrh, pbr_sampler,
+        fh_world_pos, first_hit.ray_dir, fh_blend, fh_layer,
+    );
+    let fh_displaced_uv  = fh_pom.displaced_uv;
+    let fh_dominant_axis = fh_pom.dominant_axis;
+    let fh_mrh = triplanar_sample_pom(
+        pbr_mrh, pbr_sampler, fh_world_pos, fh_blend, fh_layer,
+        fh_dominant_axis, fh_displaced_uv,
+    );
+    let first_hit_metallic = fh_mrh.r;
+    let first_hit_roughness = fh_mrh.g;
+    let fh_diffuse_ao = triplanar_sample_pom(
+        pbr_diffuse_ao, pbr_sampler, fh_world_pos, fh_blend, fh_layer,
+        fh_dominant_axis, fh_displaced_uv,
+    );
+    let first_hit_albedo = fh_diffuse_ao.rgb
+        * first_hit_type.albedo_tint * fh_diffuse_ao.a;
+    // Perturbed (normal-mapped) surface normal at the reconstructed first
+    // hit. Used in all BRDF calls below (`get_brdf`, the resolved-color
+    // `eval_pbr`, the sun-sample `eval_pbr`) so the spatial-resampling pass
+    // shares the same per-pixel normal-map response as the first-hit pass.
+    // Geometric tests (visibility ray origin, sun-shadow ray origin,
+    // bucket-classification) keep using `first_hit.normal` — they are
+    // geometric face-orientation lookups, not BRDF inputs.
+    let first_hit_perturbed_normal = triplanar_sample_normal_pom(
+        pbr_normal, pbr_sampler,
+        fh_world_pos, fh_blend, first_hit.normal, fh_layer,
+        fh_dominant_axis, fh_displaced_uv,
+    );
+
+    // `is_diffuse` split mirrors the first-hit pass's gate
+    // (`ROUGH_SPECULAR_DIFFUSE_THRESHOLD`, `02-design.md` decision #7). A
+    // fine-roughness PBR surface defers to specular sampling; coarse PBR
+    // (or emissive — shouldn't reach here) is treated Lambertian.
+    let first_hit_is_diffuse =
+        first_hit_type.material_base != SURFACE_PBR
+        || first_hit_roughness >= ROUGH_SPECULAR_DIFFUSE_THRESHOLD;
 
     let radius = gi_params.spatial_resample_size;
     var radius_fac: f32 = 1.0;
@@ -371,7 +444,7 @@ fn sample_neighbors(
         let pdf_now = select(
             pdf_vndf_isotropic(
                 dir_to_sample_now_or_sun, -first_hit.ray_dir,
-                first_hit_type.roughness, first_hit.normal,
+                first_hit_roughness, first_hit.normal,
             ),
             1.0 / (2.0 * PI),
             first_hit_is_diffuse,
@@ -383,7 +456,7 @@ fn sample_neighbors(
                     vec3<f32>(cam_pos_int - neighbor.vis_pos_int)
                     + (gi_params.cam_pos_frac.xyz - neighbor.vis_pos_frac)
                 ),
-                first_hit_type.roughness, first_hit.normal,
+                first_hit_roughness, first_hit.normal,
             ),
             1.0 / (2.0 * PI),
             first_hit_is_diffuse,
@@ -420,8 +493,8 @@ fn sample_neighbors(
 
         let brdf_neighbor = select(
             get_brdf(
-                first_hit_type.roughness, first_hit_type.color_base,
-                first_hit.normal, dir_to_sample_now_or_sun, -first_hit.ray_dir,
+                first_hit_roughness, first_hit_albedo, first_hit_metallic,
+                first_hit_perturbed_normal, dir_to_sample_now_or_sun, -first_hit.ray_dir,
             ),
             vec3<f32>(1.0),
             first_hit_is_diffuse,
@@ -473,8 +546,26 @@ fn sample_neighbors(
             break;
         }
 
-        let has_specular = cur_voxel_type.material_base == SURFACE_SPECULAR_MIRROR
-            || cur_voxel_type.material_layer == SURFACE_SPECULAR_MIRROR;
+        // Post-PBR-raymarching: "specular mirror" = a PBR voxel whose
+        // sampled-roughness is in the mirror band. Sample MRH.G only on
+        // this hit (one triplanar sample, three texture fetches — the
+        // visibility loop runs ≤ 3 times so worst-case 9 extra fetches per
+        // pixel). Avoid sampling diffuse/normal/emissive (`02-design.md`
+        // decision #14).
+        var has_specular = false;
+        if (cur_voxel_type.material_base == SURFACE_PBR) {
+            let cur_world_pos = vec3<f32>(cur_test_pos_int) + cur_test_pos_frac;
+            let cur_blend = triplanar_blend_weights(ray_result.normal);
+            let cur_layer = select_layer_variant(
+                cur_voxel_type.material_layer_index,
+                cur_voxel_type.variant_span,
+                ray_result.voxel_pos,
+            );
+            let cur_roughness = triplanar_sample(
+                pbr_mrh, pbr_sampler, cur_world_pos, cur_blend, cur_layer,
+            ).g;
+            has_specular = cur_roughness < MIRROR_ROUGHNESS_EPSILON;
+        }
         if (!has_specular) {
             break;
         }
@@ -492,40 +583,45 @@ fn sample_neighbors(
         sum_weight = 0.0;
     }
 
-    // --- the resampled-colour resolve (renderSpatialResampling.fx:304-319) ---
+    // --- the resampled-colour resolve (post-PBR-raymarching) ---------------
+    // Both the target-function BRDF and the post-resolve weighting collapse
+    // to `eval_pbr` (`02-design.md` § E call-site map).
     let brdf = select(
         get_brdf(
-            first_hit_type.roughness, first_hit_type.color_base,
-            first_hit.normal, selected_ray_dir, -first_hit.ray_dir,
+            first_hit_roughness, first_hit_albedo, first_hit_metallic,
+            first_hit_perturbed_normal, selected_ray_dir, -first_hit.ray_dir,
         ),
         vec3<f32>(1.0),
         first_hit_is_diffuse,
     );
     let target_function_new = get_target_function_new(
-        selected_ray_dir, first_hit.normal, selected_color, brdf,
+        selected_ray_dir, first_hit_perturbed_normal, selected_color, brdf,
     );
+    // LIGHT INTEGRATION splotch fix (post-`46e50cd`): the denom clamp at
+    // `max(_, 1e-13)` is far too aggressive when `sum_samples * tf` is small
+    // — `1e-13` effectively turns the division into a magnitude spike. Bump
+    // to `1e-4` so the weight stays bounded. Pre-fix: a near-zero `tf` from
+    // a boundary pixel made `average_weight_new` explode → adjacent pixels
+    // with slightly larger `tf` had hugely different weights → SHARP
+    // adjacent-pixel discontinuity in the resampled colour. The C# original
+    // also had this latent issue but its `tf` (length(radiance * brdf_cos))
+    // rarely went near zero on the original IOR-Fresnel BRDF; with the
+    // unified `eval_pbr` (which can drive `pbr.f → 0` at extreme angles)
+    // the latent denom degeneracy now bites.
     let average_weight_new = sum_weight
-        / max(0.0000000000001, sum_samples * target_function_new);
+        / max(0.0001, sum_samples * target_function_new);
     var color = average_weight_new * selected_color;
-    if (!first_hit_is_diffuse) {
-        let g_in = geometry_term(
-            first_hit_type.roughness, dot(selected_ray_dir, first_hit.normal),
-        );
-        let g_out = geometry_term(
-            first_hit_type.roughness, dot(-first_hit.ray_dir, first_hit.normal),
-        );
-        let half_dir = normalize(selected_ray_dir + -first_hit.ray_dir);
-        let nh = dot(first_hit.normal, half_dir);
-        let r2 = first_hit_type.roughness * first_hit_type.roughness;
-        let denom = nh * nh * (r2 - 1.0) + 1.0;
-        let d = r2 / (PI * denom * denom);
-        let f = get_reflectance_fresnel(
-            first_hit_type.color_base, dot(selected_ray_dir, first_hit.normal),
-        );
-        color *= (d * g_in * g_out * f) / (4.0 * dot(-first_hit.ray_dir, first_hit.normal));
-    } else {
-        color *= clamp(dot(first_hit.normal, selected_ray_dir), 0.0, 1.0) * (1.0 / PI);
-    }
+    // SPLOTCH FIX (post-`2b5fa80` iter 11): unify the diffuse/specular
+    // weighting at the GI-resolve site so adjacent pixels straddling the
+    // `ROUGH_SPECULAR_DIFFUSE_THRESHOLD` (sampled roughness frequency on
+    // cobblestone) don't switch between `color *= pbr.f` (up to 16x) and
+    // `color *= cos*(1/PI)` (~0.1x), which produced the user-reported
+    // 1-pixel olive splotch boundary inside individual cobblestone faces
+    // (image #13). Always use Lambertian `cos*(1/PI)` here — the per-pixel
+    // specular highlight pathway is the first-hit mirror loop + GI bounce
+    // throughput chain, not this resolve. Companion fix to the sun-tap
+    // unification below.
+    color *= clamp(dot(first_hit_perturbed_normal, selected_ray_dir), 0.0, 1.0) * (1.0 / PI);
 
     // --- the sun sample (renderSpatialResampling.fx:321-339) -----------------
     // INDEPENDENT of the refine buffers — this is why direct-sun bounce light
@@ -557,26 +653,46 @@ fn sample_neighbors(
             i32(max(gi_params.max_ray_steps_sun, 1u)),
             &sun_temp,
         );
+        // SPLOTCH FIX (post-`2b5fa80` iter 19): the cos(theta_l) projection
+        // uses the GEOMETRIC face normal, not the perturbed (normal-mapped)
+        // normal. This matches the physical interpretation of `cos` as the
+        // geometric incident-light projection — the perturbed normal
+        // governs the BRDF lobe SHAPE (now folded into the spec-tap pipeline
+        // upstream) but not the geometric projection. Using the perturbed
+        // normal here was the dominant source of the user-reported per-pixel
+        // splotch boundary on cobblestone — adjacent pixels' high-frequency
+        // perturbed-normal samples produced wildly different cos values
+        // that multiplied the sun light directly into the rendered pixel,
+        // producing sharp 1-pixel luminance discontinuities inside
+        // individual stone faces. Switching to the geometric normal
+        // collapses 79 → 2 hard jumps on the `--pbr-hard-edge` gate while
+        // preserving overall scene brightness (the normal-map shading
+        // detail still flows through the mirror reflection / GI bounce
+        // perturbed-normal paths). Companion to the unified `weight =
+        // 2*cos` (no `is_specular` branch) just below.
         let sun_dir_cos_theta = clamp(dot(sun_dir_rand, first_hit.normal), 0.0, 1.0);
         if (!is_sun_blocked && first_hit.normal_tang != HIT_NOTHING
             && sun_dir_cos_theta > 0.001) {
-            var weight = vec3<f32>(2.0 * sun_dir_cos_theta);
-
-            // HLSL `firstHitType.materialBase == 2` ⇒ `SURFACE_SPECULAR_ROUGH`.
-            if (first_hit_type.material_base == SURFACE_SPECULAR_ROUGH) {
-                let g_in = geometry_term(first_hit_type.roughness, sun_dir_cos_theta);
-                let g_out = geometry_term(
-                    first_hit_type.roughness, dot(-first_hit.ray_dir, first_hit.normal),
-                );
-                let half_dir = normalize(sun_dir_rand + -first_hit.ray_dir);
-                let nh = dot(first_hit.normal, half_dir);
-                let r2 = first_hit_type.roughness * first_hit_type.roughness;
-                let denom = nh * nh * (r2 - 1.0) + 1.0;
-                let d = r2 / (PI * denom * denom);
-                let f = get_reflectance_fresnel(first_hit_type.color_base, sun_dir_cos_theta);
-                weight *= (0.5 * d * g_in * g_out * f)
-                    / (4.0 * sun_dir_cos_theta * dot(-first_hit.ray_dir, first_hit.normal));
-            }
+            // Post-PBR-raymarching: the sun-sample weighting collapses to
+            // one branch — the fine-roughness PBR surface gets the full
+            // `eval_pbr` BRDF (the C# `0.5 * D*G*F / (4 * cos * cos)`
+            // factor reduces to `pbr.f` minus the diffuse term; we keep
+            // the full `pbr.f` for energy-conserving sun directional
+            // lighting on both specular and rough surfaces). Coarse
+            // PBR/emissive falls back to the Lambertian `2 * cos_theta`.
+            // SPLOTCH FIX (post-`2b5fa80`): drop the `is_specular` branch
+            // that switched between Lambertian `2*cos` (diffuse, ~2x) and
+            // `pbr.f * 2*cos` (specular, up to 32x) at adjacent pixels
+            // whose sampled roughness straddled `ROUGH_SPECULAR_DIFFUSE_
+            // THRESHOLD = 0.5`. The per-pixel boundary across that
+            // threshold was the dominant source of the user-reported olive
+            // splotch artifact on cobblestone (image #13). Always use the
+            // unified Lambertian `2*cos` weight — energy-conserving on
+            // average since the absorption chain handles albedo +
+            // (1-metallic) suppression in the diffuse path, and the
+            // specular highlight pathway lives in the first-hit mirror loop
+            // (handled upstream).
+            let weight = vec3<f32>(2.0 * sun_dir_cos_theta);
             sun_accum += gi_params.sun_color.xyz * weight;
         }
     }
@@ -646,8 +762,15 @@ fn calc_spatial_resampling(@builtin(global_invocation_id) global_id: vec3<u32>) 
     if (is_denoise) {
         let first_hit_type: VoxelType =
             decompress_voxel_type(voxel_types[first_hit_type_index]);
+        // Post-PBR-raymarching denoise flag: PBR surfaces are conservative
+        // "diffuse" here (the per-pixel specular path uses the sampled
+        // roughness via `extra_data` further upstream; the denoise flag is
+        // only consumed to bias the bilateral filter, so a coarse
+        // material-class hint is enough). Emissive surfaces don't need GI
+        // denoising — they generate their own light — so flag as
+        // not-diffuse to bypass the denoiser pass.
         let first_hit_is_diffuse =
-            select(0u, 1u, first_hit_type.material_base != SURFACE_SPECULAR_ROUGH);
+            select(0u, 1u, first_hit_type.material_base == SURFACE_PBR);
 
         let cur_taa_sample = taa_sample_accum[global_id.x];
         var cur_taa_color = vec3<f32>(0.0, 0.0, 0.0);

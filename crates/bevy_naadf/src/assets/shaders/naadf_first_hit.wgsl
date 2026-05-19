@@ -49,19 +49,32 @@
 
 #import "shaders/render_pipeline_common.wgsl"::{
     GpuCamera, GpuRenderParams, VoxelType, decompress_voxel_type, get_ray_dir,
-    compress_first_hit_data, get_reflectance_fresnel,
+    compress_first_hit_data,
     HIT_NOTHING, HIT_UNDEFINED, ENTITY_FREE,
-    SURFACE_EMISSIVE, SURFACE_SPECULAR_ROUGH, SURFACE_SPECULAR_MIRROR,
+    SURFACE_PBR, SURFACE_EMISSIVE,
     FLAG_SHOW_RAY_STEP, FLAG_IS_ATMOSPHERE_INTERACTION,
 }
 #import "shaders/ray_tracing.wgsl"::{
     RayResult, ray_aabb, shoot_ray,
 }
-#import "shaders/world_data.wgsl"::{voxel_types, world_meta}
+#import "shaders/world_data.wgsl"::{
+    voxel_types, world_meta,
+    pbr_diffuse_ao, pbr_normal, pbr_mrh, pbr_emissive, pbr_sampler,
+}
 #import "shaders/atmosphere.wgsl"::{
     AtmosphereParams, AtmoLight, apply_atmosphere, atmosphere_oct_index,
     add_light_for_direction,
 }
+#import "shaders/pbr_sampling.wgsl"::{
+    triplanar_blend_weights, triplanar_sample, triplanar_sample_normal,
+    triplanar_sample_pom, triplanar_sample_normal_pom,
+    pom_compute, pom_self_shadow,
+    select_layer_variant,
+    eval_pbr, PbrEval,
+    PbrDebugInputs, debug_view_override,
+    MIRROR_ROUGHNESS_EPSILON, ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
+}
+#import "shaders/common.wgsl"::PI
 
 // --- @group(1) — frame data -------------------------------------------------
 
@@ -154,6 +167,20 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var cur_pos_frac = cam_pos_frac;
     let entity = ENTITY_FREE;
 
+    // PBR rendering debugger — when `params.debug_view_mode != 0u`, the
+    // first-hit branches that terminate on a PBR surface (rough-PBR break +
+    // emissive fast-path) populate `debug_color` with the per-pixel debug
+    // RGB. After the loop, the value is stomped into `final_color` and
+    // `taa_sample_accum`, and `acc.absorption` is cleared so downstream
+    // GI / spatial-resampling / sun-direct multiplications all contribute
+    // zero light. Mode 0 leaves `debug_active = false` and the production
+    // path is untouched (zero perf cost — one uniform load + one compare
+    // dead-code-eliminated by the WGSL compiler). See
+    // `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+    // debugger".
+    var debug_active: bool = false;
+    var debug_color: vec3<f32> = vec3<f32>(0.0);
+
     if (volume.hit) {
         // `oldPos = curPosInt + curPosFrac` BEFORE advancing to the volume
         // entry point (`base/renderFirstHit.fx:58`) — the camera-int-relative
@@ -226,35 +253,236 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
             let voxel_type: VoxelType =
                 decompress_voxel_type(voxel_types[ray_result.hit_type]);
-            let ior = voxel_type.color_base;
 
-            // Non-mirror surface — terminate the primary-ray bounces (`:93-108`).
-            if (voxel_type.material_base != SURFACE_SPECULAR_MIRROR) {
-                // Apply albedo unless the surface is rough specular.
-                if (voxel_type.material_base != SURFACE_SPECULAR_ROUGH) {
-                    acc.absorption = acc.absorption * voxel_type.color_base;
-                }
-                // Emissive surfaces add `colorLayer.r` * absorption.
-                if (voxel_type.material_base == SURFACE_EMISSIVE) {
-                    acc.light = acc.light + acc.absorption * voxel_type.color_layer.r;
-                }
+            // PBR-raymarching pivot: every hit goes through the unified PBR
+            // path or the Emissive fast-path. `material_base` is the only
+            // surviving branch (`02-design.md` § E call-site map).
+            //
+            // World-space hit position for triplanar UV — `cur_pos_int +
+            // cur_pos_frac` is the camera-int-relative world position
+            // (`02-design.md` assumption #5). The triplanar functions only
+            // need a position whose mod-1 footprint tiles the texture; the
+            // camera-int offset is constant per frame so the tiling shifts
+            // uniformly — the visible texture is identical to the
+            // world-absolute case.
+            let hit_world_pos = vec3<f32>(cur_pos_int) + cur_pos_frac;
+            let face_normal = ray_result.normal;
+            let blend_weights = triplanar_blend_weights(face_normal);
+            let layer = select_layer_variant(
+                voxel_type.material_layer_index,
+                voxel_type.variant_span,
+                ray_result.voxel_pos,
+            );
+
+            // Emissive fast-path — skip the BRDF, sample the Emissive
+            // texture, multiply by per-VoxelType `color_layered` (HDR), add
+            // and terminate (`02-design.md` § H).
+            if (voxel_type.material_base == SURFACE_EMISSIVE) {
+                let emissive_sample = triplanar_sample(
+                    pbr_emissive, pbr_sampler,
+                    hit_world_pos, blend_weights, layer,
+                ).rgb;
+                let emissive_full = emissive_sample * voxel_type.color_layered;
+                acc.light = acc.light + acc.absorption * emissive_full;
                 distance_ray = dist + volume.dist_min_max.x;
                 voxel_type_raw = ray_result.hit_type;
-                is_diffuse = select(
-                    1u, 0u, voxel_type.material_base == SURFACE_SPECULAR_ROUGH,
-                );
-                // (`#ifdef ENTITIES` — `entity = rayResult.entity` — omitted.)
+                is_diffuse = 1u;
+                // Debug view — emissive fast-path inputs. Most BRDF channels
+                // are degenerate for emissive (no metallic / roughness /
+                // POM), so fill plausible defaults. Mode 17 (Emissive) shows
+                // the actual emissive contribution; modes 1/2/3/16 still
+                // produce signal.
+                if (params.debug_view_mode != 0u) {
+                    var dbg_in: PbrDebugInputs;
+                    dbg_in.albedo               = vec3<f32>(0.0);
+                    dbg_in.normal_perturbed     = face_normal;
+                    dbg_in.normal_geometric     = face_normal;
+                    dbg_in.metallic             = 0.0;
+                    dbg_in.roughness            = 1.0;
+                    dbg_in.ao                   = 1.0;
+                    dbg_in.height               = 0.5;
+                    dbg_in.f_base               = vec3<f32>(0.04);
+                    dbg_in.f_fresnel            = vec3<f32>(0.04);
+                    dbg_in.k_d                  = vec3<f32>(1.0);
+                    dbg_in.direct_contribution  = vec3<f32>(0.0);
+                    dbg_in.gi_proxy             = emissive_full;
+                    dbg_in.self_shadow          = 1.0;
+                    dbg_in.displaced_uv         = vec2<f32>(0.0);
+                    dbg_in.material_layer_index = layer;
+                    dbg_in.triplanar_weights    = blend_weights;
+                    dbg_in.emissive             = emissive_full;
+                    debug_color  = debug_view_override(params.debug_view_mode, dbg_in);
+                    debug_active = true;
+                }
                 break;
             }
 
-            // Mirror surface — reflect and continue to the next plane (`:110-114`).
-            let cos_theta = clamp(dot(ray_result.normal, -ray_dir), 0.0, 1.0);
-            let r = get_reflectance_fresnel(ior, cos_theta);
-            acc.absorption = acc.absorption * r;
-            ray_dir = reflect(ray_dir, ray_result.normal);
-            old_pos = vec3<f32>(cur_pos_int) + cur_pos_frac;
+            // PBR hit — sample MRH (geometric uv), then POM-displace the
+            // dominant plane's UV from the MRH.B height channel, then
+            // re-sample MRH / diffuse / normal with POM applied on the
+            // dominant plane. POM changes the SHADING-INPUT UVs only — the
+            // geometric hit position written into the G-buffer
+            // (`compress_first_hit_data` below uses `distance_ray` +
+            // `norm_tangs`, both untouched by POM) is unaffected.
+            //
+            // Modern POM (`05-diagnostic.md` "POM rewrite — modern
+            // implementation"): adaptive step count (8-32 view-angle-
+            // dependent), linear-interpolation refine, soft-clip
+            // displacement, plus a secondary `pom_self_shadow` march toward
+            // the sun in the dominant plane's tangent space.
+            //
+            // ALL POM math lives in `pom_compute` — the helper returns a
+            // single canonical `PomCompute { displaced_uv, dominant_axis,
+            // height }`. Every downstream sample call MUST consume the
+            // SAME `displaced_uv` + `dominant_axis` to keep the
+            // first-hit-pass texture sampling consistent. GI /
+            // spatial_resampling MUST call `pom_compute` themselves with
+            // the same inputs when re-shading the first-hit surface
+            // (see `05-diagnostic.md` § "POM seam-artifact diagnose+fix"
+            // for the seam-moiré root cause this consolidation closes).
+            let pom = pom_compute(
+                pbr_mrh, pbr_sampler,
+                hit_world_pos, ray_dir, blend_weights, layer,
+            );
+            let displaced_uv  = pom.displaced_uv;
+            let dominant_axis = pom.dominant_axis;
+            let mrh = triplanar_sample_pom(
+                pbr_mrh, pbr_sampler,
+                hit_world_pos, blend_weights, layer, dominant_axis, displaced_uv,
+            );
+            let sampled_metallic = mrh.r;
+            let sampled_roughness = mrh.g;
 
-            i = i + 1u;
+            let diffuse_ao = triplanar_sample_pom(
+                pbr_diffuse_ao, pbr_sampler,
+                hit_world_pos, blend_weights, layer, dominant_axis, displaced_uv,
+            );
+            // sRGB-decoded albedo × per-VoxelType tint, × per-voxel-face AO.
+            let sampled_albedo = diffuse_ao.rgb * voxel_type.albedo_tint * diffuse_ao.a;
+
+            // Perturbed (normal-mapped) surface normal — RNM-blended tangent
+            // normals lifted into world space. Replaces the geometric
+            // axis-aligned face normal for every BRDF call below (mirror
+            // Schlick + reflection axis), so the normal map is visible.
+            let perturbed_normal = triplanar_sample_normal_pom(
+                pbr_normal, pbr_sampler,
+                hit_world_pos, blend_weights, face_normal,
+                layer, dominant_axis, displaced_uv,
+            );
+
+            // POM self-shadow — secondary march from the displaced surface
+            // point toward the sun. The shadow factor folds into
+            // `acc.absorption` so downstream GI / sun-direct shading on
+            // this pixel sees the attenuated direct light. The valleys of
+            // the heightfield receive `(1 - SHADOW_STRENGTH) × full` light;
+            // the peaks see full light. The G-buffer encode is unchanged
+            // (the shadow factor passes through `first_hit_absorption`,
+            // a buffer that already exists and is already written every
+            // pixel).
+            //
+            // The shadow attenuation multiplies ALL downstream radiance
+            // through the absorption chain (sun direct + sky bounce +
+            // GI). Strictly the shadow factor should attenuate sun direct
+            // only — doing so requires either a new G-buffer slot or a
+            // POM re-evaluation in GI / spatial_resampling, both excluded
+            // by the rewrite brief. The current approximation is
+            // visually defensible: shadowed POM valleys are also less
+            // sky-exposed (the local microgeometry partially occludes
+            // the sky), so attenuating the sky bounce alongside the sun
+            // is geometrically reasonable.
+            let pom_shadow = pom_self_shadow(
+                pbr_mrh, pbr_sampler,
+                displaced_uv, pom.height,
+                atmosphere_params.sky_sun_dir,
+                layer, dominant_axis,
+            );
+
+            // Polished metal / glass — re-enter the existing 4-iteration
+            // perfect-reflect mirror loop. Schlick Fresnel weights the
+            // absorption; the mirror reflection direction stays exactly the
+            // same as the prior C# mirror branch (`02-design.md` decision
+            // #14). Reuses the `mix(0.04, albedo, metallic)` F0 to make
+            // metallic mirrors retain their metallic tint.
+            //
+            // Mirror Fresnel + reflect axis use the PERTURBED normal so the
+            // normal map shows up even on near-mirror metals.
+            if (sampled_roughness < MIRROR_ROUGHNESS_EPSILON) {
+                let cos_theta = clamp(dot(perturbed_normal, -ray_dir), 0.0, 1.0);
+                let f_base = mix(vec3<f32>(0.04), sampled_albedo, sampled_metallic);
+                let one_minus_ct = 1.0 - cos_theta;
+                let r = f_base + (vec3<f32>(1.0) - f_base) * pow(one_minus_ct, 5.0);
+                // POM self-shadow attenuates the Fresnel weight: the
+                // reflected mirror ray carries the same shadow factor as
+                // the rough-PBR break path.
+                acc.absorption = acc.absorption * r * pom_shadow;
+                ray_dir = reflect(ray_dir, perturbed_normal);
+                old_pos = vec3<f32>(cur_pos_int) + cur_pos_frac;
+                i = i + 1u;
+                continue;
+            }
+
+            // Rough PBR — terminate the primary-ray bounce, defer the
+            // shading to the GI pass. Apply `(1-metallic)*albedo`
+            // absorption (diffuse colour transport — the specular lobe
+            // contribution is added back by the GI pass per `eval_pbr`).
+            // `is_diffuse=0` for fine-roughness surfaces (VNDF sampling
+            // wins); `is_diffuse=1` above the threshold (uniform-hemisphere
+            // wins). `02-design.md` decision #7.
+            //
+            // POM self-shadow folds into the absorption: shadowed valleys
+            // attenuate downstream radiance by `(1 - SHADOW_STRENGTH)`.
+            let albedo_attenuation = (vec3<f32>(1.0) - vec3<f32>(sampled_metallic))
+                * sampled_albedo;
+            acc.absorption = acc.absorption * albedo_attenuation * pom_shadow;
+            distance_ray = dist + volume.dist_min_max.x;
+            voxel_type_raw = ray_result.hit_type;
+            is_diffuse = select(
+                1u, 0u, sampled_roughness < ROUGH_SPECULAR_DIFFUSE_THRESHOLD,
+            );
+
+            // PBR rendering debugger — populate `PbrDebugInputs` with the
+            // values we just computed for the production path, plus a couple
+            // of derived BRDF quantities for the kS / kD / direct-only /
+            // GI-only modes. Skips entirely when `debug_view_mode == 0u`.
+            // See `docs/orchestrate/pbr-raymarching/05-diagnostic.md` §
+            // "PBR rendering debugger".
+            if (params.debug_view_mode != 0u) {
+                let sun_dir = atmosphere_params.sky_sun_dir;
+                let view_dir = -ray_dir;
+                let n_dot_l = clamp(dot(perturbed_normal, sun_dir), 0.0, 1.0);
+                let pbr_eval = eval_pbr(
+                    sun_dir, view_dir, perturbed_normal,
+                    sampled_albedo, sampled_metallic, sampled_roughness,
+                );
+                let direct = atmosphere_params.sky_sun_color
+                    * pbr_eval.f * n_dot_l * pom_shadow;
+                // GI proxy: atmosphere fold (in `acc.light`) plus the
+                // diffuse colour transport this branch just put into
+                // `acc.absorption`. Coarse but visually informative.
+                let gi_proxy = acc.light + albedo_attenuation;
+                var dbg_in: PbrDebugInputs;
+                dbg_in.albedo               = sampled_albedo;
+                dbg_in.normal_perturbed     = perturbed_normal;
+                dbg_in.normal_geometric     = face_normal;
+                dbg_in.metallic             = sampled_metallic;
+                dbg_in.roughness            = sampled_roughness;
+                dbg_in.ao                   = diffuse_ao.a;
+                dbg_in.height               = mrh.b;
+                dbg_in.f_base               = pbr_eval.f_zero;
+                dbg_in.f_fresnel            = pbr_eval.fresnel;
+                dbg_in.k_d                  = (vec3<f32>(1.0) - pbr_eval.fresnel)
+                                              * (1.0 - sampled_metallic);
+                dbg_in.direct_contribution  = direct;
+                dbg_in.gi_proxy             = gi_proxy;
+                dbg_in.self_shadow          = pom_shadow;
+                dbg_in.displaced_uv         = displaced_uv;
+                dbg_in.material_layer_index = layer;
+                dbg_in.triplanar_weights    = blend_weights;
+                dbg_in.emissive             = vec3<f32>(0.0);
+                debug_color  = debug_view_override(params.debug_view_mode, dbg_in);
+                debug_active = true;
+            }
+            break;
         }
 
         // All 4 iterations ran without a non-mirror hit (`:117-121`).
@@ -272,6 +500,19 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
             atmosphere_params.atmosphere_tex_size_y,
         );
         acc = apply_atmosphere(atmosphere_comp[oct_index], acc, 1.0);
+    }
+
+    // --- PBR debug-view stomp ----------------------------------------------
+    // When the debugger is active for this pixel, overwrite `acc.light`
+    // with the debug colour and clear `acc.absorption` so downstream
+    // GI / spatial-resampling / sun-direct multiplications produce no
+    // additional light. The `taa_sample_accum` write below seeds the TAA
+    // history with the debug colour at weight=1 so the blit reads it
+    // crisply this frame (without it the blit's
+    // `cur_color = rgb / max(1, weight)` would mix in stale history).
+    if (debug_active) {
+        acc.light = debug_color;
+        acc.absorption = vec3<f32>(0.0);
     }
 
     // --- G-buffer + absorption + colour writes -----------------------------
@@ -308,8 +549,20 @@ fn calc_first_hit(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Keep `taa_sample_accum` referenced so naga retains the binding in the
     // frame layout — the `base/` first-hit no longer writes it (`ReprojectOld`
-    // + `CalcNewTaaSample` do, Batch 6). A zero-additive no-op write.
-    if (pixel_index == 0xFFFFFFFFu) {
+    // + `CalcNewTaaSample` do, Batch 6). PBR-debugger: when active, stomp
+    // the debug colour into the TAA accumulator with weight=1.0 so the
+    // final blit's `cur_color = rgb / max(1, weight)` returns it bitwise.
+    // Mirrors the encoding in `naadf_final.wgsl::fragment`:
+    //   .x = pack16(weight, R), .y = pack16(G, B)
+    if (debug_active) {
+        let r = clamp(debug_color.x, 0.0, 65000.0);
+        let g = clamp(debug_color.y, 0.0, 65000.0);
+        let b = clamp(debug_color.z, 0.0, 65000.0);
+        taa_sample_accum[pixel_index] = vec2<u32>(
+            pack2x16float(vec2<f32>(1.0, r)),
+            pack2x16float(vec2<f32>(g, b)),
+        );
+    } else if (pixel_index == 0xFFFFFFFFu) {
         taa_sample_accum[pixel_index] = vec2<u32>(0u, 0u);
     }
 }

@@ -114,6 +114,22 @@ fn main() -> ExitCode {
     let vox_gpu_oracle_mode = args.iter().any(|a| a == "--vox-gpu-oracle");
     let vox_gpu_oracle_cpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-cpu");
     let vox_gpu_oracle_gpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-gpu");
+    // PBR-raymarching visual gate (`02-design.md` § I) — side-on metallic-
+    // pillar view of the default test grid, single screenshot, three PBR
+    // signal assertions (specular highlight luma, textured-albedo variation,
+    // metallic F0 colour-pull).
+    let pbr_visual_mode = args.iter().any(|a| a == "--pbr-visual");
+    // PBR rendering-debugger gate
+    // (`docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+    // debugger"). Iterates every non-zero `DebugViewMode`, captures a
+    // per-mode framebuffer, asserts each is non-degenerate.
+    let pbr_debug_modes_mode = args.iter().any(|a| a == "--pbr-debug-modes");
+    // PBR splotch-artifact gate
+    // (`docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "LIGHT
+    // INTEGRATION splotch diagnose+fix (post-`46e50cd`)"). Captures a
+    // single screenshot at the metallic-pillar pose and counts hard
+    // 1-pixel luminance jumps in a cobblestone-interior rect.
+    let pbr_hard_edge_mode = args.iter().any(|a| a == "--pbr-hard-edge");
     // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — three-flag
     // parity gate. Mirrors the `--vox-gpu-oracle` three-flag pattern:
     //   --vox-web-parity           = top-level: spawn both sub-modes as
@@ -358,6 +374,12 @@ fn main() -> ExitCode {
         // `bevy_naadf::e2e::vox_gpu_construction` (+ the orchestration
         // bundle at `docs/orchestrate/vox-gpu-rewrite/`).
         bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction()
+    } else if pbr_visual_mode {
+        bevy_naadf::e2e::pbr_visual::run_pbr_visual()
+    } else if pbr_debug_modes_mode {
+        bevy_naadf::e2e::pbr_debug_modes::run_pbr_debug_modes()
+    } else if pbr_hard_edge_mode {
+        bevy_naadf::e2e::pbr_hard_edge::run_pbr_hard_edge()
     } else if vox_e2e_mode {
         // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
         // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then

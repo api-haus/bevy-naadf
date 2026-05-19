@@ -23,7 +23,7 @@
 use bevy::math::{IVec3, Mat4, UVec3, Vec2, Vec3};
 use bytemuck::{Pod, Zeroable};
 
-use crate::voxel::{MaterialBase, MaterialLayer, VoxelType};
+use crate::voxel::{MaterialBase, VoxelType};
 
 /// Camera uniform — the int+frac camera-relative position (D1) plus the
 /// inverse view-projection matrix `getRayDir` needs.
@@ -85,10 +85,16 @@ pub struct GpuRenderParams {
     /// `tone_mapping_fac` here as `_pad0a` / `_pad0b`; this dispatch
     /// reclaims `_pad0a` as a real field (layout-preserving rename).
     pub max_ray_steps_primary: u32,
-    /// Padding — formerly the dead `tone_mapping_fac` half of the
-    /// `18-taa-fidelity.md` fix #2 repurpose; kept as a pad to preserve the
-    /// 112-byte layout.
-    pub _pad0b: u32,
+    /// PBR rendering debugger mode index — 0 = production (no debug
+    /// override), 1..N = per-channel BRDF visualisation. See
+    /// `crate::debug_view::DebugViewMode` for the canonical enum + the
+    /// `pbr_sampling.wgsl::debug_view_override` switch for the WGSL
+    /// dispatch. Layout-preserving repurpose of the former `_pad0b` slot
+    /// (the dead `tone_mapping_fac` half of the `18-taa-fidelity` fix #2);
+    /// the 112-byte struct size is unchanged. See
+    /// `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR
+    /// rendering debugger".
+    pub debug_view_mode: u32,
 
     /// Direction *towards* the sun (the C# `skySunDir`).
     pub sky_sun_dir: Vec3,
@@ -259,15 +265,32 @@ pub struct GpuCameraHistorySlot {
     pub _pad1: Vec2,
 }
 
-/// GPU material entry — the 128-bit (`UVec4`) form of a [`VoxelType`], mirroring
-/// the C# `VoxelType.compressForRender()` (`03-design.md` §2.4):
+/// GPU material entry — the 128-bit (`UVec4`) form of a [`VoxelType`].
 ///
-/// - `data[0]` = `base | layer << 2 | f16(roughness) << 16`
-/// - `data[1]` = `f16(color_base.r) | f16(color_base.g) << 16`
-/// - `data[2]` = `f16(color_base.b) | f16(color_layered.r) << 16`
-/// - `data[3]` = `f16(color_layered.g) | f16(color_layered.b) << 16`
+/// Post-PBR-raymarching layout (88 bits used, 40 bits reserved). See
+/// `docs/orchestrate/pbr-raymarching/02-design.md` § B for the full
+/// derivation.
 ///
-/// Decoded GPU-side by `decompressVoxelType` in `render_pipeline_common.wgsl`.
+/// - `data[0]`:
+///   - `[0]`        — `material_base` (1 bit: `0=PBR, 1=Emissive`)
+///   - `[1..13]`    — `material_layer_index` (12 bits, 0..4095)
+///   - `[13..16]`   — `variant_span_log2` (3 bits: 0..7 ⇒ 1, 2, 4, ..128)
+///   - `[16..24]`   — `albedo_tint.r` (8-bit sRGB byte)
+///   - `[24..32]`   — reserved (zeroed)
+/// - `data[1]`:
+///   - `[0..8]`     — `albedo_tint.g` (sRGB byte)
+///   - `[8..16]`    — `albedo_tint.b` (sRGB byte)
+///   - `[16..32]`   — reserved (zeroed)
+/// - `data[2]`:
+///   - `[0..16]`    — `color_layered.r` (f16)
+///   - `[16..32]`   — `color_layered.g` (f16)
+/// - `data[3]`:
+///   - `[0..16]`    — `color_layered.b` (f16)
+///   - `[16..32]`   — reserved (zeroed)
+///
+/// Decoded GPU-side by `decompress_voxel_type` in
+/// `render_pipeline_common.wgsl`. The mask/shift constants below are
+/// mirrored in WGSL — keep them in lock-step.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuVoxelType {
@@ -275,19 +298,44 @@ pub struct GpuVoxelType {
     pub data: [u32; 4],
 }
 
+// PBR-raymarching bit-field placement constants (mirror the WGSL constants
+// in `render_pipeline_common.wgsl::decompress_voxel_type`).
+pub const VOXEL_GPU_BASE_MASK: u32 = 0x1;
+pub const VOXEL_GPU_LAYER_SHIFT: u32 = 1;
+pub const VOXEL_GPU_LAYER_MASK: u32 = 0xFFF << VOXEL_GPU_LAYER_SHIFT; // bits 1..13
+pub const VOXEL_GPU_VARIANT_SHIFT: u32 = 13;
+pub const VOXEL_GPU_VARIANT_MASK: u32 = 0x7 << VOXEL_GPU_VARIANT_SHIFT; // bits 13..16
+pub const VOXEL_GPU_TINT_R_SHIFT: u32 = 16;
+pub const VOXEL_GPU_TINT_R_MASK: u32 = 0xFF << VOXEL_GPU_TINT_R_SHIFT; // bits 16..24
+
 impl GpuVoxelType {
     /// Compress a CPU [`VoxelType`] into its 128-bit GPU form.
     pub fn from_voxel_type(ty: &VoxelType) -> GpuVoxelType {
-        let base = ty.material_base as u32 & 0x3;
-        let layer = ty.material_layer as u32 & 0x3;
-        let rough = f16_bits(ty.roughness);
-        let data0 = base | (layer << 2) | ((rough as u32) << 16);
-        let data1 = (f16_bits(ty.color_base.x) as u32)
-            | ((f16_bits(ty.color_base.y) as u32) << 16);
-        let data2 = (f16_bits(ty.color_base.z) as u32)
-            | ((f16_bits(ty.color_layered.x) as u32) << 16);
-        let data3 = (f16_bits(ty.color_layered.y) as u32)
-            | ((f16_bits(ty.color_layered.z) as u32) << 16);
+        let base = (ty.material_base as u32) & VOXEL_GPU_BASE_MASK;
+        let layer = ((ty.material_layer_index as u32) << VOXEL_GPU_LAYER_SHIFT)
+            & VOXEL_GPU_LAYER_MASK;
+        // Variant span: first cut hard-codes 0 (1 variant) for every type.
+        // A later patch may surface a per-VoxelType `variant_span_log2`.
+        let variant_log2: u32 = 0;
+        let variant =
+            (variant_log2 << VOXEL_GPU_VARIANT_SHIFT) & VOXEL_GPU_VARIANT_MASK;
+        let tint_r = (u32::from(ty.albedo_tint[0]) << VOXEL_GPU_TINT_R_SHIFT)
+            & VOXEL_GPU_TINT_R_MASK;
+        let data0 = base | layer | variant | tint_r;
+
+        let tint_g = u32::from(ty.albedo_tint[1]);
+        let tint_b = u32::from(ty.albedo_tint[2]) << 8;
+        // bits 16..32 of data[1] are reserved (zeroed).
+        let data1 = tint_g | tint_b;
+
+        let cl_r = f16_bits(ty.color_layered.x) as u32;
+        let cl_g = (f16_bits(ty.color_layered.y) as u32) << 16;
+        let data2 = cl_r | cl_g;
+
+        let cl_b = f16_bits(ty.color_layered.z) as u32;
+        // bits 16..32 of data[3] reserved (zeroed).
+        let data3 = cl_b;
+
         GpuVoxelType {
             data: [data0, data1, data2, data3],
         }
@@ -837,6 +885,11 @@ const _: () = assert!(std::mem::size_of::<GpuCamera>() == 64 + 32);
 const _: () = assert!(std::mem::size_of::<GpuRenderParams>() == 16 * 7);
 const _: () = assert!(std::mem::size_of::<GpuWorldMeta>() == 48);
 const _: () = assert!(std::mem::size_of::<GpuVoxelType>() == 16);
+// PBR-raymarching bit-layout pins — see `02-design.md` § B.
+const _: () = assert!(VOXEL_GPU_BASE_MASK == 0x1);
+const _: () = assert!(VOXEL_GPU_LAYER_MASK == 0x1FFE); // 12 bits at offset 1
+const _: () = assert!(VOXEL_GPU_VARIANT_MASK == 0xE000); // 3 bits at offset 13
+const _: () = assert!(VOXEL_GPU_TINT_R_MASK == 0x00FF_0000); // 8 bits at offset 16
 // Phase A-2 TAA structs (`06-design-a2.md` §4.2, §4.3); `GpuCameraHistorySlot`
 // is widened to 160 bytes by Phase B's `view_proj_inv` ring (`09-design-b.md`
 // §3.6).
@@ -893,11 +946,10 @@ const _: () = assert!(std::mem::size_of::<GpuEntityChunkInstance>() == 20);
 const _: () = assert!(std::mem::size_of::<GpuEntityInstanceHistory>() == 16);
 const _: () = assert!(std::mem::size_of::<GpuChunkUpdate>() == 8);
 
-// Keep the material enums referenced so a future material-format change can't
+// Keep the material enum referenced so a future material-format change can't
 // silently drift this file out of step (also documents the intent).
 const _: () = {
-    let _ = MaterialBase::Diffuse;
-    let _ = MaterialLayer::None;
+    let _ = MaterialBase::Pbr;
 };
 
 #[cfg(test)]
@@ -914,22 +966,48 @@ mod tests {
     }
 
     #[test]
-    fn gpu_voxel_type_packs_base_layer_roughness() {
+    fn gpu_voxel_type_packs_pbr_layout() {
         let ty = VoxelType {
             material_base: MaterialBase::Emissive, // 1
-            material_layer: MaterialLayer::MetallicMirror, // 3
-            roughness: 1.0,
-            color_base: Vec3::new(1.0, 0.0, 0.0),
-            color_layered: Vec3::new(0.0, 1.0, 0.0),
+            material_layer_index: 42,
+            albedo_tint: [255, 128, 64],
+            color_layered: Vec3::new(0.0, 1.0, 0.5),
         };
         let g = GpuVoxelType::from_voxel_type(&ty);
-        // data[0] low bits: base=1, layer=3 → 1 | (3<<2) = 0b1101 = 13.
-        assert_eq!(g.data[0] & 0xFFFF, 13);
-        // roughness 1.0 → f16 0x3C00 in the high half-word.
-        assert_eq!(g.data[0] >> 16, 0x3C00);
-        // color_base.r = 1.0 → 0x3C00 low half of data[1]; .g = 0.0 → 0 high.
-        assert_eq!(g.data[1] & 0xFFFF, 0x3C00);
-        assert_eq!(g.data[1] >> 16, 0x0000);
+
+        // data[0]:
+        //   bit 0:        material_base = 1
+        //   bits 1..13:   material_layer_index = 42 → 42 << 1 = 84
+        //   bits 13..16:  variant_log2 = 0
+        //   bits 16..24:  tint_r = 255 → 0xFF
+        //   bits 24..32:  reserved = 0
+        let expected_data0: u32 = 1 | (42 << 1) | (0xFFu32 << 16);
+        assert_eq!(g.data[0], expected_data0);
+
+        // data[1]:
+        //   bits 0..8:    tint_g = 128 = 0x80
+        //   bits 8..16:   tint_b = 64  = 0x40
+        //   bits 16..32:  reserved = 0
+        let expected_data1: u32 = 128u32 | (64u32 << 8);
+        assert_eq!(g.data[1], expected_data1);
+
+        // data[2]:
+        //   low 16 bits:  color_layered.r = 0.0 → f16 0x0000
+        //   high 16 bits: color_layered.g = 1.0 → f16 0x3C00
+        assert_eq!(g.data[2] & 0xFFFF, 0x0000);
+        assert_eq!(g.data[2] >> 16, 0x3C00);
+
+        // data[3]:
+        //   low 16 bits:  color_layered.b = 0.5 → f16 0x3800
+        //   high 16 bits: reserved = 0
+        assert_eq!(g.data[3] & 0xFFFF, 0x3800);
+        assert_eq!(g.data[3] >> 16, 0x0000);
+
+        // Mask placement sanity (mirror of compile-time pins).
+        assert_eq!(VOXEL_GPU_BASE_MASK, 0x1);
+        assert_eq!(VOXEL_GPU_LAYER_MASK, 0x1FFE);
+        assert_eq!(VOXEL_GPU_VARIANT_MASK, 0xE000);
+        assert_eq!(VOXEL_GPU_TINT_R_MASK, 0x00FF_0000);
     }
 
     /// Phase-C — runtime mirror of the compile-time `GpuConstructionParams`

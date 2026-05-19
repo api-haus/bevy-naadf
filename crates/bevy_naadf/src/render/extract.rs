@@ -164,6 +164,36 @@ pub struct ModelDataRender {
     pub size_in_chunks: [u32; 3],
 }
 
+/// Render-world mirror of the four `MaterialSet` `Handle<Image>` references.
+/// Rebuilt every frame by [`extract_material_set`] so `prepare_world_gpu` can
+/// (a) early-return until all four `GpuImage`s are uploaded and (b) bind their
+/// texture views into the world bind group at slots 8..11
+/// (`docs/orchestrate/pbr-raymarching/02-design.md` § C).
+#[derive(Resource, Clone)]
+pub struct ExtractedMaterialSet {
+    pub diffuse_ao: Handle<Image>,
+    pub normal: Handle<Image>,
+    pub mrh: Handle<Image>,
+    pub emissive: Handle<Image>,
+}
+
+/// `ExtractSchedule` system: clone the four `Handle<Image>`s from the main-
+/// world [`crate::material_set::MaterialSet`] into the render world. Cheap —
+/// `Handle::clone` is a strong-handle bump; no image copy occurs.
+pub fn extract_material_set(
+    mut commands: Commands,
+    set: Extract<Option<Res<crate::material_set::MaterialSet>>>,
+) {
+    if let Some(set) = set.as_deref() {
+        commands.insert_resource(ExtractedMaterialSet {
+            diffuse_ao: set.diffuse_ao.clone(),
+            normal: set.normal.clone(),
+            mrh: set.mrh.clone(),
+            emissive: set.emissive.clone(),
+        });
+    }
+}
+
 /// Render-world mirror of the camera's render-relevant state (`03-design.md`
 /// §4.5, §5.2). Rebuilt every frame by [`extract_camera`].
 #[derive(Resource, Default, Clone, Copy)]
@@ -479,5 +509,29 @@ pub fn extract_gi_config(
 ) {
     if let Some(args) = &*args {
         extracted.settings = args.gi;
+    }
+}
+
+/// Render-world mirror of [`crate::debug_view::DebugViewState`]. Carries
+/// only the `u32` mode discriminant — `prepare_frame_gpu` reads it once
+/// per frame and writes it into `GpuRenderParams.debug_view_mode`.
+///
+/// See `docs/orchestrate/pbr-raymarching/05-diagnostic.md` § "PBR rendering
+/// debugger".
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct ExtractedDebugView {
+    /// Mode discriminant; 0 = production (no debug override).
+    pub mode: u32,
+}
+
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::debug_view::DebugViewState`] into the render-world
+/// [`ExtractedDebugView`].
+pub fn extract_debug_view(
+    mut extracted: ResMut<ExtractedDebugView>,
+    state: Extract<Option<Res<crate::debug_view::DebugViewState>>>,
+) {
+    if let Some(state) = &*state {
+        extracted.mode = state.mode as u32;
     }
 }
