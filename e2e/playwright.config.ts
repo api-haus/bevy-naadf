@@ -2,6 +2,11 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests",
+  // Evict any stale `node serve.mjs` from a deleted worktree before
+  // Playwright's webServer block runs.  Without this, reuseExistingServer
+  // silently picks up a squatter that 404s every request.  See
+  // docs/orchestrate/wasm-chunk-aadf-nondeterminism/15-playwright-stale-server-fix.md
+  globalSetup: "./kill-stale-server.mjs",
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: 0,
