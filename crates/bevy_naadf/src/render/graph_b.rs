@@ -274,159 +274,61 @@ pub fn naadf_sample_refine_clear_node(
     time_span.end(render_context.command_encoder());
 }
 
-/// `Core3d` system: `renderSampleRefine` pass 2 — `compute_valid_history`
-/// (`09-design-b.md` §4.7 / §8.2).
+/// `Core3d` system: the **contiguous** sample-refine sequence — passes 2-5
+/// (`valid_history` → `count_valid_data_and_refine` → `count_invalid_data` →
+/// `refine_buckets`), all in one compute pass (`09-design-b.md` §4.7 / §8.2).
 ///
-/// Faithful port of `WorldRenderBase.cs:352-353` (`ValidHistory` pass): a
-/// single `[numthreads(1,1,1)]` dispatch. Walks the 128-frame `sample_counts`
-/// ring back from `accum_index`, writes the ring write cursors / totals /
-/// `findCoprime` shuffle seeds, and writes the two indirect-dispatch arg
-/// buffers (`valid_dispatch` / `invalid_dispatch`) that the next two passes
-/// dispatch off.
-pub fn naadf_sample_refine_valid_history_node(
+/// Faithful port of `WorldRenderBase.cs:352-362` — the C# reference runs all
+/// four dispatches inline in one function with no explicit synchronisation
+/// between them. wgpu's automatic resource barriers serialise the inter-
+/// dispatch storage / indirect-arg access (`valid_history` writes
+/// `valid_dispatch` / `invalid_dispatch` which the count passes consume as
+/// indirect arg buffers; the count passes write `bucket_info` /
+/// `valid_samples_refined` / `sample_counts` which `refine_buckets` consumes —
+/// each transition is a `STORAGE_WRITE → STORAGE_READ` (or `INDIRECT`) hazard
+/// the driver inserts a barrier for inside the compute pass).
+///
+/// This collapses the original 4 separate `Core3d` node systems (the
+/// pre-2026-05-20 `naadf_sample_refine_{valid_history,count_valid,count_invalid,buckets}_node`)
+/// into one body — restoring fidelity with C# NAADF's single-function dispatch.
+/// `naadf_sample_refine_clear_node` stays a separate node (it sits at a
+/// different position in the chain, BEFORE `naadf_ray_queue_node`).
+pub fn naadf_sample_refine_continuous_node(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,
     pipelines: Res<NaadfPipelines>,
     gi_gpu: Option<Res<GiGpu>>,
     gi_bind_groups: Option<Res<GiBindGroups>>,
 ) {
-    let (Some(_gi_gpu), Some(gi_bind_groups)) = (gi_gpu, gi_bind_groups) else {
+    let (Some(gi_gpu), Some(gi_bind_groups)) = (gi_gpu, gi_bind_groups) else {
         return;
     };
-    let Some(pipeline) =
+    // All 4 pipelines must be ready — if any is missing skip the whole block
+    // (the per-frame all-or-nothing seam matches the original 4 separate nodes,
+    // each of which short-circuited on missing pipeline).
+    let Some(p_history) =
         pipeline_cache.get_compute_pipeline(pipelines.sample_refine_valid_history_pipeline)
     else {
         return;
     };
-
-    let diagnostics = render_context.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-    let encoder = render_context.command_encoder();
-    let time_span = diagnostics.time_span(encoder, SAMPLE_REFINE_SPAN);
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("naadf_sample_refine_valid_history_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &gi_bind_groups.sample_refine_bind_group, &[]);
-        // `@group(1)` — `valid_dispatch` / `invalid_dispatch`, written here only
-        // (the wgpu indirect-vs-storage split — `09-design-b.md` §8.2).
-        pass.set_bind_group(1, &gi_bind_groups.sample_refine_dispatch_bind_group, &[]);
-        // `[numthreads(1,1,1)]` — a single workgroup (`WorldRenderBase.cs:353`).
-        pass.dispatch_workgroups(1, 1, 1);
-    }
-    time_span.end(render_context.command_encoder());
-}
-
-/// `Core3d` system: `renderSampleRefine` pass 3 — `count_valid_data_and_refine`
-/// (`09-design-b.md` §4.7 / §8.2).
-///
-/// Faithful port of `WorldRenderBase.cs:355-356` (`CountValidAndRefine` pass):
-/// dispatched **indirect** off `valid_dispatch` — `compute_valid_history` wrote
-/// the workgroup count into `valid_dispatch[0]`. Reprojects each lit sample in
-/// the temporal ring into the 8×8 bucket grid and writes `valid_samples_refined`.
-pub fn naadf_sample_refine_count_valid_node(
-    mut render_context: RenderContext,
-    pipeline_cache: Res<PipelineCache>,
-    pipelines: Res<NaadfPipelines>,
-    gi_gpu: Option<Res<GiGpu>>,
-    gi_bind_groups: Option<Res<GiBindGroups>>,
-) {
-    let (Some(gi_gpu), Some(gi_bind_groups)) = (gi_gpu, gi_bind_groups) else {
-        return;
-    };
-    let Some(pipeline) =
+    let Some(p_count_valid) =
         pipeline_cache.get_compute_pipeline(pipelines.sample_refine_count_valid_pipeline)
     else {
         return;
     };
-
-    let diagnostics = render_context.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-    let encoder = render_context.command_encoder();
-    let time_span = diagnostics.time_span(encoder, SAMPLE_REFINE_SPAN);
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("naadf_sample_refine_count_valid_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &gi_bind_groups.sample_refine_bind_group, &[]);
-        // Indirect dispatch off `valid_dispatch` (`WorldRenderBase.cs:356`).
-        pass.dispatch_workgroups_indirect(&gi_gpu.valid_dispatch, 0);
-    }
-    time_span.end(render_context.command_encoder());
-}
-
-/// `Core3d` system: `renderSampleRefine` pass 4 — `count_invalid_data`
-/// (`09-design-b.md` §4.7 / §8.2).
-///
-/// Faithful port of `WorldRenderBase.cs:358-359` (`CountInvalid` pass):
-/// dispatched **indirect** off `invalid_dispatch`. The same reprojection as
-/// `count_valid_data_and_refine` for unlit samples — it only `atomicAdd`s the
-/// bucket's invalid count, no sample stored.
-pub fn naadf_sample_refine_count_invalid_node(
-    mut render_context: RenderContext,
-    pipeline_cache: Res<PipelineCache>,
-    pipelines: Res<NaadfPipelines>,
-    gi_gpu: Option<Res<GiGpu>>,
-    gi_bind_groups: Option<Res<GiBindGroups>>,
-) {
-    let (Some(gi_gpu), Some(gi_bind_groups)) = (gi_gpu, gi_bind_groups) else {
-        return;
-    };
-    let Some(pipeline) =
+    let Some(p_count_invalid) =
         pipeline_cache.get_compute_pipeline(pipelines.sample_refine_count_invalid_pipeline)
     else {
         return;
     };
-
-    let diagnostics = render_context.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-    let encoder = render_context.command_encoder();
-    let time_span = diagnostics.time_span(encoder, SAMPLE_REFINE_SPAN);
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("naadf_sample_refine_count_invalid_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &gi_bind_groups.sample_refine_bind_group, &[]);
-        // Indirect dispatch off `invalid_dispatch` (`WorldRenderBase.cs:359`).
-        pass.dispatch_workgroups_indirect(&gi_gpu.invalid_dispatch, 0);
-    }
-    time_span.end(render_context.command_encoder());
-}
-
-/// `Core3d` system: `renderSampleRefine` pass 5 — `refine_buckets`
-/// (`09-design-b.md` §4.7 / §8.2).
-///
-/// Faithful port of `WorldRenderBase.cs:361-362` (`RefineBuckets` pass): one
-/// compute dispatch over `ceil(bucket_count / 64)` workgroups — the
-/// `COLOR_DIF_PROB` brightness-leveling, writing ≤8 survivors per bucket into
-/// `valid_samples_compressed` and packing the bucket header into `bucket_info`.
-///
-/// Batch 4: `valid_samples_compressed` is written but not yet read by anything
-/// — `spatialResampling` (Batch 5) is its first consumer, so the image is
-/// unchanged this batch.
-pub fn naadf_sample_refine_buckets_node(
-    mut render_context: RenderContext,
-    pipeline_cache: Res<PipelineCache>,
-    pipelines: Res<NaadfPipelines>,
-    gi_gpu: Option<Res<GiGpu>>,
-    gi_bind_groups: Option<Res<GiBindGroups>>,
-) {
-    let (Some(gi_gpu), Some(gi_bind_groups)) = (gi_gpu, gi_bind_groups) else {
-        return;
-    };
-    let Some(pipeline) =
+    let Some(p_buckets) =
         pipeline_cache.get_compute_pipeline(pipelines.sample_refine_buckets_pipeline)
     else {
         return;
     };
 
-    // `ceil(bucket_count / 64)` workgroups (`WorldRenderBase.cs:362`).
+    // `ceil(bucket_count / 64)` workgroups for `refine_buckets`
+    // (`WorldRenderBase.cs:362`).
     let workgroups = gi_gpu.bucket_count.div_ceil(FIRST_HIT_WORKGROUP_SIZE).max(1);
 
     let diagnostics = render_context.diagnostic_recorder();
@@ -435,11 +337,35 @@ pub fn naadf_sample_refine_buckets_node(
     let time_span = diagnostics.time_span(encoder, SAMPLE_REFINE_SPAN);
     {
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("naadf_sample_refine_buckets_pass"),
+            label: Some("naadf_sample_refine_continuous_pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(pipeline);
+        // `@group(0)` — the shared sample-refine bindings; bound once for all
+        // four pipelines (they all declare the same `sample_refine_layout`).
         pass.set_bind_group(0, &gi_bind_groups.sample_refine_bind_group, &[]);
+
+        // (2) `compute_valid_history` — single workgroup. Additionally binds
+        // `@group(1)` = `sample_refine_dispatch_bind_group` (the indirect-arg
+        // buffers it writes); the count passes don't declare `@group(1)` so
+        // the binding becomes inert for them after this dispatch.
+        // (`WorldRenderBase.cs:352-353`.)
+        pass.set_pipeline(p_history);
+        pass.set_bind_group(1, &gi_bind_groups.sample_refine_dispatch_bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+
+        // (3) `count_valid_data_and_refine` — indirect off `valid_dispatch`.
+        // (`WorldRenderBase.cs:355-356`.)
+        pass.set_pipeline(p_count_valid);
+        pass.dispatch_workgroups_indirect(&gi_gpu.valid_dispatch, 0);
+
+        // (4) `count_invalid_data` — indirect off `invalid_dispatch`.
+        // (`WorldRenderBase.cs:358-359`.)
+        pass.set_pipeline(p_count_invalid);
+        pass.dispatch_workgroups_indirect(&gi_gpu.invalid_dispatch, 0);
+
+        // (5) `refine_buckets` — `ceil(bucket_count / 64)` workgroups.
+        // (`WorldRenderBase.cs:361-362`.)
+        pass.set_pipeline(p_buckets);
         pass.dispatch_workgroups(workgroups, 1, 1);
     }
     time_span.end(render_context.command_encoder());

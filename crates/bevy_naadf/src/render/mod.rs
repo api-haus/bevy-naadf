@@ -59,10 +59,8 @@ use graph::{
 };
 use graph_b::{
     naadf_atmosphere_node, naadf_denoise_node, naadf_global_illum_node,
-    naadf_ray_queue_node, naadf_sample_refine_buckets_node,
-    naadf_sample_refine_clear_node, naadf_sample_refine_count_invalid_node,
-    naadf_sample_refine_count_valid_node, naadf_sample_refine_valid_history_node,
-    naadf_spatial_resampling_node,
+    naadf_ray_queue_node, naadf_sample_refine_clear_node,
+    naadf_sample_refine_continuous_node, naadf_spatial_resampling_node,
 };
 // Phase-C W3 — the regime-2 background AADF queue node lives in the
 // construction sub-module. Inserted before `naadf_atmosphere_node` in the
@@ -315,10 +313,13 @@ impl Plugin for NaadfRenderPlugin {
                     naadf_sample_refine_clear_node,
                     naadf_ray_queue_node,
                     naadf_global_illum_node,
-                    naadf_sample_refine_valid_history_node,
-                    naadf_sample_refine_count_valid_node,
-                    naadf_sample_refine_count_invalid_node,
-                    naadf_sample_refine_buckets_node,
+                    // Collapsed 4-of-5 sample-refine sequence — restores
+                    // fidelity with C# `WorldRenderBase.cs:352-362` (which runs
+                    // valid_history + count_valid + count_invalid + buckets in
+                    // one function). wgpu's automatic barriers serialise the
+                    // inter-dispatch storage / indirect-arg hazards inside one
+                    // compute pass.
+                    naadf_sample_refine_continuous_node,
                     naadf_spatial_resampling_node,
                     naadf_denoise_node,
                     naadf_calc_new_taa_sample_node,

@@ -52,11 +52,33 @@ use bevy::render::renderer::RenderDevice;
 use bevy::render::view::ExtractedView;
 use bevy::shader::{Shader, ShaderDefVal};
 
+use crate::render::gi::BUCKET_STORAGE_COUNT;
 use crate::render::gpu_types::{
     GpuAtmosphereParams, GpuCamera, GpuGiParams, GpuRenderParams, GpuTaaParams,
     GpuWorldMeta,
 };
 use crate::render::taa::TaaRingConfig;
+use crate::voxel::{CELL_CHILDREN, CELL_DIM};
+
+/// SSoT-3 — shader-def injection for the paper's `CELL_DIM` / `CELL_CHILDREN`
+/// constants. The Rust SSoT lives at [`crate::voxel::CELL_DIM`] /
+/// [`crate::voxel::CELL_CHILDREN`] (`voxel/mod.rs:63-65`); WGSL shaders that
+/// reference the cell dimensions in a way that benefits from a named const
+/// can declare `const NAADF_CELL_DIM: u32 = #{NAADF_CELL_DIM}u;` at the top of
+/// the file (the literal `4u` / `64u` then becomes `NAADF_CELL_DIM` /
+/// `NAADF_CELL_CHILDREN` at the use site).
+///
+/// Currently injected unconditionally on every D4-owned compute pipeline so
+/// WGSL files that opt in can rely on the def existing. Cross-domain reuse:
+/// D5's `ConstructionPipelines::from_world` should also call this helper when
+/// it queues a construction-side pipeline whose shader needs the named const
+/// (per D5 architect's Step 8 follow-up).
+pub fn cell_shader_defs() -> Vec<ShaderDefVal> {
+    vec![
+        ShaderDefVal::UInt("NAADF_CELL_DIM".into(), CELL_DIM as u32),
+        ShaderDefVal::UInt("NAADF_CELL_CHILDREN".into(), CELL_CHILDREN as u32),
+    ]
+}
 
 /// Asset paths of the Phase-A entry-point WGSL shaders + the Phase-A-2 TAA
 /// reproject shader.
@@ -729,6 +751,14 @@ impl FromWorld for NaadfPipelines {
         // `valid_history` is `[numthreads(1,1,1)]`. `count_valid` / `count_invalid`
         // are dispatched INDIRECT (`WorldRenderBase.cs:356,359`).
         let sample_refine_shader = asset_server.load(SAMPLE_REFINE_SHADER);
+        // SSoT-4 — inject `BUCKET_STORAGE_COUNT` so `sample_refine.wgsl`'s
+        // `array<u32, #{BUCKET_STORAGE_COUNT}>` per-thread scratch matches the
+        // Rust constant by construction (mirrors `TAA_SAMPLE_RING_DEPTH`
+        // injection above). The Rust SSoT is `gi::BUCKET_STORAGE_COUNT = 32`.
+        let sample_refine_shader_defs = vec![ShaderDefVal::UInt(
+            "BUCKET_STORAGE_COUNT".into(),
+            BUCKET_STORAGE_COUNT,
+        )];
         // The 4 passes that bind ONLY `@group(0)` (`clear` / `count_valid` /
         // `count_invalid` / `buckets`).
         let mk_sample_refine = |label: &'static str, entry: &'static str| {
@@ -736,6 +766,7 @@ impl FromWorld for NaadfPipelines {
                 label: Some(label.into()),
                 layout: vec![sample_refine_layout.clone()],
                 shader: sample_refine_shader.clone(),
+                shader_defs: sample_refine_shader_defs.clone(),
                 entry_point: Some(Cow::from(entry)),
                 ..default()
             })
@@ -754,6 +785,7 @@ impl FromWorld for NaadfPipelines {
                     sample_refine_dispatch_layout.clone(),
                 ],
                 shader: sample_refine_shader.clone(),
+                shader_defs: sample_refine_shader_defs.clone(),
                 entry_point: Some(Cow::from("compute_valid_history")),
                 ..default()
             });

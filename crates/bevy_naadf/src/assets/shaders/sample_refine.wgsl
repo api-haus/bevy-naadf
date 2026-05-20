@@ -103,6 +103,13 @@
 // `## GI-bounce-on-resize fix (2026-05-16) §Faithful-port deviation`).
 const MAX_INDIRECT_GROUPS: u32 = 32768u;
 
+// SSoT-4 — per-thread bucket-storage scratch capacity. The WGSL `array<T, N>`
+// type-form requires a compile-time `N`, so we cannot read this from
+// `gi_params.bucket_storage_count`. Instead the value is injected as a
+// naga-oil shader-def by `NaadfPipelines::from_world` (mirrors the
+// `TAA_SAMPLE_RING_DEPTH` pattern). The Rust SSoT is `gi::BUCKET_STORAGE_COUNT`.
+const BUCKET_STORAGE_COUNT: u32 = #{BUCKET_STORAGE_COUNT}u;
+
 fn capped_padded_groups(total: u32) -> u32 {
     return min(next_pow2((total + 63u) / 64u), MAX_INDIRECT_GROUPS);
 }
@@ -652,7 +659,10 @@ fn refine_buckets(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let cur_bucket_x = atomicLoad(&bucket_info[bucket_index].x);
     let valid_count = (cur_bucket_x >> 6u) & 0xFFFu;
-    let invalid_count = (cur_bucket_x >> 18u) * 8u;
+    // SSoT-4 — the `* 8u` IS `INVALID_SAMPLE_STORAGE_COUNT`. Read from the
+    // uniform so the Rust constant (`gi::INVALID_SAMPLE_STORAGE_COUNT`) is the
+    // single source of truth; the bit-packing at `:18u` shift stays unchanged.
+    let invalid_count = (cur_bucket_x >> 18u) * gi_params.invalid_sample_storage_count;
     let original_lit_ratio = f32(valid_count) / f32(valid_count + invalid_count);
     // HLSL `int effectiveValidCount = min(validCount, bucketStorageCount)`.
     let effective_valid_count = min(valid_count, gi_params.bucket_storage_count);
@@ -664,8 +674,10 @@ fn refine_buckets(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     var samples_comp_color_max: u32 = 0u;
     // The HLSL function-scope `static uint compColorMaxStorage[32]` — per-thread
-    // scratch, bounded by `effective_valid_count ≤ bucket_storage_count = 32`.
-    var comp_color_max_storage: array<u32, 32>;
+    // scratch, bounded by `effective_valid_count ≤ bucket_storage_count`. The
+    // capacity is the naga-oil shader-def `BUCKET_STORAGE_COUNT` (Rust SSoT
+    // `gi::BUCKET_STORAGE_COUNT`).
+    var comp_color_max_storage: array<u32, BUCKET_STORAGE_COUNT>;
     var distance_moments = vec2<f32>(0.0, 0.0);
 
     for (var i: u32 = 0u; i < effective_valid_count; i = i + 1u) {

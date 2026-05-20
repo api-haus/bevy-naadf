@@ -52,6 +52,8 @@
 - [x] `03` — architects (D1..D8, parallel batch) — all 8 returned; cross-architect conflicts triaged (D5 merge wins per Resolution D; D7 pre-lands `GiSettings::DEFAULT` scout commit; D7's C1-C6 deferred to D7 impl; D8 bake.rs in-place edit)
 - [ ] `04a` — D7 scout: 3-line `pub const GiSettings::DEFAULT` + `#[derive(PartialEq)]` pre-land (before D2 impl)
 - [⚠] `04` — implementor D5 — **4/8 steps landed** (escape-hatch subset: probe delete + readback extract + extract/producer extract + e2e fixtures moved to `validation.rs`). mod.rs 11 043 → 2 280 (−8 763 LOC, 79%). Net D5 Rust −1 246. All deterministic gates green; oasis-edit-visual × 4 stable. Steps 4/6/7/8 deferred for follow-up.
+- [⚠] `04` — implementor D4 — **2/6 steps landed**: SSoT scaffolding + dead `MAX_RAY_STEPS_*` deletion + sample-refine 4→1 collapse (C# fidelity restored). Net −39 LOC. ShaderType cutover bailed out per safety rule (recipe in §5). Steps 3/4/5/6 gated on Resolution D shape + D6/D7 pbr_sampling reference-drops.
+- [ ] `04` — implementor D1 (next)
 - [ ] `04` — implementor D4
 - [ ] `04` — implementor D1
 - [ ] `04` — implementor D2
