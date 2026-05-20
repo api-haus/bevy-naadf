@@ -160,11 +160,14 @@ var<storage, read_write> bound_dispatch_indirect: array<u32>;
 // only includes this group on the `prepare_group_bounds` pipeline.
 //
 // Layout: `array<u32>` flat (vec4-per-entry packed as 4 consecutive u32s).
-// Per entry: `[call_idx, qi, found_size, _pad]`. Capacity = 2048 entries =
-// 32 KiB (well under wasm `max_storage_buffer_binding_size = 2 GiB - 4`).
+// Per entry: `[call_idx, qi, found_size, _pad]`. Capacity is driven from
+// the host-side `PREPARE_PROBE_HISTORY_ENTRIES` constant (post-minimal-fix
+// = 256 entries = 4 KiB; pre-fix was 2048 entries = 32 KiB — see the Rust
+// const's docblock for the downsize rationale).
 //
 // Each `prepare_group_bounds` call writes one 4-u32 entry at offset
-// `call_idx * 4` if `call_idx < 2048`; over-capacity calls drop silently.
+// `call_idx * 4` if `call_idx < capacity`; over-capacity calls drop
+// silently. Capacity is dynamic via `arrayLength(&prepare_probe_history)`.
 @group(3) @binding(0)
 var<storage, read_write> prepare_probe_history: array<u32>;
 
@@ -402,8 +405,9 @@ fn prepare_group_bounds() {
     // dedicated entry per `prepare_group_bounds` call to a separate buffer
     // (`@group(3) @binding(0)`), drained by a dedicated CPU readback that
     // emits one `[probe1-call]` info!() line per entry. Per call: 4 u32s
-    // = `[call_idx, qi, found_size, _pad]`. Capacity = 2048 entries = 32
-    // KiB; calls beyond 2048 drop silently. `qi` packs the queue index
+    // = `[call_idx, qi, found_size, _pad]`. Capacity comes from the host-
+    // side `PREPARE_PROBE_HISTORY_ENTRIES` const (post-minimal-fix = 256,
+    // pre-fix = 2048); calls beyond capacity drop silently. `qi` packs the queue index
     // `(found_bound_size << 16) | found_xyz` for compactness (both fields
     // are < 32 so the high u16 is always 0). For the "no queue found"
     // branch we still record an entry with `qi=0xFFFFFFFF` + `found_size=0`

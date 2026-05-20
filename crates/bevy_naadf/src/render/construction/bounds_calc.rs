@@ -460,18 +460,12 @@ pub fn naadf_bounds_compute_node(
     render_device: Res<bevy::render::renderer::RenderDevice>,
     #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
     render_queue: Res<bevy::render::renderer::RenderQueue>,
-    // 2026-05-20 dispatch-2 iter-2-4 — chunks-self-copy intervention needs
-    // access to the chunks buffer.
+    // 2026-05-20 brute-force iter-2 (HP) — chunks_mirror per-encoder
+    // `copy_buffer_to_buffer` needs access to the chunks buffer. The
+    // `world_gpu.chunks_buffer` is the source; `construction_gpu.chunks_mirror_buffer`
+    // is the destination.
     #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
     world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
-    // 2026-05-20 dispatch-2 iter-2-4 — lazy scratch buffer for chunks-self-copy.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
-    mut chunks_scratch: bevy::ecs::system::Local<Option<bevy::render::render_resource::Buffer>>,
-    // 2026-05-20 brute-force iter-1 HM/HN — lazy 4 B scratch for the
-    // host-side `queue.write_buffer` fence inserted between W3 rounds on
-    // wasm.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
-    mut chunks_scratch_for_fence: bevy::ecs::system::Local<Option<bevy::render::render_resource::Buffer>>,
 ) {
     let Some(construction_pipelines) = construction_pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
@@ -596,12 +590,12 @@ pub fn naadf_bounds_compute_node(
     let diagnostics = render_context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    // 2026-05-20 brute-force iter-2 (HP) — removed dispatch-2 iter-2-4's
-    // chunks-self-copy intervention. Replaced with a structurally different
-    // approach: dedicated `chunks_mirror_buffer` that W3 reads from. See
-    // `chunks_mirror_buffer` allocation in `prepare_construction`.
-    let _ = chunks_scratch; // retained Local for signature compatibility; unused
-    let _ = chunks_scratch_for_fence; // retained Local for signature compatibility; unused
+    // 2026-05-20 brute-force iter-2 (HP) — chunks-self-copy intervention
+    // replaced with a structurally different approach: dedicated
+    // `chunks_mirror_buffer` that W3 reads from. See `chunks_mirror_buffer`
+    // allocation in `prepare_construction`. The iter-1 (HM/HN) host-side
+    // write_buffer fence scratch buffer was also reverted as part of the
+    // minimal-fix landing (`a426441`).
 
     let encoder = render_context.command_encoder();
     let time_span = diagnostics.time_span(encoder, BOUNDS_COMPUTE_SPAN);

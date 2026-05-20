@@ -146,11 +146,12 @@ pub struct ConstructionGpu {
     /// `sample_refine_dispatch_layout` fix). W3.
     pub bound_dispatch_indirect: Option<Buffer>,
     /// 2026-05-19 probe-1B — per-call probe history written by
-    /// `prepare_group_bounds`. 2048 entries × 4 u32 (= 32 KiB):
-    /// `[call_idx, qi_packed, found_size, _pad]`. `qi_packed =
+    /// `prepare_group_bounds`. [`PREPARE_PROBE_HISTORY_ENTRIES`] entries × 4
+    /// u32: `[call_idx, qi_packed, found_size, _pad]`. `qi_packed =
     /// (found_bound_size << 16) | found_xyz` for found queues; `0xFFFFFFFF`
     /// for "no queue found" calls. Drained by `aadf_per_call_probe` which
-    /// emits one `[probe1-call]` info!() line per entry.
+    /// emits one `[probe1-call]` info!() line per entry. See the const's
+    /// docblock for the post-minimal-fix downsize rationale.
     pub prepare_probe_history: Option<Buffer>,
     /// W3 — `GpuConstructionParams` uniform written once at startup with the
     /// fixed-for-the-world `size_in_chunks` / `group_size_in_groups` /
@@ -323,10 +324,22 @@ pub struct ConstructionGpu {
 pub const READBACK_STALL_BUDGET_FRAMES: u32 = 600;
 
 /// 2026-05-19 probe-1B — capacity (in entries) of the `prepare_probe_history`
-/// buffer. Each entry is 4 u32s = 16 B. 2048 entries × 16 B = 32 KiB. Calls
-/// beyond this drop silently (the WGSL guards `call_idx < capacity`).
-pub const PREPARE_PROBE_HISTORY_ENTRIES: u32 = 2048;
-/// `PREPARE_PROBE_HISTORY_ENTRIES * 4 u32 * 4 B = 32 KiB`.
+/// buffer. Each entry is 4 u32s = 16 B. Calls beyond this drop silently (the
+/// WGSL guards `call_idx < capacity`).
+///
+/// **2026-05-20 minimal-fix follow-up (`a426441` + `960eeb2`):** sized down
+/// from 2048 → 256 now that the wasm regime-2 loop runs at `n_bounds_rounds
+/// = 1`. Pre-fix world: 5 rounds/frame × ~80 prepare calls/round = ~400
+/// entries/frame → the 2048-entry ring drained in ~5 frames and was sized
+/// to capture multiple cycles of late-startup behaviour. Post-fix world: 1
+/// round/frame × 8 entries/frame at the slowest queue level. The probe
+/// readback is triggered at `PROBE_TRIGGER_FRAMES = 30` frames post-cpu-
+/// mirror — so the useful window is ~240 entries (30 frames × 8 entries).
+/// 256 keeps a power-of-two and a small headroom; if a future fix raises
+/// per-frame round count again, bump this.
+pub const PREPARE_PROBE_HISTORY_ENTRIES: u32 = 256;
+/// `PREPARE_PROBE_HISTORY_ENTRIES * 4 u32 * 4 B = 4 KiB` (post-minimal-fix
+/// downsize; was 32 KiB at 2048 entries).
 pub const PREPARE_PROBE_HISTORY_BYTES: u64 =
     (PREPARE_PROBE_HISTORY_ENTRIES as u64) * 4 * 4;
 
@@ -2045,11 +2058,13 @@ pub fn prepare_construction(
             bytemuck::cast_slice(&[1u32, 1u32, 1u32, 0u32, 0u32]),
         );
 
-        // 2026-05-19 probe-1B — allocate `prepare_probe_history`. 2048
-        // entries × 4 u32 = 32 KiB. Zero-init (the WGSL write fills 4 u32
-        // per call; the CPU reader uses `call_idx == 0 && qi_packed == 0
-        // && found_size == 0` heuristic to detect "not yet called" only
-        // when the call counter says < N entries have fired).
+        // 2026-05-19 probe-1B — allocate `prepare_probe_history`. Size driven
+        // by [`PREPARE_PROBE_HISTORY_ENTRIES`] / [`PREPARE_PROBE_HISTORY_BYTES`]
+        // (post-minimal-fix: 256 entries × 4 u32 = 4 KiB; was 2048×16 = 32
+        // KiB pre-fix). Zero-init (the WGSL write fills 4 u32 per call; the
+        // CPU reader uses `call_idx == 0 && qi_packed == 0 && found_size == 0`
+        // heuristic to detect "not yet called" only when the call counter says
+        // < N entries have fired).
         let probe_buf = render_device.create_buffer(&BufferDescriptor {
             label: Some("naadf_prepare_probe_history"),
             size: PREPARE_PROBE_HISTORY_BYTES,

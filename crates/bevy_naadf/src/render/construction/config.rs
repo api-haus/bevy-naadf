@@ -215,6 +215,37 @@ pub const DEFAULT_MAX_ENTITY_INSTANCES: u32 = 16384;
 ///
 /// **Steady-state bail cost** at 4_096: 5 rounds/frame × 4_096 workgroups
 /// × 64 threads = 1.3 M bail-out threads/frame; ~0.5 ms on modern iGPU.
+///
+/// **2026-05-20 post-fix update (`a426441` + `960eeb2`).** The original
+/// docblock above framed this constant as a perf-throttling lever paired
+/// with the direct-dispatch workaround for the Dawn STORAGE→INDIRECT
+/// barrier bug. That framing was incomplete. The full load-bearing fix
+/// for the wasm chunk-AADF non-determinism (ray-termination truncation,
+/// SSIM 0.69-0.93 cluster collapse on web) is the combination of:
+///
+/// 1. The `n_bounds_rounds = 1` wasm clamp in `From<&AppArgs>` below — one
+///    compute pass per frame eliminates the intra-encoder cross-pass write-
+///    visibility race that Dawn empirically cannot mediate for the
+///    `compute_group_bounds` chunks-RMW pattern. See commit `a426441`.
+/// 2. The `chunks_mirror` per-encoder `copy_buffer_to_buffer(chunks,
+///    chunks_mirror)` infrastructure in `naadf_bounds_compute_node` +
+///    the chunks_mirror RO bind-group entry. The TRANSFER-stage barrier
+///    from the copy provides the cross-frame visibility that the bare
+///    end-of-encoder submit boundary alone does not reliably give.
+///    Reverting only this (keeping `n_bounds_rounds = 1`) regressed 1/3
+///    web runs to SSIM 0.84.
+/// 3. (Inert layer — reverted in `960eeb2`.) An iter-3 atomicStore-on-
+///    chunks WGSL pattern that turned out to be unnecessary once 1+2 are
+///    in place.
+///
+/// Cleanup characterization (item 4 of the cleanup-sweep dispatch) confirmed
+/// the 1+2 minimal-fix set holds an SSIM ≥ 0.91 floor across a 10-run web
+/// sweep. See `docs/orchestrate/wasm-chunk-aadf-nondeterminism/13-minimal-fix-verify.md`
+/// and `14-cleanup-sweep.md` for the full diagnostic story. Lowering this
+/// const further (smaller dispatch) would slow wasm convergence past the
+/// SSIM gate's 10 s settle. Raising it (32_768) regressed SSIM to 0.69.
+/// Re-baseline this and the n=1 clamp together if a deeper fix for the
+/// underlying WebGPU regime-2 cross-pass write visibility lands.
 #[cfg(target_arch = "wasm32")]
 pub const WASM_MAX_GROUP_BOUND_DISPATCH: u32 = 4096;
 
