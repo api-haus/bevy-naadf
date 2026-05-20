@@ -90,18 +90,25 @@ pub fn construction_bounds_world_layout_descriptor() -> BindGroupLayoutDescripto
                 storage_buffer_sized(false, None),
                 // params — uniform.
                 uniform_buffer_sized(false, Some(params_size)),
-                // 2026-05-20 brute-force iter-2 (HP) — chunks_mirror_ro —
-                // read-only mirror of chunks used by compute_group_bounds for
-                // ALL its reads (own AADF + neighbour AADF). On wasm this
-                // mirror is refreshed via copy_buffer_to_buffer(chunks,
-                // chunks_mirror) between each round so the next round's
-                // reads see the prior round's writes via a TRANSFER stage
-                // barrier (the strongest cross-pass dependency wgpu offers).
-                // On native this mirror is allocated to satisfy the layout
-                // but never accessed (the shader's read path is gated by a
-                // #ifdef-WGSL-define equivalent that the Rust side cannot
-                // express; instead we ALWAYS access chunks_mirror on both
-                // targets and the native code path also issues the copy).
+                // chunks_mirror — read-only mirror of `chunks` (binding 0). All
+                // `compute_group_bounds` reads of chunk-AADF state — own-chunk at
+                // `bounds_calc.wgsl:523` AND neighbour-chunk at `:273` — come from this
+                // mirror; the only writer of chunk-AADF state is the non-atomic rw view
+                // of `chunks` at `:564`. The mirror is refreshed via
+                // `copy_buffer_to_buffer(chunks → chunks_mirror)` once before round 0
+                // (seeds from W5's chunk-classification bits — without the seed copy,
+                // `chunk_state = cur_chunk >> 30` reads 0 and every chunk
+                // false-positive-expands) and between every subsequent round (propagates
+                // the prior round's writes via a TRANSFER-stage barrier — the strongest
+                // cross-pass dependency wgpu offers).
+                //
+                // Load-bearing on BOTH targets. Both native and wasm run the same code
+                // path; only `n_bounds_rounds` differs (5 native, 1 wasm — the wasm
+                // clamp lives in `config.rs::From<&AppArgs>`). On native the mirror is
+                // also load-bearing for cross-workgroup neighbour visibility within a
+                // single round (the indirect dispatch's workgroups read each other's
+                // pre-round chunk state via the mirror; intra-round writes to `chunks`
+                // are not visible until the next mirror refresh).
                 bevy::render::render_resource::binding_types::storage_buffer_read_only_sized(false, None),
             ),
         ),
@@ -287,47 +294,6 @@ pub fn queue_compute_pipeline_with_handle(
     })
 }
 
-/// 2026-05-20 probe-2 — `end_of_encoder_noop` pipeline (M1 confirmation probe
-/// per `07-diagnosis-round2.md` §I item 1). Uses the same 2-layout list as
-/// `compute_group_bounds` (`world_layout + bounds_layout`); only `@group(1)`'s
-/// `bound_queue_sizes` is actually accessed by the entry-point body, but
-/// keeping the world group in the layout matches the compute pipeline's shape
-/// so the existing `bounds_world_bg` can be bound without ceremony.
-///
-/// Only dispatched from the wasm-only per-round encoder branch in
-/// `naadf_bounds_compute_node` (the native path never references this
-/// pipeline). The compile cost is cheap (1-line entry point) and the WGSL is
-/// always declared — only the dispatch is cfg-gated.
-pub fn queue_end_of_encoder_noop_pipeline(
-    asset_server: &AssetServer,
-    pipeline_cache: &PipelineCache,
-    world_layout: BindGroupLayoutDescriptor,
-    bounds_layout: BindGroupLayoutDescriptor,
-) -> CachedComputePipelineId {
-    let shader = asset_server.load(BOUNDS_CALC_SHADER);
-    queue_end_of_encoder_noop_pipeline_with_handle(
-        pipeline_cache,
-        world_layout,
-        bounds_layout,
-        shader,
-    )
-}
-
-pub fn queue_end_of_encoder_noop_pipeline_with_handle(
-    pipeline_cache: &PipelineCache,
-    world_layout: BindGroupLayoutDescriptor,
-    bounds_layout: BindGroupLayoutDescriptor,
-    shader: Handle<Shader>,
-) -> CachedComputePipelineId {
-    pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("naadf_bounds_calc_end_of_encoder_noop_pipeline".into()),
-        layout: vec![world_layout, bounds_layout],
-        shader,
-        entry_point: Some(Cow::from("end_of_encoder_noop")),
-        ..default()
-    })
-}
-
 // ─── Dispatch helpers ─────────────────────────────────────────────────────────
 
 /// Dispatch `add_initial_groups_to_bound_queue` for `bound_group_count`
@@ -429,6 +395,21 @@ pub fn dispatch_regime_2_rounds(
     }
 }
 
+/// Issue `copy_buffer_to_buffer(chunks → chunks_mirror)` with a
+/// `min(src.size(), dst.size())` clamp. Returns silently if either
+/// buffer is unavailable. Called once before round 0 (seed) and once
+/// between every subsequent round (propagate prior round's writes).
+fn refresh_chunks_mirror(
+    encoder: &mut CommandEncoder,
+    chunks: Option<&bevy::render::render_resource::Buffer>,
+    chunks_mirror: Option<&bevy::render::render_resource::Buffer>,
+) {
+    if let (Some(src), Some(dst)) = (chunks, chunks_mirror) {
+        let copy_size = src.size().min(dst.size());
+        encoder.copy_buffer_to_buffer(src, 0, dst, 0, copy_size);
+    }
+}
+
 // ─── Regime-2 Core3d node ─────────────────────────────────────────────────────
 
 /// `Core3d`-schedule system: the W3 regime-2 background AADF queue node
@@ -449,6 +430,28 @@ pub fn dispatch_regime_2_rounds(
 /// thread short-circuits — net work per round is a single 4³-thread group
 /// that bails immediately. (NAADF accepts the same minimum-dispatch cost —
 /// `boundsCalc.fx:92` `max(1, groupAmount)`.)
+///
+/// **wasm regime-2 mechanism (load-bearing facts):**
+///
+/// - `n_bounds_rounds = 5` on native, **clamped to `1` on wasm** at
+///   `config.rs::From<&AppArgs>`.
+/// - `chunks_mirror` is a RO mirror of `chunks`, refreshed via
+///   `copy_buffer_to_buffer(chunks, chunks_mirror, full_size)` **once before
+///   round 0** (seeds from W5's chunk-classification bits; omitting this would
+///   zero the chunk-state read, causing false-positive AADF expansion on every
+///   chunk) **and between every subsequent round**.
+/// - `compute_group_bounds` reads ALL chunk-AADF state (own + neighbour) from
+///   `chunks_mirror` and writes back to `chunks` (non-atomic rw view). **Both
+///   targets run identical code; only `n_bounds_rounds` differs.**
+/// - The direct-dispatch override (`compute_workgroups_override = Some(...)`)
+///   on wasm is **orthogonal** to the chunks-RMW story — it works around
+///   Dawn's broken STORAGE→INDIRECT barrier between `prepare_group_bounds`'
+///   indirect-args write and `compute_group_bounds`' indirect-dispatch read.
+///   Native uses `None` (indirect dispatch).
+///
+/// iter-history archaeology lives in
+/// `docs/orchestrate/wasm-chunk-aadf-nondeterminism/` (docs 12-14); source
+/// describes current behaviour only.
 pub fn naadf_bounds_compute_node(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,
@@ -456,15 +459,6 @@ pub fn naadf_bounds_compute_node(
     construction_bind_groups: Option<Res<ConstructionBindGroups>>,
     construction_gpu: Option<Res<ConstructionGpu>>,
     construction_config: Option<Res<ConstructionConfig>>,
-    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
-    render_device: Res<bevy::render::renderer::RenderDevice>,
-    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
-    render_queue: Res<bevy::render::renderer::RenderQueue>,
-    // 2026-05-20 brute-force iter-2 (HP) — chunks_mirror per-encoder
-    // `copy_buffer_to_buffer` needs access to the chunks buffer. The
-    // `world_gpu.chunks_buffer` is the source; `construction_gpu.chunks_mirror_buffer`
-    // is the destination.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
     world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
 ) {
     let Some(construction_pipelines) = construction_pipelines else { return; };
@@ -520,42 +514,11 @@ pub fn naadf_bounds_compute_node(
         return;
     };
 
-    // 2026-05-20 probe-2 — resolve the end-of-encoder no-op pipeline (wasm
-    // only). If the wasm-build hasn't yet resolved it, skip the node entirely
-    // (rather than dispatching prepare+compute without the probe — that would
-    // muddle the probe's signal).
-    #[cfg(target_arch = "wasm32")]
-    let Some(end_of_encoder_noop_pipeline) =
-        pipeline_cache.get_compute_pipeline(
-            construction_pipelines.bounds_calc_pipeline_end_of_encoder_noop,
-        )
-    else {
-        return;
-    };
-
     let n_rounds = construction_config.n_bounds_rounds.max(1);
 
-    // 2026-05-20 dispatch-2 iter-2-2 H1 — use Bevy's main encoder for wasm
-    // W3, same as native. The per-round-encoder+submit pattern (used in
-    // dispatch-1 iter-0 through iter-5) does NOT solve the bug (iter-1
-    // proved one-encoder-per-frame is also affected). But going one step
-    // further — making wasm use Bevy's render_context.command_encoder()
-    // identically to native — puts W3's compute pass + the renderer's
-    // first-hit compute pass in the SAME command buffer. Dawn's intra-
-    // encoder PassResourceUsageTracker should then insert a
-    // SHADER_WRITE→SHADER_READ barrier on chunks[] between W3's last
-    // compute pass and first-hit's read of chunks[] via world_data.wgsl's
-    // read-only binding. Native gets this for free; wasm with the per-
-    // round-submit pattern was losing it.
-    //
-    // We keep the direct-dispatch + 4096-cap on wasm (the original Dawn
-    // STORAGE→INDIRECT barrier bug is still suspected; iter-2-3 if needed
-    // will probe whether that bug still exists).
-
-    // 2026-05-19 horizon-parity AADF diagnostic — one-shot log of the
-    // construction-config values reaching the regime-2 node (verifies the
-    // wasm clamp on `max_group_bound_dispatch` actually flows here from
-    // `From<&AppArgs> for ConstructionConfig`).
+    // [aadf-probe] one-shot config log — verifies the wasm clamp on
+    // `max_group_bound_dispatch` actually flows here from
+    // `From<&AppArgs> for ConstructionConfig`.
     {
         static LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
@@ -569,19 +532,8 @@ pub fn naadf_bounds_compute_node(
         }
     }
 
-    // 2026-05-19 web-vox ray-termination fix — on WebGPU, the STORAGE→INDIRECT
-    // barrier between `prepare_group_bounds` (writes `bound_dispatch_indirect`)
-    // and the indirect `compute_group_bounds` dispatch is not honoured by
-    // wgpu's Dawn backend: Dawn reads the seeded `[1,1,1]` indirect args
-    // instead of the post-prepare write, so `compute_group_bounds` dispatches
-    // exactly 1 workgroup per round, the chunk-AADF acceleration never
-    // builds, and rays step chunk-by-chunk (120 × 16 = ~1920 voxels ≈ 30 %
-    // of the 4096-voxel world). Workaround: dispatch DIRECTLY with the
-    // `max_group_bound_dispatch` workgroup count (clamped to a wasm-friendly
-    // value via [`From<&AppArgs> for ConstructionConfig`] so the bail-out
-    // cost on the shader's existing `is_group_active = group_id.x < count`
-    // early-exit stays sub-ms in steady state). On native this is `None` →
-    // unchanged indirect dispatch (the native path's barrier works).
+    // Direct-dispatch override on wasm: bypass the Dawn STORAGE→INDIRECT
+    // barrier bug (see function docblock).
     #[cfg(target_arch = "wasm32")]
     let compute_workgroups_override = Some(construction_config.max_group_bound_dispatch);
     #[cfg(not(target_arch = "wasm32"))]
@@ -590,57 +542,24 @@ pub fn naadf_bounds_compute_node(
     let diagnostics = render_context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    // 2026-05-20 brute-force iter-2 (HP) — chunks-self-copy intervention
-    // replaced with a structurally different approach: dedicated
-    // `chunks_mirror_buffer` that W3 reads from. See `chunks_mirror_buffer`
-    // allocation in `prepare_construction`. The iter-1 (HM/HN) host-side
-    // write_buffer fence scratch buffer was also reverted as part of the
-    // minimal-fix landing (`a426441`).
-
-    let encoder = render_context.command_encoder();
-    let time_span = diagnostics.time_span(encoder, BOUNDS_COMPUTE_SPAN);
-
-    // 2026-05-20 brute-force iter-2 (HP) — between EACH round, copy
-    // `chunks` → `chunks_mirror`. The compute shader reads from
-    // `chunks_mirror` (refreshed via this copy) and writes to `chunks`.
-    // This eliminates the cross-pass intra-shader RMW hazard on
-    // `chunks`: round N writes chunks; the copy AT END OF ROUND
-    // propagates round-N's chunks state into chunks_mirror via a
-    // TRANSFER stage barrier; round N+1 reads chunks_mirror (which now
-    // reflects round-N's writes).
-    //
-    // Round 0 reads from chunks_mirror which is initially zeroed (Bevy
-    // create_buffer with mapped_at_creation=false zero-fills on web per
-    // wgpu policy). So round 0 effectively starts from "all chunks
-    // empty in mirror." That's the same starting condition as the
-    // pre-fix code where compute read chunks (which was zero-initialised
-    // by the W5 generator's atomic-store sequence). So round 0's
-    // behaviour is unchanged.
-
-    // Pull world_gpu / construction_gpu for the chunks + chunks_mirror
-    // buffer handles. These are passed in via system parameters.
     let chunks_buf_opt = world_gpu
         .as_ref()
         .map(|w| w.chunks_buffer.clone());
     let chunks_mirror_buf_opt = construction_gpu.chunks_mirror_buffer.clone();
 
-    // Issue an initial copy(chunks → chunks_mirror) BEFORE round 0 so
-    // round 0 reads the post-W5-producer chunk classification bits (the
-    // W5 producer ran in `naadf_gpu_producer_node`, BEFORE this W3 node
-    // in the Core3d chain). This copy is essential — without it the
-    // chunks_mirror is zero AND compute's `chunk_state = cur_chunk >> 30u`
-    // check would always see state=0=EMPTY for every chunk, including
-    // mixed/full chunks, causing false-positive AADF expansion. Mirror
-    // must reflect the chunk-classification bits set by W5 BEFORE round 0.
-    if let (Some(chunks), Some(chunks_mirror)) =
-        (chunks_buf_opt.as_ref(), chunks_mirror_buf_opt.as_ref())
-    {
-        let copy_size = chunks.size().min(chunks_mirror.size());
-        encoder.copy_buffer_to_buffer(chunks, 0, chunks_mirror, 0, copy_size);
-    }
+    let encoder = render_context.command_encoder();
+    let time_span = diagnostics.time_span(encoder, BOUNDS_COMPUTE_SPAN);
+
+    // Seed: mirror must reflect W5's chunk-classification bits before round 0
+    // (otherwise `chunk_state = cur_chunk >> 30` reads 0 and false-positive
+    // expands every chunk). See function docblock.
+    refresh_chunks_mirror(
+        encoder,
+        chunks_buf_opt.as_ref(),
+        chunks_mirror_buf_opt.as_ref(),
+    );
 
     for round_idx in 0..n_rounds {
-        // prepare + compute pass for this round.
         dispatch_regime_2_rounds(
             encoder,
             prepare_pipeline,
@@ -650,27 +569,18 @@ pub fn naadf_bounds_compute_node(
             dispatch_bg,
             probe_bg,
             indirect_buffer,
-            1, // one round at a time
+            1,
             compute_workgroups_override,
         );
-
-        // After each round's compute pass (except the last) — copy
-        // chunks → chunks_mirror so the next round's reads see this
-        // round's writes via a clean TRANSFER stage barrier.
+        // Propagate this round's writes to the mirror so the next round's
+        // reads see them via the TRANSFER-stage barrier.
         if round_idx + 1 < n_rounds {
-            if let (Some(chunks), Some(chunks_mirror)) =
-                (chunks_buf_opt.as_ref(), chunks_mirror_buf_opt.as_ref())
-            {
-                let copy_size = chunks.size().min(chunks_mirror.size());
-                encoder.copy_buffer_to_buffer(chunks, 0, chunks_mirror, 0, copy_size);
-            }
+            refresh_chunks_mirror(
+                encoder,
+                chunks_buf_opt.as_ref(),
+                chunks_mirror_buf_opt.as_ref(),
+            );
         }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        // Suppress the unused `end_of_encoder_noop_pipeline` warning.
-        let _ = end_of_encoder_noop_pipeline;
     }
 
     time_span.end(render_context.command_encoder());

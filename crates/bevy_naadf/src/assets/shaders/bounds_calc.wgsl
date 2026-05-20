@@ -114,15 +114,19 @@ struct ConstructionParams {
 var<storage, read_write> chunks: array<vec2<u32>>;
 @group(0) @binding(1)
 var<uniform> params: ConstructionParams;
-// 2026-05-20 brute-force iter-2 (HP) — chunks_mirror is a read-only mirror of
-// `chunks`. On wasm it is refreshed via `copy_buffer_to_buffer(chunks,
-// chunks_mirror, full_size)` between each W3 round so cross-pass reads of
-// AADF state go through a TRANSFER-stage barrier (the strongest cross-pass
-// dependency wgpu offers) rather than through the shader's intra-pass cache,
-// which on Dawn is empirically broken for non-atomic storage RMW. Both
-// `compute_group_bounds` (line 499 own-AADF read) and `add_bounds_group`
-// (line 252 neighbour read) read FROM `chunks_mirror`; the write at line 538
-// continues to target `chunks` (the rw binding).
+// chunks_mirror — read-only mirror of `chunks` (binding 0). All reads
+// of chunk-AADF state in this shader come from chunks_mirror: search
+// `chunks_mirror[` to find the read sites (own-AADF in
+// `compute_group_bounds`, neighbour-AADF in `add_bounds_group`). The
+// only writer of chunk-AADF state is the non-atomic rw view of `chunks`
+// — search `chunks[chunk_idx] =` for the write site.
+//
+// Rust-side refreshes the mirror via
+// `copy_buffer_to_buffer(chunks → chunks_mirror)` once before round 0
+// (seeds W5's chunk-classification bits) and between every subsequent
+// round (propagates the prior round's writes via a TRANSFER-stage
+// barrier). Both targets run the same code; only `n_bounds_rounds`
+// differs (5 native, 1 wasm — wasm clamp in `config.rs::From<&AppArgs>`).
 @group(0) @binding(2)
 var<storage, read> chunks_mirror: array<vec2<u32>>;
 
@@ -427,43 +431,6 @@ fn prepare_group_bounds() {
         prepare_probe_history[probe_entry_off + 2u] = found_size;
         prepare_probe_history[probe_entry_off + 3u] = 0u;
     }
-}
-
-// ─── Entry point: end_of_encoder_noop — probe-2 (2026-05-20) ─────────────────
-//
-// M1-confirmation probe per `07-diagnosis-round2.md` Section I item 1. Dispatched
-// (on wasm only — native never references this entry point) AT END OF each
-// regime-2 round's encoder, AFTER `compute_group_bounds` writes
-// `bound_queue_sizes` via `atomicAdd` and BEFORE `render_queue.submit(...)`.
-// The body atomicLoads then atomicStores `bound_queue_sizes[0]` — semantically
-// a no-op that re-writes the slot to its current value, but irreducible (the
-// store consumes the load's result, so the compiler cannot elide either).
-//
-// Purpose: register the no-op as the NEXT USER of `bound_queue_sizes` to
-// Dawn's per-encoder PassResourceUsageTracker. Per Section D.1 of the
-// diagnosis, Dawn inserts a `vkCmdPipelineBarrier(SHADER_WRITE → SHADER_READ)`
-// at the start of each dispatch based on the resource usage of the prior
-// dispatch's writes. Putting this no-op INSIDE the same encoder as the
-// compute pass forces Dawn to barrier compute's writes BEFORE this dispatch.
-// That barrier IS an availability operation in the Vulkan-ish sense — once
-// compute's writes are made available (flushed to L2 / global memory) by the
-// barrier, the writes become visible across the subsequent
-// `queue.submit(...)` boundary to the next round's `prepare_group_bounds`.
-//
-// If M1 is correct → web SSIM jumps to ≥ 0.91 and the `[probe1-call]` pattern
-// shifts to native's "visit every (size, axis) once with found_size=32768"
-// shape. If M1 is wrong → web pattern stays byte-identical to the pre-probe-2
-// baseline (linear drain of size0_ax0 across 8 calls).
-//
-// Bindings used: only `bound_queue_sizes` (`@group(1) @binding(4)`). The
-// pipeline Rust-side uses the same 2-layout list as `compute_group_bounds`
-// (`world_layout + bounds_layout`); the world group is bound to keep the
-// pipeline-layout shape symmetric with the compute pipeline but is not read
-// by this entry point's body.
-@compute @workgroup_size(1, 1, 1)
-fn end_of_encoder_noop() {
-    let v = atomicLoad(&bound_queue_sizes[0u]);
-    atomicStore(&bound_queue_sizes[0u], v);
 }
 
 // ─── Entry point 3: compute_group_bounds — fx:118-193 ─────────────────────────

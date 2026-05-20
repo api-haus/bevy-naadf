@@ -39,6 +39,7 @@ use crate::render::construction::bounds_calc::{
     queue_add_initial_pipeline_with_handle, queue_compute_pipeline_with_handle,
     queue_prepare_pipeline_with_handle, BOUNDS_CALC_SHADER_SRC,
 };
+use crate::render::construction::{PREPARE_PROBE_HISTORY_BYTES, PREPARE_PROBE_HISTORY_ENTRIES};
 use crate::render::gpu_types::{GpuBoundQueueInfo, GpuConstructionParams};
 use crate::voxel::AADF_MAX_CHUNK;
 
@@ -522,15 +523,16 @@ fn build_w3_fixture(
     let probe_layout =
         super::prepare_probe_history_layout_descriptor();
 
-    // 2026-05-19 probe-1B — small probe history buffer for tests (2048
-    // entries × 16 B = 32 KiB; matches production capacity).
+    // probe history buffer sized to production capacity (= PREPARE_PROBE_HISTORY_ENTRIES
+    // entries × 16 B/entry = PREPARE_PROBE_HISTORY_BYTES). Test mirrors
+    // production sizing so future downsizes don't drift apart.
     let prepare_probe_history = device.create_buffer(&BufferDescriptor {
         label: Some("w3_prepare_probe_history"),
-        size: 2048 * 16,
+        size: PREPARE_PROBE_HISTORY_BYTES,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let probe_zeros: Vec<u32> = vec![0u32; 2048 * 4];
+    let probe_zeros: Vec<u32> = vec![0u32; (PREPARE_PROBE_HISTORY_ENTRIES * 4) as usize];
     queue.write_buffer(&prepare_probe_history, 0, bytemuck::cast_slice(&probe_zeros));
 
     let (id_add, id_prep, id_comp) = {
