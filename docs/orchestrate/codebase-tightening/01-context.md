@@ -138,3 +138,90 @@ Each domain's explorer + architect should consult `00-reuse-audit.md §3` for it
 - **High confidence**: file/line citations (verified with Read/Grep), domain boundary placements, SSoT divergences enumerated in §3.1.
 - **Medium confidence**: estimated tightening surface per domain (some may turn out unfixable when an explorer looks closely).
 - **Low confidence (architects: re-examine)**: the OA-1 / BEV-4 reflect-driven settings recommendation — the project may deliberately keep KNOBS explicit for compile-time safety; architects judge.
+
+---
+
+## Addendum (2026-05-20, after explorer phase) — master-branch identity + resolution of explorer hard-gate flags
+
+### Master-branch identity (user clarification — read this first)
+
+**bevy-naadf master is two things, and nothing else:**
+
+1. **A minimal, complete, fair port of the C# NAADF reference** (`/mnt/archive4/DEV/NAADF/`).
+2. **Reference footnotes for the Unity port** (the next downstream target, per [[naadf-getraydir-monogame-conventions]]).
+
+**PBR raymarching work lives on a SEPARATE branch and is already ready.** Master does NOT carry PBR scaffolding. The split is intentional: master demonstrates the paper's algorithm faithfully; PBR compounds on top in its own branch.
+
+**Consequence for every architect:** when weighing a "delete vs keep" call, ask "is this in C#?" or "is this an idiomatic-Bevy improvement that the Unity port would want to know about?" If neither, **delete**. PBR-related code on master is suspect by default — it lives on the PBR branch instead. Aggressive deletion of investigation residuals, dead PBR scaffolding, and stalled-design scaffolds is **encouraged**, not just permitted.
+
+The CPU oracle (`aadf/edit.rs`) is the load-bearing exception per the prior Q2 — it stays because GPU divergence verification needs it. Everything else flagged "investigation residual" goes.
+
+### Hard-gate Q&A resolutions (2026-05-20)
+
+After all 8 explorers returned, four high-severity decisions surfaced that the user resolved before architect dispatch.
+
+#### Resolution A — `device_snapshot` full delete-chain (D7 + D6 coordinated)
+
+User confirmed: **delete the whole chain.** D7 + D6 implementors coordinate. Scope:
+
+- `diagnostics::device_snapshot` submodule (`diagnostics.rs:155-711`, ~560 LOC) — DELETE.
+- `bin/diag_compare.rs` (314 LOC) — DELETE.
+- `--device-snapshot-native` CLI flag in `bin/e2e_render.rs:139-143,364-375` — DELETE.
+- `e2e/tests/device-snapshot.spec.ts` — DELETE.
+- Any Playwright config wiring for the above — DELETE.
+
+Total drop: ~900 LOC + the Playwright spec. D7's architect designs the simplified `DiagnosticsPlugin` (press-P dump only). D6's architect notes the coupling so D6 impl phase coordinates with D7's last-position impl phase. **D6 architect may need to land their parts of the deletion ahead of D7** (test spec + CLI flag) — architects coordinate.
+
+#### Resolution B — D8 asset-pipeline: Option A (delete runtime consumers, keep bake binary)
+
+User confirmed: **Option A.** Scope:
+
+- DELETE `texture_array/**` (785 LOC).
+- DELETE `baked_material.rs` (225 LOC, including the `extensions() returns &["ron"]` footgun).
+- DELETE `material_set/mod.rs` (60 LOC, verbatim-pasted from stalled `pbr-raymarching` design).
+- DELETE the `basis-universal` Cargo dep + native C++ encoder build path.
+- DELETE the 14 lines in `lib.rs` that register the dead plugins.
+- **KEEP `bin/bake.rs` (96 LOC)** — InstaMAT offline batch baker, runs pre-build via justfile per [[instamat-bake-to-disk]]. Stays as scaffolding for InstaMAT integration.
+- **KEEP** the `bake-texarrays` justfile recipe (4 lines).
+
+Total drop: ~1 100 LOC + a C++ build dep. **Rationale:** master is the C# port; PBR raymarching lives on a separate branch where the runtime baked-material consumer will be wired. Re-introducing the runtime path here would be a PBR-branch concern, not a master-branch concern.
+
+#### Resolution C — PBR e2e gates: delete
+
+User confirmed: **delete all 3 + CLI dispatch.** Scope:
+
+- DELETE `e2e/pbr_debug_modes.rs` (218 LOC).
+- DELETE `e2e/pbr_hard_edge.rs` (1 023 LOC).
+- DELETE `e2e/pbr_visual.rs` (747 LOC).
+- DELETE `--pbr-debug-modes`, `--pbr-hard-edge`, `--pbr-visual` from `bin/e2e_render.rs`.
+- DELETE corresponding `AppArgs.pbr_*_mode` fields (D7 territory — coordinate).
+- DELETE `e2e/mod.rs` registry entries for the three.
+
+Total drop: 1 988 LOC. **Rationale:** PBR gates live on the PBR branch with the rest of the PBR work; master stays clean.
+
+#### Resolution D — W0 seam contract retired
+
+User confirmed: **architect proposes the merge, implementor lands it.** D5's architect:
+
+- Proposes folding `ConstructionPipelines` into `NaadfPipelines` (or unifying behind a single `Pipelines` resource).
+- Notes the merge in D4↔D5 shared-file notes so D4's later impl phase respects the merged shape.
+- Documents the W0-contract retirement in the architecture doc as a deliberate divergence from `15-design-c.md` (which becomes historical).
+
+This is a structural simplification, not a feature change. Behavioural parity with C# preserved.
+
+### Cross-domain coordination notes (for architects)
+
+- **D6 ↔ D7 chain (device_snapshot + diag_compare + spec)**: D6 architect lays the e2e-side deletions; D7 architect lays the production-side deletions. Implementor sequence (user-decided): D5 first, then D4, then interleave D1/D2/D3/D6/D8, then D7 last. D6 impl can land the spec + CLI deletions before D7 lands the production submodule deletion.
+- **D7 ↔ D2 ↔ D4 SSoT-1 chain**: `GiSettings` (D7's `lib.rs`) → `KNOBS` table (D2's `settings.rs`) → `GpuRenderParams.max_ray_steps_*` (D4's `gpu_types.rs`). D7's architect proposes the canonical Rust struct location; D2's architect proposes the `Reflect`-or-decl-macro KNOBS shape; D4's architect proposes the uniform consumer shape. All three architects produce designs simultaneously — they must each cite the other two domains' explorer findings (`02-exploration.md`) to land coherent designs.
+- **D5 ↔ D4 shared seam**: `gpu_types.rs` / `prepare.rs` / `pipelines.rs` stay read-only for D5. D5 architect notes what D4 needs to change in those files (per D5 explorer `## D4↔D5 shared-file notes`); D4 architect designs the changes.
+- **D3 dependency arrow inversion (D3 Finding 6)**: `web_vox::pin_web_horizon_camera` + `grid::install_imported_vox` import camera-pose constants FROM `e2e/vox_horizon_parity`. D3 architect proposes reversing this — constants move out of e2e/, into a non-e2e module, e2e gates import them. **Approved.**
+- **D1 state-bit encoding regime mismatch (D1 Finding 2)**: three regimes silently coexist around paper §3.1's encoding (Rust flag-bit, Rust state-nibble-with-magic-literals, WGSL named state-nibble constants). D1 architect picks one canonical encoding and proposes migration. Faithful-port rule: whichever is closest to C# NAADF's encoding wins; D1 architect cross-checks against C# `World/Data/ChangeHandler.cs` or `EditingHandler.cs`.
+
+### Architect-phase brief framing
+
+All 8 architect dispatches receive:
+- This `01-context.md` + the resolutions above.
+- Their domain's `02-exploration.md` (each architect reads their own, in full).
+- A pointer to other domains' explorer outputs ONLY if cross-domain coordination is required (D2/D4/D7 read each other's SSoT-1 sections; D5 + D4 read each other's shared-file notes).
+
+Architect outputs go to `<domain>/03-architecture.md`. The orchestrator does NOT read these per user directive. Implementors read their own domain's architecture + exploration directly.

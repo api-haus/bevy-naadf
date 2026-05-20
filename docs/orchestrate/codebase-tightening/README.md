@@ -47,8 +47,8 @@
 ## Phase checklist
 
 - [x] `00` — audit
-- [x] `01` — context bundle
-- [ ] `02` — explorers (D1..D8, parallel batch)
+- [x] `01` — context bundle (incl. 2026-05-20 addendum after explorer hard gate)
+- [x] `02` — explorers (D1..D8, parallel batch) — all 8 returned with prioritised findings
 - [ ] `03` — architects (D1..D8, parallel batch)
 - [ ] `04` — implementor D5
 - [ ] `04` — implementor D4
