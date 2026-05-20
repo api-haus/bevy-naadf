@@ -90,6 +90,19 @@ pub fn construction_bounds_world_layout_descriptor() -> BindGroupLayoutDescripto
                 storage_buffer_sized(false, None),
                 // params — uniform.
                 uniform_buffer_sized(false, Some(params_size)),
+                // 2026-05-20 brute-force iter-2 (HP) — chunks_mirror_ro —
+                // read-only mirror of chunks used by compute_group_bounds for
+                // ALL its reads (own AADF + neighbour AADF). On wasm this
+                // mirror is refreshed via copy_buffer_to_buffer(chunks,
+                // chunks_mirror) between each round so the next round's
+                // reads see the prior round's writes via a TRANSFER stage
+                // barrier (the strongest cross-pass dependency wgpu offers).
+                // On native this mirror is allocated to satisfy the layout
+                // but never accessed (the shader's read path is gated by a
+                // #ifdef-WGSL-define equivalent that the Rust side cannot
+                // express; instead we ALWAYS access chunks_mirror on both
+                // targets and the native code path also issues the copy).
+                bevy::render::render_resource::binding_types::storage_buffer_read_only_sized(false, None),
             ),
         ),
     )
@@ -454,6 +467,11 @@ pub fn naadf_bounds_compute_node(
     // 2026-05-20 dispatch-2 iter-2-4 — lazy scratch buffer for chunks-self-copy.
     #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
     mut chunks_scratch: bevy::ecs::system::Local<Option<bevy::render::render_resource::Buffer>>,
+    // 2026-05-20 brute-force iter-1 HM/HN — lazy 4 B scratch for the
+    // host-side `queue.write_buffer` fence inserted between W3 rounds on
+    // wasm.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+    mut chunks_scratch_for_fence: bevy::ecs::system::Local<Option<bevy::render::render_resource::Buffer>>,
 ) {
     let Some(construction_pipelines) = construction_pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
@@ -578,103 +596,88 @@ pub fn naadf_bounds_compute_node(
     let diagnostics = render_context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    // 2026-05-20 dispatch-2 iter-2-4 — on wasm, between rounds insert a
-    // copy_buffer_to_buffer(chunks → scratch). This forces Dawn to emit a
-    // SHADER_WRITE→TRANSFER_READ pipeline barrier on the FULL chunks buffer.
-    // Retained in dispatch-3 iter-3-1 because iter-2-4 produced the highest
-    // single SSIM (0.810) of any intervention; removing risks regressing
-    // baseline.
-    //
-    // Allocate scratch lazily: same-size + COPY_DST + COPY_SRC. Single
-    // allocation for the W3 node's lifetime (Local<Option<Buffer>>).
-    #[cfg(target_arch = "wasm32")]
-    let chunks_self_copy_dst: Option<bevy::render::render_resource::Buffer> = {
-        if let Some(world_gpu) = world_gpu.as_ref() {
-            let chunks_size = world_gpu.chunks_buffer.size();
-            if chunks_scratch.is_none() {
-                let scratch = render_device.create_buffer(
-                    &bevy::render::render_resource::BufferDescriptor {
-                        label: Some("naadf_chunks_self_copy_scratch_iter_2_4"),
-                        size: chunks_size,
-                        usage: bevy::render::render_resource::BufferUsages::COPY_DST
-                            | bevy::render::render_resource::BufferUsages::COPY_SRC,
-                        mapped_at_creation: false,
-                    },
-                );
-                *chunks_scratch = Some(scratch);
-                bevy::log::info!(
-                    "[aadf-probe] iter-2-4: allocated chunks_self_copy_scratch size={} B",
-                    chunks_size,
-                );
-            }
-            chunks_scratch.as_ref().cloned()
-        } else {
-            None
-        }
-    };
+    // 2026-05-20 brute-force iter-2 (HP) — removed dispatch-2 iter-2-4's
+    // chunks-self-copy intervention. Replaced with a structurally different
+    // approach: dedicated `chunks_mirror_buffer` that W3 reads from. See
+    // `chunks_mirror_buffer` allocation in `prepare_construction`.
+    let _ = chunks_scratch; // retained Local for signature compatibility; unused
+    let _ = chunks_scratch_for_fence; // retained Local for signature compatibility; unused
 
     let encoder = render_context.command_encoder();
     let time_span = diagnostics.time_span(encoder, BOUNDS_COMPUTE_SPAN);
 
-    // Per-round dispatch with chunks-self-copy between rounds (wasm) — the
-    // dispatch-2 iter-2-4 state. This iteration's iter-3-1 cheap-fence probe
-    // (dedicated W3 encoder + on_submitted_work_done + map_async fence) was
-    // REFUTED — same 0.69-0.79 SSIM cluster. Reverted to iter-2-4 baseline.
-    // The chunks-self-copy retained because iter-2-4 produced 0.810 (highest
-    // single SSIM of any intervention) and removing it risks regressing.
-    #[cfg(target_arch = "wasm32")]
+    // 2026-05-20 brute-force iter-2 (HP) — between EACH round, copy
+    // `chunks` → `chunks_mirror`. The compute shader reads from
+    // `chunks_mirror` (refreshed via this copy) and writes to `chunks`.
+    // This eliminates the cross-pass intra-shader RMW hazard on
+    // `chunks`: round N writes chunks; the copy AT END OF ROUND
+    // propagates round-N's chunks state into chunks_mirror via a
+    // TRANSFER stage barrier; round N+1 reads chunks_mirror (which now
+    // reflects round-N's writes).
+    //
+    // Round 0 reads from chunks_mirror which is initially zeroed (Bevy
+    // create_buffer with mapped_at_creation=false zero-fills on web per
+    // wgpu policy). So round 0 effectively starts from "all chunks
+    // empty in mirror." That's the same starting condition as the
+    // pre-fix code where compute read chunks (which was zero-initialised
+    // by the W5 generator's atomic-store sequence). So round 0's
+    // behaviour is unchanged.
+
+    // Pull world_gpu / construction_gpu for the chunks + chunks_mirror
+    // buffer handles. These are passed in via system parameters.
+    let chunks_buf_opt = world_gpu
+        .as_ref()
+        .map(|w| w.chunks_buffer.clone());
+    let chunks_mirror_buf_opt = construction_gpu.chunks_mirror_buffer.clone();
+
+    // Issue an initial copy(chunks → chunks_mirror) BEFORE round 0 so
+    // round 0 reads the post-W5-producer chunk classification bits (the
+    // W5 producer ran in `naadf_gpu_producer_node`, BEFORE this W3 node
+    // in the Core3d chain). This copy is essential — without it the
+    // chunks_mirror is zero AND compute's `chunk_state = cur_chunk >> 30u`
+    // check would always see state=0=EMPTY for every chunk, including
+    // mixed/full chunks, causing false-positive AADF expansion. Mirror
+    // must reflect the chunk-classification bits set by W5 BEFORE round 0.
+    if let (Some(chunks), Some(chunks_mirror)) =
+        (chunks_buf_opt.as_ref(), chunks_mirror_buf_opt.as_ref())
     {
-        let chunks_buf_opt = world_gpu.as_ref().map(|w| w.chunks_buffer.clone());
-        for round_idx in 0..n_rounds {
-            // prepare + compute pass for this round.
-            dispatch_regime_2_rounds(
-                encoder,
-                prepare_pipeline,
-                compute_pipeline,
-                bounds_world_bg,
-                bounds_bg,
-                dispatch_bg,
-                probe_bg,
-                indirect_buffer,
-                1, // one round at a time
-                compute_workgroups_override,
-            );
-            // After each compute pass (except the last), copy chunks→scratch→
-            // chunks. The src-buffer transition COMPUTE_SHADER_WRITE →
-            // TRANSFER_READ forces a full-buffer flush of compute's writes.
-            //
-            // 2026-05-20 trajectory-selector condition D — env
-            // CHUNKS_SELF_COPY_DISABLED=1 at build time skips the copy. This
-            // probes whether the copy is load-bearing for the lucky trajectory.
-            if option_env!("CHUNKS_SELF_COPY_DISABLED").is_none()
-                && round_idx + 1 < n_rounds
+        let copy_size = chunks.size().min(chunks_mirror.size());
+        encoder.copy_buffer_to_buffer(chunks, 0, chunks_mirror, 0, copy_size);
+    }
+
+    for round_idx in 0..n_rounds {
+        // prepare + compute pass for this round.
+        dispatch_regime_2_rounds(
+            encoder,
+            prepare_pipeline,
+            compute_pipeline,
+            bounds_world_bg,
+            bounds_bg,
+            dispatch_bg,
+            probe_bg,
+            indirect_buffer,
+            1, // one round at a time
+            compute_workgroups_override,
+        );
+
+        // After each round's compute pass (except the last) — copy
+        // chunks → chunks_mirror so the next round's reads see this
+        // round's writes via a clean TRANSFER stage barrier.
+        if round_idx + 1 < n_rounds {
+            if let (Some(chunks), Some(chunks_mirror)) =
+                (chunks_buf_opt.as_ref(), chunks_mirror_buf_opt.as_ref())
             {
-                if let (Some(chunks), Some(scratch)) =
-                    (chunks_buf_opt.as_ref(), chunks_self_copy_dst.as_ref())
-                {
-                    let copy_size = chunks.size().min(scratch.size());
-                    encoder.copy_buffer_to_buffer(chunks, 0, scratch, 0, copy_size);
-                    encoder.copy_buffer_to_buffer(scratch, 0, chunks, 0, copy_size);
-                }
+                let copy_size = chunks.size().min(chunks_mirror.size());
+                encoder.copy_buffer_to_buffer(chunks, 0, chunks_mirror, 0, copy_size);
             }
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
         // Suppress the unused `end_of_encoder_noop_pipeline` warning.
         let _ = end_of_encoder_noop_pipeline;
     }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    dispatch_regime_2_rounds(
-        encoder,
-        prepare_pipeline,
-        compute_pipeline,
-        bounds_world_bg,
-        bounds_bg,
-        dispatch_bg,
-        probe_bg,
-        indirect_buffer,
-        n_rounds,
-        compute_workgroups_override,
-    );
 
     time_span.end(render_context.command_encoder());
 }

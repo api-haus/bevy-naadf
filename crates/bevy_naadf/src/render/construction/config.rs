@@ -238,11 +238,19 @@ impl From<&crate::AppArgs> for ConstructionConfig {
         {
             cfg.max_group_bound_dispatch =
                 cfg.max_group_bound_dispatch.min(WASM_MAX_GROUP_BOUND_DISPATCH);
-            // 2026-05-20 dispatch-2 iter-0 — revert iter-5's n_bounds_rounds
-            // bump. iter-2 in dispatch-1 already proved bound_queue_sizes
-            // reaches all 32 size levels even at default n=5 (1760+ probe
-            // calls), so the bug is not "insufficient algorithm cycles."
-            // Restart from native's default (5).
+            // 2026-05-20 brute-force iter-4 (HU) — drop n_bounds_rounds to 1
+            // on wasm. Multiple rounds per frame → multiple compute passes in
+            // the same encoder → Dawn must insert intra-encoder cross-pass
+            // barriers between consecutive compute writes to chunks. If
+            // Dawn's intra-encoder barrier is empirically broken (per the
+            // 12 prior refutations), then n=1 sidesteps it: one pass per
+            // frame, then end-of-encoder + submit (with Bevy's render-graph
+            // submit) gives a host-observable sync boundary that's known to
+            // work for buffer-state propagation. Over 60+ frames of W3
+            // running at 1 round/frame, we accumulate ~60 rounds of
+            // expansion — less than n=5's 300, but with potentially
+            // reliable cross-frame propagation.
+            cfg.n_bounds_rounds = 1;
         }
         cfg
     }

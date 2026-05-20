@@ -105,10 +105,32 @@ struct ConstructionParams {
 // entity-pointer channel) like the W2 shaders do.
 // Web-WebGPU migration: chunks is now `array<vec2<u32>>` (was
 // `texture_storage_3d<rg32uint, read_write>`).
+// 2026-05-20 brute-force iter-3 (HR) — `chunks_atomic` is the SAME GPU buffer
+// as `chunks_mirror` (re-bound under an atomic-typed view). All WRITES from
+// `compute_group_bounds` go through `atomicStore` on `chunks_atomic` so that
+// Tint's SPIR-V emission carries the atomic decoration on the underlying
+// VkBuffer, forcing Dawn to flush cross-workgroup writes via Vulkan's
+// SubgroupMemoryBarrier semantics rather than relying on the cache-coherence
+// path that's empirically broken for non-atomic storage RMW on Dawn.
+//
+// Paired indexing: `chunks_atomic[chunk_idx*2u + 0u]` = .x = state+AADF;
+// `chunks_atomic[chunk_idx*2u + 1u]` = .y = entity pointer. Stride is the
+// same 8 B as the `array<vec2<u32>>` view (2 × u32).
 @group(0) @binding(0)
-var<storage, read_write> chunks: array<vec2<u32>>;
+var<storage, read_write> chunks_atomic: array<atomic<u32>>;
 @group(0) @binding(1)
 var<uniform> params: ConstructionParams;
+// 2026-05-20 brute-force iter-2 (HP) — chunks_mirror is a read-only mirror of
+// `chunks`. On wasm it is refreshed via `copy_buffer_to_buffer(chunks,
+// chunks_mirror, full_size)` between each W3 round so cross-pass reads of
+// AADF state go through a TRANSFER-stage barrier (the strongest cross-pass
+// dependency wgpu offers) rather than through the shader's intra-pass cache,
+// which on Dawn is empirically broken for non-atomic storage RMW. Both
+// `compute_group_bounds` (line 499 own-AADF read) and `add_bounds_group`
+// (line 252 neighbour read) read FROM `chunks_mirror`; the write at line 538
+// continues to target `chunks` (the rw binding).
+@group(0) @binding(2)
+var<storage, read> chunks_mirror: array<vec2<u32>>;
 
 // `@group(1)` = `construction_bounds_layout` — the W3 bound-queue family.
 // 2026-05-19 web fix — `bound_queue_info` is split into `bound_queue_starts`
@@ -249,7 +271,9 @@ fn add_bounds_group(
     let neighbour_idx = neighbour_pos_u.x
         + neighbour_pos_u.y * params.size_in_chunks.x
         + neighbour_pos_u.z * params.size_in_chunks.x * params.size_in_chunks.y;
-    let neighbour_x = chunks[neighbour_idx].x;
+    // 2026-05-20 brute-force iter-2 (HP) — read from `chunks_mirror`, the
+    // refreshed-between-rounds read-only mirror. See declaration above.
+    let neighbour_x = chunks_mirror[neighbour_idx].x;
     // `(neighbour.x >> 30) == BLOCK_STATE_UNIFORM_EMPTY && neighbour.y == 0`
     // — the non-`#ifdef ENTITIES` path collapses `.y` to 0 (W4 owns the
     // widening; until then we have no entity counts and the test is just
@@ -496,7 +520,9 @@ fn compute_group_bounds(
     let chunk_idx = chunk_pos_u.x
         + chunk_pos_u.y * params.size_in_chunks.x
         + chunk_pos_u.z * params.size_in_chunks.x * params.size_in_chunks.y;
-    let cur_chunk_full = chunks[chunk_idx];
+    // 2026-05-20 brute-force iter-2 (HP) — read from `chunks_mirror`, the
+    // refreshed-between-rounds read-only mirror. See declaration above.
+    let cur_chunk_full = chunks_mirror[chunk_idx];
     let cur_chunk_load = cur_chunk_full.x;
     // W4 — preserve `.y` (entity pointer channel) on the write below.
     let entity_y = cur_chunk_full.y;
@@ -533,9 +559,14 @@ fn compute_group_bounds(
     // the W3 background queue would silently zero the entity pointer on
     // every AADF expansion.
     if (is_group_active && cur_chunk_copy != cur_chunk) {
-        // Web-WebGPU migration: write to the flat chunks buffer. `chunk_idx`
-        // was computed alongside the load above (same chunk-pos).
-        chunks[chunk_idx] = vec2<u32>(cur_chunk, entity_y);
+        // 2026-05-20 brute-force iter-3 (HR) — write via atomicStore on the
+        // chunks_atomic view (paired indexing: .x = idx*2, .y = idx*2+1).
+        // The atomic semantic forces Dawn/Tint to emit SPIR-V atomic stores
+        // with appropriate memory-scope decoration, bypassing the
+        // non-atomic-cross-workgroup-visibility bug that empirically
+        // affects this access pattern.
+        atomicStore(&chunks_atomic[chunk_idx * 2u + 0u], cur_chunk);
+        atomicStore(&chunks_atomic[chunk_idx * 2u + 1u], entity_y);
         atomicStore(&any_bounds_increase, 1u);
         // 2026-05-19 horizon-parity diagnostic — count per-thread real
         // expansions. Slot [6] accumulates across all compute rounds; the

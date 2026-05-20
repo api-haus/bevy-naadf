@@ -157,6 +157,14 @@ pub struct ConstructionGpu {
     /// `bound_group_queue_max_size` / `max_group_bound_dispatch`. Bound at
     /// slot 1 of the `construction_bounds_world` group. (`15-design-c.md` §1.8.)
     pub bounds_params_buffer: Option<Buffer>,
+    /// 2026-05-20 brute-force iter-2 (HP) — read-only mirror of `chunks` used by
+    /// `compute_group_bounds` for neighbour + own AADF reads. Refreshed via
+    /// `copy_buffer_to_buffer(chunks, chunks_mirror, full_size)` between
+    /// rounds on wasm. Native uses chunks directly via the rw binding (writes
+    /// only) so this buffer is bound but never read on native — kept allocated
+    /// because the bind-group layout is shared. Same size as chunks_buffer
+    /// (`array<vec2<u32>>`, stride 8 B).
+    pub chunks_mirror_buffer: Option<Buffer>,
     /// W3 — `true` once the `add_initial_groups_to_bound_queue` regime-1
     /// seed dispatch has run (one-shot at prepare-time, no startup driver
     /// extension required for the static test grid). Mirrors
@@ -2110,11 +2118,39 @@ pub fn prepare_construction(
         bind_groups.construction_bounds_world = None;
     }
 
+    // 2026-05-20 brute-force iter-2 (HP) — allocate `chunks_mirror_buffer`
+    // (same size as `chunks_buffer`). Read-only mirror that W3's
+    // `compute_group_bounds` reads from for own + neighbour AADF.
+    // copy_buffer_to_buffer(chunks, chunks_mirror) is dispatched between
+    // each W3 round in `naadf_bounds_compute_node` on wasm; native uses
+    // chunks-rw directly and writes to chunks_mirror once at startup so
+    // the binding has SOMETHING valid.
+    if gpu.chunks_mirror_buffer.is_none() {
+        let chunks_size = world_gpu.chunks_buffer.size();
+        let buf = render_device.create_buffer(&BufferDescriptor {
+            label: Some("naadf_chunks_mirror_w3_brute_force_iter2"),
+            size: chunks_size,
+            usage: BufferUsages::STORAGE
+                | BufferUsages::COPY_DST
+                | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        gpu.chunks_mirror_buffer = Some(buf);
+        bind_groups.construction_bounds_world = None;
+        bevy::log::info!(
+            "[aadf-probe] brute-force iter-2 HP: allocated chunks_mirror_buffer size={} B",
+            chunks_size,
+        );
+    }
+
     let _ = chunk_count; // referenced for future regime-3 sizing.
 
     // === Build W3 bind groups when missing ===================================
     if bind_groups.construction_bounds_world.is_none() {
-        if let Some(params_buf) = gpu.bounds_params_buffer.as_ref() {
+        if let (Some(params_buf), Some(chunks_mirror_buf)) = (
+            gpu.bounds_params_buffer.as_ref(),
+            gpu.chunks_mirror_buffer.as_ref(),
+        ) {
             let bgl = pipeline_cache
                 .get_bind_group_layout(&construction_pipelines.construction_bounds_world_layout);
             let bg = render_device.create_bind_group(
@@ -2123,6 +2159,7 @@ pub fn prepare_construction(
                 &BindGroupEntries::sequential((
                     world_gpu.chunks_buffer.as_entire_buffer_binding(),
                     params_buf.as_entire_buffer_binding(),
+                    chunks_mirror_buf.as_entire_buffer_binding(),
                 )),
             );
             bind_groups.construction_bounds_world = Some(bg);
