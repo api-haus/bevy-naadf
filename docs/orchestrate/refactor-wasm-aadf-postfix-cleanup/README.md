@@ -27,8 +27,8 @@ hardcode.
 ## Phase checklist
 
 - [x] Exploration — 11 findings written (7 Item 1, 3 Item 2, 1 Item 3 + cross-cutting + side-notes)
-- [ ] User confirms which findings to act on
-- [ ] Architecture — design target-state for the confirmed findings
+- [x] User confirmed dispatching architect on all 11 findings
+- [x] Architecture — 5 migration steps; Item 1 = 7 findings via steps 2-5; Item 2A → ESCAPE; Item 2B/2C → EXPLORE-ONLY; Item 3 = mechanical (step 1)
 - [ ] User confirms the design
 - [ ] Refactoring — apply edits + run verification gates
 
