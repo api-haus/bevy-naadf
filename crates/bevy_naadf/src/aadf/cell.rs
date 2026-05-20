@@ -20,8 +20,8 @@
 //! Direction order for all 6-field AADFs is `-x, +x, -y, +y, -z, +z`.
 
 use crate::voxel::{
-    VoxelTypeId, AADF_BITS_CHUNK, AADF_BITS_SMALL, AADF_MAX_CHUNK, AADF_MAX_SMALL,
-    CELL_HAS_CHILDREN, CELL_PAYLOAD_MASK, CELL_UNIFORM_FULL, VOXEL_FULL_FLAG, VOXEL_PAYLOAD_MASK,
+    cell_state, CellRaw, VoxelTypeId, AADF_BITS_CHUNK, AADF_BITS_SMALL, AADF_MAX_CHUNK,
+    AADF_MAX_SMALL, VOXEL_FULL_FLAG, VOXEL_PAYLOAD_MASK,
 };
 
 /// Index into an [`Aadf6`] for each of the 6 axis-aligned directions.
@@ -31,6 +31,15 @@ pub const DIR_NEG_Y: usize = 2;
 pub const DIR_POS_Y: usize = 3;
 pub const DIR_NEG_Z: usize = 4;
 pub const DIR_POS_Z: usize = 5;
+
+/// All 6 cardinal directions in canonical iteration order (-x,+x,-y,+y,-z,+z).
+/// Use this for any `for &dir in DIRS.iter() { … aadf.d[dir] … }` pattern;
+/// **inside hot loops (`compute_aadf_layer`, `bounds_match`) the raw `usize`
+/// indices are preferred to avoid potential dispatch overhead from a wrapper
+/// enum**.
+pub const DIRS: [usize; 6] = [
+    DIR_NEG_X, DIR_POS_X, DIR_NEG_Y, DIR_POS_Y, DIR_NEG_Z, DIR_POS_Z,
+];
 
 /// 6 axis-aligned empty-distance values — the AADF of an empty cell.
 ///
@@ -117,24 +126,30 @@ pub enum VoxelCell {
 impl ChunkCell {
     /// Encode this chunk cell into its `u32` buffer word.
     ///
-    /// Mirrors the C# `shootRay` bit tests: bit 31 = has-children, bit 30 =
-    /// uniform-full, both clear = empty (low 30 bits = 5-bit AADF).
+    /// Regime-B encoding (faithful port of C# `WorldData.cs:223` `chunk >> 30`
+    /// discriminator). 2-bit state nibble at bits 30-31 +
+    /// [`crate::voxel::CELL_PAYLOAD_MASK`] in low 30 bits. Mirrors WGSL
+    /// `BLOCK_STATE_*` constants in `chunk_calc.wgsl`, `world_change.wgsl`,
+    /// `bounds_calc.wgsl`.
     pub fn encode(self) -> u32 {
         match self {
-            ChunkCell::Empty(aadf) => aadf.pack(AADF_BITS_CHUNK, AADF_MAX_CHUNK),
-            ChunkCell::UniformFull(ty) => CELL_UNIFORM_FULL | (ty.raw() as u32),
-            ChunkCell::Mixed(ptr) => CELL_HAS_CHILDREN | (ptr.0 & CELL_PAYLOAD_MASK),
+            ChunkCell::Empty(aadf) => {
+                CellRaw::new(cell_state::UNIFORM_EMPTY, aadf.pack(AADF_BITS_CHUNK, AADF_MAX_CHUNK)).0
+            }
+            ChunkCell::UniformFull(ty) => CellRaw::new(cell_state::UNIFORM_FULL, ty.raw() as u32).0,
+            ChunkCell::Mixed(ptr) => CellRaw::new(cell_state::CHILD, ptr.0).0,
         }
     }
 
     /// Decode a chunk-cell `u32` buffer word — inverse of [`encode`](Self::encode).
     pub fn decode(raw: u32) -> ChunkCell {
-        if raw & CELL_HAS_CHILDREN != 0 {
-            ChunkCell::Mixed(BlockPtr(raw & CELL_PAYLOAD_MASK))
-        } else if raw & CELL_UNIFORM_FULL != 0 {
-            ChunkCell::UniformFull(VoxelTypeId((raw as u16) & VOXEL_PAYLOAD_MASK))
-        } else {
-            ChunkCell::Empty(Aadf6::unpack(raw, AADF_BITS_CHUNK))
+        let cr = CellRaw(raw);
+        match cr.state() {
+            cell_state::CHILD => ChunkCell::Mixed(BlockPtr(cr.payload())),
+            cell_state::UNIFORM_FULL => {
+                ChunkCell::UniformFull(VoxelTypeId((cr.payload() as u16) & VOXEL_PAYLOAD_MASK))
+            }
+            _ => ChunkCell::Empty(Aadf6::unpack(raw, AADF_BITS_CHUNK)),
         }
     }
 }
@@ -142,24 +157,27 @@ impl ChunkCell {
 impl BlockCell {
     /// Encode this block cell into its `u32` buffer word.
     ///
-    /// Same state bits as a chunk cell; the AADF uses 2-bit fields (max
-    /// distance 3) and the mixed payload is a [`VoxelPtr`].
+    /// Regime-B encoding (see [`ChunkCell::encode`]). The AADF uses 2-bit
+    /// fields (max distance 3) and the mixed payload is a [`VoxelPtr`].
     pub fn encode(self) -> u32 {
         match self {
-            BlockCell::Empty(aadf) => aadf.pack(AADF_BITS_SMALL, AADF_MAX_SMALL),
-            BlockCell::UniformFull(ty) => CELL_UNIFORM_FULL | (ty.raw() as u32),
-            BlockCell::Mixed(ptr) => CELL_HAS_CHILDREN | (ptr.0 & CELL_PAYLOAD_MASK),
+            BlockCell::Empty(aadf) => {
+                CellRaw::new(cell_state::UNIFORM_EMPTY, aadf.pack(AADF_BITS_SMALL, AADF_MAX_SMALL)).0
+            }
+            BlockCell::UniformFull(ty) => CellRaw::new(cell_state::UNIFORM_FULL, ty.raw() as u32).0,
+            BlockCell::Mixed(ptr) => CellRaw::new(cell_state::CHILD, ptr.0).0,
         }
     }
 
     /// Decode a block-cell `u32` buffer word — inverse of [`encode`](Self::encode).
     pub fn decode(raw: u32) -> BlockCell {
-        if raw & CELL_HAS_CHILDREN != 0 {
-            BlockCell::Mixed(VoxelPtr(raw & CELL_PAYLOAD_MASK))
-        } else if raw & CELL_UNIFORM_FULL != 0 {
-            BlockCell::UniformFull(VoxelTypeId((raw as u16) & VOXEL_PAYLOAD_MASK))
-        } else {
-            BlockCell::Empty(Aadf6::unpack(raw, AADF_BITS_SMALL))
+        let cr = CellRaw(raw);
+        match cr.state() {
+            cell_state::CHILD => BlockCell::Mixed(VoxelPtr(cr.payload())),
+            cell_state::UNIFORM_FULL => {
+                BlockCell::UniformFull(VoxelTypeId((cr.payload() as u16) & VOXEL_PAYLOAD_MASK))
+            }
+            _ => BlockCell::Empty(Aadf6::unpack(raw, AADF_BITS_SMALL)),
         }
     }
 }

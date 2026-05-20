@@ -45,10 +45,11 @@
 
 use bevy::prelude::Resource;
 
-use crate::voxel::CELL_DIM;
+use crate::voxel::CHUNK_DIM_VOXELS as CHUNK_DIM_VOXELS_USIZE;
 
-/// Side length of a chunk in voxels (`CELL_DIM² = 16`).
-const CHUNK_DIM_VOXELS: u32 = (CELL_DIM * CELL_DIM) as u32;
+/// Side length of a chunk in voxels (`CELL_DIM² = 16`). Sourced from
+/// [`crate::voxel::CHUNK_DIM_VOXELS`] — the single Rust SSoT (SSoT-3).
+const CHUNK_DIM_VOXELS: u32 = CHUNK_DIM_VOXELS_USIZE as u32;
 
 /// Number of u32s emitted by one workgroup of `generatorModel.fx` — 64
 /// voxels per thread × 64 threads ÷ 2 voxels/u32 = 2048 u32s.

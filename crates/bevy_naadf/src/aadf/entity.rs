@@ -30,6 +30,25 @@ use crate::render::gpu_types::{
 /// `0x80000000` (`EntityData.cs:71, :84, :97, :112`).
 pub const ENTITY_VOXEL_FULL_FLAG: u32 = 0x8000_0000;
 
+/// 6-direction masks for the §3.3 neighbour-merge `addBounds` predicate
+/// (`EntityData.cs:58-63`). Each bit `b` means "the bound in direction `b`
+/// matches the neighbour's bound". The mask excludes the direction pointing
+/// back toward us. Order: `-x, +x, -y, +y, -z, +z` (same canonical iteration
+/// order as [`crate::aadf::cell::DIRS`]).
+const ENTITY_AADF_MASKS: [u32; 6] = [
+    0x3D, // -X: 0b111101 — drop the -X bit
+    0x3E, // +X: 0b111110 — drop the +X bit
+    0x37, // -Y: 0b110111 — drop the -Y bit
+    0x3B, // +Y: 0b111011 — drop the +Y bit
+    0x1F, // -Z: 0b011111 — drop the -Z bit
+    0x2F, // +Z: 0b101111 — drop the +Z bit
+];
+
+/// Bit-shifts for the 5-bit-per-axis 6-direction AADF inside an
+/// `EntityData::voxels` u32. C# `EntityData.cs:71,73,77,79,83,85` `<< 0..25`.
+/// Order matches [`ENTITY_AADF_MASKS`] (`-x, +x, -y, +y, -z, +z`).
+const ENTITY_AADF_BIT_SHIFTS: [u32; 6] = [0, 5, 10, 15, 20, 25];
+
 /// Compress a quaternion via the smallest-three encoding
 /// (port of `EntityHandler.cs:499-546` /
 /// `commonRayTracing.fxh:163-200`).
@@ -153,16 +172,6 @@ impl EntityData {
             }
         }
 
-        // The 6-bit masks (`EntityData.cs:58-63`): each bit `b` means "the
-        // bound in direction `b` matches the neighbour's bound". A neighbour
-        // contributes if every required bit is set.
-        const MASK_MX: u32 = 0x3D; // 0b111101 — drop the -X bit
-        const MASK_PX: u32 = 0x3E; // 0b111110 — drop the +X bit
-        const MASK_MY: u32 = 0x37; // 0b110111 — drop the -Y bit
-        const MASK_PY: u32 = 0x3B; // 0b111011 — drop the +Y bit
-        const MASK_MZ: u32 = 0x1F; // 0b011111 — drop the -Z bit
-        const MASK_PZ: u32 = 0x2F; // 0b101111 — drop the +Z bit
-
         let sx = size[0] as i32;
         let sy = size[1] as i32;
         let sz = size[2] as i32;
@@ -177,10 +186,24 @@ impl EntityData {
                 }
                 let mut updated = cur;
                 if x > 0 {
-                    add_bounds(&voxels, v, MASK_MX, -1, 0, &mut updated);
+                    add_bounds(
+                        &voxels,
+                        v,
+                        ENTITY_AADF_MASKS[0],
+                        -1,
+                        ENTITY_AADF_BIT_SHIFTS[0],
+                        &mut updated,
+                    );
                 }
                 if x + 1 < sx {
-                    add_bounds(&voxels, v, MASK_PX, 1, 5, &mut updated);
+                    add_bounds(
+                        &voxels,
+                        v,
+                        ENTITY_AADF_MASKS[1],
+                        1,
+                        ENTITY_AADF_BIT_SHIFTS[1],
+                        &mut updated,
+                    );
                 }
                 voxels[v] = updated;
             }
@@ -193,10 +216,24 @@ impl EntityData {
                 }
                 let mut updated = cur;
                 if y > 0 {
-                    add_bounds(&voxels, v, MASK_MY, -sx, 10, &mut updated);
+                    add_bounds(
+                        &voxels,
+                        v,
+                        ENTITY_AADF_MASKS[2],
+                        -sx,
+                        ENTITY_AADF_BIT_SHIFTS[2],
+                        &mut updated,
+                    );
                 }
                 if y + 1 < sy {
-                    add_bounds(&voxels, v, MASK_PY, sx, 15, &mut updated);
+                    add_bounds(
+                        &voxels,
+                        v,
+                        ENTITY_AADF_MASKS[3],
+                        sx,
+                        ENTITY_AADF_BIT_SHIFTS[3],
+                        &mut updated,
+                    );
                 }
                 voxels[v] = updated;
             }
@@ -209,10 +246,24 @@ impl EntityData {
                 }
                 let mut updated = cur;
                 if z > 0 {
-                    add_bounds(&voxels, v, MASK_MZ, -(sx * sy), 20, &mut updated);
+                    add_bounds(
+                        &voxels,
+                        v,
+                        ENTITY_AADF_MASKS[4],
+                        -(sx * sy),
+                        ENTITY_AADF_BIT_SHIFTS[4],
+                        &mut updated,
+                    );
                 }
                 if z + 1 < sz {
-                    add_bounds(&voxels, v, MASK_PZ, sx * sy, 25, &mut updated);
+                    add_bounds(
+                        &voxels,
+                        v,
+                        ENTITY_AADF_MASKS[5],
+                        sx * sy,
+                        ENTITY_AADF_BIT_SHIFTS[5],
+                        &mut updated,
+                    );
                 }
                 voxels[v] = updated;
             }

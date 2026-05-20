@@ -53,7 +53,8 @@
 - [ ] `04a` — D7 scout: 3-line `pub const GiSettings::DEFAULT` + `#[derive(PartialEq)]` pre-land (before D2 impl)
 - [⚠] `04` — implementor D5 — **4/8 steps landed** (escape-hatch subset: probe delete + readback extract + extract/producer extract + e2e fixtures moved to `validation.rs`). mod.rs 11 043 → 2 280 (−8 763 LOC, 79%). Net D5 Rust −1 246. All deterministic gates green; oasis-edit-visual × 4 stable. Steps 4/6/7/8 deferred for follow-up.
 - [⚠] `04` — implementor D4 — **2/6 steps landed**: SSoT scaffolding + dead `MAX_RAY_STEPS_*` deletion + sample-refine 4→1 collapse (C# fidelity restored). Net −39 LOC. ShaderType cutover bailed out per safety rule (recipe in §5). Steps 3/4/5/6 gated on Resolution D shape + D6/D7 pbr_sampling reference-drops.
-- [ ] `04` — implementor D1 (next)
+- [⚠] `04` — implementor D1 — **7/7 steps landed** (Step 8 by design = cross-domain skip). Net −172 LOC; shortfall vs architect's −400 to −500 = deliberate shim retention for `WorldData::set_voxel`/`set_voxels_batch_oracle` so D2/D5 can drop them in their phases (~390 LOC recoverable). State-bit regime A→B migration bit-pattern-identical; oasis-edit-visual ×3 stable.
+- [ ] `04` — implementor D3 (next)
 - [ ] `04` — implementor D4
 - [ ] `04` — implementor D1
 - [ ] `04` — implementor D2

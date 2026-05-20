@@ -3,6 +3,9 @@
 //! - [`data`] — the `WorldData` / `VoxelTypes` main-world resources (the three
 //!   CPU mirrors + sizes + the voxel-type palette).
 //! - [`buffer`] — the `GrowableBuffer<T>` abstraction.
+//! - [`oracle`] (crate-internal) — diagnostic-only edit oracles. Extracted
+//!   from `WorldData`'s public API by D1 (`/delegate` codebase-tightening,
+//!   Finding 1) — production code paths never call into this module.
 //!
 //! The GPU-side resources (`WorldGpu` / `FrameGpu`) and the render passes live
 //! in [`crate::render`], wired by `NaadfRenderPlugin`. `WorldPlugin` only owns
@@ -11,6 +14,7 @@
 
 pub mod buffer;
 pub mod data;
+pub(crate) mod oracle;
 
 use bevy::prelude::*;
 

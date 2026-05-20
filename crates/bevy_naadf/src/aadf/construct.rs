@@ -25,8 +25,11 @@ use crate::voxel::{
     VoxelTypeId, AADF_MAX_CHUNK, AADF_MAX_SMALL, CELL_CHILDREN, CELL_DIM,
 };
 
-/// Side of a chunk in voxels (`CELL_DIM² = 16`).
-pub const CHUNK_DIM_VOXELS: usize = CELL_DIM * CELL_DIM;
+/// Side of a chunk in voxels (`CELL_DIM² = 16`). Re-exported from
+/// [`crate::voxel::CHUNK_DIM_VOXELS`] — the single Rust SSoT for the chunk
+/// dimension (SSoT-3 / D1 Finding 6). Re-export kept so existing
+/// `use crate::aadf::construct::CHUNK_DIM_VOXELS` lines continue to resolve.
+pub use crate::voxel::CHUNK_DIM_VOXELS;
 
 /// A dense voxel volume — the input to construction. Authored by
 /// `voxel::grid` (D2). Sized in whole chunks.

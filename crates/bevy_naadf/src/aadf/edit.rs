@@ -41,7 +41,7 @@
 //! when writing these buffers.
 
 use crate::aadf::bounds::compute_aadf_layer;
-use crate::aadf::cell::{pack_voxels, unpack_voxel, BlockCell, VoxelCell};
+use crate::aadf::cell::{pack_voxels, BlockCell, VoxelCell};
 use crate::voxel::{
     AADF_MAX_SMALL, CELL_CHILDREN, CELL_DIM, VOXEL_FULL_FLAG, VOXEL_PAYLOAD_MASK,
 };
@@ -64,12 +64,10 @@ pub fn apply_chunk_edit_cpu(
     chunk_pos_packed: u32,
     new_state: u32,
 ) {
-    let cx = (chunk_pos_packed & 0x7FF) as usize;
-    let cy = ((chunk_pos_packed >> 11) & 0x3FF) as usize;
-    let cz = (chunk_pos_packed >> 21) as usize;
+    let pos = unpack_chunk_pos(chunk_pos_packed);
     let sx = size_in_chunks[0] as usize;
     let sy = size_in_chunks[1] as usize;
-    let idx = cx + cy * sx + cz * sx * sy;
+    let idx = pos[0] as usize + pos[1] as usize * sx + pos[2] as usize * sx * sy;
     // Preserve `.y` (entity pointer channel) — load-bearing W2 contract.
     let existing_y = chunks_packed[idx][1];
     chunks_packed[idx] = [new_state, existing_y];
@@ -197,6 +195,35 @@ pub struct EditBatch {
     /// `changedVoxels[]` — flat `u32[]` of `(pointer, 32 × packed_voxel_pair)`
     /// per edit. `changed_voxel_count = changed_voxels.len() / 33`.
     pub changed_voxels: Vec<u32>,
+}
+
+impl EditBatch {
+    /// Iterate edited voxel groups in the wire format
+    /// (`(pointer, &[u32; 32])` per edit — 33-u32 stride).
+    pub fn iter_voxel_edits(&self) -> impl Iterator<Item = (u32, &[u32; 32])> + '_ {
+        self.changed_voxels.chunks_exact(33).map(|c| {
+            let arr: &[u32; 32] = (&c[1..33]).try_into().unwrap();
+            (c[0], arr)
+        })
+    }
+
+    /// Iterate edited block groups in the wire format
+    /// (`(pointer, &[u32; 64])` per edit — 65-u32 stride).
+    pub fn iter_block_edits(&self) -> impl Iterator<Item = (u32, &[u32; 64])> + '_ {
+        self.changed_blocks.chunks_exact(65).map(|c| {
+            let arr: &[u32; 64] = (&c[1..65]).try_into().unwrap();
+            (c[0], arr)
+        })
+    }
+
+    /// Iterate `(chunk_pos, new_state)` pairs from `changed_chunks` with the
+    /// chunk position pre-unpacked — replaces inline-unpack loops at call
+    /// sites. `chunk_pos` is the `[x, y, z]` triple in chunk-space.
+    pub fn iter_chunks(&self) -> impl Iterator<Item = ([u32; 3], u32)> + '_ {
+        self.changed_chunks
+            .iter()
+            .map(|entry| (unpack_chunk_pos(entry[0]), entry[1]))
+    }
 }
 
 /// Packed chunk position layout: `pos.x | y<<11 | z<<21`.
@@ -337,22 +364,11 @@ pub fn process_edit_batch(
     (batch, v_cursor, b_cursor)
 }
 
-/// Helper: build an `edit_data` window (2048 u32s) from a `WorldData`-style
-/// CPU mirror, for a single edited chunk. Mirrors
-/// `WorldData.FillChunkData` (the C# helper `EditingHandler.getChunkDataToEdit`
-/// calls — pulls the chunk's 2048 voxel words back into a flat window so the
-/// edit pass can mutate them).
-///
-/// `voxels_cpu` is the CPU voxel buffer (packed two voxels per u32). The
-/// chunk's 64 blocks are at offset `chunk_index * 2048` in the buffer; each
-/// block's 32 u32s are at consecutive `32-u32` strides within the chunk.
-///
-/// Returns a fresh `Vec<u32>` of length 2048.
-///
-/// **Test-helper only.** Production editing reconstructs the chunk's voxel
-/// window by decoding `chunks_cpu[chunk_idx]` (mixed → walk blocks_cpu →
-/// walk voxels_cpu) which `WorldData::set_voxel` does in-place.
-#[allow(dead_code)]
+/// Test-helper: build a 2048-u32 chunk-edit window where every voxel is full
+/// with the given type id (`ty`). Used by the `#[cfg(test)]` fixtures only —
+/// production editing reconstructs windows via
+/// [`build_chunk_edit_window_from_world`].
+#[cfg(test)]
 pub fn build_chunk_edit_window_solid_type(ty: u16) -> Vec<u32> {
     let payload = ((ty & VOXEL_PAYLOAD_MASK) as u32) | (VOXEL_FULL_FLAG as u32);
     let packed = payload | (payload << 16);
@@ -567,11 +583,53 @@ pub fn recompute_chunk_layer_aadfs(
     changed
 }
 
-// `unpack_voxel` re-export so test code can pull it through this module.
-pub use crate::aadf::cell::unpack_voxel as cell_unpack_voxel;
-// Suppress unused-import warning under cfg(test) — re-export hookup.
-#[allow(unused_imports)]
-use unpack_voxel as _unpack_voxel;
+/// **DIAGNOSTIC-ONLY** — see [`recompute_chunk_layer_aadfs`].
+///
+/// Runs the whole-world AADF rehash and stitches the AADF-changed chunks into
+/// `batch.changed_chunks`: replaces entries already in the batch's directly-
+/// edited-chunks list with the recomputed state, then appends synthetic
+/// entries for the indirectly-affected chunks.
+///
+/// `size_in_chunks` is the world dimensions — matches the public arg of
+/// [`recompute_chunk_layer_aadfs`].
+///
+/// Collapses the ~50-LOC post-amble that previously lived inline in both
+/// `WorldData::set_voxel` and `WorldData::set_voxels_batch_oracle`
+/// (`02-exploration.md` Finding 3 — D1 DRY collapse).
+#[doc(hidden)]
+#[allow(dead_code)] // Step-5 call sites land in `world/oracle.rs`.
+pub(crate) fn merge_recomputed_aadfs_into_batch(
+    chunks_cpu: &mut [u32],
+    size_in_chunks: [u32; 3],
+    batch: &mut EditBatch,
+) {
+    let aadf_changed = recompute_chunk_layer_aadfs(chunks_cpu, size_in_chunks);
+    let sx = size_in_chunks[0];
+    let sy = size_in_chunks[1];
+    let mut already_in_batch: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(batch.changed_chunks.len());
+
+    for entry in batch.changed_chunks.iter_mut() {
+        let [cx, cy, cz] = unpack_chunk_pos(entry[0]);
+        let ci = (cx + cy * sx + cz * sx * sy) as usize;
+        if ci < chunks_cpu.len() {
+            entry[1] = chunks_cpu[ci];
+            already_in_batch.insert(ci);
+        }
+    }
+    for ci in aadf_changed {
+        if already_in_batch.contains(&ci) {
+            continue;
+        }
+        let cz = (ci / (sx as usize * sy as usize)) as u32;
+        let rem = ci % (sx as usize * sy as usize);
+        let cy = (rem / sx as usize) as u32;
+        let cx = (rem % sx as usize) as u32;
+        batch
+            .changed_chunks
+            .push([pack_chunk_pos([cx, cy, cz]), chunks_cpu[ci]]);
+    }
+}
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -721,8 +779,6 @@ mod tests {
         assert_eq!(v_cursor, 64 + 32);
         assert_eq!(b_cursor, 64 + 64);
 
-        // Avoid unused-warning on `unpack_voxel`.
-        let _ = unpack_voxel;
         // Avoid unused on `Aadf6`.
         let _ = Aadf6::ZERO;
     }

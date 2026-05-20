@@ -106,7 +106,7 @@ impl BlockHashingHandler {
         while (map_size as f32) * wanted_empty_ratio < min_reserved as f32 {
             map_size *= 2;
         }
-        let coefficients = build_polynomial_coefficients();
+        let coefficients = hash_coefficients();
         Self {
             map: vec![BlockHashEntry::default(); map_size],
             map_size,
@@ -392,7 +392,25 @@ impl Default for BlockHashingHandler {
     }
 }
 
-fn build_polynomial_coefficients() -> [u32; 65] {
+/// Compute the 65-entry hash-coefficient table used by NAADF's voxel-block
+/// hash (`BlockHashingHandler.cs:50-55` / `chunk_calc.wgsl:131-134`).
+///
+/// `c[64] = 1`; `c[i] = (c[i+1] * 31) mod 2^32` for `i = 63..0`. The hash of
+/// a 64-voxel block is:
+///
+/// ```text
+/// H = c[0] + Σᵢ c[i*2+1] * (v[i] & 0x7FFF)
+///          + c[i*2+2] * ((v[i] >> 16) & 0x7FFF)
+/// ```
+///
+/// where `v[i]` is the i-th `u32` of the 32-element packed-voxel block.
+///
+/// **Single Rust SSoT** (was previously implemented twice — see
+/// `docs/orchestrate/codebase-tightening/00-reuse-audit.md §3.1 SSoT-6` and
+/// the D1 architect's Finding 8). D5's `render/construction/hashing.rs`
+/// re-exports this function so the existing 9 import sites in
+/// `render/construction/mod.rs` continue to resolve unchanged.
+pub fn hash_coefficients() -> [u32; 65] {
     let mut c = [0u32; 65];
     c[64] = 1;
     let mut i = 64;

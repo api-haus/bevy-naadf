@@ -37,6 +37,68 @@ use bevy::prelude::*;
 
 use crate::voxel::{VoxelType, VoxelTypeId, CELL_DIM};
 
+/// A single-voxel edit — the typed alternative to the anonymous
+/// `(IVec3, VoxelTypeId)` tuple that the brush + diagnostic APIs accept.
+///
+/// One of these per voxel a brush touches.  D2's `editor/tools.rs` brushes
+/// construct these values and pass them via [`WorldData::set_voxels_batch`].
+///
+/// The signature of [`WorldData::set_voxels_batch`] continues to accept the
+/// tuple form for source-compat through D1's slot of the orchestration; D2
+/// migrates its call sites to construct `VoxelEdit` literals when it lands
+/// (and the signature flips at that point — `UA-1` close-out). The
+/// `From`/`Into` impls below let callers transparently mix forms during the
+/// transition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VoxelEdit {
+    /// World-space voxel position. Negative components are silently dropped
+    /// by [`WorldData::set_voxels_batch`].
+    pub pos: IVec3,
+    /// Target voxel type. [`VoxelTypeId::EMPTY`] clears the voxel.
+    pub ty: VoxelTypeId,
+}
+
+impl From<(IVec3, VoxelTypeId)> for VoxelEdit {
+    fn from((pos, ty): (IVec3, VoxelTypeId)) -> Self {
+        Self { pos, ty }
+    }
+}
+
+impl From<VoxelEdit> for (IVec3, VoxelTypeId) {
+    fn from(e: VoxelEdit) -> Self {
+        (e.pos, e.ty)
+    }
+}
+
+/// A whole-chunk uniform-state edit — the typed alternative to the anonymous
+/// `([u32; 3], Option<VoxelTypeId>)` tuple [`WorldData::set_chunks_uniform_batch`]
+/// accepts. Used by the brush inside-chunk fast path.
+///
+/// As with [`VoxelEdit`], the existing tuple signature is preserved through
+/// D1's slot; D2 adopts the named form when its brushes refactor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkUniformEdit {
+    /// Chunk position in chunk-space.
+    pub pos: UVec3,
+    /// `Some(ty)` for `UniformFull(ty)`; `None` (or `Some(EMPTY)`) for Empty.
+    pub ty: Option<VoxelTypeId>,
+}
+
+impl From<([u32; 3], Option<VoxelTypeId>)> for ChunkUniformEdit {
+    fn from((p, ty): ([u32; 3], Option<VoxelTypeId>)) -> Self {
+        Self {
+            pos: UVec3::new(p[0], p[1], p[2]),
+            ty,
+        }
+    }
+}
+
+impl From<ChunkUniformEdit> for ([u32; 3], Option<VoxelTypeId>) {
+    fn from(e: ChunkUniformEdit) -> Self {
+        ([e.pos.x, e.pos.y, e.pos.z], e.ty)
+    }
+}
+
 /// An inclusive integer AABB in voxel coordinates — the world's geometry
 /// bounding box (`03-design.md` §4.4 `bounding_box: IAabb3`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -233,168 +295,7 @@ impl WorldData {
     /// positions are silently ignored.
     #[doc(hidden)]
     pub fn set_voxel(&mut self, pos: IVec3, ty: VoxelTypeId) {
-        if pos.x < 0 || pos.y < 0 || pos.z < 0 {
-            return;
-        }
-        let p = [pos.x as u32, pos.y as u32, pos.z as u32];
-        let sx = self.size_in_chunks.x * CELL_DIM as u32 * CELL_DIM as u32;
-        let sy = self.size_in_chunks.y * CELL_DIM as u32 * CELL_DIM as u32;
-        let sz = self.size_in_chunks.z * CELL_DIM as u32 * CELL_DIM as u32;
-        if p[0] >= sx || p[1] >= sy || p[2] >= sz {
-            return;
-        }
-        // Identify the chunk + intra-chunk voxel position.
-        let chunk_size_voxels = (CELL_DIM * CELL_DIM) as u32; // 16
-        let chunk = [
-            p[0] / chunk_size_voxels,
-            p[1] / chunk_size_voxels,
-            p[2] / chunk_size_voxels,
-        ];
-        let voxel_in_chunk = [
-            p[0] % chunk_size_voxels,
-            p[1] % chunk_size_voxels,
-            p[2] % chunk_size_voxels,
-        ];
-        let chunk_idx = (chunk[0]
-            + chunk[1] * self.size_in_chunks.x
-            + chunk[2] * self.size_in_chunks.x * self.size_in_chunks.y)
-            as usize;
-        if chunk_idx >= self.chunks_cpu.len() {
-            return;
-        }
-        // Decode the existing chunk's voxels into an edit window, set the
-        // voxel, re-encode through `process_edit_batch`.
-        let mut window = crate::aadf::edit::build_chunk_edit_window_from_world(
-            &self.chunks_cpu,
-            &self.blocks_cpu,
-            &self.voxels_cpu,
-            chunk_idx,
-        );
-        crate::aadf::edit::set_voxel_in_window(&mut window, voxel_in_chunk, ty.raw());
-        // Run the edit batch with cursors starting at the end of the existing
-        // buffers (we never reuse existing slots — the simplified port appends
-        // fresh).
-        let v_cursor = self.voxels_cpu.len() as u32;
-        let b_cursor = self.blocks_cpu.len() as u32;
-        let (batch, _new_v, _new_b) = crate::aadf::edit::process_edit_batch(
-            &window,
-            &[(chunk, 0)],
-            v_cursor,
-            b_cursor,
-        );
-        // Apply to CPU buffers: every mixed block in the batch has appended
-        // its voxels at the input voxel_cursor; every mixed chunk has its
-        // blocks appended at the input block_cursor. Replicate that on
-        // `voxels_cpu` / `blocks_cpu` so the CPU mirror stays consistent.
-        //
-        // Note this *does NOT* free old voxel/block slots — see method-level
-        // limitations. The CPU mirror grows without bound across many edits;
-        // acceptable at test-grid scale.
-        // Append voxels (33-u32-per-edit format: skip the pointer at index 0,
-        // 32, 64, ...).
-        let mut v_iter = batch.changed_voxels.chunks_exact(33);
-        while let Some(chunk_vox) = v_iter.next() {
-            // chunk_vox[0] is the pointer; chunk_vox[1..33] is the 32 packed
-            // u32s.
-            for &v in &chunk_vox[1..33] {
-                self.voxels_cpu.push(v);
-            }
-        }
-        // Append blocks (65-u32-per-edit).
-        let mut b_iter = batch.changed_blocks.chunks_exact(65);
-        while let Some(chunk_blk) = b_iter.next() {
-            for &b in &chunk_blk[1..65] {
-                // Apply the simplified `apply_block_change` AADF computation —
-                // re-encode each empty block with the local 4³ AADF (W6 oracle).
-                self.blocks_cpu.push(b);
-            }
-        }
-        // Re-encode the empty blocks' AADFs in the just-appended slice via the
-        // `apply_block_edit_cpu` oracle. (Mirrors the GPU `apply_block_change`
-        // recompute step.)
-        for (idx, edit_block) in batch.changed_blocks.chunks_exact(65).enumerate() {
-            let ptr_unused = edit_block[0]; // pointer not used here — see below
-            let _ = ptr_unused;
-            // The pointer we wrote into `blocks_cpu` is `b_cursor + idx * 64`.
-            let block_ptr = b_cursor + (idx as u32) * 64;
-            // Build the raw 64-block array for the AADF recompute.
-            let mut raw = [0u32; 64];
-            raw[..64].copy_from_slice(&edit_block[1..65]);
-            crate::aadf::edit::apply_block_edit_cpu(&mut self.blocks_cpu, block_ptr, &raw);
-        }
-        // Update the chunks CPU buffer entry for this chunk.
-        let mut batch = batch;
-        for entry in &batch.changed_chunks {
-            let pos_packed = entry[0];
-            let new_state = entry[1];
-            let cx = (pos_packed & 0x7FF) as u32;
-            let cy = ((pos_packed >> 11) & 0x3FF) as u32;
-            let cz = (pos_packed >> 21) as u32;
-            let ci = (cx
-                + cy * self.size_in_chunks.x
-                + cz * self.size_in_chunks.x * self.size_in_chunks.y) as usize;
-            if ci < self.chunks_cpu.len() {
-                self.chunks_cpu[ci] = new_state;
-            }
-        }
-        // NOTE (`02e-perframe-cpu-investigation.md`, 2026-05-16): do NOT set
-        // `self.dirty = true` here. Per-edit changes flow through the W2 delta
-        // chain (`pending_edits.batches.changed_chunks/blocks/voxels` →
-        // `naadf_world_change_node` GPU dispatch); the full-world re-extract +
-        // re-upload that `dirty` triggers is redundant + wasteful on every
-        // edit frame. Only initial-load + size-change events should flip the
-        // flag (see `voxel/grid.rs:115`, `voxel/vox_import.rs:213`).
-
-        // Bug 4 fix — mirror of `set_voxels_batch` recompute path. See the
-        // comment block there for the rationale and for the doc-link to
-        // `03b-followup-editor-bugs-234.md`. The per-voxel `set_voxel`
-        // path also needs the chunk-layer AADF recompute so single-voxel
-        // edits don't leave stale AADFs (Bug 4 affects both paths
-        // identically; the per-voxel path is just slower per edit).
-        let size_arr = [
-            self.size_in_chunks.x,
-            self.size_in_chunks.y,
-            self.size_in_chunks.z,
-        ];
-        let aadf_changed =
-            crate::aadf::edit::recompute_chunk_layer_aadfs(&mut self.chunks_cpu, size_arr);
-        let mut already_in_batch: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        for entry in batch.changed_chunks.iter_mut() {
-            let pos_packed = entry[0];
-            let cx = (pos_packed & 0x7FF) as u32;
-            let cy = ((pos_packed >> 11) & 0x3FF) as u32;
-            let cz = (pos_packed >> 21) as u32;
-            let ci = (cx
-                + cy * self.size_in_chunks.x
-                + cz * self.size_in_chunks.x * self.size_in_chunks.y)
-                as usize;
-            if ci < self.chunks_cpu.len() {
-                entry[1] = self.chunks_cpu[ci];
-                already_in_batch.insert(ci);
-            }
-        }
-        let sx = self.size_in_chunks.x;
-        let sy = self.size_in_chunks.y;
-        for ci in aadf_changed {
-            if already_in_batch.contains(&ci) {
-                continue;
-            }
-            let cz = (ci / (sx as usize * sy as usize)) as u32;
-            let rem = ci % (sx as usize * sy as usize);
-            let cy = (rem / sx as usize) as u32;
-            let cx = (rem % sx as usize) as u32;
-            let pos_packed = crate::aadf::edit::pack_chunk_pos([cx, cy, cz]);
-            batch.changed_chunks.push([pos_packed, self.chunks_cpu[ci]]);
-        }
-
-        // Stash the edit batch on the resource so the extract pass picks it up.
-        self.pending_edits.batches.push(batch);
-        self.pending_edits.edited_groups.push([
-            chunk[0] / CELL_DIM as u32,
-            chunk[1] / CELL_DIM as u32,
-            chunk[2] / CELL_DIM as u32,
-        ]);
+        crate::world::oracle::set_voxel(self, pos, ty);
     }
 }
 
@@ -1179,166 +1080,7 @@ impl WorldData {
     /// ~75 ms per call. Never on the runtime hot path.
     #[doc(hidden)]
     pub fn set_voxels_batch_oracle(&mut self, edits: &[(IVec3, VoxelTypeId)]) {
-        if edits.is_empty() {
-            return;
-        }
-        let chunk_size_voxels = (CELL_DIM * CELL_DIM) as u32; // 16
-        let sx_v = self.size_in_chunks.x * chunk_size_voxels;
-        let sy_v = self.size_in_chunks.y * chunk_size_voxels;
-        let sz_v = self.size_in_chunks.z * chunk_size_voxels;
-        if sx_v == 0 || sy_v == 0 || sz_v == 0 {
-            return;
-        }
-
-        let mut by_chunk: std::collections::HashMap<[u32; 3], Vec<([u32; 3], u16)>> =
-            std::collections::HashMap::new();
-        for &(pos, ty) in edits {
-            if pos.x < 0 || pos.y < 0 || pos.z < 0 {
-                continue;
-            }
-            let p = [pos.x as u32, pos.y as u32, pos.z as u32];
-            if p[0] >= sx_v || p[1] >= sy_v || p[2] >= sz_v {
-                continue;
-            }
-            let chunk = [
-                p[0] / chunk_size_voxels,
-                p[1] / chunk_size_voxels,
-                p[2] / chunk_size_voxels,
-            ];
-            let voxel_in_chunk = [
-                p[0] % chunk_size_voxels,
-                p[1] % chunk_size_voxels,
-                p[2] % chunk_size_voxels,
-            ];
-            by_chunk
-                .entry(chunk)
-                .or_default()
-                .push((voxel_in_chunk, ty.raw()));
-        }
-        if by_chunk.is_empty() {
-            return;
-        }
-
-        let chunk_count = by_chunk.len();
-        let mut edit_data: Vec<u32> = vec![0; chunk_count * 2048];
-        let mut edited_chunks: Vec<([u32; 3], u32)> = Vec::with_capacity(chunk_count);
-
-        for (i, (chunk_pos, per_chunk_edits)) in by_chunk.into_iter().enumerate() {
-            let chunk_idx = (chunk_pos[0]
-                + chunk_pos[1] * self.size_in_chunks.x
-                + chunk_pos[2] * self.size_in_chunks.x * self.size_in_chunks.y)
-                as usize;
-            if chunk_idx >= self.chunks_cpu.len() {
-                continue;
-            }
-            let edit_offset = (i * 2048) as u32;
-            edited_chunks.push((chunk_pos, edit_offset));
-            let window_slice = &mut edit_data[i * 2048..(i + 1) * 2048];
-            let decoded = crate::aadf::edit::build_chunk_edit_window_from_world(
-                &self.chunks_cpu,
-                &self.blocks_cpu,
-                &self.voxels_cpu,
-                chunk_idx,
-            );
-            window_slice.copy_from_slice(&decoded);
-            for (voxel_in_chunk, ty) in per_chunk_edits {
-                crate::aadf::edit::set_voxel_in_window(window_slice, voxel_in_chunk, ty);
-            }
-        }
-        if edited_chunks.is_empty() {
-            return;
-        }
-
-        let v_cursor = self.voxels_cpu.len() as u32;
-        let b_cursor = self.blocks_cpu.len() as u32;
-        let (mut batch, _new_v, _new_b) = crate::aadf::edit::process_edit_batch(
-            &edit_data,
-            &edited_chunks,
-            v_cursor,
-            b_cursor,
-        );
-
-        let mut v_iter = batch.changed_voxels.chunks_exact(33);
-        while let Some(chunk_vox) = v_iter.next() {
-            for &v in &chunk_vox[1..33] {
-                self.voxels_cpu.push(v);
-            }
-        }
-        for (idx, edit_block) in batch.changed_blocks.chunks_exact(65).enumerate() {
-            let block_ptr = b_cursor + (idx as u32) * 64;
-            let target_len = (block_ptr + 64) as usize;
-            if self.blocks_cpu.len() < target_len {
-                self.blocks_cpu.resize(target_len, 0);
-            }
-            let mut raw = [0u32; 64];
-            raw[..64].copy_from_slice(&edit_block[1..65]);
-            crate::aadf::edit::apply_block_edit_cpu(&mut self.blocks_cpu, block_ptr, &raw);
-        }
-        for entry in &batch.changed_chunks {
-            let pos_packed = entry[0];
-            let new_state = entry[1];
-            let cx = pos_packed & 0x7FF;
-            let cy = (pos_packed >> 11) & 0x3FF;
-            let cz = pos_packed >> 21;
-            let ci = (cx
-                + cy * self.size_in_chunks.x
-                + cz * self.size_in_chunks.x * self.size_in_chunks.y) as usize;
-            if ci < self.chunks_cpu.len() {
-                self.chunks_cpu[ci] = new_state;
-            }
-        }
-        // NOTE (`02e-perframe-cpu-investigation.md`, 2026-05-16): do NOT set
-        // `self.dirty = true` here. Oracle path's synthetic batch flows
-        // through the W2 delta chain (same path as the runtime
-        // `set_voxels_batch`); the full-world re-extract is redundant.
-
-        // Whole-world AADF recompute + synthetic chunk uploads — the oracle's
-        // bit-exact invariant (pre-`02c` `set_voxels_batch` body).
-        let size_arr = [
-            self.size_in_chunks.x,
-            self.size_in_chunks.y,
-            self.size_in_chunks.z,
-        ];
-        let aadf_changed =
-            crate::aadf::edit::recompute_chunk_layer_aadfs(&mut self.chunks_cpu, size_arr);
-        let mut already_in_batch: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        for entry in batch.changed_chunks.iter_mut() {
-            let pos_packed = entry[0];
-            let cx = pos_packed & 0x7FF;
-            let cy = (pos_packed >> 11) & 0x3FF;
-            let cz = pos_packed >> 21;
-            let ci = (cx
-                + cy * self.size_in_chunks.x
-                + cz * self.size_in_chunks.x * self.size_in_chunks.y)
-                as usize;
-            if ci < self.chunks_cpu.len() {
-                entry[1] = self.chunks_cpu[ci];
-                already_in_batch.insert(ci);
-            }
-        }
-        let sx = self.size_in_chunks.x;
-        let sy = self.size_in_chunks.y;
-        for ci in aadf_changed {
-            if already_in_batch.contains(&ci) {
-                continue;
-            }
-            let cz = (ci / (sx as usize * sy as usize)) as u32;
-            let rem = ci % (sx as usize * sy as usize);
-            let cy = (rem / sx as usize) as u32;
-            let cx = (rem % sx as usize) as u32;
-            let pos_packed = crate::aadf::edit::pack_chunk_pos([cx, cy, cz]);
-            batch.changed_chunks.push([pos_packed, self.chunks_cpu[ci]]);
-        }
-
-        for &(chunk_pos, _) in &edited_chunks {
-            self.pending_edits.edited_groups.push([
-                chunk_pos[0] / CELL_DIM as u32,
-                chunk_pos[1] / CELL_DIM as u32,
-                chunk_pos[2] / CELL_DIM as u32,
-            ]);
-        }
-        self.pending_edits.batches.push(batch);
+        crate::world::oracle::set_voxels_batch_oracle(self, edits);
     }
 }
 
