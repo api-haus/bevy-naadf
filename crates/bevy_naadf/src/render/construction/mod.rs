@@ -522,6 +522,16 @@ pub struct ConstructionPipelines {
     /// per-chunk AADF expander; dispatched indirect off
     /// `bound_dispatch_indirect`).
     pub bounds_calc_pipeline_compute: CachedComputePipelineId,
+    /// 2026-05-20 probe-2 — `bounds_calc.wgsl::end_of_encoder_noop` (M1
+    /// confirmation probe per `07-diagnosis-round2.md` §I item 1). Dispatched
+    /// (wasm only) at the end of each regime-2 round's encoder, after
+    /// `compute_group_bounds` and before `render_queue.submit(...)`, to force
+    /// Dawn's per-encoder PassResourceUsageTracker to emit a Vulkan
+    /// `vkCmdPipelineBarrier(SHADER_WRITE → SHADER_READ)` between compute's
+    /// `atomicAdd` writes to `bound_queue_sizes` and the no-op's `atomicLoad`.
+    /// If M1 is confirmed by the probe, this pipeline is replaced by a real
+    /// fix; if not, it is removed.
+    pub bounds_calc_pipeline_end_of_encoder_noop: CachedComputePipelineId,
 
     // === W4 (Entity track) ====================================================
     /// W4 — `entity_world_layout` `@group(0)` (chunks_rw `Rg32Uint` + params).
@@ -625,6 +635,17 @@ impl FromWorld for ConstructionPipelines {
             construction_bounds_world_layout.clone(),
             construction_bounds_layout.clone(),
         );
+        // 2026-05-20 probe-2 — `end_of_encoder_noop` pipeline (M1 probe).
+        // Always queued so the pipeline cache resolves on both targets, but
+        // only ever dispatched from the wasm-only branch in
+        // `naadf_bounds_compute_node`.
+        let bounds_calc_pipeline_end_of_encoder_noop =
+            bounds_calc::queue_end_of_encoder_noop_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_bounds_world_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
 
         // === W4 — entity_update pipelines + layouts ==========================
         let entity_world_layout = entity_update::entity_world_layout_descriptor();
@@ -705,6 +726,7 @@ impl FromWorld for ConstructionPipelines {
             bounds_calc_pipeline_add_initial,
             bounds_calc_pipeline_prepare,
             bounds_calc_pipeline_compute,
+            bounds_calc_pipeline_end_of_encoder_noop,
             entity_world_layout,
             construction_entity_layout,
             entity_update_pipeline_update_chunks,

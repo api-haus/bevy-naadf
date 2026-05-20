@@ -274,6 +274,47 @@ pub fn queue_compute_pipeline_with_handle(
     })
 }
 
+/// 2026-05-20 probe-2 — `end_of_encoder_noop` pipeline (M1 confirmation probe
+/// per `07-diagnosis-round2.md` §I item 1). Uses the same 2-layout list as
+/// `compute_group_bounds` (`world_layout + bounds_layout`); only `@group(1)`'s
+/// `bound_queue_sizes` is actually accessed by the entry-point body, but
+/// keeping the world group in the layout matches the compute pipeline's shape
+/// so the existing `bounds_world_bg` can be bound without ceremony.
+///
+/// Only dispatched from the wasm-only per-round encoder branch in
+/// `naadf_bounds_compute_node` (the native path never references this
+/// pipeline). The compile cost is cheap (1-line entry point) and the WGSL is
+/// always declared — only the dispatch is cfg-gated.
+pub fn queue_end_of_encoder_noop_pipeline(
+    asset_server: &AssetServer,
+    pipeline_cache: &PipelineCache,
+    world_layout: BindGroupLayoutDescriptor,
+    bounds_layout: BindGroupLayoutDescriptor,
+) -> CachedComputePipelineId {
+    let shader = asset_server.load(BOUNDS_CALC_SHADER);
+    queue_end_of_encoder_noop_pipeline_with_handle(
+        pipeline_cache,
+        world_layout,
+        bounds_layout,
+        shader,
+    )
+}
+
+pub fn queue_end_of_encoder_noop_pipeline_with_handle(
+    pipeline_cache: &PipelineCache,
+    world_layout: BindGroupLayoutDescriptor,
+    bounds_layout: BindGroupLayoutDescriptor,
+    shader: Handle<Shader>,
+) -> CachedComputePipelineId {
+    pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("naadf_bounds_calc_end_of_encoder_noop_pipeline".into()),
+        layout: vec![world_layout, bounds_layout],
+        shader,
+        entry_point: Some(Cow::from("end_of_encoder_noop")),
+        ..default()
+    })
+}
+
 // ─── Dispatch helpers ─────────────────────────────────────────────────────────
 
 /// Dispatch `add_initial_groups_to_bound_queue` for `bound_group_count`
@@ -460,6 +501,19 @@ pub fn naadf_bounds_compute_node(
         return;
     };
 
+    // 2026-05-20 probe-2 — resolve the end-of-encoder no-op pipeline (wasm
+    // only). If the wasm-build hasn't yet resolved it, skip the node entirely
+    // (rather than dispatching prepare+compute without the probe — that would
+    // muddle the probe's signal).
+    #[cfg(target_arch = "wasm32")]
+    let Some(end_of_encoder_noop_pipeline) =
+        pipeline_cache.get_compute_pipeline(
+            construction_pipelines.bounds_calc_pipeline_end_of_encoder_noop,
+        )
+    else {
+        return;
+    };
+
     let n_rounds = construction_config.n_bounds_rounds.max(1);
 
     // 2026-05-19 horizon-parity AADF — on wasm, submit each {prepare,
@@ -514,6 +568,34 @@ pub fn naadf_bounds_compute_node(
                     1,
                     1,
                 );
+            }
+            // 2026-05-20 probe-2 — end-of-encoder no-op dispatch (M1
+            // confirmation probe). Runs as a third compute pass inside the
+            // SAME `round_encoder`, AFTER `compute_group_bounds`'s writes
+            // to `bound_queue_sizes` via `atomicAdd` and BEFORE the encoder
+            // is finished + submitted below. The no-op binds `@group(1)`
+            // and atomicLoad/atomicStore-s `bound_queue_sizes[0]` — that
+            // makes it a "next user" of `bound_queue_sizes` to Dawn's
+            // per-encoder PassResourceUsageTracker, which is expected to
+            // insert a `vkCmdPipelineBarrier(SHADER_WRITE → SHADER_READ)`
+            // between the compute pass and this no-op. That barrier is
+            // an availability operation on `bound_queue_sizes`, which (per
+            // `07-diagnosis-round2.md` Mechanism 1) should make compute's
+            // last-writer-in-encoder atomicAdd writes propagate across
+            // the subsequent `queue.submit(...)` boundary to the next
+            // round's `prepare_group_bounds`. See WGSL `end_of_encoder_noop`
+            // body for the load+store-self-irreducible no-op shape.
+            {
+                let mut pass = round_encoder.begin_compute_pass(
+                    &bevy::render::render_resource::ComputePassDescriptor {
+                        label: Some("naadf_bounds_calc_end_of_encoder_noop_pass_wasm"),
+                        timestamp_writes: None,
+                    },
+                );
+                pass.set_pipeline(end_of_encoder_noop_pipeline);
+                pass.set_bind_group(0, bounds_world_bg, &[]);
+                pass.set_bind_group(1, bounds_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
             }
             // Submit this round in its own command buffer so the GPU
             // fences the atomic writes to `bound_queue_sizes[]`

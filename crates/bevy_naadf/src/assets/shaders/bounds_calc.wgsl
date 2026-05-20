@@ -407,6 +407,43 @@ fn prepare_group_bounds() {
     }
 }
 
+// ─── Entry point: end_of_encoder_noop — probe-2 (2026-05-20) ─────────────────
+//
+// M1-confirmation probe per `07-diagnosis-round2.md` Section I item 1. Dispatched
+// (on wasm only — native never references this entry point) AT END OF each
+// regime-2 round's encoder, AFTER `compute_group_bounds` writes
+// `bound_queue_sizes` via `atomicAdd` and BEFORE `render_queue.submit(...)`.
+// The body atomicLoads then atomicStores `bound_queue_sizes[0]` — semantically
+// a no-op that re-writes the slot to its current value, but irreducible (the
+// store consumes the load's result, so the compiler cannot elide either).
+//
+// Purpose: register the no-op as the NEXT USER of `bound_queue_sizes` to
+// Dawn's per-encoder PassResourceUsageTracker. Per Section D.1 of the
+// diagnosis, Dawn inserts a `vkCmdPipelineBarrier(SHADER_WRITE → SHADER_READ)`
+// at the start of each dispatch based on the resource usage of the prior
+// dispatch's writes. Putting this no-op INSIDE the same encoder as the
+// compute pass forces Dawn to barrier compute's writes BEFORE this dispatch.
+// That barrier IS an availability operation in the Vulkan-ish sense — once
+// compute's writes are made available (flushed to L2 / global memory) by the
+// barrier, the writes become visible across the subsequent
+// `queue.submit(...)` boundary to the next round's `prepare_group_bounds`.
+//
+// If M1 is correct → web SSIM jumps to ≥ 0.91 and the `[probe1-call]` pattern
+// shifts to native's "visit every (size, axis) once with found_size=32768"
+// shape. If M1 is wrong → web pattern stays byte-identical to the pre-probe-2
+// baseline (linear drain of size0_ax0 across 8 calls).
+//
+// Bindings used: only `bound_queue_sizes` (`@group(1) @binding(4)`). The
+// pipeline Rust-side uses the same 2-layout list as `compute_group_bounds`
+// (`world_layout + bounds_layout`); the world group is bound to keep the
+// pipeline-layout shape symmetric with the compute pipeline but is not read
+// by this entry point's body.
+@compute @workgroup_size(1, 1, 1)
+fn end_of_encoder_noop() {
+    let v = atomicLoad(&bound_queue_sizes[0u]);
+    atomicStore(&bound_queue_sizes[0u], v);
+}
+
 // ─── Entry point 3: compute_group_bounds — fx:118-193 ─────────────────────────
 
 @compute @workgroup_size(4, 4, 4)
