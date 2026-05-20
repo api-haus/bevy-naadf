@@ -4025,6 +4025,541 @@ pub fn aadf_per_call_probe(
     }
 }
 
+// ─── 2026-05-20 CPU-vs-GPU chunks parity diagnostic ───────────────────────────
+//
+// Question this answers: "On wasm32/WebGPU, does the CPU-side AADF oracle
+// produce bit-identical chunks to the GPU build?" (Brief
+// `10-cpu-gpu-parity-diagnostic.md`.)
+//
+// Diagnostic flow:
+//   1. Wait for `cpu_mirror_populated` + `PARITY_TRIGGER_FRAMES` extra frames so
+//      regime-2 has had time to converge.
+//   2. Issue a fresh `copy_buffer_to_buffer` of `world_gpu.chunks_buffer` into a
+//      MAP_READ staging buffer + `map_async`. Uses the same proven-on-web
+//      `map_async + AtomicBool` pattern as `aadf_per_call_probe` (which DOES
+//      fire on web, vs `aadf_delayed_probe` which has been observed not to fire
+//      within Playwright's settle window).
+//   3. After callback: decode chunks bytes (`array<vec2<u32>>`, stride 8 B,
+//      lower word = `cur_chunk` = chunk AADF carrier for Empty chunks).
+//      Build `chunk_is_empty_at(c)` closure from the GPU's classification
+//      (state bits 30-31 == 00 == Empty). Run `compute_aadf_layer` to produce
+//      the CPU-oracle AADFs over the SAME chunk-emptiness pattern the GPU
+//      sees. Then for every Empty chunk compare oracle Aadf6 vs GPU Aadf6.
+//   4. Emit `[cpu-gpu-parity]` sentinel line + first 10 differing chunk_idx
+//      with their CPU vs GPU values. Prefix with `[aadf-probe2]` so Playwright's
+//      `wgpuDiagnosticLines` filter forwards the line to test stdout.
+//   5. Native: also dump the CPU oracle chunks AND the GPU chunks buffer to
+//      disk for offline inspection.
+//
+// NO FIX ATTEMPTS — pure observation. Disabled fields/structures elsewhere are
+// untouched.
+
+#[derive(Resource, Default)]
+pub struct AadfCpuGpuParity {
+    /// Frames elapsed since `cpu_mirror_populated` flipped to true.
+    pub frames_since_mirror: u32,
+    /// Per-shot readback state machine.
+    pub stage: CpuGpuParityStage,
+    /// Staging buffer for `chunks_buffer` (16 MiB at production scale).
+    pub chunks_staging: Option<Buffer>,
+    /// `AtomicBool` set by the `chunks` `map_async` callback.
+    pub chunks_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Frames spent in `ReadbackPending` waiting on the callback.
+    pub stall_frames: u32,
+    /// World extent at readback time (resolved from `WorldGpu::chunks_size_in_chunks`).
+    pub chunks_extent: [u32; 3],
+}
+
+/// 2026-05-20 CPU-vs-GPU parity diagnostic — state machine stages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CpuGpuParityStage {
+    /// Initial — waiting for trigger
+    /// (`cpu_mirror_populated && frames_since_mirror >= PARITY_TRIGGER_FRAMES`).
+    #[default]
+    Idle,
+    /// Readback issued; waiting on `chunks_done`.
+    ReadbackPending,
+    /// Decoded + emitted + dumped. Stays here for the rest of the run.
+    Done,
+}
+
+/// 2026-05-20 — Wait this many frames AFTER `cpu_mirror_populated` before
+/// issuing the parity readback. Picked at 60 frames (~1 s @ 60 fps) — twice
+/// `PROBE_TRIGGER_FRAMES` (the per-call probe1-B trigger). On native the
+/// regime-2 loop converges in ~93 substantive prepare calls before frame 30
+/// (per probe-1B native log); 60 frames gives ample headroom on both targets.
+/// On web with the broken algorithm the snapshot captures whatever state has
+/// settled by then.
+pub const PARITY_TRIGGER_FRAMES: u32 = 60;
+
+/// 2026-05-20 CPU-vs-GPU chunks parity diagnostic. Single-shot per run.
+///
+/// Registered in `ExtractSchedule` next to `aadf_per_call_probe`. Reads back
+/// `world_gpu.chunks_buffer` via `map_async` and compares against a CPU oracle
+/// produced by `compute_aadf_layer` over the same chunk-emptiness pattern. The
+/// `[aadf-probe2]` prefix piggybacks on the existing Playwright spec filter
+/// (`e2e/tests/vox-horizon-parity.spec.ts:225-237`) so the line reaches
+/// Playwright's stdout pipe.
+pub fn aadf_cpu_gpu_parity(
+    mut probe: ResMut<AadfCpuGpuParity>,
+    gpu: Option<Res<ConstructionGpu>>,
+    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+) {
+    use bevy::render::render_resource::{MapMode, PollType};
+    use std::sync::atomic::Ordering;
+
+    let Some(gpu) = gpu else { return; };
+    if matches!(probe.stage, CpuGpuParityStage::Done) { return; }
+    if !gpu.cpu_mirror_populated { return; }
+    probe.frames_since_mirror = probe.frames_since_mirror.saturating_add(1);
+
+    // Drive `map_async` callbacks on native; no-op on web (JS event loop drives
+    // them).
+    let _ = render_device.poll(PollType::Poll);
+
+    match probe.stage {
+        CpuGpuParityStage::Done => {}
+        CpuGpuParityStage::Idle => {
+            if probe.frames_since_mirror < PARITY_TRIGGER_FRAMES { return; }
+            let Some(world_gpu) = world_gpu.as_deref() else { return; };
+            let extent = world_gpu.chunks_size_in_chunks;
+            probe.chunks_extent = [extent.x, extent.y, extent.z];
+            let chunk_count = (extent.x as u64) * (extent.y as u64) * (extent.z as u64);
+            // `array<vec2<u32>>` stride 8 B.
+            let chunks_size = chunk_count * 8;
+            let staging = render_device.create_buffer(&BufferDescriptor {
+                label: Some("aadf_cpu_gpu_parity_chunks_staging"),
+                size: chunks_size,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = render_device.create_command_encoder(
+                &CommandEncoderDescriptor { label: Some("aadf_cpu_gpu_parity_enc") },
+            );
+            enc.copy_buffer_to_buffer(&world_gpu.chunks_buffer, 0, &staging, 0, chunks_size);
+            render_queue.submit([enc.finish()]);
+            probe.chunks_done.store(false, Ordering::Release);
+            let done_for_cb = probe.chunks_done.clone();
+            staging.slice(..).map_async(MapMode::Read, move |r| {
+                if r.is_err() {
+                    bevy::log::error!(
+                        "[aadf-probe2] [cpu-gpu-parity] chunks map_async callback received Err"
+                    );
+                }
+                done_for_cb.store(true, Ordering::Release);
+            });
+            probe.chunks_staging = Some(staging);
+            probe.stage = CpuGpuParityStage::ReadbackPending;
+            probe.stall_frames = 0;
+            bevy::log::info!(
+                "[aadf-probe2] [cpu-gpu-parity-meta] readback ISSUED at \
+                 frames_since_mirror={} (chunks_size={} B, extent={}x{}x{})",
+                probe.frames_since_mirror, chunks_size, extent.x, extent.y, extent.z,
+            );
+        }
+        CpuGpuParityStage::ReadbackPending => {
+            if !probe.chunks_done.load(Ordering::Acquire) {
+                probe.stall_frames += 1;
+                if probe.stall_frames >= READBACK_STALL_BUDGET_FRAMES {
+                    bevy::log::error!(
+                        "[aadf-probe2] [cpu-gpu-parity-meta] STALLED at ReadbackPending \
+                         after {} frames — map_async callback never fired. Forcing advance to Done.",
+                        READBACK_STALL_BUDGET_FRAMES,
+                    );
+                    probe.stage = CpuGpuParityStage::Done;
+                    probe.chunks_staging = None;
+                }
+                return;
+            }
+            // Mapped — decode + compute oracle + compare.
+            let Some(staging) = probe.chunks_staging.take() else {
+                probe.stage = CpuGpuParityStage::Done;
+                return;
+            };
+            let bytes: Vec<u8> = staging.slice(..).get_mapped_range().to_vec();
+            staging.unmap();
+
+            let extent = probe.chunks_extent;
+            let cx = extent[0] as usize;
+            let cy = extent[1] as usize;
+            let cz = extent[2] as usize;
+            let total_chunks = cx * cy * cz;
+            if bytes.len() < total_chunks * 8 {
+                bevy::log::error!(
+                    "[aadf-probe2] [cpu-gpu-parity-meta] readback buffer too small: \
+                     {} B for {}x{}x{}={} chunks (need {} B)",
+                    bytes.len(), cx, cy, cz, total_chunks, total_chunks * 8,
+                );
+                probe.stage = CpuGpuParityStage::Done;
+                return;
+            }
+
+            // Extract per-chunk lower-u32 (`.x`) — the chunk AADF carrier.
+            // `array<vec2<u32>>` stride 8 B; `.x` lives at offset 0 mod 8.
+            let mut gpu_chunks_x: Vec<u32> = Vec::with_capacity(total_chunks);
+            for i in 0..total_chunks {
+                let off = i * 8;
+                let lo = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                gpu_chunks_x.push(lo);
+            }
+
+            // Chunk-emptiness is determined from GPU classification (state
+            // bits 30-31 == 0 == Empty). This isolates the diagnostic to *AADF
+            // expansion* (W3 regime-2); chunk classification (Empty/Full/
+            // Mixed) is set by regime-1 chunk_calc and is not under suspicion.
+
+            // CPU oracle — direct inline port of `compute_aadf_layer` that
+            // matches the GPU's boundary semantic ("OOB chunks treated as
+            // empty + free-expanding"; the C# code is canonical for this
+            // — `aadf/bounds.rs::compute_aadf_layer`'s "clamp at extent" is
+            // a different boundary convention that propagates inward up to
+            // 31 cells, making it unusable for direct byte-compare on the
+            // 256x32x256 fixed world where AADF_MAX_CHUNK == 31).
+            //
+            // The body mirrors `compute_aadf_layer` exactly except: when an
+            // axial neighbour is OOB, the neighbour is treated as "empty
+            // with infinitely large AADF in every direction", so the
+            // bounds_match condition is trivially satisfied and expansion
+            // proceeds. This matches the GPU.
+            use crate::aadf::cell::{
+                Aadf6, ChunkCell, DIR_NEG_X, DIR_POS_X, DIR_NEG_Y, DIR_POS_Y,
+                DIR_NEG_Z, DIR_POS_Z,
+            };
+            use crate::voxel::AADF_MAX_CHUNK;
+            // Pre-build empty mask from GPU classification.
+            let mut empty_mask: Vec<bool> = Vec::with_capacity(total_chunks);
+            for idx in 0..total_chunks {
+                let word = gpu_chunks_x[idx];
+                let state = (word >> 30) & 0x3;
+                empty_mask.push(state == 0);
+            }
+            // bounds_match (`aadf/cell.rs::Aadf6`-side `checkMatchingBounds`):
+            // every set bit of `mask` must satisfy `neighbour.d[i] >= cur.d[i]`.
+            // For OOB neighbours we treat as "all 6 bounds are AADF_MAX_CHUNK"
+            // — automatically >= any cur.d[i] in [0, 31].
+            let bounds_match = |neighbour: Aadf6, cur: Aadf6, mask: u32| -> bool {
+                for bit in 0..6 {
+                    if (mask >> bit) & 1 == 0 { continue; }
+                    if neighbour.d[bit] < cur.d[bit] { return false; }
+                }
+                true
+            };
+            let max_dist = AADF_MAX_CHUNK;
+            let oob_neighbour = Aadf6 { d: [max_dist; 6] };
+            let idx_at = |x: usize, y: usize, z: usize| -> usize {
+                x + y * cx + z * cx * cy
+            };
+            let mut oracle_aadfs: Vec<Aadf6> = vec![Aadf6::ZERO; total_chunks];
+
+            // Step over one axis with a given mask. neg_dir/pos_dir into the
+            // Aadf6 array, axis 0/1/2.
+            //
+            // Note: this is the same step_axis logic from aadf/bounds.rs:343-411
+            // with the in_bounds gate REPLACED by "use oob_neighbour when OOB".
+            let step_axis_oob = |
+                empty_mask: &[bool],
+                cur: &mut [Aadf6],
+                neg_dir: usize,
+                pos_dir: usize,
+                axis: usize,
+                mask_neg: u32,
+                mask_pos: u32,
+            | {
+                let prev = cur.to_vec();
+                for z in 0..cz {
+                    for y in 0..cy {
+                        for x in 0..cx {
+                            let i = idx_at(x, y, z);
+                            if !empty_mask[i] { continue; }
+                            let me = prev[i];
+                            // Negative direction.
+                            if me.d[neg_dir] < max_dist {
+                                let (nbi, nb_aadf, nb_empty) = match axis {
+                                    0 => {
+                                        if x >= 1 {
+                                            let nb = idx_at(x - 1, y, z);
+                                            (Some(nb), prev[nb], empty_mask[nb])
+                                        } else { (None, oob_neighbour, true) }
+                                    }
+                                    1 => {
+                                        if y >= 1 {
+                                            let nb = idx_at(x, y - 1, z);
+                                            (Some(nb), prev[nb], empty_mask[nb])
+                                        } else { (None, oob_neighbour, true) }
+                                    }
+                                    _ => {
+                                        if z >= 1 {
+                                            let nb = idx_at(x, y, z - 1);
+                                            (Some(nb), prev[nb], empty_mask[nb])
+                                        } else { (None, oob_neighbour, true) }
+                                    }
+                                };
+                                let _ = nbi;
+                                if nb_empty && bounds_match(nb_aadf, me, mask_neg) {
+                                    cur[i].d[neg_dir] = me.d[neg_dir] + 1;
+                                }
+                            }
+                            // Positive direction.
+                            if me.d[pos_dir] < max_dist {
+                                let (nbi, nb_aadf, nb_empty) = match axis {
+                                    0 => {
+                                        if x + 1 < cx {
+                                            let nb = idx_at(x + 1, y, z);
+                                            (Some(nb), prev[nb], empty_mask[nb])
+                                        } else { (None, oob_neighbour, true) }
+                                    }
+                                    1 => {
+                                        if y + 1 < cy {
+                                            let nb = idx_at(x, y + 1, z);
+                                            (Some(nb), prev[nb], empty_mask[nb])
+                                        } else { (None, oob_neighbour, true) }
+                                    }
+                                    _ => {
+                                        if z + 1 < cz {
+                                            let nb = idx_at(x, y, z + 1);
+                                            (Some(nb), prev[nb], empty_mask[nb])
+                                        } else { (None, oob_neighbour, true) }
+                                    }
+                                };
+                                let _ = nbi;
+                                if nb_empty && bounds_match(nb_aadf, me, mask_pos) {
+                                    cur[i].d[pos_dir] = me.d[pos_dir] + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            for _iter in 0..max_dist {
+                step_axis_oob(&empty_mask, &mut oracle_aadfs, DIR_NEG_X, DIR_POS_X, 0, 0x3D, 0x3E);
+                step_axis_oob(&empty_mask, &mut oracle_aadfs, DIR_NEG_Y, DIR_POS_Y, 1, 0x37, 0x3B);
+                step_axis_oob(&empty_mask, &mut oracle_aadfs, DIR_NEG_Z, DIR_POS_Z, 2, 0x1F, 0x2F);
+            }
+
+            // Compare per-chunk: for every Empty chunk, decode the GPU's Aadf6
+            // and compare to the oracle's. Count same/diff; record first 10
+            // diffs.
+            //
+            // Boundary handling — the CPU `compute_aadf_layer` clamps expansion
+            // to the layer extent `[0, dims-1]`; the GPU saturates at the world
+            // boundary in directions pointing OUT of the world (a documented
+            // semantic gap from the C# port — the GPU treats OOB as "infinitely
+            // empty"). Boundary-pointing axes on edge chunks therefore always
+            // diverge; the diagnostic separates these from interior diffs so
+            // the verdict reflects the actual algorithm, not the boundary
+            // convention.
+            let mut same_bytes = 0u64;
+            let mut total_bytes = 0u64;
+            let mut same_bytes_interior = 0u64;
+            let mut total_bytes_interior = 0u64;
+            let mut total_empty = 0u64;
+            let mut empty_same = 0u64;
+            let mut empty_same_interior = 0u64;
+            let mut total_empty_interior = 0u64;
+            let mut first_diffs: Vec<(usize, [u8; 6], [u8; 6], bool)> = Vec::new();
+            let mut first_interior_diffs: Vec<(usize, [u8; 6], [u8; 6])> = Vec::new();
+            // 5-bit-per-field bitfield matches AADF_BITS_CHUNK (see
+            // `aadf/cell.rs::ChunkCell::encode` -> `Aadf6::pack(AADF_BITS_CHUNK,
+            // AADF_MAX_CHUNK)`). Use ChunkCell::decode to recover Aadf6 from the
+            // GPU word.
+            for idx in 0..total_chunks {
+                let word = gpu_chunks_x[idx];
+                let state = (word >> 30) & 0x3;
+                if state != 0 {
+                    // Non-Empty — oracle yields Aadf6::ZERO; bit-comparison
+                    // would be on the encoded state bits which we don't
+                    // care about here. Skip.
+                    continue;
+                }
+                total_empty += 1;
+                let gpu_cell = ChunkCell::decode(word);
+                let gpu_aadf = match gpu_cell {
+                    ChunkCell::Empty(a) => a,
+                    _ => continue,
+                };
+                let oracle_aadf = oracle_aadfs[idx];
+                // Clamp oracle to AADF_MAX_CHUNK (`compute_aadf_layer` already
+                // does this internally per its contract).
+                let oracle_clamped = Aadf6 {
+                    d: [
+                        oracle_aadf.d[0].min(AADF_MAX_CHUNK),
+                        oracle_aadf.d[1].min(AADF_MAX_CHUNK),
+                        oracle_aadf.d[2].min(AADF_MAX_CHUNK),
+                        oracle_aadf.d[3].min(AADF_MAX_CHUNK),
+                        oracle_aadf.d[4].min(AADF_MAX_CHUNK),
+                        oracle_aadf.d[5].min(AADF_MAX_CHUNK),
+                    ],
+                };
+                // Decode chunk position.
+                let z = idx / (cx * cy);
+                let y = (idx - z * cx * cy) / cx;
+                let x = idx - z * cx * cy - y * cx;
+                // The inline oracle (above) matches GPU's "OOB = empty,
+                // saturating" boundary semantic, so boundary chunks SHOULD
+                // match too. The `is_boundary` flag is kept only to label
+                // which diffs sit on a world edge — useful diagnostic data,
+                // not a comparison gate any more.
+                let is_boundary = x == 0 || y == 0 || z == 0
+                    || x + 1 == cx || y + 1 == cy || z + 1 == cz;
+                total_bytes += 6;
+                if !is_boundary {
+                    total_bytes_interior += 6;
+                }
+                let mut eq = true;
+                for di in 0..6 {
+                    if gpu_aadf.d[di] == oracle_clamped.d[di] {
+                        same_bytes += 1;
+                        if !is_boundary { same_bytes_interior += 1; }
+                    } else {
+                        eq = false;
+                    }
+                }
+                if eq {
+                    empty_same += 1;
+                    if !is_boundary { empty_same_interior += 1; }
+                } else {
+                    if first_diffs.len() < 10 {
+                        first_diffs.push((idx, oracle_clamped.d, gpu_aadf.d, is_boundary));
+                    }
+                    if !is_boundary && first_interior_diffs.len() < 10 {
+                        first_interior_diffs.push((idx, oracle_clamped.d, gpu_aadf.d));
+                    }
+                }
+                if !is_boundary {
+                    total_empty_interior += 1;
+                }
+            }
+
+            let ratio = if total_bytes == 0 {
+                0.0
+            } else {
+                (same_bytes as f64) * 100.0 / (total_bytes as f64)
+            };
+            let ratio_interior = if total_bytes_interior == 0 {
+                0.0
+            } else {
+                (same_bytes_interior as f64) * 100.0 / (total_bytes_interior as f64)
+            };
+            // Headline sentinel — Playwright + the orchestrator both grep
+            // `[cpu-gpu-parity]`. The `interior` variants exclude chunks on
+            // any world boundary, where the CPU oracle's "clamp at extent" and
+            // GPU's "saturate at world edge" semantics deterministically
+            // diverge — that's a documented C# port convention, not the bug.
+            bevy::log::info!(
+                "[aadf-probe2] [cpu-gpu-parity] same_bytes={} total_bytes={} \
+                 ratio={:.3}% interior_same_bytes={} interior_total_bytes={} \
+                 interior_ratio={:.3}% empty_chunks={} \
+                 empty_chunks_all_axes_match={} interior_empty_chunks={} \
+                 interior_empty_all_axes_match={} extent={}x{}x{}",
+                same_bytes, total_bytes, ratio,
+                same_bytes_interior, total_bytes_interior, ratio_interior,
+                total_empty, empty_same,
+                total_empty_interior, empty_same_interior,
+                cx, cy, cz,
+            );
+            for (rank, (idx, oracle_d, gpu_d, is_boundary)) in first_diffs.iter().enumerate() {
+                let z = idx / (cx * cy);
+                let y = (idx - z * cx * cy) / cx;
+                let x = idx - z * cx * cy - y * cx;
+                bevy::log::info!(
+                    "[aadf-probe2] [cpu-gpu-parity-diff] rank={} chunk_idx={} \
+                     chunk_pos=({},{},{}) boundary={} \
+                     oracle=[{},{},{},{},{},{}] gpu=[{},{},{},{},{},{}]",
+                    rank, idx, x, y, z, is_boundary,
+                    oracle_d[0], oracle_d[1], oracle_d[2], oracle_d[3], oracle_d[4], oracle_d[5],
+                    gpu_d[0], gpu_d[1], gpu_d[2], gpu_d[3], gpu_d[4], gpu_d[5],
+                );
+            }
+            // Separate listing of first 10 INTERIOR diffs (the load-bearing
+            // signal — interior diffs cannot be explained by boundary semantics).
+            for (rank, (idx, oracle_d, gpu_d)) in first_interior_diffs.iter().enumerate() {
+                let z = idx / (cx * cy);
+                let y = (idx - z * cx * cy) / cx;
+                let x = idx - z * cx * cy - y * cx;
+                bevy::log::info!(
+                    "[aadf-probe2] [cpu-gpu-parity-interior-diff] rank={} chunk_idx={} \
+                     chunk_pos=({},{},{}) oracle=[{},{},{},{},{},{}] \
+                     gpu=[{},{},{},{},{},{}]",
+                    rank, idx, x, y, z,
+                    oracle_d[0], oracle_d[1], oracle_d[2], oracle_d[3], oracle_d[4], oracle_d[5],
+                    gpu_d[0], gpu_d[1], gpu_d[2], gpu_d[3], gpu_d[4], gpu_d[5],
+                );
+            }
+
+            // Native: also dump CPU oracle + GPU chunks to disk for offline
+            // analysis. On wasm the equivalent serialization would be a
+            // base64-into-console payload — disabled here to avoid log
+            // explosion; the sentinel + diff lines carry the needed signal.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use std::io::Write;
+                let dir = std::path::Path::new("target/diagnostics/cpu-gpu-parity");
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    bevy::log::warn!(
+                        "[aadf-probe2] [cpu-gpu-parity-meta] could not create artifact dir: {}",
+                        e,
+                    );
+                } else {
+                    // Encode CPU oracle as Vec<u32> chunk words (same layout as
+                    // GPU's chunks.x for direct byte-compare). For non-Empty
+                    // chunks copy the GPU word verbatim (the oracle doesn't
+                    // produce a classification, it only produces AADFs for
+                    // Empty cells).
+                    let mut cpu_words: Vec<u32> = Vec::with_capacity(total_chunks);
+                    for idx in 0..total_chunks {
+                        let word = gpu_chunks_x[idx];
+                        let state = (word >> 30) & 0x3;
+                        if state != 0 {
+                            cpu_words.push(word);
+                        } else {
+                            let cell = ChunkCell::Empty(oracle_aadfs[idx]);
+                            cpu_words.push(cell.encode());
+                        }
+                    }
+                    let cpu_path = dir.join("native-cpu-chunks.bin");
+                    let gpu_path = dir.join("native-gpu-chunks.bin");
+                    let cpu_bytes: Vec<u8> = cpu_words
+                        .iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let gpu_bytes_u32: Vec<u8> = gpu_chunks_x
+                        .iter().flat_map(|w| w.to_le_bytes()).collect();
+                    match std::fs::File::create(&cpu_path)
+                        .and_then(|mut f| f.write_all(&cpu_bytes))
+                    {
+                        Ok(()) => bevy::log::info!(
+                            "[aadf-probe2] [cpu-gpu-parity-meta] dumped {} bytes to {}",
+                            cpu_bytes.len(), cpu_path.display(),
+                        ),
+                        Err(e) => bevy::log::warn!(
+                            "[aadf-probe2] [cpu-gpu-parity-meta] CPU dump write failed: {}",
+                            e,
+                        ),
+                    }
+                    match std::fs::File::create(&gpu_path)
+                        .and_then(|mut f| f.write_all(&gpu_bytes_u32))
+                    {
+                        Ok(()) => bevy::log::info!(
+                            "[aadf-probe2] [cpu-gpu-parity-meta] dumped {} bytes to {}",
+                            gpu_bytes_u32.len(), gpu_path.display(),
+                        ),
+                        Err(e) => bevy::log::warn!(
+                            "[aadf-probe2] [cpu-gpu-parity-meta] GPU dump write failed: {}",
+                            e,
+                        ),
+                    }
+                }
+            }
+
+            bevy::log::info!(
+                "[aadf-probe2] [cpu-gpu-parity-meta] DONE",
+            );
+            probe.stage = CpuGpuParityStage::Done;
+        }
+    }
+}
+
 impl Plugin for ConstructionPlugin {
     fn build(&self, app: &mut App) {
         // Read the main-world `AppArgs.construction_config` once at
@@ -4063,6 +4598,8 @@ impl Plugin for ConstructionPlugin {
             .init_resource::<AadfDelayedProbe>()
             // 2026-05-19 probe-1B — per-call probe readback resource.
             .init_resource::<AadfPerCallProbe>()
+            // 2026-05-20 CPU-vs-GPU chunks parity diagnostic resource.
+            .init_resource::<AadfCpuGpuParity>()
             // Empty pipeline registry — W1..W5 add pipeline fields + a
             // proper `FromWorld` impl as they land.
             .init_gpu_resource::<ConstructionPipelines>()
@@ -4104,7 +4641,14 @@ impl Plugin for ConstructionPlugin {
             // `prepare_probe_history` buffer once `cpu_mirror_populated +
             // PROBE_TRIGGER_FRAMES`, emits one `[probe1-call]` info!() line
             // per `prepare_group_bounds` call observed).
-            .add_systems(ExtractSchedule, aadf_per_call_probe);
+            .add_systems(ExtractSchedule, aadf_per_call_probe)
+            // 2026-05-20 CPU-vs-GPU chunks parity diagnostic — issues a
+            // delayed `copy_buffer_to_buffer` of the chunks_buffer at
+            // PARITY_TRIGGER_FRAMES post `cpu_mirror_populated`, decodes
+            // it, runs the CPU `compute_aadf_layer` oracle over the same
+            // chunk-emptiness pattern, and emits a `[cpu-gpu-parity]`
+            // sentinel with bit-match ratio + first 10 differing chunks.
+            .add_systems(ExtractSchedule, aadf_cpu_gpu_parity);
     }
 }
 

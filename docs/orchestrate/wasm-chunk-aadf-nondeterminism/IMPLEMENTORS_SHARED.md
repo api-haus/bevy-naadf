@@ -583,3 +583,268 @@ Visual diff: screenshot pairs at `target/e2e-screenshots/vox_horizon_{native,web
 
 If Option C also fails, drop to Option D (CPU fallback) as a known-good escape hatch.
 
+
+---
+
+## Dispatch 3 — third implementor
+
+### Context loaded on entry
+- IMPLEMENTORS_SHARED.md (full, dispatch-1 + dispatch-2 traces, 585 lines).
+- 09-synthesis-classifications.md (full, the new top-candidate analysis).
+- 00-handoff-verbatim.md (full).
+- Re-verified source line numbers for chunks-access in bounds_calc.wgsl:
+  - `chunks[neighbour_idx].x` at line 252 (in `add_bounds_group` helper)
+  - `let cur_chunk_full = chunks[chunk_idx];` at line 499 (RMW read)
+  - `chunks[chunk_idx] = vec2<u32>(cur_chunk, entity_y);` at line 538 (RMW write)
+  All cited correctly in synthesis §F.
+- Verified worktree state: `bounds_calc.rs` carries dispatch-2 iter-2-4's
+  chunks-self-copy pattern (chunks->scratch->chunks BETWEEN rounds, inside
+  Bevy's main encoder). `config.rs` has n_bounds_rounds at native default (5).
+  end_of_encoder_noop pipeline still defined but suppressed.
+
+### Plan for dispatch-3
+
+Per synthesis §G:
+- Iter 1: cheap fence probe (queue.on_submitted_work_done equivalent + dedicated W3 submit). Discriminates C3/C6 (fence-family bug) from C1/C4 (intrinsic RMW race on chunks[]).
+- Iter 2: chunks history probe if iter 1 doesn't win.
+- Iter 3+: based on data.
+
+---
+
+## Iteration 3-1 — Probe 1 (cheap fence probe)
+
+### Hypothesis statement (C3 + C6 family)
+
+The bug is that W3's compute writes to `chunks[]` are batched in Bevy's main
+encoder along with everything else, submitted in one `queue.submit` call at
+end of frame; Dawn either (a) does not insert the necessary
+SHADER_WRITE->SHADER_READ barrier across the W3 compute pass and the
+renderer's later read in the SAME command-buffer-batch submit, or (b) defers
+its flush such that the renderer's reads see stale chunks state on most
+frames, with occasional "lucky" runs where the flush coincides.
+
+If we (i) pull W3's dispatches out of Bevy's main encoder onto a DEDICATED
+encoder, (ii) issue `queue.submit([w3_encoder.finish()])` IMMEDIATELY (its
+own submission boundary BEFORE Bevy's main submit), (iii) force Dawn to
+materialize that submit via `queue.on_submitted_work_done(callback)` + a
+trivial `map_async` on a 4-byte scratch buffer that received a
+copy_buffer_to_buffer(chunks, scratch, 4) inside the same dedicated encoder,
+then Dawn must flush W3's writes to global memory before Bevy's main encoder
+submit picks up. Renderer reads chunks via its own bind group; the cross-
+submit dependency on chunks SHOULD then be honoured.
+
+### Predict-the-outcome
+
+If C3/C6 (fence-family) is correct:
+- Web SSIM stabilises at >=0.91 on all 3 runs.
+- Web AADF probe value shifts from `[0,0,0,0,1,1]` toward
+  native's `[4,4,3,3,3,3]` (multi-axis multi-round expansion visible).
+- [probe1-call] pattern may also shift to "every (size, axis) visited once"
+  resembling native, because cross-pass `bound_queue_sizes` reads now see
+  fresh writes from the prior compute's atomicAdd.
+
+If C3/C6 is wrong and C1/C4 (intrinsic RMW race on chunks[]) is correct:
+- SSIM remains in 0.69-0.81 cluster (cheap fence is structurally insufficient).
+- AADF still reads `[0,0,0,0,1,1]`.
+- [probe1-call] still shows the linear-drain pattern.
+- This refutation rules out the entire C3/C6 fence-family in one shot;
+  the bug is intrinsic to the chunks[]-RMW pattern (C1/C4).
+
+### Implementation shape
+
+1. Replace `render_context.command_encoder()` usage on wasm with a
+   `render_device.create_command_encoder(...)` dedicated W3 encoder.
+2. Encode the same n_rounds of {prepare, compute}.
+3. Keep dispatch-2 iter-2-4's chunks-self-copy between rounds. (Not the
+   subject of the probe; leave as-is since iter-2-4 produced 0.810 — the
+   highest single SSIM achieved by any intervention. Removing it risks
+   regressing baseline.)
+4. After the loop, `render_queue.submit([w3_encoder.finish()])`.
+5. Call `render_queue.on_submitted_work_done(|| {})` — forces Dawn to
+   flush its internal queue.
+6. Issue `slice.map_async(MapMode::Read, |_| {})` on a small COPY_DST |
+   MAP_READ scratch buffer that received a `copy_buffer_to_buffer(chunks,
+   fence_scratch, 4)` in the same encoder, to drive Dawn's submit-side
+   flush.
+7. Suppress the now-orphaned `end_of_encoder_noop_pipeline` resolve.
+8. Native path unchanged.
+
+
+### Iter-3-1 results
+
+- Web SSIM 3 runs: **0.693519 / 0.693067 / 0.789544** — three for three FAILED. Same 0.69-0.79 cluster as baseline.
+- Native: ran `--vox-horizon-native` → screenshot saved successfully; chunk@(242,31,219) AADF reads `[mx=31 px=31 my=10 py=31 mz=20 pz=9]` (multi-axis multi-round expansion — the canonical reference).
+- Web AADF probe (early sampling, frame-N post-W3): chunk@(242,31,219) reads `word=0x02100000 chunk_aadf=[mx=0 px=0 my=0 py=0 mz=1 pz=1]` (run 3) and `word=0x00000000` all-zeros (run 2). Same as dispatch-2 baseline — only Z axis ever shows expansion.
+- `[probe1-call]` pattern UNCHANGED: still linear drain `size0_ax0` 32768→28672→24576→...→4096 over 8 calls, then `size0_ax1`, then `size0_ax2`, etc. Web reaches size8 by call ~208-209.
+- Run-3 reached size8 with 210 entries; runs 1,2 similar.
+
+### Prediction vs actual (iter-3-1)
+
+Prediction was: if C3/C6 (fence-family) is correct, SSIM stabilizes ≥0.91 on all 3 web runs AND [probe1-call] pattern shifts toward native (visit every (size, axis) once). Actual: SSIM in 0.69-0.79 cluster on all 3 runs; pattern unchanged. **C3/C6 (fence-family) is REFUTED.** Adding a dedicated W3 encoder + submit boundary + `on_submitted_work_done` + `map_async` fence does not fix the bug. The bug is intrinsic to the chunks[] RMW access pattern (C1/C4 family).
+
+### Decision after iter-3-1
+
+Per the synthesis recommendation: since C3/C6 (cheap fence) is REFUTED, move to iter 2 = chunks-history probe (synthesis §G item 2). This directly measures whether `compute_group_bounds`'s round-N read of `chunks[chunk_idx]` sees the round-(N-1) writes by other workgroups.
+
+
+---
+
+## Iteration 3-2 — Atomicise chunks reads/writes in bounds_calc.wgsl only
+
+### Hypothesis statement (C1/C4 fix, scoped)
+
+Per IMPLEMENTORS_SHARED.md Option C and synthesis §F+§G+§I-1: convert `chunks[]`
+in `bounds_calc.wgsl` ONLY from `array<vec2<u32>>` to `array<atomic<u32>>` (twice
+the elements: chunk_idx*2 = .x = AADF, chunk_idx*2+1 = .y = entity_y). Reads of
+.x become `atomicLoad(&chunks[chunk_idx * 2u])`. Writes become
+`atomicStore(&chunks[chunk_idx * 2u], cur_chunk)`. Other shaders that bind the
+same buffer keep their existing `array<vec2<u32>>` declarations (separate bind
+groups, separate WGSL views of the same underlying GPU buffer).
+
+The hypothesis: atomic operations have proven cross-pass visibility on Dawn
+(per Shape B / bound_queue_sizes which works), while non-atomic
+storage-buffer reads do NOT (per dispatch-2 chunks-AADF probe finding).
+Replacing the non-atomic load and the non-atomic store with atomicLoad +
+atomicStore should make the cross-round chunks reads see the prior round's
+writes.
+
+We skip the chunks-history probe (synthesis §G item 2): dispatch-2's iter-2-1
+AADF probe is already direct measurement of the bug — web reads `[0,0,0,0,1,1]`
+versus native `[4,4,3,3,3,3]` — so additional instrumentation isn't needed
+to know the bug is in chunks-RMW visibility. The probe would tell us WHAT
+intermediate values web sees but we already KNOW from the AADF probe that
+they're stale; the next move is to try the fix.
+
+### Predict-the-outcome
+
+If the C1/C4 atomic-load-fixes-visibility theory is correct:
+- Web SSIM stabilises ≥0.91 on all 3 runs.
+- Web AADF probe at chunk@(242,31,219) shifts toward native's
+  `[mx=31 px=31 my=10 py=31 mz=20 pz=9]` (multi-axis multi-round expansion
+  visible).
+- [probe1-call] may also shift (the bound_queue_sizes drain via atomicAdd
+  might also benefit if the underlying cross-pass visibility issue was on
+  the same root cause).
+
+If atomic-load doesn't help OR the bug is elsewhere:
+- SSIM stays in 0.69-0.81 cluster.
+- AADF still reads `[0,0,0,0,1,1]`.
+- Then the next move would be atomicOr on the bits rather than
+  atomicLoad+atomicStore RMW (a stronger fix, but requires algorithm change).
+
+
+### Iter-3-2 results
+
+- Web SSIM 3 runs: **0.792799 / 0.693159 / 0.692933** — same 0.69-0.79 cluster.
+- Native AADF chunk@(242,31,219): `chunk_aadf=[mx=31 px=31 my=10 py=31 mz=20 pz=9]` — unchanged from baseline. No native regression.
+- Web AADF chunk@(242,31,219): `chunk_aadf=[mx=0 px=0 my=0 py=0 mz=1 pz=1]` (or all-zeros depending on probe sampling timing) — UNCHANGED from dispatch-2 baseline.
+
+### Prediction vs actual (iter-3-2)
+
+Prediction: if atomic-load-fixes-visibility theory is correct, web SSIM ≥0.91 and AADF shows multi-axis multi-round values. Actual: SSIM in broken cluster; AADF unchanged. **The atomic-primitive fix on chunks[] DID NOT restore cross-pass visibility.** This is a surprising and significant finding — it implies that on Dawn/WebGPU, atomic operations on a 16 MiB storage buffer with many-workgroup writers do NOT have cross-pass cross-workgroup visibility the same way atomicAdd on the 384 B `bound_queue_sizes` buffer does. Either buffer size or writer-count matters for Dawn's atomic-coherence behavior.
+
+---
+
+## Iteration 3-3 — atomicAdd of delta (eliminate RMW write hazard, keep RMW read)
+
+### Hypothesis statement
+
+In iter-3-2 the `atomicStore` of `cur_chunk` replaced the prior non-atomic write
+but per-round writes still OVERWRITE the chunks slot (no monotonic accumulation
+across rounds). Per the synthesis Classification 4: each round reads stale 0,
+modifies, writes — losing prior rounds' writes. Replacing the
+`atomicStore(cur_chunk)` write with `atomicAdd(delta)` where
+`delta = cur_chunk - cur_chunk_copy` makes the write monotonic-additive:
+even if the read returns stale 0, the WRITE accumulates onto whatever is
+already in the chunks slot from prior rounds. Subsequent rounds may still
+read stale, but at least the accumulated chunks state at the FINAL frame
+read by the renderer should be the OR/sum of all rounds' deltas.
+
+### Predicted outcome
+
+If atomicAdd-of-delta restores accumulation: AADF probe shows multi-axis expansion across rounds (`[1,1,1,1,1,1]` at minimum, with some axes >1). SSIM may move toward PASS.
+
+If atomicAdd-of-delta is also ineffective (same Dawn cross-pass visibility issue applies to atomicAdd writes on chunks): SSIM stays in broken cluster, AADF still shows only last round's contribution.
+
+### Results
+
+- Web SSIM 3 runs: **0.796067 / 0.693492 / 0.693133** — same 0.69-0.79 cluster.
+- Web AADF chunk@(242,31,219): unchanged from iter-3-2 — `chunk_aadf=[mx=0 px=0 my=0 py=0 mz=1 pz=1]`.
+
+### Prediction vs actual (iter-3-3)
+
+Prediction was: if atomic-add-of-delta works, AADF shows multi-axis values. Actual: AADF unchanged. **atomicAdd writes on chunks[] also do not propagate cross-pass on Dawn for this access pattern.** The chunks-state at the renderer-read frame ONLY contains the LAST round's delta — even though atomicAdd should have ACCUMULATED across rounds. The Dawn cross-pass visibility issue applies UNIFORMLY to all atomic ops on chunks (atomicLoad, atomicStore, atomicAdd).
+
+---
+
+## STATUS: BAILED (dispatch 3) — iteration 3 exhausted
+
+### Hypotheses tried in dispatch-3
+
+1. **iter-3-1 (Probe 1 — cheap fence probe).** Dedicated W3 encoder + separate `render_queue.submit` + `on_submitted_work_done` callback + `map_async` on fence-scratch + `device.poll(Poll)`. Per synthesis §G item 1, this discriminates C3/C6 (fence-family) from C1/C4 (intrinsic RMW). Web SSIM 0.694/0.693/0.790. AADF `[0,0,0,0,1,1]`. Pattern unchanged. **REFUTED C3/C6.** Cross-encoder/cross-submit fence does not fix the bug.
+
+2. **iter-3-2 (atomicise chunks reads + writes in bounds_calc.wgsl only).** Per synthesis Option C / §F: `array<atomic<u32>>` view of the same buffer (paired indexing: chunk_idx*2 = .x, *2+1 = .y). atomicLoad + atomicStore everywhere chunks is touched in bounds_calc.wgsl. Other shaders keep `array<vec2<u32>>` views (separate bindings of same buffer). Web SSIM 0.793/0.693/0.693. AADF `[0,0,0,0,1,1]`. **REFUTED the narrow atomicLoad+atomicStore hypothesis** — atomic primitives on chunks[] do NOT restore cross-pass visibility on Dawn for this access pattern. This was the synthesis's TOP-RECOMMENDED fix shape and it did not work.
+
+3. **iter-3-3 (atomicAdd-of-delta on chunks).** Replaces atomicStore-of-cur_chunk with atomicAdd of (cur_chunk - cur_chunk_copy) delta. Even if reads remain stale, writes accumulate monotonically. Web SSIM 0.796/0.693/0.693. AADF unchanged. **REFUTED atomicAdd-of-delta hypothesis** — atomicAdd writes on chunks[] also do not propagate cross-pass on Dawn. The chunks-state at the renderer-read frame ONLY shows the LAST round's contribution despite atomicAdd's monotonic accumulation semantics. This is the strongest evidence yet that Dawn's atomic-coherence for chunks-shaped (16 MiB, many-workgroup-writers) buffers is fundamentally broken in this version of Chrome's WebGPU implementation.
+
+### Critical finding for next dispatch (REFRAMES the bug class)
+
+**The synthesis's TOP-RANKED CLASSIFICATION (C1/C4 — chunks[]-RMW race fixable by atomicising) is REFUTED by iter-3-2 and iter-3-3.** Atomic operations (atomicLoad, atomicStore, atomicAdd) on chunks[] do NOT have cross-pass visibility on Dawn/WebGPU even when the underlying buffer is the same and only the WGSL declaration changes. The Shape-B success on `bound_queue_sizes` (384 B, few writers) does NOT generalize to `chunks` (16 MiB, 4096 × 64 = 262144 writers per round).
+
+The dispatch-3 fence probe also refuted C3/C6 — cross-submit-boundary explicit fence does not help.
+
+This leaves Classification 1 (cross-workgroup cross-pass NON-atomic storage visibility race) and Classification 5 (renderer/upload-path bug) as the surviving hypotheses, BUT in a STRONGER form than the synthesis originally framed: even ATOMIC primitives do not bypass the underlying visibility broken-ness for chunks-shaped buffers.
+
+### Surviving hypotheses (post-dispatch-3)
+
+1. **C1 (strengthened): Dawn's cross-pass cross-workgroup storage-visibility for buffers in the 1-16 MiB+ range with many writers is broken at a LOWER LEVEL than the WGSL atomic primitive can address.** This is consistent with both the non-atomic AND atomic chunks failures. Fix shape: algorithmic restructure (Shape G — queue rebuild from masks, eliminating the cross-pass chunks dependency) OR per-frame readback + CPU stitching (Shape C — already ruled out by dispatch-1 as structurally a non-starter on wasm).
+
+2. **C5 (renderer-side or upload-path bug, AADF probe partial-state misleading).** The web AADF probe reads `[0,0,0,0,1,1]` which superficially "looks like W3 ran one round" — but if the chunks buffer the RENDERER reads is on a DIFFERENT page allocation from the chunks buffer W3 writes, OR if Dawn's bind-group caching captured a different buffer handle, we'd see this same symptom for a completely different reason. This was partially tested in iter-2-3 (read_write flip on renderer's chunks binding → regressed) but not via direct bind-group-cache investigation.
+
+3. **NEW C7 (Dawn buffer-size-tier coherence threshold).** The fact that `bound_queue_sizes` (384 B) works while `chunks` (16 MiB) doesn't, even with identical atomic primitives, hints at a Dawn allocator tier boundary. Buffers above some size threshold may be allocated from a different VkBuffer pool with different VkMemoryPropertyFlags (e.g., HOST_COHERENT vs DEVICE_LOCAL-only). Testing shape: shrink the world to <1 MiB chunks total via a small test scene, see if the broken pattern persists. If shrinking fixes it, the bug is allocation-tier dependent.
+
+### Recommended directions for next dispatch (4th)
+
+In order of cost-effectiveness:
+
+**A. Shape G — Algorithmic restructure (eliminate cross-pass chunks dependency).**
+Instead of `compute_group_bounds` reading `chunks[chunk_idx]` to compute the new state, structure the algorithm so each round's chunks-WRITE is to a DIFFERENT BUFFER from the reads. E.g.:
+- Round N writes per-thread delta entries into a sidecar `chunks_delta_ring: array<vec2<u32>>` (size: max_dispatched_chunks * n_bounds_rounds).
+- Between rounds, a SCAN/reduce kernel coalesces the delta ring back into chunks via atomicAdd (cross-pass, but reducer is single-thread per chunk).
+- Renderer reads chunks normally.
+- This avoids the cross-pass cross-workgroup READ-MODIFY-WRITE pattern that Dawn doesn't handle.
+- Cost: ~1 day implementation. Risk: algorithm correctness preservation.
+
+**B. Bind-group rebuild every frame (probe C5).**
+Force the renderer's `naadf_world_bind_group` to be rebuilt every frame from `world_gpu.chunks_buffer` (rather than using a cached bind group). If web SSIM stabilizes ≥0.91 after this, C5 is confirmed. Cost: 1-line edit in prepare.
+
+**C. Shrink the world (probe C7).**
+Try a 4x4x4 chunk world (256 B chunks) vs the current 256x32x256 (16 MiB). If small-world web SSIM passes consistently, the bug is Dawn allocator-tier dependent. Cost: 1-line config change + new test asset.
+
+**D. Test isolation on a different machine / Chrome version.**
+Pre-condition for the above: confirm the bug reproduces on a clean Chrome install (eliminating user-specific GPU driver / shader cache issues). The user has likely already verified this; if not, worth doing.
+
+**E. Option D from dispatch-2: CPU fallback on wasm.**
+Set `gpu_construction_enabled = false` on wasm. Loses GPU-acceleration but provides deterministic correctness. The horizon parity SSIM gate would PASS (CPU-built chunks state would be identical to native's CPU-built state — they share the same `aadf::construct::construct` codepath). The bevy-naadf project rule of "faithful port" allows wasm-specific divergences with explicit user approval; per the dispatch-2 recommendation this is the known-good escape hatch.
+
+### Hard constraints encountered
+Same as prior dispatches (no SSIM floor reduction, no MAX_RAY_STEPS bump, etc.).
+
+### State of the worktree at bail time
+
+Reverted to dispatch-2 iter-2-4 state (chunks non-atomic in WGSL; chunks-self-copy between rounds on wasm via Bevy's main encoder). The dispatch-3 iter-3-2 atomic chunks experiment and the iter-3-3 atomicAdd-of-delta experiment have been REVERTED. The iter-3-1 dedicated W3 encoder + fence experiment has been REVERTED.
+
+The orchestrator inheriting state SHOULD restart from the same baseline as dispatch-3 (= dispatch-2 iter-2-4 = 0.69-0.81 statistical cluster with occasional lucky PASS).
+
+Modified files at bail time (vs dispatch-2 iter-2-4 baseline): none of substance. Only logs + IMPLEMENTORS_SHARED.md and 09-synthesis-classifications.md docs grew.
+
+### Logs / artefacts
+
+Per-iteration logs in `target/diagnostics/consolidated/`:
+- `iter-3-1/{web-run-{1,2,3,2-full,3-full}.log, native-run-1.log, native-build.log, web-build.log}` — iter-3-1 fence probe.
+- `iter-3-2/{web-run-{1,2,3}.log, native-run-1.log, web-build.log}` — iter-3-2 atomicLoad+atomicStore.
+- `iter-3-3/{web-run-{1,2,3}.log, web-build.log}` — iter-3-3 atomicAdd-of-delta.
+- `iter-3-bail-baseline/web-run-1.log` — post-revert sanity check (0.795 in expected cluster).
+
+Native AADF reference (`target/e2e-screenshots/vox_horizon_native.png` + `vox_horizon_native.aadf-probe.log`) and web visual (`vox_horizon_web.png`) preserved for comparison.
+

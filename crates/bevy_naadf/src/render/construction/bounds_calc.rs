@@ -580,13 +580,13 @@ pub fn naadf_bounds_compute_node(
 
     // 2026-05-20 dispatch-2 iter-2-4 — on wasm, between rounds insert a
     // copy_buffer_to_buffer(chunks → scratch). This forces Dawn to emit a
-    // SHADER_WRITE→TRANSFER_READ pipeline barrier on the FULL chunks buffer,
-    // which is the strongest memory-availability operation available on the
-    // host side. The hypothesis (H4 from dispatch-1, refuted at 4-byte size;
-    // re-testing at FULL size in case Dawn's barrier scope is per-range).
+    // SHADER_WRITE→TRANSFER_READ pipeline barrier on the FULL chunks buffer.
+    // Retained in dispatch-3 iter-3-1 because iter-2-4 produced the highest
+    // single SSIM (0.810) of any intervention; removing risks regressing
+    // baseline.
     //
-    // Allocate scratch lazily: same-size + COPY_DST only. Single allocation
-    // for the W3 node's lifetime (Local<Option<Buffer>>).
+    // Allocate scratch lazily: same-size + COPY_DST + COPY_SRC. Single
+    // allocation for the W3 node's lifetime (Local<Option<Buffer>>).
     #[cfg(target_arch = "wasm32")]
     let chunks_self_copy_dst: Option<bevy::render::render_resource::Buffer> = {
         if let Some(world_gpu) = world_gpu.as_ref() {
@@ -616,7 +616,12 @@ pub fn naadf_bounds_compute_node(
     let encoder = render_context.command_encoder();
     let time_span = diagnostics.time_span(encoder, BOUNDS_COMPUTE_SPAN);
 
-    // Per-round dispatch with optional chunks-self-copy between rounds (wasm).
+    // Per-round dispatch with chunks-self-copy between rounds (wasm) — the
+    // dispatch-2 iter-2-4 state. This iteration's iter-3-1 cheap-fence probe
+    // (dedicated W3 encoder + on_submitted_work_done + map_async fence) was
+    // REFUTED — same 0.69-0.79 SSIM cluster. Reverted to iter-2-4 baseline.
+    // The chunks-self-copy retained because iter-2-4 produced 0.810 (highest
+    // single SSIM of any intervention) and removing it risks regressing.
     #[cfg(target_arch = "wasm32")]
     {
         let chunks_buf_opt = world_gpu.as_ref().map(|w| w.chunks_buffer.clone());
@@ -637,9 +642,6 @@ pub fn naadf_bounds_compute_node(
             // After each compute pass (except the last), copy chunks→scratch→
             // chunks. The src-buffer transition COMPUTE_SHADER_WRITE →
             // TRANSFER_READ forces a full-buffer flush of compute's writes.
-            // Then the dst-buffer transition TRANSFER_WRITE → COMPUTE_SHADER_
-            // READ on the chunks buffer makes the writes visible to next
-            // round's compute pass's chunks reads.
             if round_idx + 1 < n_rounds {
                 if let (Some(chunks), Some(scratch)) =
                     (chunks_buf_opt.as_ref(), chunks_self_copy_dst.as_ref())
