@@ -238,13 +238,11 @@ impl From<&crate::AppArgs> for ConstructionConfig {
         {
             cfg.max_group_bound_dispatch =
                 cfg.max_group_bound_dispatch.min(WASM_MAX_GROUP_BOUND_DISPATCH);
-            // 2026-05-20 iter-5 — bump n_bounds_rounds to compensate for the
-            // 8× smaller per-round claim (4096 vs native's 32768). With
-            // n_bounds_rounds=40, wasm makes the same per-frame claim budget
-            // as native; combined with the per-round-encoder+submit pattern
-            // and the chunks TRANSFER-stage barrier, the convergence should
-            // complete in the same wall-clock window as native.
-            cfg.n_bounds_rounds = cfg.n_bounds_rounds.max(40);
+            // 2026-05-20 dispatch-2 iter-0 — revert iter-5's n_bounds_rounds
+            // bump. iter-2 in dispatch-1 already proved bound_queue_sizes
+            // reaches all 32 size levels even at default n=5 (1760+ probe
+            // calls), so the bug is not "insufficient algorithm cycles."
+            // Restart from native's default (5).
         }
         cfg
     }

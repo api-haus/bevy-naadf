@@ -447,19 +447,13 @@ pub fn naadf_bounds_compute_node(
     render_device: Res<bevy::render::renderer::RenderDevice>,
     #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
     render_queue: Res<bevy::render::renderer::RenderQueue>,
-    // 2026-05-20 iter-4 H4 — chunks buffer access for the TRANSFER-barrier
-    // probe on wasm. The chunks buffer carries the 5-bit AADF that the
-    // ray-tracing renderer consumes; iter-2 showed even with W3 fully
-    // converged (1760 calls, reaches every size level), web SSIM stayed
-    // at 0.69 — meaning the chunks AADF data itself is wrong on web. The
-    // hypothesis is that compute_group_bounds's writes to chunks[] are
-    // not visible to subsequent compute passes' reads cross-round, even
-    // though Dawn's intra-encoder PassResourceUsageTracker should be
-    // inserting SHADER_WRITE→SHADER_READ barriers. A TRANSFER-stage barrier
-    // (via copy_buffer_to_buffer) is a strictly stronger flush; if it
-    // restores visibility, H4 is confirmed.
+    // 2026-05-20 dispatch-2 iter-2-4 — chunks-self-copy intervention needs
+    // access to the chunks buffer.
     #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
     world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    // 2026-05-20 dispatch-2 iter-2-4 — lazy scratch buffer for chunks-self-copy.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+    mut chunks_scratch: bevy::ecs::system::Local<Option<bevy::render::render_resource::Buffer>>,
 ) {
     let Some(construction_pipelines) = construction_pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
@@ -529,100 +523,22 @@ pub fn naadf_bounds_compute_node(
 
     let n_rounds = construction_config.n_bounds_rounds.max(1);
 
-    // 2026-05-20 iter-4 H4 — on wasm, between rounds insert a
-    // `copy_buffer_to_buffer(chunks, scratch, 4)`. The TRANSFER stage
-    // barrier this triggers is a strictly stronger memory-availability
-    // operation than the SHADER_WRITE→SHADER_READ barrier Dawn inserts
-    // intra-encoder; it flushes compute_group_bounds's writes to chunks[]
-    // out of L1/L2 caches into global memory, making them visible to the
-    // next round's compute pass's reads of neighbour chunks (the
-    // `add_bounds_group` chain that decides whether a chunk's AADF can
-    // grow). Without this, stale neighbour reads cause over-expansion of
-    // AADF bits → rendered output skips over distant geometry → SSIM
-    // diverges from native (iter-2 evidence: 1760 calls converging all 32
-    // queue size levels but SSIM still 0.69, indicating the chunks data
-    // is wrong even after full algorithmic convergence).
+    // 2026-05-20 dispatch-2 iter-2-2 H1 — use Bevy's main encoder for wasm
+    // W3, same as native. The per-round-encoder+submit pattern (used in
+    // dispatch-1 iter-0 through iter-5) does NOT solve the bug (iter-1
+    // proved one-encoder-per-frame is also affected). But going one step
+    // further — making wasm use Bevy's render_context.command_encoder()
+    // identically to native — puts W3's compute pass + the renderer's
+    // first-hit compute pass in the SAME command buffer. Dawn's intra-
+    // encoder PassResourceUsageTracker should then insert a
+    // SHADER_WRITE→SHADER_READ barrier on chunks[] between W3's last
+    // compute pass and first-hit's read of chunks[] via world_data.wgsl's
+    // read-only binding. Native gets this for free; wasm with the per-
+    // round-submit pattern was losing it.
     //
-    // Reuses `bound_dispatch_indirect` as a 4-byte scratch dst (it has
-    // COPY_DST + is overwritten by prepare's `bound_dispatch_indirect[0]
-    // = max(1u, group_amount)` next round, so any corruption is benign).
-    // Per-round encoder+submit is kept (iter-1 H1 reverted) because the
-    // per-round queue-timeline fence may help bound_queue_sizes too.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let chunks_buffer_opt = world_gpu.as_ref().map(|w| &w.chunks_buffer);
-        for _ in 0..n_rounds {
-            let mut round_encoder = render_device.create_command_encoder(
-                &bevy::render::render_resource::CommandEncoderDescriptor {
-                    label: Some("naadf_bounds_calc_round_wasm"),
-                },
-            );
-            // prepare pass — single-thread scan that writes
-            // `bound_refined_info` + `bound_dispatch_indirect`.
-            {
-                let mut pass = round_encoder.begin_compute_pass(
-                    &bevy::render::render_resource::ComputePassDescriptor {
-                        label: Some("naadf_bounds_calc_prepare_pass_wasm"),
-                        timestamp_writes: None,
-                    },
-                );
-                pass.set_pipeline(prepare_pipeline);
-                pass.set_bind_group(0, bounds_world_bg, &[]);
-                pass.set_bind_group(1, bounds_bg, &[]);
-                pass.set_bind_group(2, dispatch_bg, &[]);
-                pass.set_bind_group(3, probe_bg, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
-            // compute pass — direct dispatch.
-            {
-                let mut pass = round_encoder.begin_compute_pass(
-                    &bevy::render::render_resource::ComputePassDescriptor {
-                        label: Some("naadf_bounds_calc_compute_pass_wasm"),
-                        timestamp_writes: None,
-                    },
-                );
-                pass.set_pipeline(compute_pipeline);
-                pass.set_bind_group(0, bounds_world_bg, &[]);
-                pass.set_bind_group(1, bounds_bg, &[]);
-                pass.dispatch_workgroups(
-                    construction_config.max_group_bound_dispatch.max(1),
-                    1,
-                    1,
-                );
-            }
-            // iter-4 H4 — TRANSFER-stage barrier on chunks via 4-byte
-            // self-copy. The copy_buffer_to_buffer with src=chunks forces
-            // Dawn to emit `vkCmdPipelineBarrier(srcStage=COMPUTE_SHADER,
-            // srcAccess=SHADER_WRITE, dstStage=TRANSFER,
-            // dstAccess=TRANSFER_READ)` on chunks before this copy. That
-            // barrier is an availability operation that flushes
-            // compute_group_bounds's chunks-writes to L2/global memory.
-            if let Some(chunks) = chunks_buffer_opt.as_ref() {
-                round_encoder.copy_buffer_to_buffer(
-                    chunks,
-                    0,
-                    indirect_buffer,
-                    16, // write past the 5×u32=20B indirect args (which prepare overwrites next round).
-                    4,
-                );
-            }
-            // M1 probe noop kept — reads/writes bound_queue_sizes[0].
-            {
-                let mut pass = round_encoder.begin_compute_pass(
-                    &bevy::render::render_resource::ComputePassDescriptor {
-                        label: Some("naadf_bounds_calc_end_of_encoder_noop_pass_wasm"),
-                        timestamp_writes: None,
-                    },
-                );
-                pass.set_pipeline(end_of_encoder_noop_pipeline);
-                pass.set_bind_group(0, bounds_world_bg, &[]);
-                pass.set_bind_group(1, bounds_bg, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
-            render_queue.submit([round_encoder.finish()]);
-        }
-        return;
-    }
+    // We keep the direct-dispatch + 4096-cap on wasm (the original Dawn
+    // STORAGE→INDIRECT barrier bug is still suspected; iter-2-3 if needed
+    // will probe whether that bug still exists).
 
     // 2026-05-19 horizon-parity AADF diagnostic — one-shot log of the
     // construction-config values reaching the regime-2 node (verifies the
@@ -661,8 +577,84 @@ pub fn naadf_bounds_compute_node(
 
     let diagnostics = render_context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
+
+    // 2026-05-20 dispatch-2 iter-2-4 — on wasm, between rounds insert a
+    // copy_buffer_to_buffer(chunks → scratch). This forces Dawn to emit a
+    // SHADER_WRITE→TRANSFER_READ pipeline barrier on the FULL chunks buffer,
+    // which is the strongest memory-availability operation available on the
+    // host side. The hypothesis (H4 from dispatch-1, refuted at 4-byte size;
+    // re-testing at FULL size in case Dawn's barrier scope is per-range).
+    //
+    // Allocate scratch lazily: same-size + COPY_DST only. Single allocation
+    // for the W3 node's lifetime (Local<Option<Buffer>>).
+    #[cfg(target_arch = "wasm32")]
+    let chunks_self_copy_dst: Option<bevy::render::render_resource::Buffer> = {
+        if let Some(world_gpu) = world_gpu.as_ref() {
+            let chunks_size = world_gpu.chunks_buffer.size();
+            if chunks_scratch.is_none() {
+                let scratch = render_device.create_buffer(
+                    &bevy::render::render_resource::BufferDescriptor {
+                        label: Some("naadf_chunks_self_copy_scratch_iter_2_4"),
+                        size: chunks_size,
+                        usage: bevy::render::render_resource::BufferUsages::COPY_DST
+                            | bevy::render::render_resource::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    },
+                );
+                *chunks_scratch = Some(scratch);
+                bevy::log::info!(
+                    "[aadf-probe] iter-2-4: allocated chunks_self_copy_scratch size={} B",
+                    chunks_size,
+                );
+            }
+            chunks_scratch.as_ref().cloned()
+        } else {
+            None
+        }
+    };
+
     let encoder = render_context.command_encoder();
     let time_span = diagnostics.time_span(encoder, BOUNDS_COMPUTE_SPAN);
+
+    // Per-round dispatch with optional chunks-self-copy between rounds (wasm).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let chunks_buf_opt = world_gpu.as_ref().map(|w| w.chunks_buffer.clone());
+        for round_idx in 0..n_rounds {
+            // prepare + compute pass for this round.
+            dispatch_regime_2_rounds(
+                encoder,
+                prepare_pipeline,
+                compute_pipeline,
+                bounds_world_bg,
+                bounds_bg,
+                dispatch_bg,
+                probe_bg,
+                indirect_buffer,
+                1, // one round at a time
+                compute_workgroups_override,
+            );
+            // After each compute pass (except the last), copy chunks→scratch→
+            // chunks. The src-buffer transition COMPUTE_SHADER_WRITE →
+            // TRANSFER_READ forces a full-buffer flush of compute's writes.
+            // Then the dst-buffer transition TRANSFER_WRITE → COMPUTE_SHADER_
+            // READ on the chunks buffer makes the writes visible to next
+            // round's compute pass's chunks reads.
+            if round_idx + 1 < n_rounds {
+                if let (Some(chunks), Some(scratch)) =
+                    (chunks_buf_opt.as_ref(), chunks_self_copy_dst.as_ref())
+                {
+                    let copy_size = chunks.size().min(scratch.size());
+                    encoder.copy_buffer_to_buffer(chunks, 0, scratch, 0, copy_size);
+                    encoder.copy_buffer_to_buffer(scratch, 0, chunks, 0, copy_size);
+                }
+            }
+        }
+        // Suppress the unused `end_of_encoder_noop_pipeline` warning.
+        let _ = end_of_encoder_noop_pipeline;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     dispatch_regime_2_rounds(
         encoder,
         prepare_pipeline,
@@ -675,6 +667,7 @@ pub fn naadf_bounds_compute_node(
         n_rounds,
         compute_workgroups_override,
     );
+
     time_span.end(render_context.command_encoder());
 }
 

@@ -340,3 +340,246 @@ All per-iteration logs in `target/diagnostics/consolidated/iter-{1,2,3,4,5}/`:
 
 Visual diff: screenshot pairs at `target/e2e-screenshots/vox_horizon_{native,web}.png`. The web image (from iter-4 last run which PASSED) is nearly identical to native, demonstrating that the algorithm CAN produce correct output when the stars align. The challenge is making it ALWAYS produce correct output.
 
+
+---
+
+## Dispatch 2 — second implementor
+
+### Context loaded on entry
+- IMPLEMENTORS_SHARED.md (full, dispatch-1 trace).
+- 00-handoff-verbatim.md (full).
+- 02-diagnostics-impl.md (84-divergence catalog + 6 load-bearing).
+- 03-diagnosis.md, 04-probe1-impl.md, 05-fix-design.md, 06-fix-impl.md, 07-diagnosis-round2.md, 08-probe2-impl.md.
+- Read source: `bounds_calc.rs` (711 L), `bounds_calc.wgsl` (579 L), `config.rs:200-289`, `world_data.wgsl` (renderer's read-only chunks binding), `mod.rs:1093-1565` (populate_cpu_mirror), `mod.rs:300-330` (Core3d schedule chain).
+
+### Decisions about prior dispatch's worktree state
+- **Reverted iter-5's `n_bounds_rounds = max(40)` config bump** (config.rs:241-248). iter-2 already proved algorithmic convergence is NOT the bug.
+- **Reverted iter-4's chunks `copy_buffer_to_buffer(chunks, indirect, 4)` between rounds** (bounds_calc.rs:592-608). Refuted by iter-4 results.
+- **KEPT the end-of-encoder noop pass** (M1 probe) — leaving instrumentation in place per brief.
+- **KEPT per-round encoder + submit** (H1 from iter-1) — neutral to baseline statistically and cleaner separation between rounds.
+- **KEPT probe1-call (probe-1B) instrumentation everywhere** — load-bearing.
+
+After reverts, baseline = per-round-encoder+submit + M1 noop, n_bounds_rounds=5 (native default), max_group_bound_dispatch=4096 wasm-clamp.
+
+### Dual-angle enumeration (orchestrator's mandate)
+
+**Angle A — "why broken on web"** (prior dispatches focused here):
+- A1. Tint lowers atomicAdd to memory model with missing Coherent decoration → cross-pass atomic invisibility. REFUTED by iter-2 (queue sizes DO drain, all 32 levels reached).
+- A2. Dawn intra-encoder shader→shader barrier insufficient → cross-pass storage write→read invisibility on `chunks[]`. REFUTED by iter-3+iter-4 (no improvement from TRANSFER-stage barrier or shader-side touch).
+- A3. Renderer reads `chunks[]` via world_data.wgsl binding before W3's writes land — Dawn missing cross-NODE / cross-submit barrier between W3's separate-encoder submits and the main render encoder. **NOT YET PROBED.**
+- A4. The W3 wasm code uses `render_device.create_command_encoder()` + `render_queue.submit()` directly. The renderer uses Bevy's `render_context.command_encoder()` (one big encoder). The two encoders are NOT in the same submit; submits are ordered W3-1..W3-N then main, but the main encoder's bind groups reference `chunks` as RO. Dawn must insert resource-tracking barrier ACROSS submits — empirically, this may be working sometimes (rare-success) and not other times (broken-side).
+- A5. The bind group for `world_data` (renderer) is built ONCE in `prepare`. After W3 writes to `chunks_buffer`, the bind group is stale — but bind groups reference buffer HANDLES (GPU-side), not snapshots. So this should be live. CHECK: is there a render-side bind group that's built from a cache that's older than W3's first write?
+- A6. **subgroup_min/max_size DIVERGES (native 32/32, web 4/128)** — the WebGPU adapter exposes wider subgroup range. If the compute_group_bounds workgroup (4³=64 threads) gets dispatched on subgroups of size 4 on web (vs 32 native), thread synchronization semantics differ. `workgroupBarrier()` is workgroup-scoped, NOT subgroup-scoped — should be fine. But uniform control flow assumptions might differ.
+- A7. **max_dynamic_storage_buffers_per_pipeline_layout: 8 on web vs 16 on native.** prepare_group_bounds binds 7 storage buffers in 4 groups. Could be at a cliff that triggers different shader-compilation paths.
+- A8. **max_bind_groups: 4 on web vs 8 on native.** prepare_group_bounds uses exactly 4 groups. Recompiling tight to web's exact cap might trigger different layout allocation on the GPU side.
+- A9. **max_buffer_size: 4 GiB - 4 on web vs 1 TiB on native.** Not a problem for current buffer sizes but worth tagging.
+- A10. **min_storage_buffer_offset_alignment: 256 on web vs 32 on native.** Could affect dynamic-offset binding alignment — but we don't use dynamic offsets in W3.
+
+**Angle B — "why does it OCCASIONALLY work"** (orchestrator's new emphasis):
+- B1. Race in submit ordering — sometimes W3's last submit lands before main encoder's submit, sometimes not. Browser microtask scheduling jitter.
+- B2. Dawn maintains a batched flush threshold (e.g. N submits or M bytes pending); when the threshold is crossed, all pending writes are flushed including stale W3 chunks-writes. If a frame happens to cross the threshold mid-W3 (lucky), data lands in time for renderer; otherwise it sits in the Dawn driver's deferred-flush queue.
+- B3. GPU warmup state — first few frames after page load have cold caches / pipeline-compilation pauses that ACCIDENTALLY serialize W3 writes to global memory before the renderer runs.
+- B4. The `populate_cpu_mirror_from_gpu_producer` issues a `copy_buffer_to_buffer(chunks_buffer, staging, ...)` and a `queue.submit([enc.finish()])` (mod.rs:1200-1218). This copy+submit happens EARLY in the frame (ExtractSchedule). On the rare "lucky" run, this submit may serve as a TRANSFER barrier that flushes chunks writes from prior frame, making the renderer's read see correct data this frame. On unlucky runs, the readback runs once after first GPU producer pass, then never re-fires (gated on `cpu_mirror_populated`), so W3's per-frame writes never get an explicit transfer-barrier.
+- B5. (Combination of A4 + B4): the readback-driven copy_buffer_to_buffer happening ONCE early in the frame acts as a one-time barrier. If renderer reads chunks before W3 has expanded the AADF beyond a threshold, the rays terminate short. If by luck enough W3 rounds have accumulated to global memory in the readback flush, the rays go further. Once `cpu_mirror_populated` flips true, the readback-flush is gone; whatever state was captured then is what the renderer sees.
+
+**Hypotheses ranked combining both angles:**
+
+**H1 (HIGH PRIORITY, combination): A4 + B4 + B5 — renderer's bind group reads stale `chunks[]` because Bevy's render-graph submits the main encoder BEFORE Dawn has flushed W3's separate per-round submits to global memory.** A barrier ACROSS submits should be implicit but Dawn may be relaxed about it for storage buffers that change usage class (W3 writes RW, renderer reads RO from same buffer, distinct bind groups). The rare-success matches B4: the `populate_cpu_mirror_from_gpu_producer`'s copy_buffer_to_buffer (early in frame, before W3) acts as a one-time TRANSFER barrier that on a lucky frame lands chunks state correctly before the renderer runs.
+
+Fix attempt: insert a per-frame `copy_buffer_to_buffer(chunks_buffer, chunks_buffer, 4)` (or chunks→indirect 4B) AFTER W3's last round on wasm. This forces a TRANSFER barrier on chunks AFTER all W3 writes are issued, which Dawn should chain before the next submit (the main encoder). This is structurally different from iter-4 which inserted copies BETWEEN rounds — H1 here inserts the copy ONCE at end-of-W3 (or just submits a dedicated transfer-only encoder after W3's last round).
+
+**H2 (MEDIUM PRIORITY, broken-side only): A5 — the renderer's world_data bind group is built using a CACHED chunks_buffer handle that's not the live W3-target buffer.** Sometimes the bind group gets rebuilt by some other system (lucky case). CHECK: source path that builds `naadf_world_bind_group` and verify it references `world_gpu.chunks_buffer` directly.
+
+**H3 (MEDIUM PRIORITY, combination): A6/A7/A8/A10 — some capability divergence forces Dawn to lower compute_group_bounds shader differently on web (e.g. with relaxed atomic memory ordering, or with a per-subgroup loop rewrite).** Hard to test without re-instrumenting; deferring unless H1/H2 fail.
+
+**H4 (REJECTED for now): Algorithmic restructure (Shape G).** iter-2 of dispatch-1 proved algorithmic convergence happens on web. Restructure won't help.
+
+### Plan for iteration
+
+Iter-2-1: Verify baseline (post-reverts) and confirm the iter-1 statistical cluster (0.69-0.79-PASS).
+Iter-2-2: H1 — `copy_buffer_to_buffer(chunks, scratch, full-size or 4B)` AFTER W3's last round, ONCE per frame on wasm. Predict: web SSIM stabilizes at PASS if H1 is correct. Probe-1B pattern unchanged (probe is about queue_sizes, H1 fix is about cross-submit chunks barrier).
+
+---
+
+## Iteration 2-1 — baseline after reverts (per-round encoder + M1 noop)
+
+### Setup
+- Reverted iter-5's `n_bounds_rounds=max(40)` → 5 (native default).
+- Reverted iter-4's chunks copy_buffer_to_buffer between rounds.
+- Kept per-round encoder + render_queue.submit + M1 noop pass.
+
+### Results
+- Web SSIM: 0.793145 / 0.792506 / 0.693035 (cluster 0.69-0.79, baseline)
+- Web AADF at chunk@(242,31,219): `word=0x02100000 chunk_aadf=[mx=0 px=0 my=0 py=0 mz=1 pz=1]`
+- Native AADF: `word=0x06318c84 chunk_aadf=[mx=4 px=4 my=3 py=3 mz=3 pz=3]`
+
+**CRITICAL OBSERVATION:** On web, EMPTY chunks show AADF=0,0,0,0,1,1 (only Z-axis expansion by 1). On native, AADF=4,4,3,3,3,3 (multi-round expansion across all axes).
+
+The bug: **cross-pass writes to `chunks[chunk_idx]` from `compute_group_bounds` get OVERWRITTEN by subsequent rounds' reads of stale chunks=0**. Each round of W3 reads chunks (sees 0), expands one axis by 1, writes back. Next round reads chunks again — sees 0 again (or sees a different round's write) — expands its own axis by 1, OVERWRITES previous expansion. Only the LAST round's expansion survives.
+
+This matches the symptom: on web, AADF ends up with 1 bit on only ONE axis (the last-processed axis).
+
+---
+
+## Iteration 2-2 — H1: native code path on wasm (one encoder, indirect dispatch)
+
+### Hypothesis
+The wasm-only per-round-encoder+submit pattern was the cause. Bevy's main encoder (`render_context.command_encoder()`) puts W3 + renderer in ONE command buffer; Dawn's intra-encoder PassResourceUsageTracker should insert the chunks SHADER_RW→SHADER_READ barrier properly. Removed the wasm-specific path so wasm uses `dispatch_regime_2_rounds` exactly like native, with indirect dispatch.
+
+### Predicted outcome
+Web SSIM jumps to ≥0.91 if the cross-encoder pattern was the cause.
+
+### Results
+- Web SSIM: 0.793149 / 0.693496 / 0.693788 (same cluster)
+- Web AADF: `word=0x02100000 chunk_aadf=[mx=0 px=0 my=0 py=0 mz=1 pz=1]` (same as baseline)
+- **Probe-1B**: `found_size=32768` initially drains by 4096 per call — meaning indirect dispatch IS reading post-prepare bound_dispatch_indirect[0]=4096. So Dawn's STORAGE→INDIRECT barrier IS working. The handoff's "indirect-barrier-broken" claim is REFUTED in this state.
+
+### Refutation analysis
+H1 wrong. Putting W3 in Bevy's main encoder with indirect dispatch didn't fix it. Direct-vs-indirect is NOT the discriminator. Encoder boundary is NOT the discriminator. The bug is INTRA-ENCODER cross-pass chunks-write visibility.
+
+---
+
+## Iteration 2-3 — H2: flip renderer's chunks binding to read_write
+
+### Hypothesis
+Dawn fails to insert the SHADER_RW→SHADER_READ usage transition barrier on chunks_buffer between W3 (storage_rw binding) and renderer (storage_read binding). Forcing both bindings to read_write makes them identical-usage-class and removes the transition.
+
+### Predicted outcome
+If usage-transition is the cause, web SSIM jumps to ≥0.91.
+
+### Results
+- Web SSIM: 0.693419 / 0.693632 / 0.694291 (3/3 LOWEST, regressed vs baseline)
+- Web AADF: `word=0x00000000 chunk_aadf=[0,0,0,0,0,0]` (REGRESSED to all-zeros)
+
+### Refutation analysis
+H2 wrong AND regressing. Making chunks rw on renderer side made things worse — possibly because Dawn then thinks the renderer ALSO writes chunks, leading to a different stall pattern. **REVERTED.**
+
+---
+
+## Iteration 2-4 — H4-redo: FULL chunks self-copy between rounds via scratch buffer
+
+### Hypothesis
+Dispatch-1 iter-4 inserted `copy_buffer_to_buffer(chunks, scratch, 4 bytes)` which may have only barriered the 0-3 byte range. Re-test with FULL chunks-size (16 MiB) copies, AND additionally copy back into chunks (forcing the chunks usage to transition both into and out of TRANSFER).
+
+### Implementation
+- Allocated lazy `chunks_self_copy_scratch` buffer (16 MiB, COPY_SRC|COPY_DST) via `Local<Option<Buffer>>` on the W3 system.
+- Between each round of {prepare, compute}:
+  - `encoder.copy_buffer_to_buffer(chunks, 0, scratch, 0, chunks.size())`
+  - `encoder.copy_buffer_to_buffer(scratch, 0, chunks, 0, chunks.size())`
+- Used Bevy's main `render_context.command_encoder()` so W3 + renderer share one cmd buffer.
+- Kept direct-dispatch + 4096 cap on wasm.
+
+### Predicted outcome
+If chunks cross-pass write visibility IS the bug AND copy_buffer_to_buffer barrier scope is per-byte-range (not whole-buffer), then full-size copies should restore visibility → SSIM ≥0.91.
+
+### Results
+- Web SSIM: 0.809535 / 0.693448 / 0.694741
+- Web AADF run-1: `chunk_aadf=[mx=0 px=0 my=1 py=1 mz=1 pz=1]` (FIRST TIME 4 axes expanded! though only by 1 each, native does 3-4 rounds)
+- Web AADF run-3: `chunk_aadf=[0,0,0,0,0,0]` (REGRESSED to no expansion)
+- Run-1 SSIM=0.810 is the **HIGHEST DISPATCH-2 SCORE** (vs prior cluster 0.69-0.79).
+
+### Partial confirmation, not enough to win
+
+H4-redo gives strongest evidence yet that the cross-pass chunks visibility IS the bug:
+- Best run shows Y and Z and pz expansion landing (4 of 6 axes got 1 bit).
+- Worst run shows total regression (no expansion).
+
+But: even FULL chunks copies don't reliably make ALL rounds' writes propagate. The native pattern is "expand by 1 per round per axis, across multiple rounds" (final 3-4 per axis). Web gets only 1 round of expansion per axis at best, never multi-round.
+
+This suggests that **even with full chunks copies, Dawn ISN'T making cross-pass writes from compute → next compute visible reliably**. Possible reasons:
+- Dawn batches copy_buffer_to_buffer with subsequent compute passes without intermediate sync.
+- The compute pass's SHADER_WRITE→COPY_SRC barrier doesn't actually flush to global memory; it just changes usage tracking.
+- WebGPU's spec is non-binding about this; Chrome's Dawn implementation defers.
+
+### State at iteration 2-4 end
+- Modified files: 
+  - `bounds_calc.rs` — wasm uses render_context.command_encoder() with per-round chunks self-copy intervention via lazy Local<Option<Buffer>>. Native path unchanged.
+  - `config.rs` — reverted iter-5's n_bounds_rounds=40 bump.
+- `world_data.wgsl` and `pipelines.rs` — reverted iter-2-3's read_write flip.
+
+---
+
+## STATUS: BAILED (dispatch 2) — iteration 4 exhausted
+
+### Hypotheses tried in dispatch-2 (with angle classification)
+
+1. **iter-2-1 baseline**: revert iter-5 and iter-4 to per-round-encoder + M1 noop. angle=broken-side. SSIM=0.793/0.793/0.693. Confirmed baseline cluster. Web AADF only 1 bit on Z axis vs native's 4,4,3,3,3,3.
+2. **iter-2-2 H1**: native code path on wasm (one encoder, indirect dispatch). angle=combination. SSIM=0.793/0.693/0.694. Encoder boundary NOT the issue. Indirect IS working (barrier OK).
+3. **iter-2-3 H2**: chunks read_write on renderer. angle=broken-side (usage-transition theory). SSIM=0.693/0.693/0.694. REGRESSED. REFUTED + REVERTED.
+4. **iter-2-4 H4-redo**: FULL chunks self-copy between rounds. angle=combination. SSIM=0.810/0.693/0.695. BEST RESULT so far (0.810 is highest dispatch-2 SSIM); web AADF for the GOOD run shows 4/6 axes expanded (vs only 1 in baseline). Partial confirmation that cross-pass chunks visibility is the bug. But not 3/3 PASS.
+
+### Critical finding for next dispatch
+
+The bug is **cross-pass write→read visibility on `chunks[]` storage buffer on Dawn/WebGPU**. Each round of `compute_group_bounds` reads `chunks[chunk_idx]`, computes new AADF, writes back. On native, subsequent rounds read the FRESH value. On web, subsequent rounds read STALE value (0) and overwrite. Result: only the LAST round's writes survive, giving AADF=0,0,0,0,1,1 (only Z, the last-processed axis).
+
+This is NOT solved by:
+- per-round-encoder+submit (dispatch-1 iter-0, iter-2-1)
+- one-encoder-per-frame (dispatch-1 iter-1, iter-2-2)
+- end-of-encoder noop (dispatch-1 probe-2 / iter-2-1)
+- chunks copy_buffer_to_buffer(4 bytes) between rounds (dispatch-1 iter-4)
+- chunks copy_buffer_to_buffer(FULL size, both directions) between rounds (dispatch-2 iter-2-4) — PARTIAL
+- renderer chunks binding flipped to rw (dispatch-2 iter-2-3) — REGRESSED
+
+### Ideas considered but not tried this dispatch
+
+1. **Algorithmic restructure (Shape G — queue rebuild from masks).** Big refactor; the data shows the existing algorithm WORKS on native and FAILS on web for the same reason. Restructure doesn't address the GPU memory visibility bug.
+
+2. **Read+write all chunks via single-pass, no cross-pass dependency.** Have ONE compute pass do ALL axes for ALL queues for ALL bound sizes in one go. Impossible: bound size N requires the result of bound size N-1.
+
+3. **Read chunks ONLY ONCE per frame, cache in workgroup memory.** Doesn't scale (workgroup memory ~64 KB, chunks ~16 MB).
+
+4. **Use storageBarrier() at end of compute_group_bounds.** WGSL storageBarrier is workgroup-scope, not cross-workgroup. May or may not help; not tested due to running out of iteration budget.
+
+5. **Bisect via custom probe: a one-shot e2e test that reads chunks[chunk_idx] from a known position AFTER all W3 work, compare native vs web verbatim.** Indirectly done via the aadf-probe2 readback; both targets show their respective AADF values.
+
+6. **Eliminate the cross-pass dependency by passing AADF state through bound_group_queues instead of chunks.** Each entry in bound_group_queues carries (group_pos, current_AADF). Compute_group_bounds reads current AADF from queue entry, updates it, writes back to chunks (final). bound_group_queues is then the actual mutable state across rounds — and it IS atomic, so it might survive the cross-pass visibility issue.
+
+7. **Stall the screenshot until the algorithm has been "running long enough" by polling some convergence flag.** Doesn't help if writes never propagate.
+
+8. **Use a different shader-compile path on wasm.** E.g., `naga::Backend::Wgsl` instead of `naga::Backend::Spv`. Not in scope.
+
+### Recommended directions for the next dispatch (dispatch 3)
+
+**High priority — restructure data flow to avoid cross-pass chunks dependency.**
+
+Option A — **Queue carries AADF state**: extend bound_group_queues entries from `u32` (packed position) to `vec2<u32>` (packed_position, current_aadf). compute_group_bounds reads its AADF from the queue entry (not chunks), expands, writes back to the queue AND optionally to chunks. The renderer reads chunks (the cached final state).
+
+Option B — **Per-round chunks subset writes**: limit each compute pass to ONLY the chunks for the CURRENT bound size + axis combination. The other axes' chunks are written by OTHER compute passes. Since each axis writes to disjoint chunk-axes-bits within the SAME chunk word, writes from different rounds DON'T conflict if interleaved correctly. But the AADF axis bits live in the SAME word, so this isn't possible without atomicOr.
+
+Option C — **Use atomicOr on chunks**: convert chunks `array<vec2<u32>>` to `array<atomic<u32>>` (drop .y, use a separate buffer for entity pointer). Each `compute_group_bounds` round uses `atomicOr(&chunks[chunk_idx], 1u << bounds_location)` to set the AADF bit. atomicOr survives cross-pass visibility issues better than non-atomic writes (per dispatch-1 H2 / iter-2 evidence on bound_queue_sizes which works as atomic). This is a significant refactor of bounds_calc.wgsl + chunk_calc.wgsl + ray_tracing.wgsl + world_data.wgsl, but bounded.
+
+Option D — **CPU fallback for W3 on wasm**: gate `gpu_construction_enabled = false` on wasm so the CPU `construct()` builds AADF on CPU and uploads chunks once. Loses GPU-acceleration but provides correctness. Easy.
+
+**LOW priority — punt on PR-completeness, ship as-is with `cpu_fallback=true` on wasm.** The handoff is months-deep; the orchestrator might prefer a working wasm build over a fast wasm build.
+
+### State of the worktree at bail time
+
+Modified files (current state — iter-2-4 chunks-self-copy in place):
+- `crates/bevy_naadf/src/render/construction/bounds_calc.rs` — wasm uses `render_context.command_encoder()` with per-round chunks self-copy via lazy `Local<Option<Buffer>>`. The native path is unchanged.
+- `crates/bevy_naadf/src/render/construction/config.rs` — reverted iter-5's `n_bounds_rounds = max(40)` to native default (5).
+
+Files reverted from prior dispatch's edits:
+- `crates/bevy_naadf/src/render/construction/bounds_calc.rs` — removed the per-round-encoder+submit + chunks-copy(4byte) state from dispatch-1 iter-5.
+- `crates/bevy_naadf/src/assets/shaders/world_data.wgsl` — re-verted iter-2-3's `read_write` flip; back to `read`.
+- `crates/bevy_naadf/src/render/pipelines.rs` — re-verted iter-2-3's storage_buffer_sized flip; back to storage_buffer_read_only_sized.
+
+Files NOT touched in dispatch-2:
+- `crates/bevy_naadf/src/assets/shaders/bounds_calc.wgsl` — unchanged from end of dispatch-1.
+
+Probe-2's end_of_encoder_noop dispatch is REMOVED in dispatch-2's iter-2-4 (we no longer use the per-round-encoder branch). The PIPELINE resolution is still gated on wasm (line 515-522) but the dispatch is suppressed via `let _ = end_of_encoder_noop_pipeline;` at line 605.
+
+### Logs / artefacts
+
+All per-iteration logs in `target/diagnostics/consolidated/iter-2-{1,2,3,4}/`:
+- `web-run-{1,2,3}.log` — full Playwright stdout with SSIM, panic markers, [probe1-call] lines, [aadf-probe] AADF samples.
+- `native-run-1.log` (iter-2-1 only) — native run with [aadf-probe2] [probe1-call] convergence pattern.
+- `web-build.log` — wasm release build output.
+
+Visual diff: screenshot pairs at `target/e2e-screenshots/vox_horizon_{native,web}.png`. The latest web image reflects iter-2-4's chunks-self-copy state.
+
+### Recommendations for orchestrator
+
+**Strongly suggest dispatch-3 attempt Option C (chunks as atomic<u32>) before Option D (CPU fallback).** The data from iter-2-4 shows chunks-write-visibility IS the bug; atomic operations have been shown to work cross-pass on web (via the `bound_queue_sizes` split-buffer fix). Converting chunks to atomic should follow the same proven pattern. Cost: ~3 days of refactoring across 4 shaders + their Rust bindings + their layout descriptors.
+
+If Option C also fails, drop to Option D (CPU fallback) as a known-good escape hatch.
+
