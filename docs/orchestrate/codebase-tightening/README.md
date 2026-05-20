@@ -49,7 +49,8 @@
 - [x] `00` — audit
 - [x] `01` — context bundle (incl. 2026-05-20 addendum after explorer hard gate)
 - [x] `02` — explorers (D1..D8, parallel batch) — all 8 returned with prioritised findings
-- [ ] `03` — architects (D1..D8, parallel batch)
+- [x] `03` — architects (D1..D8, parallel batch) — all 8 returned; cross-architect conflicts triaged (D5 merge wins per Resolution D; D7 pre-lands `GiSettings::DEFAULT` scout commit; D7's C1-C6 deferred to D7 impl; D8 bake.rs in-place edit)
+- [ ] `04a` — D7 scout: 3-line `pub const GiSettings::DEFAULT` + `#[derive(PartialEq)]` pre-land (before D2 impl)
 - [ ] `04` — implementor D5
 - [ ] `04` — implementor D4
 - [ ] `04` — implementor D1

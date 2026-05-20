@@ -1,0 +1,812 @@
+# D8 — asset-pipeline architecture
+
+**Author**: asset-pipeline architect (Phase-2, codebase-tightening orchestration).
+**Date**: 2026-05-20.
+**Resolution**: Option A confirmed by user — delete runtime consumers, keep
+the `bake` binary + `bake-texarrays` justfile recipe as the InstaMAT scaffold.
+**Verdict**: D8 collapses to a deletion list. No new types, no migration of
+behaviour. The implementor brief is a `git rm` set, a Cargo.toml prune, a 14-line
+`lib.rs` edit, and one verification run.
+
+This doc is short by design (the brief explicitly permits it). The exploration
+already did the deletion-list work; the architect's job here is to (a) re-verify
+zero-callers with fresh grep evidence, (b) finalise the Cargo.toml cleanup
+boundary (which deps cross the D8 ↔ D7 line), and (c) sequence the steps so each
+intermediate state builds clean.
+
+---
+
+## 1 — Findings addressed
+
+- **F-D8-A (`texture_array/**`)** — DELETE per Resolution B.
+- **F-D8-B (`baked_material.rs`)** — DELETE per Resolution B. Includes the
+  documented `MaterialRonLoader::extensions = &["ron"]` footgun, which goes
+  with its parent.
+- **F-D8-C (`material_set/mod.rs`)** — DELETE per Resolution B. Unreachable
+  module (never registered in `lib.rs`).
+- **F-D8-D (Cargo deps the deletion frees up)** — design the prune list.
+- **F-D8-E (`lib.rs` 14-line plugin-registration removal)** — design the edit,
+  coordinate with D7.
+- **F-D8-F (sample assets — `sample.texarray.ron`, two PNGs, two `.meta`s)** —
+  DELETE the demo asset tree (no consumer remains after F-D8-A; the same
+  paths are referenced only from doc-comments in deleted modules).
+- **KEEP `bin/bake.rs` (96 LOC)** — InstaMAT pre-bake scaffold per
+  [[instamat-bake-to-disk]] user memory. Stays even though its only collaborator
+  module (`texture_array`) is being deleted — see Open Conflicts §5.
+- **KEEP `justfile` `bake-texarrays` recipe** — user-facing pipeline entry.
+
+**Findings explicitly NOT addressed here** (delegated to other domains):
+- D7's `diagnostics::device_snapshot` deletion (Resolution A) — D7 territory.
+  Touches the same `serde`/`serde_json` direct deps in this Cargo.toml, but
+  D7's architect owns those decisions.
+- D6's `e2e/tests/device-snapshot.spec.ts` + `--device-snapshot-native` CLI —
+  D6 territory.
+- D8's exploration §10 flag of `dist/src/assets/` git-tracking — out of D8
+  scope. Flagged in §6 side-notes for D7.
+
+---
+
+## 2 — Zero-callers re-verification (grep evidence)
+
+Commands run from `/mnt/archive4/DEV/bevy-naadf` (worktrees excluded — only
+`crates/`, `e2e/`, `justfile`, `Cargo.toml`, `Trunk.toml` in the master tree
+counted):
+
+```
+grep -rn "TextureArrayPlugin\|BakedMaterialPlugin\|MaterialSetPlugin\
+|MaterialRonLoader\|TextureArrayLoader\|MaterialSet\|baked_material\
+|material_set\|texture_array\|MaterialRon\|TextureArrayDef\
+|TextureArrayBasisSaver\|bake_texture_array\|compress_array_to_basis" \
+    --include='*.rs' crates/
+```
+
+Non-self-referential hits (i.e. callers OUTSIDE the D8 modules themselves):
+
+| caller | line | reference | disposition |
+|---|---|---|---|
+| `crates/bevy_naadf/src/lib.rs` | 15 | `pub mod baked_material;` | DELETE (Step 3) |
+| `crates/bevy_naadf/src/lib.rs` | 23 | `pub mod texture_array;` | DELETE (Step 3) |
+| `crates/bevy_naadf/src/lib.rs` | 753-758 | `BakedMaterialPlugin,` + 5-line comment block | DELETE (Step 3) |
+| `crates/bevy_naadf/src/lib.rs` | 759-763 | `TextureArrayPlugin,` + 4-line comment block | DELETE (Step 3) |
+| `crates/bevy_naadf/src/lib.rs` | 724 | `// `just bake`) — see `crate::texture_array`.` (comment-only inside the `AssetPlugin` set-block) | EDIT — drop the `crate::texture_array` cross-ref clause |
+| `crates/bevy_naadf/src/bin/bake.rs` | 36, 84 | `use bevy_naadf::texture_array::TextureArrayPlugin;` + plugin add | **CONFLICT** — see §5 |
+| `crates/bevy_naadf/src/diagnostics.rs` | 248, 528, 624 | `max_texture_array_layers` field on wgpu `SnapshotLimits` | NOT D8 — substring collision, this is wgpu's `Limits.max_texture_array_layers` (different `texture_array` concept). Leave alone. |
+
+Non-Rust non-self hits:
+
+```
+grep -rn "TextureArrayPlugin\|BakedMaterialPlugin\|MaterialSetPlugin\
+|MaterialRonLoader\|TextureArrayLoader\|MaterialSet\|texarray\.ron\
+|material\.ron\|basis-universal\|bake-texarrays" \
+    crates/ e2e/ justfile Cargo.toml Trunk.toml
+```
+
+| caller | reference | disposition |
+|---|---|---|
+| `crates/bevy_naadf/Cargo.toml:46,89,93,137,139-153` | Doc-comments + the `basis-universal = "0.3"` + `bevy/asset_processor` + `bevy/basis-universal` features inside `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` | EDIT (Step 4) — see §3 |
+| `justfile:34-37` | `bake-texarrays` recipe (the comment header + 2-line body) | **KEEP** per Resolution B |
+| `crates/bevy_naadf/src/assets/textures/sample.texarray.ron` | demo asset | DELETE (Step 2) |
+| `crates/bevy_naadf/dist/src/assets/textures/sample.texarray.ron` | Trunk build artifact (out of D8 scope) | not D8 — `dist/` is regenerated by `trunk build`; flagged for D7 |
+| `crates/bevy_naadf/imported_assets/log` | references like `materials/diffuse.texarray.ron` | not D8 — out-of-tree artifact dir; gitignored or stale, doesn't reference back to source |
+| `e2e/**` | `grep -rn "texture_array\|baked_material\|material_set\|MaterialRon\|TextureArray\|MaterialSet\|texarray\|bake\.rs\|BakedMaterial\|basis-universal" e2e/` returned **zero hits** | confirmed — e2e harness has no D8 references |
+| `Trunk.toml` | no D8 references found | confirmed |
+
+**Workspace `Cargo.toml`** (`/mnt/archive4/DEV/bevy-naadf/Cargo.toml`) is read-only here — it lists the two member crates and `[profile.*]`. Nothing D8-specific.
+
+**Verdict**: every D8 source file has zero callers outside (a) D8's own modules
+and (b) the `lib.rs` plugin-registration block. The deletion is clean modulo
+the `bin/bake.rs` ↔ `texture_array/` retention conflict resolved in §5.
+
+---
+
+## 3 — Cargo.toml cleanup design
+
+Two crate-level `Cargo.toml` sections require edits. The workspace-root
+`Cargo.toml` is untouched.
+
+### 3.1 — Drops (lines reference `crates/bevy_naadf/Cargo.toml` at HEAD)
+
+| line(s) | content | action | rationale |
+|---|---|---|---|
+| `148-153` | the **entire** `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` block (`bevy = { ..., features = ["asset_processor", "basis-universal"] }` + `basis-universal = "0.3"`) | **DELETE THE BLOCK** | The two `bevy` features and the `basis-universal` direct dep are the only contents. `bake.rs` needs `asset_processor` (see Open Conflicts §5) — so this block is **NOT deleted outright**, it is reduced. See §3.2. |
+| `89-92` | `ron = "0.12"` direct dep + its 3-line comment | DELETE | The only direct caller was `texture_array/loader.rs` + `baked_material.rs`. Bevy still pulls `ron` transitively; no other crate-level Rust source `use ron::` after deletion. Verified: `grep -rn 'use ron\|ron::' crates/bevy_naadf/src/` returned no hits outside D8 modules. |
+| `68-71` | `image = { ..., features = ["png", "jpeg"] }` | EDIT: drop `"jpeg"` from the features list | The only consumer of JPEG decoding was `texture_array/loader.rs`'s source PNG/JPEG decoder. Verified: `grep -rn 'jpeg\|Jpeg' crates/bevy_naadf/src/ crates/bevy_naadf/src/e2e/` returned zero non-D8 hits. The `image` dep stays (PNG encoding remains in `e2e/framebuffer.rs::Framebuffer::save_png`). |
+| `137-147` | the explanatory comment block "`Native-only support for the texture-array Basis pipeline ...`" | EDIT: rewrite the comment to describe ONLY the `bake.rs`-relevant features after §3.2 reduction | Comment must agree with the trimmed dep block. |
+
+### 3.2 — `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` final shape
+
+After §3.1: the block still exists because `bake.rs` survives. `bake.rs:36-84`
+imports `bevy_naadf::texture_array::TextureArrayPlugin`, BUT that plugin is
+being deleted. So `bake.rs` itself must be edited (or deleted). See §5 Open
+Conflicts — the conflict resolution determines whether the block survives.
+
+**If the user-confirmed retention of `bake.rs` stands literally** (Option A
+keeps `bin/bake.rs` referencing `texture_array::TextureArrayPlugin`, but
+`texture_array/**` is also being deleted) — the import breaks. Two possible
+reconciliations, both within Option A:
+
+1. **(Recommended)** Edit `bin/bake.rs` to remove the `TextureArrayPlugin`
+   import + `add_plugins` entry. Without `TextureArrayPlugin`, the
+   `AssetProcessor` boots but processes nothing — the binary becomes a
+   no-op skeleton retained as the InstaMAT-pattern *template*, exactly as
+   [[instamat-bake-to-disk]] describes. The skeleton still demonstrates:
+   `MinimalPlugins + ScheduleRunnerPlugin + AssetPlugin(Processed) +
+   ImagePlugin + register_asset_loader(ImageLoader) + exit-when-finished`.
+   The future InstaMAT integration plugs into the same shape.
+
+2. Delete `bin/bake.rs` entirely (and the `bake-texarrays` justfile recipe).
+
+The user directive **(KEEP `bin/bake.rs`)** combined with the recommendation
+to keep [[instamat-bake-to-disk]]-style scaffolding selects reconciliation
+**(1)**. Implementor edits `bake.rs` per Step 5 below.
+
+After §3.2: the `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`
+block becomes:
+
+```toml
+# Native-only: the `bake` binary (`src/bin/bake.rs`) needs `AssetProcessor`
+# for the future InstaMAT pre-bake pipeline; the production app stays
+# `Unprocessed` and just ignores the unused processor code.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "=0.19.0-rc.1", features = ["asset_processor"] }
+```
+
+- `bevy/asset_processor` STAYS — `bake.rs` calls `AssetProcessor::get_state()`.
+- `bevy/basis-universal` GOES — the runtime transcoder is only useful if
+  something runtime-loaded `.basis` files. After D8's deletion nothing does.
+- `basis-universal = "0.3"` direct dep GOES — the encoder is only used by the
+  deleted `texture_array/saver.rs`.
+
+### 3.3 — `[[bin]]` entries
+
+`[[bin]] name = "bake"` (`Cargo.toml:30-32`) STAYS. The `[[bin]] name = "diag_compare"`
+(`Cargo.toml:39-41`) entry is **D7's deletion**, not D8's — flagged so D8's
+implementor doesn't touch it.
+
+### 3.4 — `default-run` and the header comment
+
+- `default-run = "bevy-naadf"` (line 9) STAYS.
+- Header comment lines 7-17 mentions three binaries `(bevy-naadf, e2e_render, bake)`.
+  STAYS — `bake` remains. D7's `diag_compare` deletion is the only header
+  edit, NOT D8's.
+
+### 3.5 — Deps confirmed STAYING (do not touch)
+
+- `serde = { version = "1", features = ["derive"] }` — D7's `device_snapshot`
+  submodule uses `serde::Serialize`. D7 owns whether this stays. D8 does not
+  touch.
+- `serde_json` — D7's `diagnostics.rs:429` + `bin/diag_compare.rs` use it.
+  D7-territory; D8 does not touch.
+- `thiserror = "2"` — also used by `voxel/vox_import.rs:61`,
+  `voxel/cvox_import.rs:62`, `voxel/voxel_dispatch.rs:38`. STAYS.
+- `image-compare`, `bytemuck`, `dot_vox`, `zip`, `wgpu`, `web-time`, `tracing*`
+  — unrelated.
+
+---
+
+## 4 — `lib.rs` cleanup design
+
+Edits to `crates/bevy_naadf/src/lib.rs`:
+
+| line(s) at HEAD | content | action |
+|---|---|---|
+| `15` | `pub mod baked_material;` | DELETE |
+| `23` | `pub mod texture_array;` | DELETE |
+| `720-724` | comment block ending `// `just bake`) — see `crate::texture_array`.` (inside the `AssetPlugin` set-block) | EDIT: drop the `see `crate::texture_array`` clause; the block now reads `// The texture-array Basis pipeline runs out-of-band in the dedicated `bake` binary instead (`src/bin/bake.rs`, `just bake-texarrays`).` |
+| `753-758` | 5 lines: 4-line comment about the `material.ron` loader + the `baked_material::BakedMaterialPlugin,` entry | DELETE |
+| `759-763` | 5 lines: 4-line comment about the `*.texarray.ron` loader + the `texture_array::TextureArrayPlugin,` entry | DELETE |
+
+**Total `lib.rs` line drop: 12 lines deleted + 1 inline-comment edit.** (The
+exploration's "14 lines" figure rounded up; actual = the 5 + 5 + 2 mod decls
+= 12 lines removed verbatim, plus one comment trimmed.)
+
+After deletion, the `add_plugins(...)` tuple at lines 737-764 retains:
+
+```rust
+.add_plugins((
+    FrameTimeDiagnosticsPlugin::default(),
+    RenderDiagnosticsPlugin,
+    world::WorldPlugin,
+    render::NaadfRenderPlugin,
+    // Phase-C construction seam (`15-design-c.md` §3, §1.1) ...
+    render::construction::ConstructionPlugin,
+));
+```
+
+**D7 coordination**: D7's `build_app_with_args` decomposition (F1 in
+`app-and-camera/02-exploration.md`) will not register `TextureArrayPlugin` /
+`BakedMaterialPlugin` / `MaterialSetPlugin` (they are gone after D8). D7's
+plugin-target sketch at `app-and-camera/02-exploration.md:355-358` already
+lists `BakedMaterialPlugin` / `TextureArrayPlugin` under "Core engine plugins
+(already extracted, just re-listed)" — D7's architect must remove those two
+entries from the sketch before D7's impl phase. D8 does not edit D7's
+architecture doc; D8 simply notes the dependency.
+
+---
+
+## 5 — `justfile` cleanup
+
+| line(s) | action |
+|---|---|
+| `34-37` (the `bake-texarrays` recipe + its 3-line comment) | **KEEP** per Resolution B |
+| Everything else in `justfile` | not D8 — D7 owns the `diag-*` recipes (lines 185-213); the `web*` / `noise-*` / `test*` recipes are out of D8 scope. |
+
+No edits to `justfile` by D8.
+
+---
+
+## 6 — Migration steps
+
+Each step leaves the codebase in a buildable state. Implementor runs the
+verification gate between steps; any step that fails build means revert and
+ask.
+
+### Step 1 — Reduce `texture_array/` plugin so `bake.rs` doesn't link it
+
+**Edits**:
+- `crates/bevy_naadf/src/bin/bake.rs:36` — delete the line
+  `use bevy_naadf::texture_array::TextureArrayPlugin;`.
+- `crates/bevy_naadf/src/bin/bake.rs:84` — delete the line `TextureArrayPlugin,`
+  inside the `add_plugins` tuple.
+- `crates/bevy_naadf/src/bin/bake.rs:1-16` (module doc-comment) — edit to
+  describe the bake binary as an InstaMAT-pattern scaffold:
+
+```rust
+//! `bake` — runs Bevy's [`AssetProcessor`] over `src/assets/` once, then exits.
+//!
+//! Retained as an InstaMAT pre-bake-to-disk scaffold (see
+//! `instamat-bake-to-disk` user memory): a headless, render-less Bevy app that
+//! boots the asset pipeline in `AssetMode::Processed` and exits when the
+//! processor reports `ProcessorState::Finished`. The runtime baked-material
+//! consumer lives on a separate PBR branch; on master this binary processes no
+//! assets — it is the template the future InstaMAT integration plugs into.
+//!
+//! Native-only: the production app (`bevy-naadf`) and the e2e harness both
+//! run in `AssetMode::Unprocessed`; a Bevy `AssetProcessor` is app-global and
+//! racing it against the render pipeline's shader loads is fragile.
+//!
+//! Run it with `cargo run --bin bake` (or `just bake-texarrays`).
+```
+
+- `crates/bevy_naadf/src/bin/bake.rs:73-75` — drop the comment fragment
+  `// `AssetProcessor` resource exists for `TextureArrayPlugin` to / // register
+  its processor against.` and any `MinimalPlugins.set(...)` lines that mention
+  `TextureArrayPlugin`. The remaining body (lines 67-95) is otherwise unchanged.
+
+**Rationale**: severs `bake.rs`'s only inbound link from D8's source tree
+before deleting the source tree.
+
+**Post-step state**:
+- `bake.rs` compiles standalone (no `texture_array` import).
+- `texture_array/**` still exists and is still wired into `lib.rs`.
+- The build is green; `cargo run --bin bake` runs and exits Success
+  (`ProcessorState::Finished` fires immediately because there are no
+  asset processors registered).
+
+**Verification**: `cargo build --workspace`. Optionally
+`cargo run --bin bake --no-default-features --release` (`just bake-texarrays`)
+to confirm clean exit.
+
+---
+
+### Step 2 — Delete the sample asset trio
+
+**Edits** (git rm):
+- `crates/bevy_naadf/src/assets/textures/sample.texarray.ron`
+- `crates/bevy_naadf/src/assets/textures/sample_color.png`
+- `crates/bevy_naadf/src/assets/textures/sample_color.png.meta`
+- `crates/bevy_naadf/src/assets/textures/sample_height.png`
+- `crates/bevy_naadf/src/assets/textures/sample_height.png.meta`
+- `crates/bevy_naadf/src/assets/textures/` (the directory itself, since it
+  becomes empty)
+
+**Rationale**: the demo assets are only referenced by doc-comments in
+`texture_array/mod.rs` and `texture_array/loader.rs` (which Step 3 deletes).
+After Step 1 they are still loadable by code (the loader exists, the assets
+exist), but nothing on disk has a `Startup` system or test that loads them
+— verified by §2's grep.
+
+**Post-step state**: the asset directory contains only `shaders/`. The
+`Trunk.toml` asset-copy step (out of D8 scope, but worth knowing) will
+regenerate `dist/src/assets/textures/` empty.
+
+**Verification**: `cargo build --workspace`. The build does not depend on
+the asset files (they are runtime-loaded, not `include_bytes!`-ed).
+
+---
+
+### Step 3 — Delete D8 source files + `lib.rs` registrations
+
+**Edits**:
+- `git rm crates/bevy_naadf/src/baked_material.rs` (225 LOC).
+- `git rm crates/bevy_naadf/src/material_set/mod.rs` (60 LOC); `git rm -r
+  crates/bevy_naadf/src/material_set/` (the directory, now empty).
+- `git rm -r crates/bevy_naadf/src/texture_array/` (whole subtree:
+  `mod.rs:133` + `def.rs:127` + `loader.rs:331` + `saver.rs:194` = 785 LOC).
+- `crates/bevy_naadf/src/lib.rs:15` — DELETE `pub mod baked_material;`.
+- `crates/bevy_naadf/src/lib.rs:23` — DELETE `pub mod texture_array;`.
+- `crates/bevy_naadf/src/lib.rs:753-758` — DELETE the 5-line block
+  containing the `BakedMaterialPlugin` registration + its preceding 4-line
+  comment.
+- `crates/bevy_naadf/src/lib.rs:759-763` — DELETE the 5-line block
+  containing the `TextureArrayPlugin` registration + its preceding 4-line
+  comment.
+- `crates/bevy_naadf/src/lib.rs:720-724` — EDIT the `AssetPlugin` set-block
+  comment to drop the `see `crate::texture_array`` cross-reference:
+
+  Before (lines 719-725):
+  ```rust
+                  // Stays `AssetMode::Unprocessed` for the production app and
+                  // the e2e harness: a Bevy `AssetProcessor` is app-global and
+                  // racing it against the render pipeline's shader loads is
+                  // fragile. The texture-array Basis pipeline runs out-of-band
+                  // in the dedicated `bake` binary instead (`src/bin/bake.rs`,
+                  // `just bake`) — see `crate::texture_array`.
+                  ..default()
+  ```
+
+  After:
+  ```rust
+                  // Stays `AssetMode::Unprocessed` for the production app and
+                  // the e2e harness: a Bevy `AssetProcessor` is app-global and
+                  // racing it against the render pipeline's shader loads is
+                  // fragile. The dedicated `bake` binary (`src/bin/bake.rs`,
+                  // `just bake-texarrays`) opts into `AssetMode::Processed`
+                  // instead — retained as an InstaMAT pre-bake scaffold.
+                  ..default()
+  ```
+
+**Rationale**: now that `bake.rs` no longer imports `texture_array`, the
+modules are unreachable; deletion is mechanical.
+
+**Post-step state**: D8 source tree is gone. `lib.rs` no longer references
+the deleted modules. The `add_plugins(...)` tuple at lines 737-764 retains 5
+entries (down from 7).
+
+**Verification**: `cargo build --workspace` — proves no stale references
+remain. `cargo test --workspace --lib` — proves the unit tests inside
+`texture_array/loader.rs` and `texture_array/saver.rs` were correctly
+removed alongside their modules (the test runner finds no orphans).
+
+---
+
+### Step 4 — Prune `Cargo.toml`
+
+**Edits to `crates/bevy_naadf/Cargo.toml`**:
+
+- Lines `89-92` — DELETE the `ron = "0.12"` direct dep + its preceding 3-line
+  doc-comment. After deletion the `# image = ...` / `# image-compare = ...`
+  comments stay; `ron` becomes a transitive (still pulled by Bevy).
+- Lines `68-71` — EDIT the `image` features list, dropping `"jpeg"`:
+
+  Before:
+  ```toml
+  image = { version = "=0.25.10", default-features = false, features = [
+      "png",
+      "jpeg",
+  ] }
+  ```
+
+  After:
+  ```toml
+  image = { version = "=0.25.10", default-features = false, features = [
+      "png",
+  ] }
+  ```
+
+- Lines `63-67` — EDIT the `image` doc-comment to remove the
+  `PNG/JPEG *decoding* for the texture-array loader's source maps` half:
+
+  Before:
+  ```toml
+  # image = PNG encoding for the e2e harness's persistent screenshot-to-disk
+  # (`src/e2e/framebuffer.rs` `Framebuffer::save_png`) plus PNG/JPEG *decoding* for
+  # the texture-array loader's source maps (`src/texture_array/loader.rs`). Pinned
+  # to the exact version Bevy 0.19-rc.1 already pulls in transitively (so there is
+  # no second copy of the crate).
+  ```
+
+  After:
+  ```toml
+  # image = PNG encoding for the e2e harness's persistent screenshot-to-disk
+  # (`src/e2e/framebuffer.rs` `Framebuffer::save_png`). Pinned to the exact
+  # version Bevy 0.19-rc.1 already pulls in transitively (so there is no
+  # second copy of the crate).
+  ```
+
+- Lines `93-96` — EDIT the `serde` doc-comment to drop the texture-array half;
+  KEEP the dep itself (D7 owns it via `device_snapshot`). Before:
+  ```toml
+  # serde = derive `Deserialize` for the `*.texarray.ron` definition types
+  # (`src/texture_array/def.rs`). thiserror = the loader/saver error enums
+  # (`src/texture_array/{loader,saver}.rs`). Both are already in Bevy's tree at
+  # these majors, so neither adds a second copy.
+  ```
+
+  After:
+  ```toml
+  # serde = derive surface (`#[derive(Serialize)]` used by the press-P
+  # device-snapshot dump in `src/diagnostics.rs`). thiserror = the
+  # error enums in `voxel/vox_import.rs` + `voxel/cvox_import.rs` +
+  # `voxel/voxel_dispatch.rs`. Both are already in Bevy's tree at these
+  # majors, so neither adds a second copy.
+  ```
+
+  **Note**: this comment edit collides with D7's `device_snapshot` deletion
+  (after D7 lands, `serde` may itself become droppable). D8 conservatively
+  leaves the dep alone and writes the comment for HEAD's state. D7's
+  implementor revisits if `serde` ends up unused.
+
+- Lines `137-153` — REPLACE the entire native-only deps block + its preamble
+  comment:
+
+  Before (lines 131-153):
+  ```toml
+  # Native-only support for the texture-array Basis pipeline (`src/texture_array/`,
+  # `src/bin/bake.rs`):
+  #   * `bevy/asset_processor` — gates Bevy's `AssetProcessor` itself; without it
+  #     `AssetMode::Processed` only *reads* a pre-built `imported_assets/`, it
+  #     never runs the processor. The `bake` binary needs it; the production app
+  #     stays `Unprocessed` and just ignores the extra (unused) processor code.
+  #   * `bevy/basis-universal` — Bevy's runtime transcoder, so `ImageLoader` can
+  #     decode the baked `.basis` files and transcode them per-GPU at load.
+  #   * `basis-universal` — the encoder half, used by the processor's saver
+  #     (`src/texture_array/saver.rs`); version tracks the `0.3` Bevy 0.19 uses.
+  # Native-only on purpose: `basis-universal-sys` compiles the encoder C++
+  # unconditionally, and that does not cross-compile to bare
+  # `wasm32-unknown-unknown` (no C sysroot for `<stdlib.h>`). The web build
+  # therefore drops Basis entirely and loads `*.texarray.ron` uncompressed through
+  # `TextureArrayLoader` — see `src/texture_array/`. A single compressed artifact
+  # for both targets would need either a wasm C sysroot or a `bevy_voxel_world`
+  # style dual-format (BC7 + ETC2) pre-transcoding baker.
+  [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+  bevy = { version = "=0.19.0-rc.1", features = [
+      "asset_processor",
+      "basis-universal",
+  ] }
+  basis-universal = "0.3"
+  ```
+
+  After:
+  ```toml
+  # Native-only — the `bake` binary (`src/bin/bake.rs`) needs Bevy's
+  # `AssetProcessor` to opt into `AssetMode::Processed`. Without
+  # `bevy/asset_processor` Bevy only *reads* a pre-built `imported_assets/`;
+  # it never runs the processor. The production app + the e2e harness stay
+  # `Unprocessed` and ignore the extra processor code. Retained as
+  # InstaMAT pre-bake-to-disk scaffold (see the `instamat-bake-to-disk`
+  # user memory).
+  [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+  bevy = { version = "=0.19.0-rc.1", features = ["asset_processor"] }
+  ```
+
+  Drops the `bevy/basis-universal` Bevy feature + the `basis-universal = "0.3"`
+  direct dep entirely. The `basis-universal-sys` C++ encoder no longer
+  compiles — biggest knock-on win.
+
+**Rationale**: the deletions in Steps 1-3 made all of these deps + features
+unused. After Step 4 the workspace's native compile drops a C++ build step.
+
+**Post-step state**: `Cargo.lock` regenerates without `basis-universal`,
+`basis-universal-sys`, and whatever JPEG-related transitives the `image`
+crate's `jpeg` feature pulled.
+
+**Verification**: `cargo build --workspace` — proves the trimmed deps are
+sufficient. `cargo run --bin bake --no-default-features --release` (via
+`just bake-texarrays`) — proves the `bake` binary still builds and runs.
+
+---
+
+### Step 5 — Final verification
+
+**Edits**: none (verification-only).
+
+**Rationale**: end-to-end proof the deletion did not regress runtime
+behaviour.
+
+**Verification** (per the brief's "minimum verification gate"):
+
+1. `cargo build --workspace` — compilation.
+2. `cargo test --workspace --lib` — unit + integration logic. (`texture_array`'s
+   own unit tests went with its module; nothing else regresses.)
+3. `cargo run -p bevy-naadf --bin bake --no-default-features --release`
+   (== `just bake-texarrays`) — exit code 0 (`AppExit::Success`) within
+   the 30-second cap. Proves the InstaMAT scaffold still works.
+4. **At least one e2e gate** — per the brief and CLAUDE.md. Recommended:
+   `cargo run --bin e2e_render -- --vox-gpu-construction` (the
+   `--validate-gpu-construction` family is the project's canonical
+   construction-side verification; it boots the full
+   `DefaultPlugins + RenderPlugin` and runs Algorithm 1, exercising the
+   `AssetPlugin` set-block where the comment edit landed). Optional
+   second gate: `--oasis-edit-visual` (visual SSIM, more sensitive to
+   regressions but slower).
+5. **Web build (optional, recommended)**: `just web-build-release` — proves
+   the wasm32 build still compiles. The `[target.'cfg(target_arch =
+   "wasm32")']` block is untouched by D8, but the workspace-level lock changes
+   from Step 4 could in principle affect wasm32 resolution. A clean
+   `trunk build --release` confirms no regression.
+
+**Post-step state**: D8 complete. ~1 100 LOC + 5 asset files + a C++ build
+dep gone. The runtime is byte-identical (no live consumer was deleted).
+`bake.rs` survives as the InstaMAT scaffold.
+
+---
+
+## 7 — What stays / what changes / what is removed
+
+### Stays unchanged
+- `crates/bevy_naadf/src/bin/bake.rs` — kept as InstaMAT scaffold (see Step 1
+  for the in-place edit that removes its `texture_array` import + retitles
+  the docblock).
+- `justfile:34-37` (`bake-texarrays` recipe).
+- `crates/bevy_naadf/src/diagnostics.rs:248,528,624` references to
+  `max_texture_array_layers` — substring collision with wgpu's
+  `Limits.max_texture_array_layers` field, unrelated.
+- `serde`, `serde_json`, `thiserror`, `ron` (transitively via Bevy after the
+  direct dep drops), `image-compare`, `dot_vox`, `zip`, `wgpu`, `web-time`,
+  `bytemuck`, `tracing*` — Cargo deps with non-D8 consumers.
+- `Cargo.toml:9` (`default-run = "bevy-naadf"`), header comment lines 7-17
+  (still mentions the three live bins).
+- `[[bin]]` entries for `bevy-naadf`, `e2e_render`, and `bake`.
+- Workspace-root `Cargo.toml` and `.cargo/config.toml`.
+- `Trunk.toml` (not touched by D8).
+
+### Changes
+- `crates/bevy_naadf/src/bin/bake.rs` — Step 1 in-place edit (drop
+  `texture_array` import + plugin add + retitle the docblock).
+- `crates/bevy_naadf/src/lib.rs` — Step 3 deletions of 4 line-ranges
+  (lines 15, 23, 753-758, 759-763) + Step 3 inline-comment edit at lines
+  719-725.
+- `crates/bevy_naadf/Cargo.toml` — Step 4 edits to lines 63-71 (`image`
+  doc-comment + drop `jpeg` feature), lines 89-92 (drop `ron` direct dep
+  block), lines 93-97 (`serde`/`thiserror` comment), lines 131-153 (collapse
+  native-only deps block).
+
+### Removed
+- `crates/bevy_naadf/src/baked_material.rs` (225 LOC). Callers: only
+  `lib.rs:15,758` (both deleted in Step 3).
+- `crates/bevy_naadf/src/material_set/mod.rs` (60 LOC). Callers: none —
+  module was never even registered.
+- `crates/bevy_naadf/src/material_set/` directory.
+- `crates/bevy_naadf/src/texture_array/mod.rs` (133 LOC) + `def.rs` (127) +
+  `loader.rs` (331) + `saver.rs` (194) = 785 LOC. Callers: `lib.rs:23,763`
+  (Step 3), `bin/bake.rs:36,84` (Step 1).
+- `crates/bevy_naadf/src/texture_array/` directory.
+- `crates/bevy_naadf/src/assets/textures/sample.texarray.ron` + the four
+  associated PNG/`.png.meta` files.
+- `crates/bevy_naadf/src/assets/textures/` directory.
+- `ron = "0.12"` direct dep + its doc-block (lines 89-92).
+- `basis-universal = "0.3"` direct dep.
+- `bevy/basis-universal` feature.
+- `image.features = ["jpeg"]` (drops the jpeg decoder transitive).
+- Net Cargo lock drop: `basis-universal`, `basis-universal-sys` (C++ encoder),
+  whatever transitives the `image` `jpeg` feature pulled (`jpeg-decoder`,
+  ...).
+
+**Tally**: 225 + 60 + 785 = **1 070 LOC of Rust source deleted** + 5 asset
+files + 12 lines from `lib.rs` + roughly 25 lines from `Cargo.toml` + a C++
+build dep. (Exploration estimate was ~1 100 LOC + a C++ build dep — close.)
+
+---
+
+## 8 — Decisions and rejected alternatives
+
+### Decided
+
+1. **Keep `bin/bake.rs` as the InstaMAT scaffold**, edit it to drop the
+   `texture_array` import. The binary becomes a no-op skeleton that still
+   demonstrates the `MinimalPlugins + AssetMode::Processed + exit-when-finished`
+   pattern. **Rationale**: literal compliance with the brief's "KEEP
+   `bin/bake.rs`" directive + the user memory [[instamat-bake-to-disk]],
+   which describes the *pattern*, not specifically the texture-array
+   pipeline. The scaffold survives as the integration shape the future
+   PBR-branch + InstaMAT integration plugs into.
+
+2. **Keep the `bake-texarrays` justfile recipe verbatim**, despite its name
+   now being aspirational (the binary no longer bakes texarrays). **Rationale**:
+   the brief is explicit ("KEEP the `bake-texarrays` justfile recipe + the
+   bake-related justfile lines"). Renaming the recipe is out of D8 scope; the
+   user can rename it in a separate pass if desired.
+
+3. **Drop `basis-universal` direct dep + `bevy/basis-universal` feature
+   entirely**, not partial. **Rationale**: with the encoder + transcoder both
+   unused (the `bake` skeleton no longer encodes anything, and nothing
+   runtime-loads `.basis` files), there's no reason to keep either. The
+   native build link time drops measurably.
+
+4. **Drop `ron = "0.12"` direct dep, keep `ron` as a transitive (via Bevy)**.
+   **Rationale**: no remaining source `use ron::` in crate. Bevy's RON
+   re-export covers any future use; the direct pin is unused.
+
+5. **Drop `image.features = ["jpeg"]`, keep `image.features = ["png"]`**.
+   **Rationale**: PNG encoding stays (e2e framebuffer captures). JPEG decode
+   was only `texture_array/loader.rs`'s source-image fallback; verified
+   zero non-D8 JPEG references.
+
+6. **Delete the sample asset trio** (Step 2), not retain. **Rationale**: the
+   doc-comments referencing them die with `texture_array/mod.rs`; they have
+   no live loader; "templates live in docs" per the exploration recommendation.
+
+7. **Do not touch `[[bin]] name = "diag_compare"`** (Cargo.toml lines 39-41).
+   **Rationale**: D7's `diagnostics::device_snapshot` deletion territory.
+   Despite the exploration noting it as a candidate D8 deletion ("audit
+   whether anything still consumes it" — `00-reuse-audit.md` D8 row), D7's
+   exploration (F7) re-claimed it. Cross-domain — D8 stays in lane.
+
+### Rejected alternatives
+
+- **Reject Option B** (keep the texture-array scaffold as living code,
+  drop only `baked_material.rs` + `material_set/mod.rs`). Reason: Resolution
+  B is unambiguous (Option A confirmed by user); the exploration's
+  recommendation aligned; the PBR-branch will rebuild the runtime path when
+  it ships, not master.
+
+- **Reject deleting `bin/bake.rs`** outright. Reason: brief is explicit
+  ("KEEP `bin/bake.rs`"). The scaffold-with-no-baker reconciliation chosen
+  in §3.2(1) honours the brief literally.
+
+- **Reject deleting the `bake-texarrays` justfile recipe**. Reason: brief
+  is explicit ("KEEP" the recipe).
+
+- **Reject renaming `bake-texarrays`** to `bake` or `bake-instamat`. Reason:
+  out of D8 scope; the brief asks for KEEP-as-is.
+
+- **Reject moving D8 retained content into a sibling crate** (e.g.
+  `crates/bevy_naadf_bake/`). Reason: out of D8 scope; the brief is a
+  deletion design, not a re-architecture.
+
+- **Reject `#[cfg(feature = "...")]` gating of `texture_array/**`** instead of
+  deletion. Reason: contradicts the user directive "everything else can go".
+  Feature-gating ≠ deletion; the master branch carries the gated dead code
+  forever.
+
+---
+
+## 9 — Assumptions made
+
+1. **`crates/bevy_naadf/src/assets/textures/` is a deletable subtree** —
+   nothing depends on its presence beyond the doc-comments in the deleted
+   modules. Verified: no `include_bytes!` or `Path::new(".../textures/sample*")`
+   references in any non-deleted source file (grep).
+
+2. **`crates/bevy_naadf/dist/src/assets/textures/sample.texarray.ron`** is a
+   Trunk build artifact (verified — `dist/` is the Trunk output dir per
+   `Trunk.toml`). After Step 2 deletes the source, the next `trunk build`
+   regenerates `dist/` without it. Implementor doesn't need to manually
+   delete the dist mirror — but if `dist/` is git-tracked (per exploration
+   side-note #10), `trunk build` will produce a diff in `dist/`. That is
+   D7's concern (build setup), not D8's. **Flagged for D7 in §10 side-notes.**
+
+3. **`crates/bevy_naadf/imported_assets/log`** is an out-of-tree artifact
+   (not git-tracked or stale). Verified: it's the `AssetProcessor`'s own log
+   output. Not a source file; doesn't enter D8's deletion plan.
+
+4. **D7's `device_snapshot` deletion lands BEFORE D8's `Cargo.toml` `serde`
+   audit completes**, but D8 doesn't gate on it. D8 leaves `serde` alone
+   regardless of D7's outcome; D7's architect/impl revisits if `serde`
+   becomes droppable after `device_snapshot` deletion.
+
+5. **The user-confirmed sequencing** (`01-context.md:212-213`: "D5 first,
+   then D4, then interleave D1/D2/D3/D6/D8, then D7 last") means D8 lands
+   BEFORE D7. So when D8 deletes `lib.rs:15,23,753-758,759-763`, the
+   `lib.rs` file is still in its monolithic form (D7's plugin-extraction
+   hasn't happened yet). D8's edits are line-targeted at HEAD's line
+   numbers; if D5 or any interleaved domain has already shifted line
+   numbers, the implementor re-locates by symbol-search, not by line.
+
+6. **`bevy/asset_processor` Bevy feature flag remains valid + non-default**
+   at `=0.19.0-rc.1` after the prune. Confirmed by reading Bevy's feature
+   list in `Cargo.toml`.
+
+7. **The brief's "delete 14 lines in lib.rs" figure** rounds up two
+   `pub mod` lines (15, 23) + the two 5-line registration blocks
+   (753-758, 759-763) + the inline comment edit. The actual physical
+   line drop is 12; the brief's "14" includes the comment edit and the
+   `AssetPlugin` comment trim that this design preserves. Both numbers
+   describe the same surface, just counted differently.
+
+---
+
+## 10 — D7 coordination notes
+
+For D7's architect (and D7's implementor reading after D8 lands):
+
+1. **D7's plugin sketch** (`app-and-camera/02-exploration.md:355-358`) lists
+   `BakedMaterialPlugin` and `TextureArrayPlugin` under "Core engine plugins
+   (already extracted, just re-listed)". After D8 lands, **these two
+   entries must be removed** from D7's `build_app_with_args` redesign.
+   D7's architecture doc should reflect the post-D8 plugin set.
+
+2. **D7's `lib.rs` line-number references** will shift after D8's Step 3
+   deletions. D7's architect should write designs against symbol names, not
+   line numbers (or re-verify line numbers against post-D8 HEAD).
+
+3. **The `dist/src/assets/textures/sample.texarray.ron` mirror** (exploration
+   side-note #10) — after D8 deletes the source asset, this file becomes a
+   phantom build artifact. If `dist/` is git-tracked (it appears to be —
+   `git ls-files | grep dist/` would confirm), D7's architect/impl owns the
+   decision to either (a) `git rm` the dist mirror, (b) regenerate via
+   `trunk build` and commit the diff, or (c) add `dist/` to `.gitignore`.
+   D8 does not touch `dist/`.
+
+4. **Cargo.toml `serde` direct dep** — D8 leaves it alone. After D7's
+   `device_snapshot` deletion, the only remaining `#[derive(Serialize)]` in
+   the crate may be gone. D7's architect verifies; if so, D7 drops `serde`
+   from the direct deps (and `serde_json`, depending on `diag_compare`
+   deletion outcome).
+
+5. **The `Cargo.toml` header comment** (lines 7-17) lists "three binaries
+   (`bevy-naadf`, `e2e_render`, `bake`)". D8 keeps this — `bake` survives.
+   D7's `diag_compare` deletion (per Resolution A) does NOT add a binary
+   either way (`diag_compare` wasn't in the header list). Comment stays
+   verbatim.
+
+---
+
+## Side notes / observations / complaints
+
+1. **Bake binary's name is now misleading** — `bake` with no bakers attached
+   reads weird in the recipe list. The honest rename would be `instamat-bake`
+   or `asset-process` or drop the binary entirely and revive it when the
+   PBR branch needs it. The user-confirmed retention says "scaffold", and a
+   scaffold can have a stale-feeling name without being wrong. Flagging
+   because a reader hitting `crates/bevy_naadf/src/bin/bake.rs` and finding
+   a binary that bakes nothing will pause and re-read. The retitled
+   docblock (Step 1) mitigates this, but doesn't eliminate it.
+
+2. **The exploration's footgun observation** (`MaterialRonLoader::extensions
+   = &["ron"]`) dies with `baked_material.rs`. Worth recording: that loader
+   would have shadowed every other `.ron` file in the asset tree once a
+   second one existed. Master shipping it as-is for months without other
+   `.ron` consumers is luck, not design. The deletion incidentally fixes
+   the latent bug.
+
+3. **The `imported_assets/log` file** in `crates/bevy_naadf/imported_assets/log`
+   references `materials/{diffuse,normal,occlusion_roughness_metallic_height,
+   fabric,pavement,gravelrock}` `.texarray.ron` / `material.ron` paths that
+   **do not exist on disk** in the source tree (only `sample.texarray.ron`
+   does). That suggests an older HEAD had a richer asset tree that has
+   since been pruned, with the processor log surviving the prune. The log
+   is git-tracked? Unverified — if so, a separate D-misc / housekeeping
+   pass could `git rm` it (it's a transient artifact). Out of D8 scope;
+   flagging for whoever owns build-output hygiene.
+
+4. **Subjective**: D8's deliverable as a deletion design rather than a
+   refactor design feels right for the scope, but it makes the whole
+   "phase-2 architecture phase" structurally heavy for what is a 5-step
+   plan. The exploration's side-note #9 ("the architect phase could
+   plausibly skip a full `03-architecture.md`") was correct in spirit;
+   the orchestrator's call to keep the full phase pipeline is defensible
+   for consistency across the 8 domains, but D8's implementor brief is
+   going to be ~10 lines once this doc is read.
+
+5. **Equal-footing complaint**: the brief's instruction "Verify zero callers
+   for each file before proposing its deletion" was correctly mandatory, but
+   re-grepping with worktree-exclusion logic (the `.claude/worktrees/` tree
+   contained ~70% of the raw grep noise from sibling worktrees of unrelated
+   feature branches) cost ~15 minutes of disambiguation. Future architects
+   reading similar briefs should be told upfront: **grep `crates/` directly,
+   not the repo root**, to skip worktree pollution.
+
+6. **The `MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(...))`** in
+   `bake.rs:71` continues to make sense in the post-Step-1 scaffold —
+   future InstaMAT integration needs the same headless run-loop shape.
+   The 30-second cap (`MAX_BAKE_TICKS: u32 = 3_000`) at line 49 also
+   stays useful as the timeout pattern for whatever the scaffold bakes
+   next. The exploration's "tightening sketch" Option B improvements
+   (named const for `3_000`, named const for the thread count `Compressor::new(4)`)
+   are now moot — `saver.rs` is gone, and the bake binary's `3_000`
+   could be tightened in a follow-up but isn't D8 scope.
+
+7. **The 4-finding `00-reuse-audit.md §Side notes` item about
+   "Phase-A/B/C scaffolding"** applies to D8 exactly: `material_set/mod.rs`
+   was a verbatim paste from `docs/orchestrate/pbr-raymarching/02-design.md`.
+   The PBR design doc is the SSoT; the runtime-shape paste was investigation
+   residue. The deletion closes that particular paste-rot cleanly.
+
+8. **The `Trunk.toml` build pipeline** (out of D8 scope) copies
+   `src/assets/` into `dist/src/assets/`. After Step 2's deletion of the
+   `textures/` subdirectory, Trunk's next build will produce a `dist/`
+   without `textures/`. If anyone has a Playwright spec or a manual
+   browser test reaching for `textures/sample.texarray.ron`, it will 404.
+   Verified zero hits in `e2e/tests/**` — safe.
