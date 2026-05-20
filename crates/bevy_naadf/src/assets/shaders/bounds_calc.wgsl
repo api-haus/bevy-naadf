@@ -157,24 +157,6 @@ var<storage, read_write> bound_queue_sizes: array<atomic<u32>>;
 @group(2) @binding(0)
 var<storage, read_write> bound_dispatch_indirect: array<u32>;
 
-// `@group(3)` = `prepare_probe_history_layout` — single-binding rw storage
-// for the 2026-05-19 probe-1B per-call probe history. Only referenced from
-// `prepare_group_bounds`; the other entry points (`add_initial_groups_to_bound_queue`
-// and `compute_group_bounds`) ignore this binding. The Rust pipeline-layout
-// only includes this group on the `prepare_group_bounds` pipeline.
-//
-// Layout: `array<u32>` flat (vec4-per-entry packed as 4 consecutive u32s).
-// Per entry: `[call_idx, qi, found_size, _pad]`. Capacity is driven from
-// the host-side `PREPARE_PROBE_HISTORY_ENTRIES` constant (post-minimal-fix
-// = 256 entries = 4 KiB; pre-fix was 2048 entries = 32 KiB — see the Rust
-// const's docblock for the downsize rationale).
-//
-// Each `prepare_group_bounds` call writes one 4-u32 entry at offset
-// `call_idx * 4` if `call_idx < capacity`; over-capacity calls drop
-// silently. Capacity is dynamic via `arrayLength(&prepare_probe_history)`.
-@group(3) @binding(0)
-var<storage, read_write> prepare_probe_history: array<u32>;
-
 // ─── Constants — `boundsCalc.fx:4-12` ─────────────────────────────────────────
 
 const BLOCK_STATE_CHILD: u32 = 2u;
@@ -402,35 +384,6 @@ fn prepare_group_bounds() {
     let ring_index = 8u + (prev_calls % 8u);
     bound_refined_info[ring_index] = found_size;
 
-    // 2026-05-19 probe-1B — per-call probe history. The probe-1A ring above
-    // captures only the LAST 8 readings (`prev_calls % 8` slot reuse) and
-    // requires the existing `aadf_delayed_probe` to fire to be read, which
-    // never happens on web inside Playwright's settle. Probe-1B writes one
-    // dedicated entry per `prepare_group_bounds` call to a separate buffer
-    // (`@group(3) @binding(0)`), drained by a dedicated CPU readback that
-    // emits one `[probe1-call]` info!() line per entry. Per call: 4 u32s
-    // = `[call_idx, qi, found_size, _pad]`. Capacity comes from the host-
-    // side `PREPARE_PROBE_HISTORY_ENTRIES` const (post-minimal-fix = 256,
-    // pre-fix = 2048); calls beyond capacity drop silently. `qi` packs the queue index
-    // `(found_bound_size << 16) | found_xyz` for compactness (both fields
-    // are < 32 so the high u16 is always 0). For the "no queue found"
-    // branch we still record an entry with `qi=0xFFFFFFFF` + `found_size=0`
-    // so the CPU side distinguishes "not yet called" (zero-initialised
-    // buffer) from "called and found empty queue".
-    let probe_call_idx = prev_calls;
-    let probe_entry_off = probe_call_idx * 4u;
-    let probe_capacity_entries = arrayLength(&prepare_probe_history) / 4u;
-    if (probe_call_idx < probe_capacity_entries) {
-        prepare_probe_history[probe_entry_off + 0u] = probe_call_idx;
-        if (found) {
-            let qi_packed = (found_bound_size << 16u) | found_xyz;
-            prepare_probe_history[probe_entry_off + 1u] = qi_packed;
-        } else {
-            prepare_probe_history[probe_entry_off + 1u] = 0xFFFFFFFFu;
-        }
-        prepare_probe_history[probe_entry_off + 2u] = found_size;
-        prepare_probe_history[probe_entry_off + 3u] = 0u;
-    }
 }
 
 // ─── Entry point 3: compute_group_bounds — fx:118-193 ─────────────────────────

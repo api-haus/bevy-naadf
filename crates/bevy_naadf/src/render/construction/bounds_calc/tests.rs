@@ -39,7 +39,6 @@ use crate::render::construction::bounds_calc::{
     queue_add_initial_pipeline_with_handle, queue_compute_pipeline_with_handle,
     queue_prepare_pipeline_with_handle, BOUNDS_CALC_SHADER_SRC,
 };
-use crate::render::construction::{PREPARE_PROBE_HISTORY_BYTES, PREPARE_PROBE_HISTORY_ENTRIES};
 use crate::render::gpu_types::{GpuBoundQueueInfo, GpuConstructionParams};
 use crate::voxel::AADF_MAX_CHUNK;
 
@@ -412,6 +411,11 @@ fn build_test_chunk_world() -> ([u32; 3], Vec<u32>, Vec<bool>) {
 struct W3Fixture {
     // Web-WebGPU migration: chunks is `array<vec2<u32>>` storage buffer.
     chunks_buffer: Buffer,
+    // chunks_mirror — read-only seed for `compute_group_bounds` reads
+    // (`@group(0) @binding(2)`). Refreshed between regime-2 rounds via
+    // `copy_buffer_to_buffer(chunks → chunks_mirror)`, mirroring the
+    // production node's per-round refresh in `naadf_bounds_compute_node`.
+    chunks_mirror_buffer: Buffer,
     // 2026-05-19 wasm-chunk-aadf-determinism — `bound_queue_info` was split
     // into two top-level flat buffers (`bound_queue_starts: array<u32>` +
     // `bound_queue_sizes: array<atomic<u32>>`) so Tint emits the proven-
@@ -423,14 +427,10 @@ struct W3Fixture {
     bound_group_masks: Buffer,
     bound_refined_info: Buffer,
     bound_dispatch_indirect: Buffer,
-    // 2026-05-19 probe-1B — `@group(3)` per-call probe history buffer.
-    prepare_probe_history: Buffer,
     params_buffer: Buffer,
     world_bg: bevy::render::render_resource::BindGroup,
     bounds_bg: bevy::render::render_resource::BindGroup,
     dispatch_bg: bevy::render::render_resource::BindGroup,
-    // 2026-05-19 probe-1B — `@group(3)` bind group on the prepare pipeline.
-    probe_bg: bevy::render::render_resource::BindGroup,
     add_initial_pipeline: ComputePipeline,
     prepare_pipeline: ComputePipeline,
     compute_pipeline: ComputePipeline,
@@ -462,6 +462,20 @@ fn build_w3_fixture(
         mapped_at_creation: false,
     });
     queue.write_buffer(&chunks_buffer, 0, bytemuck::cast_slice(&paired_chunks));
+
+    // chunks_mirror — read-only mirror of `chunks`, seeded with the same data
+    // so the W3 prepare/compute reads see W5-equivalent initial chunk-AADF
+    // classification bits. Bound at `@group(0) @binding(2)` per the W3
+    // `construction_bounds_world_layout`. Production refreshes this between
+    // rounds via `copy_buffer_to_buffer`; the test seeds once and lets the
+    // single-round dispatch consume the seed.
+    let chunks_mirror_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("w3_chunks_mirror"),
+        size: (total_chunks as u64) * 8,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&chunks_mirror_buffer, 0, bytemuck::cast_slice(&paired_chunks));
 
     // 2026-05-19 wasm-chunk-aadf-determinism — split the C# packed
     // `BoundQueueInfo { start, size }` struct into two flat buffers
@@ -519,21 +533,6 @@ fn build_w3_fixture(
     let world_layout = construction_bounds_world_layout_descriptor();
     let bounds_layout = construction_bounds_layout_descriptor();
     let dispatch_layout = bound_dispatch_indirect_layout_descriptor();
-    // 2026-05-19 probe-1B — `@group(3)` per-call probe history layout.
-    let probe_layout =
-        super::prepare_probe_history_layout_descriptor();
-
-    // probe history buffer sized to production capacity (= PREPARE_PROBE_HISTORY_ENTRIES
-    // entries × 16 B/entry = PREPARE_PROBE_HISTORY_BYTES). Test mirrors
-    // production sizing so future downsizes don't drift apart.
-    let prepare_probe_history = device.create_buffer(&BufferDescriptor {
-        label: Some("w3_prepare_probe_history"),
-        size: PREPARE_PROBE_HISTORY_BYTES,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let probe_zeros: Vec<u32> = vec![0u32; (PREPARE_PROBE_HISTORY_ENTRIES * 4) as usize];
-    queue.write_buffer(&prepare_probe_history, 0, bytemuck::cast_slice(&probe_zeros));
 
     let (id_add, id_prep, id_comp) = {
         let render_app = app.get_sub_app(RenderApp).unwrap();
@@ -549,7 +548,6 @@ fn build_w3_fixture(
             world_layout.clone(),
             bounds_layout.clone(),
             dispatch_layout.clone(),
-            probe_layout.clone(),
             shader_handle.clone(),
         );
         let c = queue_compute_pipeline_with_handle(
@@ -577,6 +575,7 @@ fn build_w3_fixture(
         &BindGroupEntries::sequential((
             chunks_buffer.as_entire_buffer_binding(),
             params_buffer.as_entire_buffer_binding(),
+            chunks_mirror_buffer.as_entire_buffer_binding(),
         )),
     );
     // 2026-05-19 web fix — 5 bindings: starts/queues/masks/refined/sizes.
@@ -596,30 +595,22 @@ fn build_w3_fixture(
         &dispatch_bgl,
         &BindGroupEntries::sequential((bound_dispatch_indirect.as_entire_buffer_binding(),)),
     );
-    // 2026-05-19 probe-1B — `@group(3)` bind group for the prepare pipeline.
-    let probe_bgl = cache.get_bind_group_layout(&probe_layout);
-    let probe_bg = device.create_bind_group(
-        "w3_probe_bg",
-        &probe_bgl,
-        &BindGroupEntries::sequential((prepare_probe_history.as_entire_buffer_binding(),)),
-    );
 
     let _ = Cow::<'_, str>::from("w3");
 
     Some(W3Fixture {
         chunks_buffer,
+        chunks_mirror_buffer,
         bound_queue_starts,
         bound_queue_sizes,
         bound_group_queues,
         bound_group_masks,
         bound_refined_info,
         bound_dispatch_indirect,
-        prepare_probe_history,
         params_buffer,
         world_bg,
         bounds_bg,
         dispatch_bg,
-        probe_bg,
         add_initial_pipeline,
         prepare_pipeline,
         compute_pipeline,
@@ -681,23 +672,40 @@ fn bounds_calc_convergence_matches_cpu_oracle() {
     }
 
     // Regime-2 rounds — 200 rounds drives full convergence on a 1-group test.
+    // Production wraps `dispatch_regime_2_rounds(_, n_rounds=1)` with a
+    // `copy_buffer_to_buffer(chunks → chunks_mirror)` between every round so
+    // subsequent rounds see the prior round's chunk-AADF writes. The test
+    // mirrors that pattern: 200 single-round dispatches with a mirror refresh
+    // between each.
     {
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("w3_rounds"),
-        });
-        dispatch_regime_2_rounds(
-            &mut encoder,
-            &fixture.prepare_pipeline,
-            &fixture.compute_pipeline,
-            &fixture.world_bg,
-            &fixture.bounds_bg,
-            &fixture.dispatch_bg,
-            &fixture.probe_bg,
-            &fixture.bound_dispatch_indirect,
-            200,
-            None,
-        );
-        queue.submit([encoder.finish()]);
+        for _round_idx in 0..200u32 {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("w3_round"),
+            });
+            let copy_size = fixture
+                .chunks_buffer
+                .size()
+                .min(fixture.chunks_mirror_buffer.size());
+            encoder.copy_buffer_to_buffer(
+                &fixture.chunks_buffer,
+                0,
+                &fixture.chunks_mirror_buffer,
+                0,
+                copy_size,
+            );
+            dispatch_regime_2_rounds(
+                &mut encoder,
+                &fixture.prepare_pipeline,
+                &fixture.compute_pipeline,
+                &fixture.world_bg,
+                &fixture.bounds_bg,
+                &fixture.dispatch_bg,
+                &fixture.bound_dispatch_indirect,
+                1,
+                None,
+            );
+            queue.submit([encoder.finish()]);
+        }
     }
 
     let gpu_chunks = readback_chunks_buffer(&device, &queue, &fixture.chunks_buffer, size);
@@ -796,7 +804,6 @@ fn bounds_queue_no_overrun() {
             &fixture.world_bg,
             &fixture.bounds_bg,
             &fixture.dispatch_bg,
-            &fixture.probe_bg,
             &fixture.bound_dispatch_indirect,
             200,
             None,
@@ -917,7 +924,6 @@ fn bounds_per_axis_atomic_correctness() {
             &fixture.world_bg,
             &fixture.bounds_bg,
             &fixture.dispatch_bg,
-            &fixture.probe_bg,
             &fixture.bound_dispatch_indirect,
             5,
             None,
