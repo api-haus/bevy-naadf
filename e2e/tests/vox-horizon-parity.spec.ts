@@ -61,8 +61,142 @@ const SSIM_MIN = 0.91;
 const HORIZON_NATIVE_PNG = "vox_horizon_native.png";
 const HORIZON_WEB_PNG = "vox_horizon_web.png";
 const E2E_SCREENSHOT_DIR = path.join(REPO_ROOT, "target", "e2e-screenshots");
+const FUNNEL_DIR = path.join(E2E_SCREENSHOT_DIR, "funnel");
 
 const CANVAS_SETTLE_MS = 30_000;
+
+/**
+ * Filesystem-safe ISO-8601-ish timestamp used as the funnel per-run basename.
+ * Example: `20260520T084530-123` (UTC YYYYMMDDTHHMMSS-millis). Colons and
+ * dots are not portable across all filesystems / tooling — this format
+ * strips them entirely.
+ */
+function makeRunTimestamp(): string {
+  const d = new Date();
+  const pad = (n: number, w = 2): string => String(n).padStart(w, "0");
+  return (
+    `${d.getUTCFullYear()}` +
+    `${pad(d.getUTCMonth() + 1)}` +
+    `${pad(d.getUTCDate())}` +
+    `T` +
+    `${pad(d.getUTCHours())}` +
+    `${pad(d.getUTCMinutes())}` +
+    `${pad(d.getUTCSeconds())}` +
+    `-${pad(d.getUTCMilliseconds(), 3)}`
+  );
+}
+
+/** Regex matching the `[xxx]` sentinel prefix used by the inline probe + diagnostics. */
+const SENTINEL_RE = /\[[a-z][a-z0-9_-]+\]/i;
+
+/** Markers used to flag browser panics / fatal runtime errors in console text. */
+const PANIC_MARKERS = [
+  "panicked",
+  "RuntimeError",
+  "Uncaught",
+  "DeviceLost",
+  "fatal",
+] as const;
+
+/**
+ * Extracts the SSIM score reported by `e2e_render --ssim-compare`. The
+ * binary prints `SSIM=<f64>` on its own line at ssim.rs:143. Returns
+ * `null` if no such line is present (e.g. the subprocess errored out
+ * before emitting a score).
+ */
+function extractSsimScore(stdout: string): number | null {
+  const m = stdout.match(/^SSIM=([0-9]+(?:\.[0-9]+)?)/m);
+  if (!m) return null;
+  const v = Number.parseFloat(m[1]);
+  return Number.isFinite(v) ? v : null;
+}
+
+/**
+ * Build the per-run funnel `.txt` sidecar body. The orchestrator + user
+ * visually groups runs via the per-run PNGs and reads this sidecar to
+ * understand why a given run landed in a given attractor state.
+ *
+ * The sentinel groups are emitted in this order: `[aadf-probe]` (the
+ * inline ray-walk probe), `[probe1-call]` first 20 + last 10 (the
+ * indirect-dispatch convergence trace — usually 200+ entries),
+ * `[cpu-gpu-parity]`, `[device-snapshot]`, any OTHER `[xxx]` sentinel
+ * lines, finally any console lines containing panic / fatal markers.
+ *
+ * Every captured line is emitted verbatim — no truncation, no
+ * normalisation — so the funnel data is a faithful record of what the
+ * browser printed.
+ */
+function buildFunnelSidecar(opts: {
+  timestamp: string;
+  ssim: number | null;
+  ssimPass: boolean | null;
+  sentinelLines: string[];
+  panicLines: string[];
+}): string {
+  const { timestamp, ssim, ssimPass, sentinelLines, panicLines } = opts;
+
+  const lines = sentinelLines;
+  const aadfProbe = lines.filter(
+    (l) => l.includes("[aadf-probe]") || l.includes("[aadf-probe2]"),
+  );
+  // Anything tagged with the `[probe1-call*]` family (the indirect-dispatch
+  // convergence trace). Captured separately because it's verbose (200+
+  // entries) and the orchestrator wants head+tail, not the full firehose.
+  const probe1Call = lines.filter((l) => l.includes("[probe1-call"));
+  const cpuGpuParity = lines.filter((l) => l.includes("[cpu-gpu-parity"));
+  const deviceSnapshot = lines.filter((l) => l.includes("[device-snapshot"));
+
+  // "Other" sentinels = anything with a `[xxx]` prefix that didn't fall
+  // into one of the named buckets above. Useful as a catch-all so new
+  // diagnostic sentinels added to the codebase don't silently drop out of
+  // the funnel sidecar.
+  const namedBuckets = [
+    "[aadf-probe]",
+    "[aadf-probe2]",
+    "[probe1-call",
+    "[cpu-gpu-parity",
+    "[device-snapshot",
+  ];
+  const other = lines.filter(
+    (l) => !namedBuckets.some((tag) => l.includes(tag)),
+  );
+
+  const ssimStr = ssim === null ? "<unavailable>" : ssim.toFixed(6);
+  const passStr = ssimPass === null ? "<unavailable>" : ssimPass ? "yes" : "no";
+
+  const sections = [
+    `# Run ${timestamp}`,
+    `SSIM: ${ssimStr}`,
+    `pass (>= ${SSIM_MIN})?: ${passStr}`,
+    ``,
+    `## [aadf-probe] sentinel lines (raw)`,
+    aadfProbe.length > 0 ? aadfProbe.join("\n") : "<none>",
+    ``,
+    `## [probe1-call] first 20 lines (raw)`,
+    probe1Call.length > 0 ? probe1Call.slice(0, 20).join("\n") : "<none>",
+    ``,
+    `## [probe1-call] last 10 lines (raw)`,
+    probe1Call.length > 0 ? probe1Call.slice(-10).join("\n") : "<none>",
+    ``,
+    `## [probe1-call] total count`,
+    String(probe1Call.length),
+    ``,
+    `## [cpu-gpu-parity] line(s) (raw)`,
+    cpuGpuParity.length > 0 ? cpuGpuParity.join("\n") : "<none>",
+    ``,
+    `## [device-snapshot] sentinel (raw)`,
+    deviceSnapshot.length > 0 ? deviceSnapshot.join("\n") : "<none>",
+    ``,
+    `## Any other [xxx] sentinel lines`,
+    other.length > 0 ? other.join("\n") : "<none>",
+    ``,
+    `## Browser-console error/panic markers`,
+    panicLines.length > 0 ? panicLines.join("\n") : "<none>",
+    ``,
+  ];
+
+  return sections.join("\n");
+}
 
 /**
  * Shell out to `cargo run --bin e2e_render -- --vox-horizon-native` to
@@ -179,6 +313,22 @@ test.describe("Cross-target horizon parity", () => {
   test("native horizon capture vs WASM horizon capture — SSIM similar", async ({
     browser,
   }) => {
+    // Per-run funnel timestamp — used for the unique PNG + .txt basename
+    // so the user can visually group runs by attractor state after the
+    // 15-run sweep. The fixed `vox_horizon_web.png` path is still written
+    // for backwards compatibility with the SSIM-compare subprocess and
+    // any sidecar tooling that hard-codes that name.
+    const runTimestamp = makeRunTimestamp();
+    await fs.mkdir(FUNNEL_DIR, { recursive: true });
+    const funnelPngPath = path.join(
+      FUNNEL_DIR,
+      `vox_horizon_web-${runTimestamp}.png`,
+    );
+    const funnelTxtPath = path.join(
+      FUNNEL_DIR,
+      `vox_horizon_web-${runTimestamp}.txt`,
+    );
+
     // === Phase 1 — produce the native reference PNG ========================
     //
     // Spawns the e2e_render binary at the C# default horizon pose. The
@@ -213,6 +363,12 @@ test.describe("Cross-target horizon parity", () => {
 
     let voxInstallSeen = false;
     const wgpuDiagnosticLines: string[] = [];
+    // 2026-05-20 — funnel data collection. ANY console line that contains a
+    // `[xxx]` sentinel prefix gets buffered here, so the per-run sidecar
+    // doc captures the full diagnostic surface (not just the specific
+    // tags this spec used to forward). Panic markers tracked separately.
+    const sentinelLines: string[] = [];
+    const panicLines: string[] = [];
     page.on("console", (msg: ConsoleMessage) => {
       const text = msg.text();
       if (text.includes("NAADF .vox loaded from")) {
@@ -233,6 +389,22 @@ test.describe("Cross-target horizon parity", () => {
         wgpuDiagnosticLines.push(text);
         // eslint-disable-next-line no-console
         console.log(`[wasm-diag] ${text}`);
+      }
+      // 2026-05-20 — capture every sentinel-tagged line for the funnel
+      // sidecar, regardless of which named bucket it falls into.
+      if (SENTINEL_RE.test(text)) {
+        sentinelLines.push(text);
+      }
+      if (PANIC_MARKERS.some((m) => text.includes(m))) {
+        panicLines.push(text);
+      }
+    });
+    // Uncaught exceptions / pageerrors aren't routed through console.log;
+    // capture them explicitly so funnel sidecar panic markers stay complete.
+    page.on("pageerror", (err: Error) => {
+      const text = `[pageerror] ${err.message}`;
+      if (PANIC_MARKERS.some((m) => text.includes(m))) {
+        panicLines.push(text);
       }
     });
 
@@ -276,6 +448,24 @@ test.describe("Cross-target horizon parity", () => {
       HORIZON_WEB_PNG,
       CANVAS_SETTLE_MS,
       E2E_SCREENSHOT_DIR,
+    );
+    // 2026-05-20 — funnel: write a unique-per-run copy of the canvas
+    // capture so the funnel sweep preserves all 15 PNGs instead of the
+    // last one overwriting the previous 14.
+    await fs.writeFile(funnelPngPath, web.bytes);
+    // First-pass sidecar write — covers the failure path where the
+    // panic / errors / install-not-seen assertions below throw and we
+    // never reach the SSIM compare. Re-written below with the SSIM
+    // score once Phase 3 completes.
+    await fs.writeFile(
+      funnelTxtPath,
+      buildFunnelSidecar({
+        timestamp: runTimestamp,
+        ssim: null,
+        ssimPass: null,
+        sentinelLines,
+        panicLines,
+      }),
     );
 
     // Surface the WebGPU diagnostic lines as test annotations so they're
@@ -346,6 +536,29 @@ test.describe("Cross-target horizon parity", () => {
     test.info().annotations.push({
       type: "ssim-compare-stderr",
       description: ssim.stderr,
+    });
+
+    // 2026-05-20 — funnel sidecar. Persist the per-run diagnostic .txt
+    // BEFORE the `expect(ssim.code).toBe(0)` assertion so a failed SSIM
+    // run still leaves its sidecar on disk (failed runs are the
+    // load-bearing data — they're the attractor states we want to group).
+    const ssimScore = extractSsimScore(ssim.stdout);
+    const ssimPass = ssim.code === 0;
+    const sidecarBody = buildFunnelSidecar({
+      timestamp: runTimestamp,
+      ssim: ssimScore,
+      ssimPass: ssimScore === null ? null : ssimPass,
+      sentinelLines,
+      panicLines,
+    });
+    await fs.writeFile(funnelTxtPath, sidecarBody);
+    test.info().annotations.push({
+      type: "funnel-png",
+      description: funnelPngPath,
+    });
+    test.info().annotations.push({
+      type: "funnel-txt",
+      description: funnelTxtPath,
     });
 
     expect(

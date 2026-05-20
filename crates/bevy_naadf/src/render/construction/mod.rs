@@ -4560,6 +4560,31 @@ pub fn aadf_cpu_gpu_parity(
     }
 }
 
+/// 2026-05-20 trajectory-selector — env-gated wrapper for the CPU oracle.
+/// `CPU_GPU_PARITY_DISABLED=1` at build time skips the oracle entirely so we
+/// can test if the oracle's in-process compute work is incidentally fencing /
+/// otherwise perturbing the GPU trajectory.
+pub fn aadf_cpu_gpu_parity_maybe(
+    probe: ResMut<AadfCpuGpuParity>,
+    gpu: Option<Res<ConstructionGpu>>,
+    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+) {
+    if option_env!("CPU_GPU_PARITY_DISABLED").is_some() {
+        // Disabled — emit a one-shot sentinel so we can confirm from logs.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            bevy::log::info!(
+                "[aadf-probe2] [trajectory-selector] CPU_GPU_PARITY_DISABLED=1; skipping oracle",
+            );
+        }
+        return;
+    }
+    aadf_cpu_gpu_parity(probe, gpu, world_gpu, render_device, render_queue);
+}
+
 impl Plugin for ConstructionPlugin {
     fn build(&self, app: &mut App) {
         // Read the main-world `AppArgs.construction_config` once at
@@ -4648,7 +4673,10 @@ impl Plugin for ConstructionPlugin {
             // it, runs the CPU `compute_aadf_layer` oracle over the same
             // chunk-emptiness pattern, and emits a `[cpu-gpu-parity]`
             // sentinel with bit-match ratio + first 10 differing chunks.
-            .add_systems(ExtractSchedule, aadf_cpu_gpu_parity);
+            //
+            // 2026-05-20 trajectory-selector condition B — disable via
+            // env CPU_GPU_PARITY_DISABLED=1 at build time. Defaults to ON.
+            .add_systems(ExtractSchedule, aadf_cpu_gpu_parity_maybe);
     }
 }
 

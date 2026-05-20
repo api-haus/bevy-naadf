@@ -642,7 +642,13 @@ pub fn naadf_bounds_compute_node(
             // After each compute pass (except the last), copy chunks→scratch→
             // chunks. The src-buffer transition COMPUTE_SHADER_WRITE →
             // TRANSFER_READ forces a full-buffer flush of compute's writes.
-            if round_idx + 1 < n_rounds {
+            //
+            // 2026-05-20 trajectory-selector condition D — env
+            // CHUNKS_SELF_COPY_DISABLED=1 at build time skips the copy. This
+            // probes whether the copy is load-bearing for the lucky trajectory.
+            if option_env!("CHUNKS_SELF_COPY_DISABLED").is_none()
+                && round_idx + 1 < n_rounds
+            {
                 if let (Some(chunks), Some(scratch)) =
                     (chunks_buf_opt.as_ref(), chunks_self_copy_dst.as_ref())
                 {
