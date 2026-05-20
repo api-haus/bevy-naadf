@@ -105,19 +105,13 @@ struct ConstructionParams {
 // entity-pointer channel) like the W2 shaders do.
 // Web-WebGPU migration: chunks is now `array<vec2<u32>>` (was
 // `texture_storage_3d<rg32uint, read_write>`).
-// 2026-05-20 brute-force iter-3 (HR) — `chunks_atomic` is the SAME GPU buffer
-// as `chunks_mirror` (re-bound under an atomic-typed view). All WRITES from
-// `compute_group_bounds` go through `atomicStore` on `chunks_atomic` so that
-// Tint's SPIR-V emission carries the atomic decoration on the underlying
-// VkBuffer, forcing Dawn to flush cross-workgroup writes via Vulkan's
-// SubgroupMemoryBarrier semantics rather than relying on the cache-coherence
-// path that's empirically broken for non-atomic storage RMW on Dawn.
-//
-// Paired indexing: `chunks_atomic[chunk_idx*2u + 0u]` = .x = state+AADF;
-// `chunks_atomic[chunk_idx*2u + 1u]` = .y = entity pointer. Stride is the
-// same 8 B as the `array<vec2<u32>>` view (2 × u32).
+// 2026-05-20 minimal-fix iter — iter-3 (atomicStore-on-chunks) reverted; only
+// iter-2 (chunks_mirror RO + per-round copy_buffer_to_buffer) retained as
+// load-bearing on top of `n_bounds_rounds = 1`. Write at line ~564 goes
+// through the non-atomic rw view of `chunks`; reads still come from
+// `chunks_mirror` (the iter-2 mechanism).
 @group(0) @binding(0)
-var<storage, read_write> chunks_atomic: array<atomic<u32>>;
+var<storage, read_write> chunks: array<vec2<u32>>;
 @group(0) @binding(1)
 var<uniform> params: ConstructionParams;
 // 2026-05-20 brute-force iter-2 (HP) — chunks_mirror is a read-only mirror of
@@ -559,14 +553,11 @@ fn compute_group_bounds(
     // the W3 background queue would silently zero the entity pointer on
     // every AADF expansion.
     if (is_group_active && cur_chunk_copy != cur_chunk) {
-        // 2026-05-20 brute-force iter-3 (HR) — write via atomicStore on the
-        // chunks_atomic view (paired indexing: .x = idx*2, .y = idx*2+1).
-        // The atomic semantic forces Dawn/Tint to emit SPIR-V atomic stores
-        // with appropriate memory-scope decoration, bypassing the
-        // non-atomic-cross-workgroup-visibility bug that empirically
-        // affects this access pattern.
-        atomicStore(&chunks_atomic[chunk_idx * 2u + 0u], cur_chunk);
-        atomicStore(&chunks_atomic[chunk_idx * 2u + 1u], entity_y);
+        // 2026-05-20 minimal-fix iter — iter-3 (atomicStore) reverted; write
+        // through the non-atomic `chunks` rw view. iter-2's chunks_mirror
+        // copy_buffer_to_buffer between rounds provides the cross-pass
+        // visibility; the atomic write decoration was found inert at n=1.
+        chunks[chunk_idx] = vec2<u32>(cur_chunk, entity_y);
         atomicStore(&any_bounds_increase, 1u);
         // 2026-05-19 horizon-parity diagnostic — count per-thread real
         // expansions. Slot [6] accumulates across all compute rounds; the
