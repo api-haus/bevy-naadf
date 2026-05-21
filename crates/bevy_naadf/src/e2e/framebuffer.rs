@@ -394,6 +394,31 @@ impl Framebuffer {
             .map_err(|e| format!("could not write PNG to {}: {e}", path.display()))
     }
 
+    /// Save `self` to `target/e2e-screenshots/<filename>`. Best-effort; logs to
+    /// stdout/stderr with `gate_tag` for grep-ability, returns the resolved
+    /// path on success. Centralises the per-gate `save_*_screenshot` wrappers
+    /// that all duplicated the same prefix + `save_png` + log shape.
+    pub fn save_in_screenshots_dir(
+        &self,
+        filename: &str,
+        gate_tag: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let path = Path::new(crate::e2e::E2E_SCREENSHOT_DIR).join(filename);
+        match self.save_png(&path) {
+            Ok(()) => {
+                println!(
+                    "e2e_render --{gate_tag}: screenshot saved to {}",
+                    path.display()
+                );
+                Ok(path)
+            }
+            Err(e) => {
+                eprintln!("e2e_render --{gate_tag}: {filename} save failed: {e}");
+                Err(e)
+            }
+        }
+    }
+
     /// Whether every channel of `a` is within `tol` of `b` (channels in
     /// `0.0..=255.0`).
     pub fn is_near(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {

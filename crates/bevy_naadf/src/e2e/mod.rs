@@ -24,6 +24,7 @@
 pub mod checks;
 pub mod driver;
 pub mod framebuffer;
+pub mod gate;
 pub mod gates;
 pub mod oasis_edit_visual;
 pub mod readback;

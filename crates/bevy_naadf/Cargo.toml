@@ -31,15 +31,6 @@ path = "src/bin/e2e_render.rs"
 name = "bake"
 path = "src/bin/bake.rs"
 
-# 2026-05-19 — `wasm-chunk-aadf-determinism` diagnostic. Tiny standalone CLI
-# that reads the two `target/diagnostics/device-snapshot-{native,web}.json`
-# files produced by the `--device-snapshot-native` mode + the Playwright
-# `device-snapshot.spec.ts` capture, walks them field-by-field, prints
-# divergences. No Bevy boot — pure serde_json comparison.
-[[bin]]
-name = "diag_compare"
-path = "src/bin/diag_compare.rs"
-
 [dependencies]
 # free_camera = the prebuilt fly-camera from bevy_camera_controller (off by default).
 # The `dlss` feature is forwarded from this crate's own `[features]` below;
@@ -97,8 +88,8 @@ ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 # serde_json — single-line JSON emit for the `[device-snapshot]` static
 # diagnostic surface (`src/diagnostics.rs`). Pulled in transitively already
-# via Bevy; declared here so `diagnostics.rs` and `bin/diag_compare.rs` can
-# `use serde_json` without a feature-gate scramble.
+# via Bevy; declared here so `diagnostics.rs` can `use serde_json` without
+# a feature-gate scramble.
 serde_json = "1"
 thiserror = "2"
 # web_time — drop-in replacement for `std::time::{Instant, SystemTime}` that
