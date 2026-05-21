@@ -101,10 +101,12 @@
          Trunk's built-in loader expects. -->
     <link data-trunk rel="copy-file" href="init-wasm-rayon.mjs" />
 
-    <!-- The NAADF WGSL shaders / fonts / textures are loaded at runtime by the
-         Bevy asset server from `src/assets/` (AssetPlugin.file_path). Copy
-         each real subdir into dist so the dev server serves them at the same
-         path the asset server fetches. -->
+    <!-- The NAADF WGSL shaders / fonts are loaded at runtime by the Bevy
+         asset server from `src/assets/` (AssetPlugin.file_path). Copy each
+         real subdir into dist so the dev server serves them at the same path
+         the asset server fetches. (The `textures/` subdir was retired by D8
+         when the runtime AssetProcessor pipeline was deleted in commit
+         `6d2505d`.) -->
     <link
       data-trunk
       rel="copy-dir"
@@ -116,12 +118,6 @@
       rel="copy-dir"
       href="src/assets/shaders"
       data-target-path="src/assets/shaders"
-    />
-    <link
-      data-trunk
-      rel="copy-dir"
-      href="src/assets/textures"
-      data-target-path="src/assets/textures"
     />
 
     <!-- Cloudflare Pages COOP/COEP headers + cache rules (`_headers`), and the
