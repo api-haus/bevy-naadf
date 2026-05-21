@@ -442,9 +442,9 @@ fn summarise_clients_for_e2e_render(out: Option<&std::process::Output>) -> Strin
 /// [`SystemParam`] struct.
 ///
 /// The driver is at Bevy's 16-positional-`SystemParam` ceiling; Step 6 of
-/// the config-as-resource refactor adds a third config read
+/// the config-as-resource refactor added a third config read
 /// ([`E2eGateMode`] — the e2e-mode-boolean collapse) on top of the
-/// Step-8-era `app_args` + `spawn_test_entity` pair. A
+/// Step-8-era `spawn_test_entity` + (then) `app_args` pair. A
 /// `#[derive(SystemParam)]` struct is one positional slot regardless of
 /// how many resources it groups, so this keeps `e2e_driver` under the
 /// ceiling and gives the config reads a name.
@@ -454,9 +454,12 @@ fn summarise_clients_for_e2e_render(out: Option<&std::process::Output>) -> Strin
 /// historical reads were all `Option`-tolerant.
 #[derive(bevy::ecs::system::SystemParam)]
 pub struct E2eDriverConfig<'w> {
-    /// Residual `AppArgs` — carries only `vox_e2e_mode` after Step 6
-    /// (Bucket A; drains to `VoxE2eAssertion` in Step 7).
-    pub app_args: Option<Res<'w, crate::AppArgs>>,
+    /// Whether the `ASSERT` step swaps the default-scene region gates for
+    /// the `--vox-e2e` non-skybox assertion (Bucket A — `02-design.md`
+    /// Decision §3). Step 7 of the config-as-resource refactor migrated
+    /// this off the now-deleted `AppArgs.vox_e2e_mode` field onto its own
+    /// [`crate::e2e::VoxE2eAssertion`] resource.
+    pub vox_e2e_assertion: Option<Res<'w, crate::e2e::VoxE2eAssertion>>,
     /// Whether the Phase-C `--entities` test fixture was spawned — drives
     /// the entity-aware ASSERT baseline (Step 8).
     pub spawn_test_entity: Option<Res<'w, crate::render::construction::SpawnTestEntity>>,
@@ -493,14 +496,14 @@ pub fn e2e_driver(
     mut exit: MessageWriter<AppExit>,
     // Bootstrap-config reads, grouped into one `#[derive(SystemParam)]`
     // struct — the driver is at Bevy's 16-positional-param ceiling, so the
-    // three config resources (`app_args`, `spawn_test_entity`, `gate_mode`)
-    // travel in one struct that counts as a single positional slot. Step 6
-    // introduced the struct (replacing the Step-8-era ad-hoc tuple) when it
-    // added the third read, `E2eGateMode`.
+    // three config resources (`vox_e2e_assertion`, `spawn_test_entity`,
+    // `gate_mode`) travel in one struct that counts as a single positional
+    // slot. Step 6 introduced the struct (replacing the Step-8-era ad-hoc
+    // tuple) when it added the third read, `E2eGateMode`.
     config: E2eDriverConfig,
 ) {
     let E2eDriverConfig {
-        app_args,
+        vox_e2e_assertion,
         spawn_test_entity,
         gate_mode,
     } = config;
@@ -725,7 +728,7 @@ pub fn e2e_driver(
             // test grid and don't apply when a `.vox` file is loaded
             // (`crate::e2e::vox_e2e`).
             let vox_e2e_mode =
-                app_args.as_deref().is_some_and(|a| a.vox_e2e_mode);
+                vox_e2e_assertion.as_deref().is_some_and(|v| v.0);
             let result = run_assertions(
                 screenshot.as_mut(),
                 &diagnostics,

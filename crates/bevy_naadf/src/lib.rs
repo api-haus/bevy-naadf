@@ -162,9 +162,11 @@ pub fn build_app(cfg: AppConfig) -> App {
 /// [`build_app_with_args`] directly — e2e gates need canonical world / TAA
 /// for deterministic SSIM comparisons across runs and across machines.
 pub fn build_app_with_budget(cfg: AppConfig, args: AppArgs, grid_preset: GridPreset) -> App {
+    // `AppArgs` is a zero-field shell after Step 7 of the config-as-resource
+    // refactor — kept only so this signature stays stable; Step 9 drops it.
+    let _ = args;
     let caps = crate::render::budget::probe_and_select();
     let inputs = crate::bootstrap::BootstrapInputs {
-        args,
         grid_preset,
         taa_ring_depth: crate::render::taa::TaaRingConfig {
             depth: caps.taa_ring_depth,
@@ -317,6 +319,20 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         .contains_resource::<crate::e2e::gate::E2eGateMode>()
     {
         app.insert_resource(crate::e2e::gate::E2eGateMode::default());
+    }
+    // Step 7 of the config-as-resource refactor — defensive seed for the
+    // per-domain `VoxE2eAssertion` (the last field drained off `AppArgs`).
+    // The e2e driver reads it via `Option<Res<VoxE2eAssertion>>` so it is
+    // already resource-absent tolerant, but seeding the canonical default
+    // (`VoxE2eAssertion(false)`) keeps the direct `build_app(AppConfig::e2e())`
+    // path (`run_e2e_render`) consistent with the bootstrap fan-out. Callers
+    // routing through `build_app_with_bootstrap_inputs` overwrite it; only
+    // the `--vox-e2e` gate inserts `VoxE2eAssertion(true)`.
+    if !app
+        .world()
+        .contains_resource::<crate::e2e::VoxE2eAssertion>()
+    {
+        app.insert_resource(crate::e2e::VoxE2eAssertion::default());
     }
 
     // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#

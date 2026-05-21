@@ -368,20 +368,19 @@ pub fn run_vox_e2e() -> AppExit {
     //     - `setup_test_grid` reads `Res<GridPreset>` = `GridPreset::Vox
     //       { path }` and calls `vox_import::load_vox(&path)`.
     //     - The driver's `ASSERT` step swaps the default-scene batch gate
-    //       for `assert_vox_geometry_visible` (driver branch on
-    //       `args.vox_e2e_mode`).
-    // `vox_e2e_mode` is Bucket A (Decision §3) — it is NOT a flow selector,
-    // so it stays on `AppArgs` until Step 7 (the `--vox-e2e` gate runs the
-    // STANDARD driver flow, hence `gate_mode` is left at the default
-    // `E2eGateMode::Standard`).
-    let mut app_args = crate::AppArgs::default();
-    app_args.vox_e2e_mode = true;
-    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
-    // off `AppArgs` onto `BootstrapInputs.grid_preset`. vox-gpu-rewrite
-    // Stage 2 (2026-05-18): the production install path is the only
-    // install path — the synthesised fixture flows through
-    // `install_vox_in_fixed_world` + the W5 GPU producer chain just like
-    // the production binary's `--vox` flag. The W5 chain runs
+    //       for `assert_vox_geometry_visible` (driver branch on the
+    //       `VoxE2eAssertion` resource).
+    // `VoxE2eAssertion` is Bucket A (Decision §3) — it is NOT a flow
+    // selector (the `--vox-e2e` gate runs the STANDARD driver flow, hence
+    // `gate_mode` is left at the default `E2eGateMode::Standard`); Step 7
+    // of the config-as-resource refactor migrated it off the (then-last,
+    // now-deleted) `AppArgs.vox_e2e_mode` field onto its own resource.
+    //
+    // `grid_preset` migrated off `AppArgs` onto `BootstrapInputs.grid_preset`
+    // in Step 5. vox-gpu-rewrite Stage 2 (2026-05-18): the production
+    // install path is the only install path — the synthesised fixture flows
+    // through `install_vox_in_fixed_world` + the W5 GPU producer chain just
+    // like the production binary's `--vox` flag. The W5 chain runs
     // `generator_model` + `chunk_calc` per segment to populate the fixed
     // `(4096, 512, 4096)`-voxel world; `gpu_construction_enabled` is on by
     // default (`ConstructionConfig::for_target_arch`), no override needed.
@@ -390,8 +389,8 @@ pub fn run_vox_e2e() -> AppExit {
     //    `AppConfig::e2e()` window (256×256 non-resizable) is reused so
     //    the gate rect fractions stay calibrated.
     let inputs = crate::bootstrap::BootstrapInputs {
-        args: app_args,
         grid_preset: crate::GridPreset::Vox { path },
+        vox_e2e_assertion: crate::e2e::VoxE2eAssertion(true),
         ..crate::bootstrap::BootstrapInputs::default()
     };
     crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)

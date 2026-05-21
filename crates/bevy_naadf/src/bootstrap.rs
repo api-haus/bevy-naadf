@@ -25,38 +25,27 @@
 use bevy::prelude::{App, AppExit};
 
 use crate::e2e::gate::E2eGateMode;
+use crate::e2e::VoxE2eAssertion;
 use crate::render::construction::{ConstructionConfig, SpawnTestEntity};
 use crate::render::taa::{TaaConfig, TaaRingConfig};
 use crate::{AppArgs, AppConfig, GiSettings, GridPreset};
 
 /// Transient bootstrap-time configuration carrier.
 ///
-/// At Step 1 this is a thin wrapper around [`AppArgs`]. Each subsequent
-/// migration step moves one or more fields off `AppArgs` into a typed
-/// per-domain field on this struct (matching the per-domain resources the
-/// fan-out inserts). When the migration completes, the `args` field goes
-/// away.
+/// Every field is a typed per-domain resource (Decision §2) that the
+/// [`build_app_with_bootstrap_inputs`] fan-out inserts. Steps 2-8 of the
+/// config-as-resource refactor progressively drained the original
+/// `AppArgs` god-resource into these per-domain fields; Step 7 migrated
+/// the last field (`vox_e2e_mode` → `vox_e2e_assertion`), so the legacy
+/// `args: AppArgs` field is gone.
 ///
-/// `BootstrapInputs::default()` is byte-identical, by construction, to
-/// `AppArgs::default()` — `Default` is derived and the only inner field is
-/// `args: AppArgs`, whose `Default` impl is the canonical-default contract at
-/// `crates/bevy_naadf/src/app_args.rs:185-207`. This guarantees that
-/// `build_app_with_bootstrap_inputs(cfg, BootstrapInputs::default())` and
-/// `build_app_with_args(cfg, AppArgs::default())` produce byte-identical
-/// `App`s, which is the e2e-determinism requirement
-/// (`docs/orchestrate/config-as-resource-refactor/01-context.md` —
-/// "E2e-path byte-identical defaults").
+/// `BootstrapInputs::default()` produces every per-domain resource at its
+/// canonical default, which is byte-identical to what the old
+/// `AppArgs::default()` god-resource produced — the e2e-determinism
+/// requirement (`docs/orchestrate/config-as-resource-refactor/01-context.md`
+/// — "E2e-path byte-identical defaults").
 #[derive(Clone)]
 pub struct BootstrapInputs {
-    /// Transient carrier for the [`AppArgs`] fields not yet migrated to
-    /// per-domain resources. As fields move out of `AppArgs` in subsequent
-    /// migration steps, they relocate to typed sibling fields on this struct.
-    ///
-    /// (No `Debug` derive — `AppArgs` itself is not `Debug` at
-    /// `crates/bevy_naadf/src/app_args.rs:24`, only `Resource + Clone`.
-    /// Adding `Debug` here would force a derive on `AppArgs` and its inner
-    /// types, which is out of scope for Step 1.)
-    pub args: AppArgs,
     /// TAA sample-ring depth (`18-taa-fidelity.md` fix #3). Migrated out of
     /// `AppArgs.taa_ring_depth` in Step 2 of the config-as-resource refactor.
     /// `TaaRingConfig::default()` = [`crate::DEFAULT_TAA_RING_DEPTH`] = 32;
@@ -112,9 +101,19 @@ pub struct BootstrapInputs {
     /// fan-out inserts it as a main-world `Res<E2eGateMode>` that the e2e
     /// driver state machine and the per-gate `pin_*_camera` systems read,
     /// and that [`crate::window_config::window_for_gate_mode`] reads to pick
-    /// the e2e window resolution. `vox_e2e_mode` is NOT folded in here — it
-    /// is Bucket A and stays on `AppArgs` until Step 7.
+    /// the e2e window resolution. The `--vox-e2e` ASSERT-time tag is NOT
+    /// folded in here — it is Bucket A and travels on `vox_e2e_assertion`
+    /// below (`02-design.md` Decision §3).
     pub gate_mode: E2eGateMode,
+    /// Whether the e2e driver's `ASSERT` step swaps the default-scene
+    /// region gates for the `--vox-e2e` non-skybox assertion — Bucket A
+    /// (`02-design.md` Decision §3). Migrated out of the last surviving
+    /// `AppArgs` field (`vox_e2e_mode`) in Step 7 of the
+    /// config-as-resource refactor. `VoxE2eAssertion::default()` =
+    /// `VoxE2eAssertion(false)`; only `run_vox_e2e` flips it on. The
+    /// fan-out inserts it as a main-world `Res<VoxE2eAssertion>` that the
+    /// driver reads once at ASSERT time.
+    pub vox_e2e_assertion: VoxE2eAssertion,
 }
 
 impl Default for BootstrapInputs {
@@ -127,7 +126,6 @@ impl Default for BootstrapInputs {
         // byte-identical to pre-Step-4. All other fields use their own
         // `Default` impls.
         Self {
-            args: AppArgs::default(),
             taa_ring_depth: TaaRingConfig::default(),
             taa: TaaConfig::default(),
             gi: GiSettings::default(),
@@ -135,18 +133,20 @@ impl Default for BootstrapInputs {
             grid_preset: GridPreset::default(),
             spawn_test_entity: SpawnTestEntity::default(),
             gate_mode: E2eGateMode::default(),
+            vox_e2e_assertion: VoxE2eAssertion::default(),
         }
     }
 }
 
 /// Build the bevy-naadf `App` from an [`AppConfig`] and a [`BootstrapInputs`].
 ///
-/// Step-2 shape — forwards to [`crate::build_app_with_args`] for the
-/// not-yet-migrated `AppArgs` fields, then inserts the per-domain resources
-/// already migrated off `AppArgs`. As more fields migrate, this becomes a
-/// pure resource fan-out (no `AppArgs` forwarding).
+/// Forwards to [`crate::build_app_with_args`] for the shared plugin-pyramid
+/// wiring, then fans the per-domain resources off `inputs` into the App.
+/// After Step 7 of the config-as-resource refactor `AppArgs` is a
+/// zero-field shell — `build_app_with_args` no longer carries any state;
+/// Step 9 folds it away entirely.
 pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) -> App {
-    let mut app = crate::build_app_with_args(cfg, inputs.args);
+    let mut app = crate::build_app_with_args(cfg, AppArgs::default());
     // Migrated in Step 2 — main-world `TaaRingConfig` resource. Bevy's
     // second-call `insert_resource` semantic is overwrite-in-place, so
     // mobile-budget callers that wrote a non-canonical depth into
@@ -196,6 +196,14 @@ pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) 
     // seed for direct-`build_app` callers; this insert wins for callers
     // routing through the fan-out (every e2e gate).
     app.insert_resource(inputs.gate_mode);
+    // Migrated in Step 7 — main-world `VoxE2eAssertion`. The last field
+    // off the drained `AppArgs` god-resource (`vox_e2e_mode` — Bucket A,
+    // Decision §3). The e2e driver reads it once at ASSERT time via
+    // `Option<Res<VoxE2eAssertion>>`. `build_app_with_args` has a
+    // defensive `VoxE2eAssertion::default()` seed for the direct
+    // `build_app(AppConfig::e2e())` path; this insert wins for callers
+    // routing through the fan-out (the `--vox-e2e` gate flips it on).
+    app.insert_resource(inputs.vox_e2e_assertion);
     app
 }
 
@@ -264,8 +272,9 @@ mod tests {
         // Step 6 — the 10 e2e-mode booleans collapsed into the
         // `E2eGateMode` enum; the default is the standard gate flow.
         assert_eq!(inputs.gate_mode, crate::e2e::gate::E2eGateMode::Standard);
-        // `vox_e2e_mode` (Bucket A) stays on `AppArgs` until Step 7; off
-        // by default.
-        assert!(!inputs.args.vox_e2e_mode);
+        // Step 7 — `vox_e2e_mode` (Bucket A) migrated off `AppArgs` onto
+        // the typed `vox_e2e_assertion: VoxE2eAssertion` field; off by
+        // default (only `run_vox_e2e` flips it).
+        assert!(!inputs.vox_e2e_assertion.0);
     }
 }

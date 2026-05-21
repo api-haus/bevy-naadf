@@ -1275,3 +1275,123 @@ the struct's params by type at registration.
   with no design re-litigation. The collapse is byte-identical: every gate
   passed, including the SSIM-compare gates whose thresholds would have
   caught any pose / window / install-path drift.
+
+## Step 7 — Extract vox_e2e_mode to VoxE2eAssertion (2026-05-21)
+
+### What landed
+
+The last field on `AppArgs` — the `vox_e2e_mode: bool` ASSERT-time tag —
+migrated onto its own per-domain `VoxE2eAssertion(pub bool)` resource
+(Bucket A, Decision §3). `AppArgs` is now a zero-field unit struct
+(`pub struct AppArgs;`). Per the Step 6 side-note, the driver's read
+folded into the existing `E2eDriverConfig` `#[derive(SystemParam)]` struct
+(the `app_args` field was *replaced* by `vox_e2e_assertion`, not added
+alongside — `AppArgs` has nothing left to read).
+
+- **`crates/bevy_naadf/src/e2e/mod.rs`** — added the
+  `VoxE2eAssertion(pub bool)` newtype `Resource`
+  (`#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]`),
+  placed in a new `--- ASSERT-time gate options ---` section just before
+  the App-wiring block. Module-doc not touched (the `--- App wiring ---`
+  banner already separates the sections).
+- **`crates/bevy_naadf/src/e2e/driver.rs`** — `E2eDriverConfig`'s
+  `app_args: Option<Res<AppArgs>>` field swapped to
+  `vox_e2e_assertion: Option<Res<VoxE2eAssertion>>`; the driver's
+  destructure + the ASSERT-time read
+  (`vox_e2e_assertion.as_deref().is_some_and(|v| v.0)`) updated. The
+  `vox_e2e_mode` local + `run_assertions` signature are unchanged — only
+  the *source* of the boolean changed.
+- **`crates/bevy_naadf/src/bootstrap.rs`** — dropped the `args: AppArgs`
+  field from `BootstrapInputs`, added `vox_e2e_assertion: VoxE2eAssertion`;
+  the fan-out gained `app.insert_resource(inputs.vox_e2e_assertion)`. The
+  fan-out's `build_app_with_args(cfg, inputs.args)` call became
+  `build_app_with_args(cfg, AppArgs::default())` (the zero-field shell
+  carries no state — Step 9 folds the call away). `Default` impl + the
+  `default_wraps_canonical_app_args_defaults` pin test updated to assert
+  on `inputs.vox_e2e_assertion.0`.
+- **`crates/bevy_naadf/src/e2e/vox_e2e.rs`** — `run_vox_e2e` dropped the
+  `crate::AppArgs::default()` + `app_args.vox_e2e_mode = true` local and
+  sets `vox_e2e_assertion: crate::e2e::VoxE2eAssertion(true)` on the
+  `BootstrapInputs` literal instead.
+- **`crates/bevy_naadf/src/app_args.rs`** — `AppArgs` is now
+  `#[derive(Resource, Clone, Default)] pub struct AppArgs;` (zero fields,
+  derived `Default` replacing the hand-written impl). Module + struct
+  docstrings updated to the "drained shell — Step 9 deletes it" framing.
+- **`crates/bevy_naadf/src/lib.rs`** — `build_app_with_budget`'s
+  `BootstrapInputs` literal dropped the `args` field (`let _ = args;`
+  retains the now-vestigial parameter for signature stability — Step 9
+  removes it). Added the defensive `VoxE2eAssertion::default()` seed in
+  `build_app_with_args` (same Step-6 pattern — the direct
+  `build_app(AppConfig::e2e())` path bypasses the fan-out).
+- **`crates/bevy_naadf/src/bin/e2e_render.rs`** — comment fixup on the
+  `--vox-e2e` arm (no longer says `vox_e2e_mode` rides on `AppArgs`).
+
+### Files touched
+
+| File | Change kind |
+|---|---|
+| `crates/bevy_naadf/src/e2e/mod.rs` | New `VoxE2eAssertion(pub bool)` `Resource` |
+| `crates/bevy_naadf/src/e2e/driver.rs` | `E2eDriverConfig`: `app_args` field → `vox_e2e_assertion`; ASSERT-time read source swap |
+| `crates/bevy_naadf/src/bootstrap.rs` | Drop `args` field, add `vox_e2e_assertion`; fan-out insert; `Default` + pin test |
+| `crates/bevy_naadf/src/e2e/vox_e2e.rs` | `run_vox_e2e` sets `vox_e2e_assertion` instead of `AppArgs.vox_e2e_mode` |
+| `crates/bevy_naadf/src/app_args.rs` | `AppArgs` drained to a zero-field unit struct; docstrings |
+| `crates/bevy_naadf/src/lib.rs` | `build_app_with_budget` literal fixup; `VoxE2eAssertion` defensive seed |
+| `crates/bevy_naadf/src/bin/e2e_render.rs` | `--vox-e2e` arm comment fixup |
+
+### Decisions made during impl
+
+1. **`E2eDriverConfig.app_args` replaced, not extended.** The Step 6
+   side-note said Step 7's read should "join `E2eDriverConfig`". Since
+   `AppArgs` is now empty, there is nothing left for an `app_args` field
+   to read — so the field is *replaced* by `vox_e2e_assertion`. The struct
+   still has exactly three fields; the driver stays one positional slot.
+2. **`build_app_with_args` kept (Step 7 boundary).** Step 7's atomic
+   commit empties `AppArgs`; Step 9 deletes it. `build_app_with_args` is
+   still called by `build_app` and `build_app_with_bootstrap_inputs` with
+   `AppArgs::default()`. Folding it into the fan-out is Step 9 work — the
+   design's Step 9 spec + the Step 6 side-note both call for it there.
+3. **Defensive `VoxE2eAssertion` seed added.** The driver reads it via
+   `Option<Res<…>>` (resource-absent tolerant), so the seed is not
+   strictly required for correctness. Added anyway for consistency with
+   the Step 3/4/5/6/8 defensive-seed pattern — every other per-domain
+   resource has one, and the direct `build_app(AppConfig::e2e())` path
+   (`run_e2e_render`) should see a populated resource.
+
+### Verification
+
+- `cargo build --workspace`: PASS (clean — no errors, no warnings).
+- `cargo test --workspace --lib`: PASS (192 passed; 0 failed; 1 ignored).
+  The updated `bootstrap::tests::default_wraps_canonical_app_args_defaults`
+  pin test (now asserting `!inputs.vox_e2e_assertion.0`) is in the passing
+  set.
+- `cargo run --bin e2e_render -- --vox-e2e`: PASS — `vox_geometry` centre
+  rect luminance 250.5, channel max 251.8 (thresholds > 160 / > 30); the
+  standard batch-6 region gate also green (emissive 250.7, solid 250.5,
+  sky 223.0). The `VoxE2eAssertion(true)` correctly rode the fan-out and
+  the driver swapped to the `assert_vox_geometry_visible` gate.
+
+### Side notes / observations / complaints
+
+- **The design's Step 7 spec matched reality exactly.** Three sites
+  (new resource, driver read, vox_e2e builder) — plus the mechanical
+  `BootstrapInputs.args` removal + `build_app_with_budget` /
+  `build_app_with_args` fixups the spec implied but did not enumerate
+  (the spec said "~30 LOC"; actual is ~120 lines counting doc churn,
+  mostly comment rewrites). No file:line drift broke anything.
+- **`E2eDriverConfig` absorbed the read cleanly.** The Step 6 side-note's
+  instruction was precise and correct — the swap was a one-field rename
+  on the struct + the destructure. The driver stayed at one config
+  positional slot; no `SystemParam`-ceiling pressure.
+- **`AppArgs` is now a literal zero-field unit struct** —
+  `pub struct AppArgs;`. It is fully vestigial: `build_app_with_args`
+  takes it but reads nothing; `build_app_with_budget` takes it and
+  `let _ = args;`-discards it. This is the correct incremental state —
+  Step 9 deletes it. The user's principle is now satisfied at the data
+  level: no `args`-conceptualised configuration is readable at runtime;
+  every config value is a per-domain resource inserted at bootstrap.
+- **Subjective:** the migration's last field was the cleanest of the
+  nine — `VoxE2eAssertion` is a textbook Bucket-A newtype, and Decision
+  §3's "ASSERT-time data tag, not a flow selector" framing held up: the
+  driver reads it exactly once, in `run_assertions`, with zero
+  state-machine involvement. Splitting it off `E2eGateMode` was the
+  right call.

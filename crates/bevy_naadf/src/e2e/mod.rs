@@ -193,6 +193,27 @@ pub const E2E_RESIZE_INITIAL_PNG: &str = "resize_initial.png";
 pub const E2E_RESIZE_A_PNG: &str = "resize_a.png";
 pub const E2E_RESIZE_B_PNG: &str = "resize_b.png";
 
+// --- ASSERT-time gate options ---------------------------------------------
+
+/// Whether the e2e driver's `ASSERT` step swaps the default-scene
+/// `assert_batch_6` region gates for the `--vox-e2e` "non-skybox"
+/// assertion ([`vox_e2e::assert_vox_geometry_visible`]).
+///
+/// Bucket A — Parameter (`02-design.md` Decision §3). Morphologically a
+/// "mode" boolean, but the e2e driver reads it ONCE, at `ASSERT` time
+/// (`driver.rs::run_assertions`), as a data tag — "is this run loading a
+/// `.vox` file or the default scene?" — not as a state-machine selector.
+/// Every OTHER former e2e-mode boolean routes the driver into a `*Warmup`
+/// fast-path and collapsed into the [`gate::E2eGateMode`] enum (Bucket B,
+/// Step 6); this one stays a standalone parameter resource.
+///
+/// Step 7 of the config-as-resource refactor migrated this off the
+/// (now-deleted) `AppArgs.vox_e2e_mode` field. `run_vox_e2e` sets
+/// `VoxE2eAssertion(true)` on its `BootstrapInputs`; every other gate
+/// leaves it at the `VoxE2eAssertion(false)` default.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VoxE2eAssertion(pub bool);
+
 // --- App wiring -----------------------------------------------------------
 
 /// Wire the e2e-specific systems + resources into the app (called by

@@ -315,9 +315,9 @@ fn parse_gate_command(args: &[String]) -> BootCommand {
         };
     }
     if args.iter().any(|a| a == "--vox-e2e") {
-        // `--vox-e2e` runs the STANDARD driver flow (Decision §3 —
-        // `vox_e2e_mode` is Bucket A, an ASSERT-time tag, not a flow
-        // selector). `run_vox_e2e` carries `vox_e2e_mode` on `AppArgs`.
+        // `--vox-e2e` runs the STANDARD driver flow (Decision §3 — the
+        // vox-e2e ASSERT tag is Bucket A, not a flow selector). `run_vox_e2e`
+        // sets the `VoxE2eAssertion` resource on its `BootstrapInputs`.
         return BootCommand::NamedGate {
             gate: E2eGateMode::Standard,
             run: bevy_naadf::e2e::vox_e2e::run_vox_e2e,

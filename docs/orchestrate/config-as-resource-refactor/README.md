@@ -35,7 +35,7 @@ Decompose `AppArgs` from a runtime-read god-resource into per-domain Bevy resour
 - [x] Step 4 — Migrate `construction_config` + relocate wasm32 divergence to `for_target_arch()` — commit `d89b603`
 - [x] Step 5 — Migrate `grid_preset` + relocate `?skybox=1` to wasm bootstrap — commits `7efce79` (partial checkpoint) + `e7a2a4d` (completion)
 - [x] Step 6 — Collapse 10 e2e-mode booleans → `E2eGateMode` enum (`GateKind` promoted); `e2e_driver` config reads grouped into the `E2eDriverConfig` `#[derive(SystemParam)]` struct
-- [ ] Step 7 — Extract `vox_e2e_mode` → `VoxE2eAssertion(bool)` — **NOT STARTED**
+- [x] Step 7 — Extract `vox_e2e_mode` → `VoxE2eAssertion(bool)`; `AppArgs` drained to a zero-field shell; driver read folded into `E2eDriverConfig`
 - [x] Step 8 — Extract `spawn_test_entity` → `SpawnTestEntity(bool)` — commit `53c37b3`
 - [ ] Step 9 — Delete the now-empty `AppArgs` shell — **NOT STARTED** (blocked on Step 7; after Step 6 `AppArgs` holds only `vox_e2e_mode`)
 
