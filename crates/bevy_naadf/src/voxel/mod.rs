@@ -12,11 +12,14 @@
 pub mod async_vox;
 pub mod cvox_import;
 pub mod grid;
+pub mod plugin;
 pub mod vox_import;
 pub mod voxel_dispatch;
 
 #[cfg(target_arch = "wasm32")]
 pub mod web_vox;
+
+pub use plugin::VoxelIoPlugin;
 
 use bevy::prelude::Vec3;
 

@@ -65,7 +65,7 @@
 - [ ] `04F` — D5↔D1 SSoT-6 follow-up: re-export `hash_coefficients` in `render/construction/hashing.rs` (~5 LOC win)
 - [ ] `04F` — Resolution D `NaadfPipelines` merge shape (post-D7)
 - [⚠] `04F` — D6 follow-up dispatch — **Step 5 landed (CLI ladder refactor, e2e_render.rs 462→523 LOC structural); Steps 3+4 deferred — analytical, not bandwidth**. Implementor identified that gate.rs trait's `apply_edit` signature lacks per-gate State resources each gate's apply phase mutates; landing Step 3 additively without Step 4 produces ~600 LOC of dead trait impls. Recommend atomic Step 3+4 dispatch with the 8-gate verification matrix. Build ✓ / 179 lib tests pass / 5 e2e gates green incl oasis-edit-visual ×2 (Δlum 18.09 / 17.99).
-- [ ] `04F` — D7 cleanup follow-ups: D3 VoxelIoPlugin extract, D5 spawn_phase_c_test_entity rehome, D6 vox_horizon_parity device-snapshot cleanup, GiSettings → settings/canonical.rs relocation
+- [x] `04F` — D7 cleanup follow-ups — **all 4 landed** ✓. lib.rs 598→365 LOC (−233 alone); new `voxel/plugin.rs` (VoxelIoPlugin), `settings/canonical.rs` (GiSettings relocation), `render/construction/test_fixture.rs` (extracted), `e2e/tests/vox-horizon-parity.spec.ts` cleaned. Net +83 LOC (module docstring cost). Build ✓ / 137 lib tests pass / 7 e2e gates green incl oasis-edit-visual ×2. New open: minor production→e2e dep arrow `crate::e2e::gates::demo_origin_v()` imported by `render::construction::test_fixture` (deferred).
 
 ## Orchestrator discipline
 

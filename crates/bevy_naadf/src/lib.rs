@@ -30,6 +30,7 @@ pub mod world_size;
 pub use app_args::AppArgs;
 pub use app_config::AppConfig;
 pub use dev_font::{load_dev_font, DevFont};
+pub use settings::canonical::GiSettings;
 pub use window_config::WindowConfig;
 pub use world_size::{
     WORLD_GEN_SEGMENT_SIZE_IN_GROUPS, WORLD_SIZE_IN_CHUNKS,
@@ -101,123 +102,9 @@ pub enum GridPreset {
     WebSkybox,
 }
 
-/// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#
-/// `WorldRenderBase` ImGui sliders (`SettingDataRenderBase`) become these
-/// `AppArgs` constants — there is no GI settings GUI in the port (§1). The
-/// values are the C# slider *defaults*.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GiSettings {
-    /// Max secondary-ray bounce count (C# `bounceCount`).
-    pub bounce_count: u32,
-    /// GI accumulation-ring depth (C# `globalIllumMaxAccum`).
-    pub global_illum_max_accum: u32,
-    /// Spatial-resampling neighbour-search size (C# `spatialResampleSize`).
-    pub spatial_resample_size: f32,
-    /// Spatial-resampling visibility ray-step count (C# `spatialVisibilityCount`).
-    pub spatial_visibility_count: u32,
-    /// Denoiser threshold (C# `denoiseThresh`).
-    pub denoise_thresh: f32,
-    /// Lit-radius factor (C# `radiusLitFactor`).
-    pub radius_lit_factor: f32,
-    /// Noise-suppression factor (C# `noiseSuppressionFactor`).
-    pub noise_suppression_factor: f32,
-    /// The 1↔0.25-spp toggle (C# `skipSamples`) — drives `rayQueueCalc`.
-    pub skip_samples: bool,
-    /// Run the sparse bilateral denoiser (C# `isDenoise`).
-    pub is_denoise: bool,
-    /// Brightness-level the bucket samples (C# `isSampleLeveling`).
-    pub is_sample_leveling: bool,
-    /// Vary the spatial-resampling radius per pixel (C# `isVaryingResmaplingRadius`).
-    pub is_varying_resampling_radius: bool,
-    /// Apply the in-volume atmosphere interaction (C# `isAtmosphereInteraction`).
-    pub is_atmosphere_interaction: bool,
-    /// Per-pixel sun-shadow tap count for the spatial-resampling sun sample
-    /// (`crates/bevy_naadf/src/assets/shaders/spatial_resampling.wgsl:529-560`).
-    /// Multi-tap extension addressing the paper §5.2 limitation: *"soft shadows
-    /// from the sun are not handled during resampling, resulting in slightly
-    /// increased noise."* Default **4** — N=1 reproduces the C# single-tap path
-    /// bit-equivalently (modulo loop-induced rand-stream advancement). The
-    /// shader clamps to `max(_, 1)`, so writing 0 here is harmless (resolves
-    /// to a single tap, matching the C# baseline). No CLI flag — config-struct
-    /// knob only (Dispatch A scope; see
-    /// `docs/orchestrate/naadf-bevy-port/19-gi-reservoir-scope.md` §3.1).
-    pub sun_shadow_taps: u32,
-    // === Quality-panel runtime knobs (`21-design-quality-panel.md` §2.1) ====
-    // The 5 ray-step caps + spatial iter count promoted from WGSL `const`s
-    // to runtime uniform fields, so the in-app quality panel can dial them
-    // live without rebuilds. All defaults match the C#/paper canonical values
-    // bit-for-bit — panel-disabled (or default-loaded) behaviour is identical
-    // to pre-dispatch. The WGSL consumers clamp `max(_, 1u)` defensively;
-    // zero is safe.
-    /// Max DDA step count for the primary G-buffer ray
-    /// (`naadf_first_hit.wgsl::shoot_ray` arg, was const
-    /// `MAX_RAY_STEPS_PRIMARY = 120`). Uploaded into
-    /// `GpuRenderParams.max_ray_steps_primary` (offset 24, repurposed `_pad0a`
-    /// slot — layout-preserving).
-    pub max_ray_steps_primary: u32,
-    /// Max DDA step count for GI secondary bounce rays
-    /// (`naadf_global_illum.wgsl::shoot_ray`, was const
-    /// `MAX_RAY_STEPS_SECONDARY = 100`). Uploaded into
-    /// `GpuGiParams.max_ray_steps_secondary`.
-    pub max_ray_steps_secondary: u32,
-    /// Max DDA step count for the spatial-resampling sun-visibility ray
-    /// (`spatial_resampling.wgsl::shoot_ray`, was const
-    /// `MAX_RAY_STEPS_SUN = 120`). Uploaded into `GpuGiParams.max_ray_steps_sun`.
-    pub max_ray_steps_sun: u32,
-    /// Max DDA step count for the per-bounce sun-shadow ray inside
-    /// `globalIllum` (`naadf_global_illum.wgsl::shoot_ray` sun-secondary call,
-    /// was const `MAX_RAY_STEPS_SUN_SECONDARY = 80`). Uploaded into
-    /// `GpuGiParams.max_ray_steps_sun_secondary`.
-    pub max_ray_steps_sun_secondary: u32,
-    /// Max DDA step count for the spatial-resampling reservoir-visibility ray
-    /// (`spatial_resampling.wgsl::shoot_ray` visibility-loop, was const
-    /// `MAX_RAY_STEPS_VISIBILITY = 60`). Note the 3-iteration outer mirror
-    /// loop multiplies this cost up to 3×. Uploaded into
-    /// `GpuGiParams.max_ray_steps_visibility`.
-    pub max_ray_steps_visibility: u32,
-    /// Algorithm-2 spatial-resampling iteration count
-    /// (`spatial_resampling.wgsl::sample_neighbors` `sample_count` arg, was
-    /// hardcoded `12u`). Paper §4.2 + C# `renderSpatialResampling.fx:359`
-    /// default = 12. Variance ∝ 1/√N — bump to 16/24 trades cost for less
-    /// indirect-bounce noise (`19-gi-reservoir-scope.md` §3.3). Uploaded into
-    /// `GpuGiParams.spatial_iter_count`.
-    pub spatial_iter_count: u32,
-}
-
-impl GiSettings {
-    /// Canonical defaults — single source of truth for the C# slider defaults
-    /// (`WorldRenderBase.cs:14-25`) + the 5 promoted ray-step caps +
-    /// `spatial_iter_count`. Consumed by `Default for GiSettings`, D2's
-    /// `settings::KNOBS` table `default:` fields, and D4's GPU-params
-    /// `From<&AppArgs>` conversion.
-    pub const DEFAULTS: GiSettings = GiSettings {
-        bounce_count: 3,
-        global_illum_max_accum: 128,
-        spatial_resample_size: 500.0,
-        spatial_visibility_count: 80,
-        denoise_thresh: 400.0,
-        radius_lit_factor: 3.0,
-        noise_suppression_factor: 0.4,
-        skip_samples: true,
-        is_denoise: true,
-        is_sample_leveling: true,
-        is_varying_resampling_radius: true,
-        is_atmosphere_interaction: true,
-        sun_shadow_taps: 1,
-        max_ray_steps_primary: 120,
-        max_ray_steps_secondary: 100,
-        max_ray_steps_sun: 120,
-        max_ray_steps_sun_secondary: 80,
-        max_ray_steps_visibility: 60,
-        spatial_iter_count: 12,
-    };
-}
-
-impl Default for GiSettings {
-    fn default() -> Self {
-        Self::DEFAULTS
-    }
-}
+// `GiSettings` lives in `settings/canonical.rs` (D7 cleanup follow-up 4); the
+// `pub use settings::canonical::GiSettings;` re-export below preserves all
+// `crate::GiSettings` import sites.
 
 /// The default TAA sample-ring depth — **32**, NAADF's / the paper's depth
 /// (`WorldRenderBase.cs:17`, paper §4.1 / Fig 6).
@@ -386,83 +273,19 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // handle as DevFont. Runs first so setup_hud / setup_panel can query it.
     app.add_plugins(dev_font::DevFontPlugin);
 
-    // The test grid + camera spawn — shared. The e2e config spawns a fixed-pose
-    // camera instead of the production `setup_camera`; the e2e systems own that
-    // (`crate::e2e::add_e2e_systems`).
-    //
-    // On web, `voxel::web_vox::startup_fetch_default_vox` runs `.before`
-    // `setup_test_grid` so it can mutate `AppArgs.grid_preset` to
-    // `GridPreset::WebSkybox` (Q6 `?skybox=1` URL-param handling) before
-    // `setup_test_grid` reads it. The ordering is enforced by an explicit
-    // `.before(setup_test_grid)` on the web-side registration below.
-    app.add_systems(Startup, voxel::grid::setup_test_grid);
+    // `VoxelIoPlugin` owns `setup_test_grid` + `PendingVoxParse` init +
+    // `poll_pending_vox_parse` + wasm `web_vox::startup_fetch_default_vox` +
+    // wasm `apply_pending_vox` + wasm `pin_web_horizon_camera` + native
+    // drag-and-drop systems. Reads `Res<AppConfig>` (inserted above) to gate
+    // the native dnd registration off the e2e harness.
+    app.add_plugins(voxel::VoxelIoPlugin);
 
-    // web-vox-async-loading Step 4 (2026-05-18) — async `.vox` parse pump.
-    // The polling system drains the `PendingVoxParse` hand-off resource
-    // produced by the target-specific async parse spawn (native:
-    // `AsyncComputeTaskPool::spawn` from `native_vox_drop_listener`; web:
-    // `rayon::spawn` from `web_vox::apply_pending_vox`). Resource +
-    // system registered on BOTH targets so the cfg-gated internals share
-    // one main-thread driver. The system is wired even when no drop has
-    // landed yet — it short-circuits when `pending.inner.is_none()`.
-    app.init_resource::<voxel::async_vox::PendingVoxParse>()
-        .add_systems(Update, voxel::async_vox::poll_pending_vox_parse);
-
-    // Web-only .vox streaming: kick off the default-model HTTP fetch on
-    // `Startup`, and run the consumer system on `Update` so both the fetch
-    // and any drag-dropped `.vox` files swap the active scene the moment
-    // their bytes are ready. The default scene from `setup_test_grid` stays
-    // visible until then.
-    //
-    // Order: `apply_pending_vox` runs `.after(poll_pending_vox_parse)` so
-    // its overlay-hide branch sees `pending.inner.is_none()` the same
-    // frame the polling system clears the slot post-install. Otherwise
-    // the overlay would linger an extra frame.
-    #[cfg(target_arch = "wasm32")]
-    app.add_systems(
-        Startup,
-        voxel::web_vox::startup_fetch_default_vox
-            .before(voxel::grid::setup_test_grid),
-    )
-    .add_systems(
-        Update,
-        voxel::web_vox::apply_pending_vox
-            .after(voxel::async_vox::poll_pending_vox_parse),
-    )
-    // 2026-05-19 — `?pose=horizon` URL-param camera pin. Runs every frame
-    // when the override resource is present; bypasses FreeCamera input so
-    // the cross-target SSIM gate's WASM-side capture is deterministic.
-    // `.run_if(resource_exists)` keeps the scheduler from invoking the
-    // system body when the param is absent (the common case).
-    .add_systems(
-        Update,
-        voxel::web_vox::pin_web_horizon_camera
-            .after(voxel::async_vox::poll_pending_vox_parse)
-            .run_if(bevy::ecs::schedule::common_conditions::resource_exists::<
-                voxel::web_vox::WebHorizonPoseOverride,
-            >),
-    );
-
-    // Native drag-and-drop: drop a `.vox` file onto the window to replace the
-    // active scene. Gated off the e2e harness — winit emits the event in both
-    // modes but the e2e harness should never see foreign input.
-    #[cfg(not(target_arch = "wasm32"))]
-    if !cfg.add_e2e_systems {
-        app.add_systems(Startup, voxel::grid::log_native_dnd_registered)
-            .add_systems(Update, voxel::grid::native_vox_drop_listener);
-    }
-
-    // Phase-C wave-3 — spawn the W4 fixture entity (gated on
-    // `args.spawn_test_entity`). Runs after `setup_test_grid` so the world
-    // dimensions are known; populates `MainWorldEntities` with one entity at
-    // the test grid centre. Per-frame `extract_world_changes` then runs the
-    // `EntityHandler` + uploads the result into `ConstructionEvents`; the
-    // wave-3 dispatch chain (`naadf_entity_update_node` + the
-    // `ray_tracing.wgsl::shoot_ray` entity sub-traversal) folds it into the
-    // framebuffer.
-    if args.spawn_test_entity {
-        app.add_systems(Startup, spawn_phase_c_test_entity.after(voxel::grid::setup_test_grid));
-    }
+    // `spawn_phase_c_test_entity` (the W4 fixture spawner gated on
+    // `AppArgs::spawn_test_entity`) lives in
+    // `render::construction::test_fixture` and is registered inside
+    // `ConstructionPlugin::build` with the same
+    // `.after(voxel::grid::setup_test_grid)` ordering. See D7 cleanup
+    // follow-up 2.
     if cfg.add_e2e_systems {
         e2e::add_e2e_systems(&mut app);
     }
@@ -534,64 +357,8 @@ pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
     e2e::run_with_app(app)
 }
 
-/// Phase-C wave-3 — startup system that spawns one W4 fixture entity into
-/// the main-world [`render::construction::MainWorldEntities`] resource.
-///
-/// Gated on `AppArgs::spawn_test_entity = true` at `build_app_with_args` time
-/// — `e2e_render --entities` sets the flag.
-///
-/// Fixture: a 4×4×4-voxel green-emissive block at the (sky-visible) world
-/// position that the e2e camera frames in front of the look target — the
-/// camera at `(86, 42, 90)` looking at `(32, 16, 32)` sees this entity high
-/// + central in the framebuffer. All voxels are voxel-type 11 (green
-/// emissive, `voxel/grid.rs:192-199`). The entity is at identity rotation;
-/// one entity instance, `entity = 0`, `voxel_start = 0` (the first 64 u32s
-/// of `entity_voxel_data`). The entity sits ~3 voxels above the existing
-/// scene's tallest emissive block so the screen position is distinct.
-fn spawn_phase_c_test_entity(
-    mut entities: ResMut<render::construction::MainWorldEntities>,
-) {
-    use crate::aadf::entity::EntityData;
-    use crate::render::gpu_types::EntityInstance;
-
-    // 4×4×4 green-emissive entity, every voxel type = 11.
-    let size = [4u32, 4, 4];
-    let voxel_count = (size[0] * size[1] * size[2]) as usize;
-    let types: Vec<u32> = vec![11u32; voxel_count];
-    let data = EntityData::from_types(size, &types);
-
-    // Pad to 64 u32s (NAADF `EntityHandler.cs:325-329` indexes
-    // `voxelStart * 64 + voxelIndex`, and a 4×4×4 entity uses 64 voxels).
-    let mut voxel_data = data.voxels.clone();
-    while voxel_data.len() < 64 {
-        voxel_data.push(0);
-    }
-    entities.voxel_data = voxel_data;
-    entities.voxel_data_generation = entities.voxel_data_generation.wrapping_add(1);
-
-    // Place at (30, 24, 30) RELATIVE TO THE SMALL DEFAULT-SCENE DEMO
-    // ORIGIN. vox-gpu-rewrite Stage 2 (2026-05-18): the demo now lives
-    // centered in the fixed `(4096, 512, 4096)`-voxel world, so the entity
-    // position must translate through `demo_origin_v` to land in the same
-    // relative spot the e2e camera frames.
-    let demo_off = crate::e2e::gates::demo_origin_v();
-    let entity_pos = demo_off + bevy::math::Vec3::new(30.0, 24.0, 30.0);
-    entities.instances = vec![EntityInstance {
-        position: entity_pos,
-        quaternion: [0.0, 0.0, 0.0, 1.0],
-        voxel_start: 0,
-        entity: 0,
-        size,
-    }];
-
-    info!(
-        "phase-c wave-3 — spawned fixture entity: 4×4×4 green-emissive @ {:?} \
-         (demo-relative (30, 24, 30) + demo origin {:?}); voxel_data {} u32s",
-        entity_pos,
-        demo_off,
-        entities.voxel_data.len()
-    );
-}
+// `spawn_phase_c_test_entity` moved to `render::construction::test_fixture`
+// (D7 cleanup follow-up 2).
 
 // Tests moved with their subjects:
 //   - `default_taa_ring_depth_*` → `app_args.rs::tests`

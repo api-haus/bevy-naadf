@@ -119,8 +119,8 @@ function extractSsimScore(stdout: string): number | null {
  * The sentinel groups are emitted in this order: `[aadf-probe]` (the
  * inline ray-walk probe), `[probe1-call]` first 20 + last 10 (the
  * indirect-dispatch convergence trace — usually 200+ entries),
- * `[cpu-gpu-parity]`, `[device-snapshot]`, any OTHER `[xxx]` sentinel
- * lines, finally any console lines containing panic / fatal markers.
+ * `[cpu-gpu-parity]`, any OTHER `[xxx]` sentinel lines, finally any
+ * console lines containing panic / fatal markers.
  *
  * Every captured line is emitted verbatim — no truncation, no
  * normalisation — so the funnel data is a faithful record of what the
@@ -144,7 +144,6 @@ function buildFunnelSidecar(opts: {
   // entries) and the orchestrator wants head+tail, not the full firehose.
   const probe1Call = lines.filter((l) => l.includes("[probe1-call"));
   const cpuGpuParity = lines.filter((l) => l.includes("[cpu-gpu-parity"));
-  const deviceSnapshot = lines.filter((l) => l.includes("[device-snapshot"));
 
   // "Other" sentinels = anything with a `[xxx]` prefix that didn't fall
   // into one of the named buckets above. Useful as a catch-all so new
@@ -155,7 +154,6 @@ function buildFunnelSidecar(opts: {
     "[aadf-probe2]",
     "[probe1-call",
     "[cpu-gpu-parity",
-    "[device-snapshot",
   ];
   const other = lines.filter(
     (l) => !namedBuckets.some((tag) => l.includes(tag)),
@@ -183,9 +181,6 @@ function buildFunnelSidecar(opts: {
     ``,
     `## [cpu-gpu-parity] line(s) (raw)`,
     cpuGpuParity.length > 0 ? cpuGpuParity.join("\n") : "<none>",
-    ``,
-    `## [device-snapshot] sentinel (raw)`,
-    deviceSnapshot.length > 0 ? deviceSnapshot.join("\n") : "<none>",
     ``,
     `## Any other [xxx] sentinel lines`,
     other.length > 0 ? other.join("\n") : "<none>",

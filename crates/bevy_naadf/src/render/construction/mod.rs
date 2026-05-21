@@ -69,6 +69,7 @@ pub mod map_copy;
 pub mod producer;
 pub mod readback;
 pub mod shader_drift_guard;
+pub mod test_fixture;
 pub mod validation;
 pub mod world_change;
 
@@ -2144,6 +2145,18 @@ impl Plugin for ConstructionPlugin {
         // populates `instances` + `voxel_data` (and flags `voxel_data_dirty`).
         // The `extract_world_changes` system reads it.
         app.init_resource::<MainWorldEntities>();
+
+        // Phase-C wave-3 — `--entities` fixture spawner. Self-gates on
+        // `AppArgs::spawn_test_entity` so registration is unconditional; the
+        // scheduler skips the system body when the flag is `false`. Runs
+        // after `voxel::grid::setup_test_grid` so the world dimensions are
+        // known before the fixture computes its demo-relative position.
+        app.add_systems(
+            Startup,
+            test_fixture::spawn_phase_c_test_entity
+                .after(crate::voxel::grid::setup_test_grid)
+                .run_if(|args: Res<crate::AppArgs>| args.spawn_test_entity),
+        );
 
         // Main-world `Startup` driver (regime-1, `15-design-c.md` §1.2). W0
         // body is the gated no-op above; W1 fills it.

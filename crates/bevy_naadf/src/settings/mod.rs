@@ -16,6 +16,10 @@
 //! Both keyboard navigation and mouse drag-sliders are live concurrently,
 //! mutating `AppArgs.gi`.
 
+pub mod canonical;
+
+pub use canonical::GiSettings;
+
 use std::fmt::Write;
 
 use bevy::input::mouse::AccumulatedMouseMotion;
@@ -34,7 +38,7 @@ use crate::render::gi::{
     VALID_SAMPLE_STORAGE_COUNT,
 };
 use crate::render::taa::CAMERA_HISTORY_DEPTH;
-use crate::{AppArgs, DevFont, GiSettings};
+use crate::{AppArgs, DevFont};
 
 /// Drag-detection threshold in physical pixels.
 const DRAG_THRESHOLD_PX: f32 = 2.0;

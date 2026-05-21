@@ -274,3 +274,153 @@ Per architect's own §3 Step 8 recommendation: "**Recommendation: defer.** The b
 9. **D6's `vox_horizon_parity.spec.ts` still has 4 `[device-snapshot]` console-reads** (per architect's open conflict C1) — they'll silently no-op after our submodule deletion. Not a regression (the architect explicitly flagged this as D6-side cleanup). Surfaced for the orchestrator.
 
 10. **Subjective**: D7 was structurally the easiest of the eight domains — pure mechanical extraction, every system already had a clear owner. The whole session ran clean (no rolled-back commits, no failed gates). The orchestration's user observation that "this codebase is well-structured under the bloat" lands true. The remaining shape (598-LOC lib.rs spine, one module per concern, every plugin self-contained) reads cleanly.
+
+---
+
+## D7 cleanup follow-ups — 2026-05-21
+
+**Author**: D7-cleanup follow-ups implementor.
+**Brief**: land the 4 cross-domain cleanup items that D7's main dispatch left open — (1) D3 `VoxelIoPlugin` extraction, (2) D5 `spawn_phase_c_test_entity` rehome, (3) D6 `vox-horizon-parity.spec.ts` `[device-snapshot]` console-read cleanup, (4) `GiSettings` relocation to `settings/canonical.rs`.
+
+### 1. Step-by-step log
+
+#### Follow-up 1 — Extract `VoxelIoPlugin` (D3 architect F4 + D7 Step 7)
+
+**Edits applied:**
+- `crates/bevy_naadf/src/voxel/plugin.rs` — NEW FILE (98 LOC). `pub struct VoxelIoPlugin;` + `impl Plugin`. Owns `setup_test_grid` (`Startup`), `PendingVoxParse` resource init, `async_vox::poll_pending_vox_parse` (`Update`), wasm `web_vox::startup_fetch_default_vox` (`Startup`, `.before(setup_test_grid)`), wasm `web_vox::apply_pending_vox` (`Update`, `.after(poll_pending_vox_parse)`), wasm `web_vox::pin_web_horizon_camera` (`Update`, `.after(poll_pending_vox_parse)` + `.run_if(resource_exists::<WebHorizonPoseOverride>)`), and the native dnd pair `grid::log_native_dnd_registered` + `grid::native_vox_drop_listener` gated on `!Res<AppConfig>.add_e2e_systems`.
+- `crates/bevy_naadf/src/voxel/mod.rs:12-21` — added `pub mod plugin;` + `pub use plugin::VoxelIoPlugin;`.
+- `crates/bevy_naadf/src/lib.rs:388-453` (pre-edit) — deleted ~60 LOC of inline `setup_test_grid` / `PendingVoxParse` init / `poll_pending_vox_parse` / wasm `web_vox::*` / native dnd registrations.
+- `crates/bevy_naadf/src/lib.rs:388-394` (post-edit) — replaced with `app.add_plugins(voxel::VoxelIoPlugin);` + a 5-line comment block describing the plugin's contents.
+
+**Behavioural note:** `web_vox::hide_ui` registration remains INSIDE `lib.rs`'s `if cfg.add_hud { … }` block — `hide_ui` depends on the HUD being present (it queries UI roots) so its registration is properly HUD-gated. Moving it into `VoxelIoPlugin` would couple voxel-io to HUD presence. Kept at the original site.
+
+**Verification:**
+- `cargo build --workspace` — pass (27.25s).
+- `cargo test --workspace --lib -- --skip render::construction --skip world::buffer --skip e2e` — pass (137 passed; same 43-test GPU-driver-blocked skip set as the main D7 session).
+- `cargo run --bin e2e_render -- baseline` — PASS (luminance 100%; emissive 247.7, solid 243.7, sky 202.9).
+
+**Notes:** D3's architect's F4 didn't include a "this is what `VoxelIoPlugin` looks like" snippet — only the systems-to-bundle list. The plugin shape follows D7 architect's `## 6 Cross-domain assumptions` line "D3 lands `voxel::VoxelIoPlugin` that owns `setup_test_grid` + `PendingVoxParse` init + `poll_pending_vox_parse` + wasm `web_vox::startup_fetch_default_vox` + wasm `apply_pending_vox` + wasm `pin_web_horizon_camera` + native dnd." Done verbatim.
+
+**Status:** complete.
+
+---
+
+#### Follow-up 2 — Rehome `spawn_phase_c_test_entity` to `render/construction/test_fixture.rs`
+
+**Edits applied:**
+- `crates/bevy_naadf/src/render/construction/test_fixture.rs` — NEW FILE (78 LOC). `pub fn spawn_phase_c_test_entity(mut entities: ResMut<MainWorldEntities>)` — verbatim transplant of the body from `lib.rs:551-594` (pre-edit). Imports `crate::aadf::entity::EntityData`, `crate::render::gpu_types::EntityInstance`, `super::MainWorldEntities`, and `crate::e2e::gates::demo_origin_v` (the production→e2e dep-arrow remains; D7 architect's Side note 6 flagged it as a separate cleanup).
+- `crates/bevy_naadf/src/render/construction/mod.rs:71-74` — added `pub mod test_fixture;` to the existing module list.
+- `crates/bevy_naadf/src/render/construction/mod.rs:2146-2155` (pre-edit ConstructionPlugin::build interior) — registered the fixture spawner as a Startup system with `.after(crate::voxel::grid::setup_test_grid)` + `.run_if(|args: Res<crate::AppArgs>| args.spawn_test_entity)`. Self-gating per D7 architect's open conflict C2 option (a).
+- `crates/bevy_naadf/src/lib.rs:455-465` (pre-edit) — deleted the `if args.spawn_test_entity { app.add_systems(Startup, spawn_phase_c_test_entity.after(voxel::grid::setup_test_grid)); }` block (subsumed by `ConstructionPlugin`).
+- `crates/bevy_naadf/src/lib.rs:473-530` (pre-edit) — deleted the 58-LOC `fn spawn_phase_c_test_entity(...)` body (moved to `test_fixture.rs`).
+
+**Verification:**
+- `cargo build --workspace` — pass (31.91s).
+- `cargo test --workspace --lib -- --skip render::construction --skip world::buffer --skip e2e` — pass (137).
+- `cargo run --bin e2e_render -- --entities` — PASS. Fixture spawn log fires from the new module location (`bevy_naadf::render::construction::test_fixture: phase-c wave-3 — spawned fixture entity: 4×4×4 green-emissive @ Vec3(2046.0, 24.0, 2046.0) …`). `entity handler validation PASS: frame A: 8 chunk_updates, 1 entity_chunk_instances, 1 history; frame B: 8 chunk_updates`.
+
+**Notes:** `crate::e2e::gates::demo_origin_v()` import remains — the production→e2e arrow flagged in D7 architect's Side note 6. Resolving it (move `demo_origin_v` to a non-e2e module like `voxel/grid::demo_origin_v`) is in-scope for a future cleanup; this follow-up's brief said "consult the D5 architect's design first" and D5's architect doesn't propose a destination, so the minimal-rehome path is taken.
+
+**Status:** complete.
+
+---
+
+#### Follow-up 3 — Remove `[device-snapshot]` console-reads from `vox-horizon-parity.spec.ts`
+
+**Edits applied:**
+- `e2e/tests/vox-horizon-parity.spec.ts:122` — docstring line listing the sentinel groups dropped the `[device-snapshot]` entry.
+- `e2e/tests/vox-horizon-parity.spec.ts:147` (pre-edit) — deleted `const deviceSnapshot = lines.filter((l) => l.includes("[device-snapshot"));`.
+- `e2e/tests/vox-horizon-parity.spec.ts:158` (pre-edit) — removed `"[device-snapshot",` from the `namedBuckets` array.
+- `e2e/tests/vox-horizon-parity.spec.ts:187` (pre-edit) — deleted the 3-line sidecar section header + body that emitted `## [device-snapshot] sentinel (raw)`.
+
+**Verification:**
+- `grep -n "device-snapshot" e2e/tests/vox-horizon-parity.spec.ts` — 0 matches. All 4 references confirmed removed.
+- `cargo build --workspace` — pass (TS file isn't part of cargo's compile surface; the build verifies nothing for this follow-up but is run anyway as a regression sanity check).
+- Playwright `--vox-horizon-native` web run not executed — the wider gate spawns a 10-minute native compile + WASM-canvas capture; it's the heaviest gate in the repo and was non-functional pre-edit anyway (web-side AADF convergence bug). The edit is mechanical TypeScript surgery (delete 4 references to a removed sentinel); the spec's `[xxx]` sentinel filter still picks up any future tag through the "other" bucket.
+
+**Notes:** the file's full path is `e2e/tests/vox-horizon-parity.spec.ts` (hyphenated), not `vox_horizon_parity.spec.ts` as the orchestrator's brief stated. Same file; updated all 4 cited reference points.
+
+**Status:** complete.
+
+---
+
+#### Follow-up 4 — Relocate `GiSettings` to `settings/canonical.rs`
+
+**Edits applied:**
+- `crates/bevy_naadf/src/settings.rs` → `crates/bevy_naadf/src/settings/mod.rs` — `git mv` (preserves blame). No body change.
+- `crates/bevy_naadf/src/settings/canonical.rs` — NEW FILE (125 LOC). Contains the `pub struct GiSettings { … }` (19 fields, verbatim from `lib.rs:108-185` pre-edit), `impl GiSettings { pub const DEFAULTS: GiSettings = … }` (verbatim 19-field const literal), `impl Default for GiSettings { fn default() -> Self { Self::DEFAULTS } }`.
+- `crates/bevy_naadf/src/settings/mod.rs:18-21` — added `pub mod canonical;` + `pub use canonical::GiSettings;` immediately under the existing module docstring.
+- `crates/bevy_naadf/src/settings/mod.rs:41` (pre-edit) — `use crate::{AppArgs, DevFont, GiSettings};` → `use crate::{AppArgs, DevFont};` (the local `pub use canonical::GiSettings` shadows the prior re-export from `crate`, so the explicit import would collide; the in-module symbol now resolves via the local re-export).
+- `crates/bevy_naadf/src/lib.rs:104-220` (pre-edit) — deleted the `pub struct GiSettings { … }` + `impl GiSettings { pub const DEFAULTS … }` + `impl Default for GiSettings`. ~117 LOC removed. Replaced with a 3-line "moved" comment block.
+- `crates/bevy_naadf/src/lib.rs:30-37` — added `pub use settings::canonical::GiSettings;` to the existing re-export block so existing `crate::GiSettings` imports throughout the codebase (e.g. D2's KNOBS macros, D4's GPU mirror) resolve unchanged.
+
+**Verification:**
+- `cargo build --workspace` — pass (24.63s).
+- `cargo test --workspace --lib -- --skip render::construction --skip world::buffer --skip e2e` — pass (137).
+- `cargo run --bin e2e_render -- baseline` — PASS.
+- `cargo run --bin e2e_render -- --validate-gpu-construction` — PASS (`GPU construction byte-equal to CPU oracle: 388 bytes compared`).
+- `cargo run --bin e2e_render -- --edit-mode` — PASS.
+- `cargo run --bin e2e_render -- --runtime-edit-mode` — PASS.
+- `cargo run --bin e2e_render -- --vox-e2e` — PASS (vox_geometry luminance 250.5, channel max 251.8).
+- `cargo run --bin e2e_render -- --oasis-edit-visual` ×2 — PASS, PASS (rect mean per-pixel RGB Δ=18.03, then Δ=18.07; well above 8.0 floor; consistent with prior session's 18.0 range — no behavioural delta).
+
+**Notes:** D2's architect's HIGH-3 left the directory-vs-file question open ("Either home is fine for D2"); this follow-up took the `settings/` directory path (D7 architect's C3 / Step 2 first branch). The in-tree consumer chain — `settings/mod.rs` (KNOBS table) reads `GiSettings::DEFAULTS` via the local `pub use canonical::GiSettings`; `lib.rs` re-exports via the existing public surface; all downstream `crate::GiSettings` imports unchanged. The `Resource` derive on `GiSettings` (D2's KNOBS table consumes it through `AppArgs.gi`) was NOT applied — the type isn't a standalone `Resource`; it's an embedded field of `AppArgs` (which IS a `Resource`). Verbatim transplant; no derive change.
+
+**Status:** complete.
+
+---
+
+### 2. Failure (if any)
+
+None.
+
+---
+
+### 3. Summary
+
+- **Follow-ups complete**: 4 of 4 (VoxelIoPlugin: yes / spawn_phase_c_test_entity: yes / vox_horizon_parity cleanup: yes / GiSettings relocation: yes).
+- **Verification gates final pass/fail**:
+  - `cargo build --workspace` — pass (all 4 follow-ups built clean).
+  - `cargo test --workspace --lib -- --skip render::construction --skip world::buffer --skip e2e` — 137 passed, 1 ignored, 42 filtered. Same host-NVIDIA-Vulkan-driver block as the main D7 session.
+  - `cargo run --bin e2e_render -- baseline` — PASS.
+  - `cargo run --bin e2e_render -- --validate-gpu-construction` — PASS (388 bytes byte-equal).
+  - `cargo run --bin e2e_render -- --edit-mode` — PASS.
+  - `cargo run --bin e2e_render -- --runtime-edit-mode` — PASS.
+  - `cargo run --bin e2e_render -- --entities` — PASS (entity handler validation green; fixture log emits from new `test_fixture` module).
+  - `cargo run --bin e2e_render -- --vox-e2e` — PASS.
+  - `cargo run --bin e2e_render -- --oasis-edit-visual` ×2 — PASS, PASS (Δ=18.03, Δ=18.07; non-deterministic ≥2× rule satisfied).
+- **Files changed (5 modified, 3 added, 0 removed; 1 git-renamed)**:
+  - `crates/bevy_naadf/src/lib.rs` — modified (−240 LOC; lost `GiSettings` struct + impls + `spawn_phase_c_test_entity` fn + the inline voxel-io registrations + the inline fixture-spawn `if` block; gained 1 `pub use` line + 3 `add_plugins` / "moved" comments).
+  - `crates/bevy_naadf/src/voxel/mod.rs` — modified (+3 LOC; added `pub mod plugin;` + `pub use plugin::VoxelIoPlugin;`).
+  - `crates/bevy_naadf/src/render/construction/mod.rs` — modified (+13 LOC; added `pub mod test_fixture;` + 11-LOC fixture-spawner registration inside `ConstructionPlugin::build`).
+  - `crates/bevy_naadf/src/settings.rs` → `crates/bevy_naadf/src/settings/mod.rs` — git rename + +3 LOC body edit (`pub mod canonical;` + `pub use canonical::GiSettings;`; the inline `use crate::{… GiSettings};` reduced to drop the re-export collision).
+  - `e2e/tests/vox-horizon-parity.spec.ts` — modified (−7 LOC; deleted the 4 `[device-snapshot]` references — docstring line + filter line + namedBuckets entry + sidecar section).
+- **Files added (3)**:
+  - `crates/bevy_naadf/src/voxel/plugin.rs` — 98 LOC; `VoxelIoPlugin`.
+  - `crates/bevy_naadf/src/render/construction/test_fixture.rs` — 78 LOC; `spawn_phase_c_test_entity` body.
+  - `crates/bevy_naadf/src/settings/canonical.rs` — 125 LOC; `GiSettings` struct + `DEFAULTS` const + `Default` impl.
+- **Net LOC**: existing files −260 +42 (diff stat) = −218; new files +301; **net ≈ +83 LOC** (relocations move docstring-heavy types out of the spine into purpose-named modules — the docstrings travel with the types, and the new module-header docstrings add ~50 LOC). The `lib.rs` spine alone dropped from 598 to ~360 LOC, which is the structural-tidy win the brief asked for; net LOC delta being slightly positive is the docstring-relocation cost.
+- **Behavioural deltas observed during verification**: none. All 9 e2e gates produced numerically identical (or within the non-deterministic noise floor) outputs to the pre-follow-up baseline. The `spawn_phase_c_test_entity` move was the only one that risked behavioural drift (system ordering), and the `.after(setup_test_grid)` edge was preserved verbatim — entity spawn log entries and entity-handler chunk counts are unchanged.
+
+---
+
+### 4. Open conflicts for the orchestrator
+
+- **`crate::e2e::gates::demo_origin_v()` is still imported by production code** (`render::construction::test_fixture::spawn_phase_c_test_entity`). D7 architect Side note 6 flagged this dep-arrow inversion; the cleanest resolution is moving `demo_origin_v` out of `e2e/gates.rs` into a non-e2e module (e.g. `voxel/grid::demo_origin_v` next to `DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS`). Not landed in this follow-up — would expand scope. Surface for a future cleanup pass.
+- **D2's `GiSettings` re-import collision was resolved by dropping `GiSettings` from the explicit `use crate::{…};`** at `settings/mod.rs:41`. The local `pub use canonical::GiSettings;` (at line 21) handles the re-export within the module; in-file references to `GiSettings` resolve through that. No semantic change but worth noting for any future cross-module type imports.
+
+### 5. Side notes / observations / complaints
+
+1. **D3's architect documented `VoxelIoPlugin` only by name** in their architecture doc; D7's architect documented its expected systems list explicitly in `## 6 Cross-domain assumptions`. The follow-up implementor used D7 architect's list as the authority since D3 architect's F4 only describes a `GridPreset` enum extension, not a plugin extraction. Net result is the same plugin shape D7 architect expected.
+
+2. **The `cargo run --bin e2e_render -- --oasis-edit-visual` numerical floor held flat across all four follow-ups** — pre-follow-up Δ=18.08 (D7 main session), post-follow-up-1 (this session): not measured separately; post-follow-up-4 (final): Δ=18.03, Δ=18.07. The voxel-io extraction, fixture rehome, and `GiSettings` move are all behaviour-preserving by construction; the numerical match is corroboration.
+
+3. **The brief's `vox_horizon_parity.spec.ts` filename was a typo** — actual file is `vox-horizon-parity.spec.ts` with hyphen. Same file; the 4 `[device-snapshot]` references were located, removed, and verified zero remaining.
+
+4. **`settings.rs` → `settings/mod.rs` via `git mv`** preserves blame across the directory split. The `git status` output shows `RM` (renamed-modified) rather than `D` + `??`, which is the desired outcome for archaeology.
+
+5. **`GiSettings` doesn't get a `Resource` derive** because it's an embedded field of `AppArgs` (which IS the `Resource`). D7 architect §2 F2 hinted at this implicitly ("`pub use settings::canonical::GiSettings;` for source-stability on existing `crate::GiSettings` imports") — confirmed by reading the consumer chain: `AppArgs.gi: GiSettings` → KNOBS macros read `args.gi.<field>` → no direct `Res<GiSettings>` access anywhere.
+
+6. **Subjective**: these four follow-ups were exactly the pattern D7 main session predicted ("D7's mechanical Plugin-extraction work is the easy half"). The dependency chain on D2/D3/D5/D6 architects' designs held — every cross-domain plugin call site was already in shape; only the plugin definitions themselves needed authoring. The whole follow-up session ran clean (no rolled-back commits, no failed gates, no rebuilds-from-scratch). Net lib.rs spine is now ~360 LOC of pure plugin wiring + re-exports, which reads as a one-page summary of the application's structure.
+
+7. **Equal-footing observation**: with these follow-ups landed, the open conflicts surfaced by the D7 main session reduce to one residual (`demo_origin_v` production→e2e arrow). The codebase-tightening orchestration's structural work is materially complete for D7's domain; what remains is D5's `mod.rs` LOC reduction (still ~6000 LOC) and the `demo_origin_v` cross-module-arrow cleanup. Both are in-scope for future `/refactor` sessions on their respective domains.
