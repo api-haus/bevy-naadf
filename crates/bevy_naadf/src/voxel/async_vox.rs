@@ -21,6 +21,7 @@
 
 use bevy::prelude::*;
 
+use crate::render::budget::EffectiveWorldSize;
 use crate::voxel::grid::install_imported_vox;
 use crate::voxel::vox_import::ImportedVox;
 use crate::voxel::voxel_dispatch::parse_voxel_bytes;
@@ -82,10 +83,12 @@ pub const PARSE_BUDGET_SECS: u64 = 60;
 pub fn poll_pending_vox_parse(
     mut commands: Commands,
     mut pending: ResMut<PendingVoxParse>,
+    effective_world: Res<EffectiveWorldSize>,
 ) {
     let Some(inner) = pending.inner.as_mut() else {
         return;
     };
+    let effective = *effective_world;
 
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -111,7 +114,9 @@ pub fn poll_pending_vox_parse(
             let source_label = std::mem::take(&mut inner.source_label);
             pending.inner = None;
             match result {
-                Ok((imp, label)) => install_imported_vox(&mut commands, imp, &label),
+                Ok((imp, label)) => {
+                    install_imported_vox(&mut commands, imp, &label, &effective)
+                }
                 Err(e) => error!(
                     ".vox async parse failed (source: {source_label}): {e}; \
                      current scene stays as-is."
@@ -127,7 +132,9 @@ pub fn poll_pending_vox_parse(
                 let source_label = std::mem::take(&mut inner.source_label);
                 pending.inner = None;
                 match result {
-                    Ok((imp, label)) => install_imported_vox(&mut commands, imp, &label),
+                    Ok((imp, label)) => {
+                        install_imported_vox(&mut commands, imp, &label, &effective)
+                    }
                     Err(e) => error!(
                         ".vox async parse failed (source: {source_label}): {e}; \
                          current scene stays as-is."

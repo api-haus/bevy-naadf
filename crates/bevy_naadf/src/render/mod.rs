@@ -14,6 +14,13 @@
 //! (the HUD's UI pass then draws on top).
 
 pub mod atmosphere;
+// Mobile GPU budget preselection (`docs/orchestrate/mobile-budget/02-design.md`).
+// Owns the [`budget::EffectiveWorldSize`] resource (runtime override of the
+// C# canonical [`crate::WORLD_SIZE_IN_SEGMENTS`] const) + the probe-then-
+// select routine that Android pre-runs to size the three oversized storage-
+// buffer bindings (`voxels`, `blocks`, `taa_samples`) under the WebGPU 256 MiB
+// `max_storage_buffer_binding_size` ceiling.
+pub mod budget;
 pub mod color_compression;
 // Phase C (`15-design-c.md` §1.1) — the construction sub-module. W0 lands the
 // empty seam (`ConstructionGpu` / `ConstructionBindGroups` shells +
@@ -108,6 +115,20 @@ impl Plugin for NaadfRenderPlugin {
             .map(|args| args.taa_ring_depth)
             .unwrap_or(crate::DEFAULT_TAA_RING_DEPTH);
 
+        // Mobile GPU budget — mirror the main-world `EffectiveWorldSize`
+        // resource (inserted defensively by `build_app_with_args`, possibly
+        // overridden by the Android probe routine) into the render sub-app
+        // so the producer node can read it via
+        // `world.get_resource::<RenderEffectiveWorldSize>()` without crossing
+        // the sub-app boundary mid-frame. Same shape as `TaaRingConfig`
+        // above; see `docs/orchestrate/mobile-budget/02-design.md` §3
+        // "Render-sub-app mirror".
+        let effective_world = app
+            .world()
+            .get_resource::<crate::render::budget::EffectiveWorldSize>()
+            .copied()
+            .unwrap_or_else(crate::render::budget::EffectiveWorldSize::canonical);
+
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -116,6 +137,9 @@ impl Plugin for NaadfRenderPlugin {
             .insert_resource(TaaRingConfig {
                 depth: taa_ring_depth,
             })
+            .insert_resource(crate::render::budget::RenderEffectiveWorldSize(
+                effective_world,
+            ))
             // `02f` rearch: no `ExtractedWorld` resource. The build-once
             // hand-off goes through `WorldGpuStaging` (transient, dropped
             // after `prepare_world_gpu` consumes it) + `WorldDataMeta`

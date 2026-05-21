@@ -7,68 +7,92 @@
 //! `android-game-activity` Bevy feature) looks up after the APK loads. The
 //! function below is what gets called once per activity startup.
 //!
-//! ## 2026-05-21 — minimal-probe build
+//! ## 2026-05-21 — budget-aware production entry
 //!
-//! The first full-app launch on Galaxy Tab A8 (Mali-G52, 2.5 GiB shared RAM)
-//! kernel-OOM'd hard enough to reboot the device — the C#-faithful
-//! 256×32×256 fixed-world container's `voxels` (1 GiB) + `blocks` (512 MiB)
-//! GPU buffers blow past the tablet's physical RAM ceiling. The world
-//! install runs as part of `build_app_with_args`'s plugin pyramid
-//! (`world::WorldPlugin` + `voxel::VoxelIoPlugin` + `render::NaadfRenderPlugin`),
-//! so there's no way to bring the renderer up *without* triggering it.
+//! The earlier minimal-probe build (`DefaultPlugins` only) was a stopgap to
+//! survive the first Galaxy Tab A8 launch — the C#-faithful 256×32×256
+//! fixed-world install OOM-rebooted the kernel on touch because the three
+//! big storage-buffer bindings (`voxels` = 1024 MiB, `blocks` = 512 MiB,
+//! `taa_samples` ≈ 720 MiB at depth=32) blew past Mali-G52's 256 MiB
+//! `max_storage_buffer_binding_size` and the device's 2.5 GiB unified RAM.
 //!
-//! For now this entry point bypasses the whole pyramid and brings up only
-//! `DefaultPlugins` so that:
+//! This entry now runs the GPU budget preselection routine BEFORE building
+//! the real app:
 //!
-//!   1. We never reach the world-install allocations and the tablet survives.
-//!   2. We can read `RenderDevice.limits()` from logcat — the data point we
-//!      need to design Task #7 (scalable TAA + (V)RAM budget preselection).
+//!   1. [`crate::render::budget::probe_and_select`] spins up a throwaway
+//!      render `App` with `MinimalPlugins + AssetPlugin + ImagePlugin +
+//!      RenderPlugin`, reads `RenderDevice::limits()`, and drops the probe
+//!      app. The cap (Mali = 256 MiB) drives the selection of safe values
+//!      from the [`crate::render::budget::WORLD_SIZE_LADDER`] +
+//!      [`crate::render::budget::TAA_RING_DEPTH_LADDER`] descending ladders.
+//!      On Mali-G52 this returns `taa_ring_depth = 8, world_size_in_segments
+//!      = (6, 2, 6)` (= 96×32×96 chunks = 1536×512×1536 voxels).
+//!   2. The chosen TAA depth is written into [`crate::AppArgs`]; the chosen
+//!      `EffectiveWorldSize` is inserted into the App after
+//!      [`crate::build_app_with_args`] returns so the defensive seed inside
+//!      that helper is overridden in-place (Bevy `insert_resource` second-
+//!      call semantic is overwrite).
+//!   3. The full Naadf plugin pyramid runs against the reduced budgets;
+//!      `prepare_world_gpu` allocates `voxels` at 144 MiB, `blocks` at
+//!      72 MiB, and `taa_samples` at ~192 MiB — every binding under the
+//!      256 MiB cap with the 75% headroom factor.
 //!
-//! Once Task #7 lands, this file flips back to the real `build_app_with_args`
-//! path with budget-aware sizing.
+//! Mobile divergence is APPROVED per the user's faithful-port rule (locked
+//! Q2 in `docs/orchestrate/mobile-budget/01-context.md`): the C# canonical
+//! `(16, 2, 16)` segments const stays intact at
+//! `crates/bevy_naadf/src/world_size.rs:16` together with its compile-time
+//! pin test; the mobile divergence lives entirely in the [`EffectiveWorldSize`]
+//! resource.
 
 use bevy::prelude::*;
-use bevy::render::renderer::{RenderAdapterInfo, RenderDevice};
 use bevy::window::WindowMode;
 use bevy::winit::WinitSettings;
 
+use crate::render::budget::{probe_and_select, EffectiveWorldSize};
+use crate::{build_app_with_args, AppArgs, AppConfig};
+
 #[bevy_main]
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                resizable: false,
-                mode: WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
-                ..default()
-            }),
-            ..default()
-        }))
-        .insert_resource(WinitSettings::mobile())
-        .add_systems(Startup, log_render_device_limits)
-        .run();
-}
+    // 1. Probe-app (throwaway): boots `MinimalPlugins + AssetPlugin +
+    //    ImagePlugin + RenderPlugin`, reads the device cap, selects safe
+    //    `(taa_ring_depth, world_size_in_segments)`, drops the probe app.
+    //    Emits the `[budget]` log line to logcat — the device-step
+    //    success signal (`docs/orchestrate/mobile-budget/02-design.md` §8).
+    //
+    //    On Galaxy Tab A8 / Mali-G52: ~150 ms cold-boot, ~250 MiB PSS peak
+    //    (matches the empty-probe baseline at `docs/todo/android-build.md:28`).
+    let caps = probe_and_select();
 
-/// Minimal-probe diagnostic: dump the wgpu adapter info + limits to logcat
-/// as soon as the render device exists. The single line we actually need is
-/// the `Limits` debug print — it pins `max_buffer_size`,
-/// `max_storage_buffer_binding_size`, and the rest of the per-device caps
-/// that Task #7's budget routine has to read. Mirrors the pattern Bevy's own
-/// `examples/mobile/src/lib.rs` uses.
-fn log_render_device_limits(
-    device: Res<RenderDevice>,
-    adapter_info: Res<RenderAdapterInfo>,
-) {
-    info!(
-        "[naadf-probe] wgpu adapter: name={:?} vendor={:#x} device={:#x} \
-         device_type={:?} driver={:?} driver_info={:?} backend={:?}",
-        adapter_info.name,
-        adapter_info.vendor,
-        adapter_info.device,
-        adapter_info.device_type,
-        adapter_info.driver,
-        adapter_info.driver_info,
-        adapter_info.backend,
-    );
-    info!("[naadf-probe] wgpu device limits = {:#?}", device.limits());
-    info!("[naadf-probe] wgpu device features = {:#?}", device.features());
+    // 2. Apply the budget to AppArgs (TAA ring depth is plumbed end-to-end
+    //    through `AppArgs.taa_ring_depth` already — see
+    //    `crates/bevy_naadf/src/render/mod.rs:105-118`).
+    let mut args = AppArgs::default();
+    args.taa_ring_depth = caps.taa_ring_depth;
+
+    // 3. Build the real App. `build_app_with_args` defensively seeds
+    //    `EffectiveWorldSize::canonical()` if no caller inserted one yet —
+    //    we override it post-build with the budget-chosen rung. Bevy's
+    //    `insert_resource` overwrites on second call, so this is safe and
+    //    cheap (~16 ms on Mali during the W5 GPU producer's 6³ segment
+    //    loop = 216 dispatches × 2 ≈ 432 submits, down from 512 segments
+    //    × 2 = 1024 on desktop).
+    let cfg = AppConfig::windowed();
+    let mut app = build_app_with_args(cfg, args);
+    app.insert_resource(EffectiveWorldSize::from_segments(
+        caps.world_size_in_segments,
+    ));
+
+    // 4. Mobile-specific window config — full-screen borderless on Android.
+    //    Preserved from the pre-budget minimal-probe entry; the Gradle
+    //    project's `MainActivity` is built around this shape.
+    {
+        let mut window_q = app.world_mut().query::<&mut Window>();
+        if let Ok(mut window) = window_q.single_mut(app.world_mut()) {
+            window.resizable = false;
+            window.mode = WindowMode::BorderlessFullscreen(MonitorSelection::Primary);
+        }
+    }
+    app.insert_resource(WinitSettings::mobile());
+
+    app.run();
 }

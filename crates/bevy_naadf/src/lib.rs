@@ -187,7 +187,24 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         // The 128-deep camera-history ring + the monotonic frame counter
         // (`06-design-a2.md` §2.3). Main-world resource, `Default`-seeded,
         // updated each frame by `update_camera_history`.
-        .init_resource::<render::taa::CameraHistory>()
+        .init_resource::<render::taa::CameraHistory>();
+
+    // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#
+    // canonical value if no caller (Android entry / future probe-mode CLI)
+    // inserted one before this point. Every existing caller (production
+    // `main.rs`, 17 e2e gates, every `--bin e2e_render -- <mode>` path) leaves
+    // this resource absent; the seed makes their behaviour byte-identical to
+    // pre-budget code (the canonical 256×32×256 chunk world).
+    // The Android probe routine (`android_main.rs`) overrides this with a
+    // smaller rung AFTER `build_app_with_args` returns; Bevy's
+    // `insert_resource` second-call semantic is overwrite-in-place.
+    //
+    // See `docs/orchestrate/mobile-budget/02-design.md` §3 "Insertion point".
+    if !app.world().contains_resource::<crate::render::budget::EffectiveWorldSize>() {
+        app.insert_resource(crate::render::budget::EffectiveWorldSize::canonical());
+    }
+
+    app
         .add_plugins(
             // The NAADF WGSL render shaders live in `src/assets/shaders/`
             // (`03-design.md` §1 module layout) — point the asset server

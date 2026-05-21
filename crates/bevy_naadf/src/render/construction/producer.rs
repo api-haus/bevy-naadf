@@ -66,6 +66,11 @@ pub fn naadf_gpu_producer_node(
     // `.vox` file was loaded into the fixed world via
     // `install_vox_in_fixed_world` (W5.1).
     model_data: Option<Res<crate::render::extract::ModelDataRender>>,
+    // Mobile GPU budget — the runtime world-size override. Mirrored from the
+    // main-world `EffectiveWorldSize` by `NaadfRenderPlugin::build` (same
+    // shape as `TaaRingConfig`). Desktop value is byte-identical to the C#
+    // canonical `crate::WORLD_SIZE_IN_*` consts.
+    effective_world: Option<Res<crate::render::budget::RenderEffectiveWorldSize>>,
 ) {
     let Some(config) = construction_config else { return; };
     if !config.gpu_construction_enabled {
@@ -77,6 +82,17 @@ pub fn naadf_gpu_producer_node(
     }
     let Some(pipelines) = pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
+
+    // Mobile GPU budget — drive the segment-loop bounds + the per-segment
+    // uniforms from the runtime world size. Desktop value = the canonical
+    // `crate::WORLD_SIZE_IN_*` consts; mobile shrinks to e.g. (6,2,6)
+    // segments. If the mirror isn't inserted yet (early frames before
+    // `NaadfRenderPlugin::build` ran — shouldn't happen in practice), fall
+    // back to canonical so the producer still runs.
+    let effective = effective_world
+        .as_deref()
+        .map(|w| w.0)
+        .unwrap_or_else(crate::render::budget::EffectiveWorldSize::canonical);
 
     // Common-prerequisite pipelines (Algorithm 1 + bounds chain). Both branches
     // of the ladder below need these; resolve up-front.
@@ -135,9 +151,9 @@ pub fn naadf_gpu_producer_node(
         };
 
         let world_size_in_voxels = [
-            crate::WORLD_SIZE_IN_VOXELS.x,
-            crate::WORLD_SIZE_IN_VOXELS.y,
-            crate::WORLD_SIZE_IN_VOXELS.z,
+            effective.in_voxels.x,
+            effective.in_voxels.y,
+            effective.in_voxels.z,
         ];
         // Per-segment chunk extent. C# `WorldData.cs:73,143-145` uses
         // `worldGenSegmentSizeInChunks = WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4
@@ -176,9 +192,9 @@ pub fn naadf_gpu_producer_node(
         // params rewrites (the bounds chain reads from blocks/voxels, not
         // params.chunk_offset).
         let mut segment_count: u32 = 0;
-        for sz in 0..crate::WORLD_SIZE_IN_SEGMENTS.z {
-            for sy in 0..crate::WORLD_SIZE_IN_SEGMENTS.y {
-                for sx in 0..crate::WORLD_SIZE_IN_SEGMENTS.x {
+        for sz in 0..effective.in_segments.z {
+            for sy in 0..effective.in_segments.y {
+                for sx in 0..effective.in_segments.x {
                     let group_offset_in_chunks = [
                         sx * segment_chunks,
                         sy * segment_chunks,
@@ -227,22 +243,22 @@ pub fn naadf_gpu_producer_node(
                     // instead of skipping at chunk granularity); diagnostic
                     // at `06-diagnostic-inversion.md:477-507`.
                     let bound_group_count = bounds_calc::bound_group_count_of([
-                        crate::WORLD_SIZE_IN_CHUNKS.x,
-                        crate::WORLD_SIZE_IN_CHUNKS.y,
-                        crate::WORLD_SIZE_IN_CHUNKS.z,
+                        effective.in_chunks.x,
+                        effective.in_chunks.y,
+                        effective.in_chunks.z,
                     ]);
                     let construction_params = crate::render::gpu_types::GpuConstructionParams {
                         size_in_chunks: [
-                            crate::WORLD_SIZE_IN_CHUNKS.x,
-                            crate::WORLD_SIZE_IN_CHUNKS.y,
-                            crate::WORLD_SIZE_IN_CHUNKS.z,
+                            effective.in_chunks.x,
+                            effective.in_chunks.y,
+                            effective.in_chunks.z,
                         ],
                         _pad0: 0,
                         group_size_in_groups:
                             bounds_calc::group_size_in_groups_of([
-                                crate::WORLD_SIZE_IN_CHUNKS.x,
-                                crate::WORLD_SIZE_IN_CHUNKS.y,
-                                crate::WORLD_SIZE_IN_CHUNKS.z,
+                                effective.in_chunks.x,
+                                effective.in_chunks.y,
+                                effective.in_chunks.z,
                             ]),
                         _pad1: 0,
                         bound_group_queue_max_size: bound_group_count.max(1),
@@ -331,9 +347,8 @@ pub fn naadf_gpu_producer_node(
         //
         // `split_3d_dispatch` repacks these to 3D shapes within the 65535
         // per-axis cap; the WGSL flattens.
-        let world_chunks = crate::WORLD_SIZE_IN_CHUNKS.x
-            * crate::WORLD_SIZE_IN_CHUNKS.y
-            * crate::WORLD_SIZE_IN_CHUNKS.z;
+        let world_chunks =
+            effective.in_chunks.x * effective.in_chunks.y * effective.in_chunks.z;
         let max_blocks_u64 = (world_chunks as u64) * 64;
         let max_voxels_u64 = max_blocks_u64 * 32;
         let voxel_workgroups =

@@ -111,7 +111,7 @@ pub const SMALL_EDIT_CLICK_VOXEL: IVec3 = IVec3::new(32, 29, 32);
 /// demo origin offset.
 pub fn small_edit_click_voxel_world() -> IVec3 {
     use crate::e2e::gates::demo_origin_v;
-    let off = demo_origin_v();
+    let off = demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     SMALL_EDIT_CLICK_VOXEL + IVec3::new(off.x as i32, off.y as i32, off.z as i32)
 }
 
@@ -291,7 +291,7 @@ pub fn pin_small_edit_camera(
 pub fn count_non_empty_voxels(world_data: &WorldData) -> u64 {
     use crate::e2e::gates::demo_origin_v;
     use crate::voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS;
-    let off = demo_origin_v();
+    let off = demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     let off_x = off.x as i32;
     let off_z = off.z as i32;
     let demo_sx = (DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[0] * 16) as i32;

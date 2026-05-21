@@ -45,10 +45,10 @@ Design and ship a **startup-time GPU budget preselection routine** that reads `d
 - [x] Step 6a — checkpoint commit before architect (`76463ed`)
 - [x] Step 6b — architect dispatch (delegate-architect — 02-design.md, 9 sections, 10 decisions, 10 assumptions, 10 side notes)
 - [x] Step 7a — synthesize architect result; user approved Mali pick `(taa=8, world=(6,2,6))`, design as-is. Context-doc fix: `taa_sample_accum` corrected (3 big bindings, not 4).
-- [ ] Step 6c — checkpoint commit before impl
-- [ ] Step 6d — impl dispatch
-- [ ] Step 7b — synthesize impl result; hard gate for visual check on Mali-G52 device
-- [ ] Step 8 — exit when phase checklist complete
+- [x] Step 6c — checkpoint commit before impl (`ff5e89d`)
+- [x] Step 6d — impl dispatch (general-purpose Opus — Phases A-E landed; Phase F deferred — no tethered device; 187/187 lib tests green; APK built at `android/app/build/outputs/apk/debug/app-debug.apk`)
+- [ ] Step 7b — user on-device check (HARD GATE — install APK on Mali-G52 tablet, verify `[budget]` log line appears + device does not OOM-reboot)
+- [ ] Step 8 — exit when on-device check passes
 
 ## Verification surface (project rule — see `CLAUDE.md`)
 

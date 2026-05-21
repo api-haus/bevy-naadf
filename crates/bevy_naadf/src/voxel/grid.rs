@@ -31,7 +31,14 @@ use crate::aadf::construct::{construct, ConstructedWorld, DenseVolume};
 use crate::voxel::vox_import;
 use crate::voxel::{MaterialBase, MaterialLayer, VoxelType, VoxelTypeId};
 use crate::world::data::{IAabb3, VoxelTypes, WorldData};
-use crate::{AppArgs, GridPreset, WORLD_SIZE_IN_CHUNKS, WORLD_SIZE_IN_VOXELS};
+use crate::render::budget::EffectiveWorldSize;
+// `WORLD_SIZE_IN_CHUNKS` is referenced by the test module below
+// (`composed_default_*` tests pin the canonical compose at the C# canonical
+// world shape); production code now reads dimensions from the
+// `EffectiveWorldSize` resource instead of the consts.
+#[cfg(test)]
+use crate::WORLD_SIZE_IN_CHUNKS;
+use crate::{AppArgs, GridPreset};
 
 // Palette indices into `VoxelTypes::types`. Index 0 is the reserved empty
 // placeholder (C# convention) — see `VoxelTypes::default`.
@@ -80,11 +87,11 @@ pub const DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS: [u32; 3] = GRID_SIZE_IN_CHUNKS;
 /// world container places the demo. Previously lived in `e2e/gates.rs`; moved
 /// out of `e2e/` per the codebase-tightening D7 architect's Side note 6
 /// (production code must not depend on the `e2e` module).
-pub fn demo_origin_v() -> Vec3 {
+pub fn demo_origin_v(world_size_in_chunks: UVec3) -> Vec3 {
     let small_in_voxels_x = DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[0] * 16;
     let small_in_voxels_z = DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[2] * 16;
-    let off_x = (WORLD_SIZE_IN_CHUNKS.x * 16 - small_in_voxels_x) / 2;
-    let off_z = (WORLD_SIZE_IN_CHUNKS.z * 16 - small_in_voxels_z) / 2;
+    let off_x = (world_size_in_chunks.x * 16 - small_in_voxels_x) / 2;
+    let off_z = (world_size_in_chunks.z * 16 - small_in_voxels_z) / 2;
     Vec3::new(off_x as f32, 0.0, off_z as f32)
 }
 
@@ -111,10 +118,15 @@ pub fn demo_origin_v() -> Vec3 {
 /// that routes `Vox` loads to [`install_vox_sized_to_model`] (the legacy
 /// natural-bound CPU oracle) — used as the CPU phase of the SSIM-based
 /// `--vox-gpu-oracle` gate. Production callers never set this flag.
-pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
+pub fn setup_test_grid(
+    mut commands: Commands,
+    args: Res<AppArgs>,
+    effective_world: Res<EffectiveWorldSize>,
+) {
+    let effective = *effective_world;
     match &args.grid_preset {
         GridPreset::Default => {
-            install_default_embedded_in_fixed_world(&mut commands);
+            install_default_embedded_in_fixed_world(&mut commands, &effective);
         }
         GridPreset::Vox { path } => {
             if args.vox_gpu_oracle_cpu_phase {
@@ -126,18 +138,18 @@ pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
                 // still flagging gross renderer regressions.
                 install_vox_sized_to_model(&mut commands, path);
             } else {
-                install_vox_in_fixed_world(&mut commands, path);
+                install_vox_in_fixed_world(&mut commands, path, &effective);
             }
         }
         GridPreset::Empty => {
-            install_empty_world(&mut commands, "cli-empty");
+            install_empty_world(&mut commands, "cli-empty", &effective);
         }
         GridPreset::WebSkybox => {
             // Web `?skybox=1` URL-param — `web_vox::startup_fetch_default_vox`
             // mutates `AppArgs.grid_preset` to this arm before
             // `setup_test_grid` reads it (enforced by the `.before(...)`
             // ordering at `lib.rs:838-842`).
-            install_empty_world(&mut commands, "skybox-only");
+            install_empty_world(&mut commands, "skybox-only", &effective);
         }
     }
 }
@@ -173,7 +185,11 @@ struct WorldInstall<'a> {
     source_label: &'a str,
 }
 
-fn install_world_at_fixed_size(commands: &mut Commands, install: WorldInstall<'_>) {
+fn install_world_at_fixed_size(
+    commands: &mut Commands,
+    install: WorldInstall<'_>,
+    effective: &EffectiveWorldSize,
+) {
     commands.insert_resource(crate::camera::InitialCameraPose(install.camera_pose));
 
     if let Some(model_data) = install.model_data {
@@ -184,13 +200,13 @@ fn install_world_at_fixed_size(commands: &mut Commands, install: WorldInstall<'_
         chunks_cpu: install.chunks_cpu,
         blocks_cpu: install.blocks_cpu,
         voxels_cpu: install.voxels_cpu,
-        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
+        size_in_chunks: effective.in_chunks,
         bounding_box: IAabb3 {
             min: IVec3::ZERO,
             max: IVec3::new(
-                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
-                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
-                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
+                effective.in_voxels.x as i32 - 1,
+                effective.in_voxels.y as i32 - 1,
+                effective.in_voxels.z as i32 - 1,
             ),
         },
         pending_edits: Default::default(),
@@ -237,17 +253,21 @@ fn install_world_at_fixed_size(commands: &mut Commands, install: WorldInstall<'_
 ///
 /// `voxel_types` is a single transparent slot (palette index 0) — the
 /// renderer needs at least one entry to bind the storage buffer.
-pub fn install_empty_world(commands: &mut Commands, source_label: &'static str) {
+pub fn install_empty_world(
+    commands: &mut Commands,
+    source_label: &'static str,
+    effective: &EffectiveWorldSize,
+) {
     info!(
         "voxel/grid: install_empty_world ({source_label}) — empty WorldData at fixed world \
          size {}×{}×{} chunks ({}×{}×{} voxels); GPU producer chain disabled \
          (no ModelData, empty dense_voxel_types); rendered frame is pure sky.",
-        WORLD_SIZE_IN_CHUNKS.x,
-        WORLD_SIZE_IN_CHUNKS.y,
-        WORLD_SIZE_IN_CHUNKS.z,
-        WORLD_SIZE_IN_VOXELS.x,
-        WORLD_SIZE_IN_VOXELS.y,
-        WORLD_SIZE_IN_VOXELS.z,
+        effective.in_chunks.x,
+        effective.in_chunks.y,
+        effective.in_chunks.z,
+        effective.in_voxels.x,
+        effective.in_voxels.y,
+        effective.in_voxels.z,
     );
 
     // Camera pose: same as the embedded-default scene so the camera is
@@ -270,6 +290,7 @@ pub fn install_empty_world(commands: &mut Commands, source_label: &'static str) 
             seed_block_hashing: false,
             source_label,
         },
+        effective,
     );
 }
 
@@ -284,7 +305,10 @@ pub fn install_empty_world(commands: &mut Commands, source_label: &'static str) 
 /// dense u16 mirror is ~17 GiB. The data-driven gate at
 /// `render/construction/mod.rs:888` then skips the GPU producer chain and the
 /// renderer reads the pre-built CPU buffers directly.
-fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
+fn install_default_embedded_in_fixed_world(
+    commands: &mut Commands,
+    effective: &EffectiveWorldSize,
+) {
     let palette = build_palette();
     let volume = build_default_volume();
     let small = construct(&volume);
@@ -296,18 +320,18 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
     let ground_template = construct(&build_ground_chunk_volume());
 
     let center_offset_chunks = IVec3::new(
-        (WORLD_SIZE_IN_CHUNKS.x as i32 - small.size_in_chunks[0] as i32) / 2,
+        (effective.in_chunks.x as i32 - small.size_in_chunks[0] as i32) / 2,
         0,
-        (WORLD_SIZE_IN_CHUNKS.z as i32 - small.size_in_chunks[2] as i32) / 2,
+        (effective.in_chunks.z as i32 - small.size_in_chunks[2] as i32) / 2,
     );
 
     let composed = compose_default_scene_into_fixed_world(
         &small,
         &ground_template,
-        WORLD_SIZE_IN_CHUNKS,
+        effective.in_chunks,
         center_offset_chunks,
     );
-    let size_v = WORLD_SIZE_IN_VOXELS;
+    let size_v = effective.in_voxels;
 
     info!(
         "NAADF default scene embedded in fixed world: small={}×{}×{} chunks centered at chunk-({},{},{}); \
@@ -320,9 +344,9 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
         center_offset_chunks.x,
         center_offset_chunks.y,
         center_offset_chunks.z,
-        WORLD_SIZE_IN_CHUNKS.x,
-        WORLD_SIZE_IN_CHUNKS.y,
-        WORLD_SIZE_IN_CHUNKS.z,
+        effective.in_chunks.x,
+        effective.in_chunks.y,
+        effective.in_chunks.z,
         size_v.x,
         size_v.y,
         size_v.z,
@@ -365,6 +389,7 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
             seed_block_hashing: true,
             source_label: "default-scene",
         },
+        effective,
     );
 }
 
@@ -377,6 +402,10 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
 /// SSIM compare measures two distinct install paths' renders rather than two
 /// captures of the same render.
 fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path) {
+    // Note: the oracle phase is test-only and intentionally sizes to the model
+    // bounds (not the [`EffectiveWorldSize`] resource) — the SSIM compare
+    // pairs the natural-bound CPU render against the GPU render in the
+    // canonical fixed world. Mobile budgets never reach this code path.
     match vox_import::load_vox(path) {
         Ok(imp) => {
             let size_in_chunks = imp.world.size_in_chunks;
@@ -411,7 +440,12 @@ fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path) {
                 ".vox load failed ({e}); falling back to embedded default in fixed world (path: {})",
                 path.display()
             );
-            install_default_embedded_in_fixed_world(commands);
+            // Oracle phase is desktop-test-only; fall back to the canonical
+            // world for the embedded-default install path.
+            install_default_embedded_in_fixed_world(
+                commands,
+                &EffectiveWorldSize::canonical(),
+            );
         }
     }
 }
@@ -433,7 +467,11 @@ fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path) {
 /// On load failure: falls back to `install_default_embedded_in_fixed_world`
 /// (same as the pre-W5.1 behaviour, so the world is still fixed-size and
 /// editable — matches C#'s missing-`oasis.cvox` path).
-fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
+fn install_vox_in_fixed_world(
+    commands: &mut Commands,
+    path: &std::path::Path,
+    effective: &EffectiveWorldSize,
+) {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -442,11 +480,16 @@ fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
                  default in fixed world (path: {})",
                 path.display()
             );
-            install_default_embedded_in_fixed_world(commands);
+            install_default_embedded_in_fixed_world(commands, effective);
             return;
         }
     };
-    install_vox_bytes_in_fixed_world(commands, &bytes, &path.display().to_string());
+    install_vox_bytes_in_fixed_world(
+        commands,
+        &bytes,
+        &path.display().to_string(),
+        effective,
+    );
 }
 
 /// Bytes-based variant of [`install_vox_in_fixed_world`]. Used by:
@@ -478,15 +521,16 @@ pub fn install_vox_bytes_in_fixed_world(
     commands: &mut Commands,
     bytes: &[u8],
     source_label: &str,
+    effective: &EffectiveWorldSize,
 ) {
     match crate::voxel::voxel_dispatch::parse_voxel_bytes(bytes) {
-        Ok(imp) => install_imported_vox(commands, imp, source_label),
+        Ok(imp) => install_imported_vox(commands, imp, source_label, effective),
         Err(e) => {
             error!(
                 ".vox load failed ({e}); falling back to embedded default in \
                  fixed world (source: {source_label})"
             );
-            install_default_embedded_in_fixed_world(commands);
+            install_default_embedded_in_fixed_world(commands, effective);
         }
     }
 }
@@ -509,13 +553,14 @@ pub fn install_imported_vox(
     commands: &mut Commands,
     imp: vox_import::ImportedVox,
     source_label: &str,
+    effective: &EffectiveWorldSize,
 ) {
     let model_size_in_chunks = imp.world.size_in_chunks;
     info!(
         "NAADF .vox loaded from {} → ModelData ({}×{}×{} chunks; \
          data_chunk={} u32s, data_block={} u32s, data_voxel={} u32s, \
          {} palette entries). Fixed world {}×{}×{} chunks; GPU producer \
-         chain runs per WORLD_SIZE_IN_SEGMENTS = ({}, {}, {}).",
+         chain runs per EffectiveWorldSize.in_segments = ({}, {}, {}).",
         source_label,
         model_size_in_chunks[0],
         model_size_in_chunks[1],
@@ -524,12 +569,12 @@ pub fn install_imported_vox(
         imp.world.blocks.len(),
         imp.world.voxels.len(),
         imp.palette.len(),
-        WORLD_SIZE_IN_CHUNKS.x,
-        WORLD_SIZE_IN_CHUNKS.y,
-        WORLD_SIZE_IN_CHUNKS.z,
-        crate::WORLD_SIZE_IN_SEGMENTS.x,
-        crate::WORLD_SIZE_IN_SEGMENTS.y,
-        crate::WORLD_SIZE_IN_SEGMENTS.z,
+        effective.in_chunks.x,
+        effective.in_chunks.y,
+        effective.in_chunks.z,
+        effective.in_segments.x,
+        effective.in_segments.y,
+        effective.in_segments.z,
     );
 
     // 2026-05-19 — initial camera spawn pose now matches the cross-target
@@ -605,6 +650,7 @@ pub fn install_imported_vox(
             seed_block_hashing: true,
             source_label,
         },
+        effective,
     );
 }
 

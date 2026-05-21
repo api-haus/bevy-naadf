@@ -62,7 +62,9 @@ pub fn spawn_phase_c_test_entity(mut entities: ResMut<MainWorldEntities>) {
     // centered in the fixed `(4096, 512, 4096)`-voxel world, so the entity
     // position must translate through `demo_origin_v` to land in the same
     // relative spot the e2e camera frames.
-    let demo_off = crate::voxel::grid::demo_origin_v();
+    // e2e fixture entity assumes the canonical desktop world size (the fixture
+    // is desktop-test-only — mobile budgets never reach this entity spawner).
+    let demo_off = crate::voxel::grid::demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     let entity_pos = demo_off + Vec3::new(30.0, 24.0, 30.0);
     entities.instances = vec![EntityInstance {
         position: entity_pos,
