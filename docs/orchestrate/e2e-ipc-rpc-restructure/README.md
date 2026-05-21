@@ -44,5 +44,5 @@ branch `feat/android-build`.
 - [x] Step 2.5 — execution mode selection (distributed)
 - [x] Step 3/4 — method presented + architectural framing
 - [x] Step 5 — `01-context.md` written
-- [ ] Design phase
+- [x] Design phase — `02-design.md` complete
 - [ ] Implementation phase (scope confirmed at the design hard gate)
