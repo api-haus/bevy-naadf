@@ -281,6 +281,70 @@ pub struct NaadfPipelines {
     /// Strong handle to the `naadf_final` fragment shader, kept so re-queuing
     /// the blit pipeline per format does not re-load it.
     blit_shader: Handle<Shader>,
+
+    // === Phase-C construction pipelines + layouts (Resolution D — W0 seam retired) ===
+    // Folded in from the former `render/construction/mod.rs::ConstructionPipelines`
+    // resource per the codebase-tightening D5 architect §2.10 + Resolution D
+    // approval. Field names preserved verbatim from the prior struct to
+    // minimise consumer-call-site churn; the 5 prepare/node systems that read
+    // them now access them off the merged `NaadfPipelines` instead.
+    //
+    // **W5 — generator_model**
+    /// W5 — `@group(0)` layout for `generator_model.wgsl`.
+    pub generator_model_layout: BindGroupLayoutDescriptor,
+    /// W5 — `generator_model.wgsl::fill_chunk_data_with_model_data`.
+    pub generator_model_pipeline: CachedComputePipelineId,
+    // **W1 — chunk_calc**
+    /// W1 — `construction_world_layout` `@group(0)` shared by the three
+    /// `chunk_calc.wgsl` entry points.
+    pub construction_world_layout: BindGroupLayoutDescriptor,
+    /// W1 — `chunk_calc.wgsl::calc_block_from_raw_data`.
+    pub chunk_calc_pipeline_calc_block: CachedComputePipelineId,
+    /// W1 — `chunk_calc.wgsl::compute_voxel_bounds`.
+    pub chunk_calc_pipeline_voxel_bounds: CachedComputePipelineId,
+    /// W1 — `chunk_calc.wgsl::compute_block_bounds`.
+    pub chunk_calc_pipeline_block_bounds: CachedComputePipelineId,
+    /// W1 — `map_copy_layout` `@group(0)` for the hash-map regrow shader.
+    pub map_copy_layout: BindGroupLayoutDescriptor,
+    /// W1 — `map_copy.wgsl::copy_map`.
+    pub map_copy_pipeline_copy: CachedComputePipelineId,
+    /// W1 — `map_copy.wgsl::test_hash`.
+    pub map_copy_pipeline_test: CachedComputePipelineId,
+    // **W3 — bounds_calc**
+    /// W3 — `construction_bounds_world_layout` `@group(0)` (chunks + params).
+    pub construction_bounds_world_layout: BindGroupLayoutDescriptor,
+    /// W3 — `construction_bounds_layout` `@group(1)` (bound-queue family).
+    pub construction_bounds_layout: BindGroupLayoutDescriptor,
+    /// W3 — `bound_dispatch_indirect_layout` `@group(2)` (indirect counter write).
+    pub bound_dispatch_indirect_layout: BindGroupLayoutDescriptor,
+    /// W3 — `bounds_calc.wgsl::add_initial_groups_to_bound_queue`.
+    pub bounds_calc_pipeline_add_initial: CachedComputePipelineId,
+    /// W3 — `bounds_calc.wgsl::prepare_group_bounds`.
+    pub bounds_calc_pipeline_prepare: CachedComputePipelineId,
+    /// W3 — `bounds_calc.wgsl::compute_group_bounds`.
+    pub bounds_calc_pipeline_compute: CachedComputePipelineId,
+    // **W4 — entity_update**
+    /// W4 — `entity_world_layout` `@group(0)`.
+    pub entity_world_layout: BindGroupLayoutDescriptor,
+    /// W4 — `construction_entity_layout` `@group(1)`.
+    pub construction_entity_layout: BindGroupLayoutDescriptor,
+    /// W4 — `entity_update.wgsl::update_chunks`.
+    pub entity_update_pipeline_update_chunks: CachedComputePipelineId,
+    /// W4 — `entity_update.wgsl::copy_entity_chunk_instances`.
+    pub entity_update_pipeline_copy_entity_chunk_instances: CachedComputePipelineId,
+    /// W4 — `entity_update.wgsl::copy_entity_history`.
+    pub entity_update_pipeline_copy_entity_history: CachedComputePipelineId,
+    // **W2 — world_change**
+    /// W2 — `construction_change_layout` `@group(1)`.
+    pub construction_change_layout: BindGroupLayoutDescriptor,
+    /// W2 — `world_change.wgsl::apply_group_change`.
+    pub world_change_pipeline_apply_group_change: CachedComputePipelineId,
+    /// W2 — `world_change.wgsl::apply_chunk_change`.
+    pub world_change_pipeline_apply_chunk_change: CachedComputePipelineId,
+    /// W2 — `world_change.wgsl::apply_block_change`.
+    pub world_change_pipeline_apply_block_change: CachedComputePipelineId,
+    /// W2 — `world_change.wgsl::apply_voxel_change`.
+    pub world_change_pipeline_apply_voxel_change: CachedComputePipelineId,
 }
 
 impl FromWorld for NaadfPipelines {
@@ -854,6 +918,146 @@ impl FromWorld for NaadfPipelines {
             &[],
         );
 
+        // === Phase-C construction pipelines (Resolution D — W0 seam retired) =
+        // Absorbed verbatim from the former `ConstructionPipelines::from_world`
+        // (`render/construction/mod.rs`). Field names + queue order preserved
+        // so the per-workstream construction submodules continue to compile
+        // unchanged — they now read these off the merged NaadfPipelines.
+        use crate::render::construction::{
+            bounds_calc, chunk_calc, entity_update, generator_model, map_copy,
+            world_change,
+        };
+
+        // === W5 — generator_model pipeline + layout ==========================
+        let generator_model_layout =
+            generator_model::generator_model_layout_descriptor();
+        let generator_model_pipeline = generator_model::queue_generator_model_pipeline(
+            &asset_server,
+            pipeline_cache,
+            generator_model_layout.clone(),
+        );
+
+        // === W1 — chunk_calc pipelines + layout ==============================
+        let construction_world_layout =
+            chunk_calc::construction_world_layout_descriptor();
+        let chunk_calc_pipeline_calc_block = chunk_calc::queue_calc_block_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_world_layout.clone(),
+        );
+        let chunk_calc_pipeline_voxel_bounds = chunk_calc::queue_voxel_bounds_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_world_layout.clone(),
+        );
+        let chunk_calc_pipeline_block_bounds = chunk_calc::queue_block_bounds_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_world_layout.clone(),
+        );
+
+        // === W1 — map_copy pipelines + layout ================================
+        let map_copy_layout = map_copy::map_copy_layout_descriptor();
+        let map_copy_pipeline_copy = map_copy::queue_copy_map_pipeline(
+            &asset_server,
+            pipeline_cache,
+            map_copy_layout.clone(),
+        );
+        let map_copy_pipeline_test = map_copy::queue_test_hash_pipeline(
+            &asset_server,
+            pipeline_cache,
+            map_copy_layout.clone(),
+        );
+
+        // === W3 — bounds_calc pipelines + 3 layouts ===========================
+        let construction_bounds_world_layout =
+            bounds_calc::construction_bounds_world_layout_descriptor();
+        let construction_bounds_layout =
+            bounds_calc::construction_bounds_layout_descriptor();
+        let bound_dispatch_indirect_layout =
+            bounds_calc::bound_dispatch_indirect_layout_descriptor();
+        let bounds_calc_pipeline_add_initial = bounds_calc::queue_add_initial_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_bounds_world_layout.clone(),
+            construction_bounds_layout.clone(),
+        );
+        let bounds_calc_pipeline_prepare = bounds_calc::queue_prepare_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_bounds_world_layout.clone(),
+            construction_bounds_layout.clone(),
+            bound_dispatch_indirect_layout.clone(),
+        );
+        let bounds_calc_pipeline_compute = bounds_calc::queue_compute_pipeline(
+            &asset_server,
+            pipeline_cache,
+            construction_bounds_world_layout.clone(),
+            construction_bounds_layout.clone(),
+        );
+
+        // === W4 — entity_update pipelines + layouts ==========================
+        let entity_world_layout = entity_update::entity_world_layout_descriptor();
+        let construction_entity_layout =
+            entity_update::construction_entity_layout_descriptor();
+        let entity_update_pipeline_update_chunks =
+            entity_update::queue_update_chunks_pipeline(
+                &asset_server,
+                pipeline_cache,
+                entity_world_layout.clone(),
+                construction_entity_layout.clone(),
+            );
+        let entity_update_pipeline_copy_entity_chunk_instances =
+            entity_update::queue_copy_entity_chunk_instances_pipeline(
+                &asset_server,
+                pipeline_cache,
+                entity_world_layout.clone(),
+                construction_entity_layout.clone(),
+            );
+        let entity_update_pipeline_copy_entity_history =
+            entity_update::queue_copy_entity_history_pipeline(
+                &asset_server,
+                pipeline_cache,
+                entity_world_layout.clone(),
+                construction_entity_layout.clone(),
+            );
+
+        // === W2 — world_change pipelines + layout ============================
+        let construction_change_layout =
+            world_change::construction_change_layout_descriptor();
+        let world_change_pipeline_apply_group_change =
+            world_change::queue_apply_group_change_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_world_layout.clone(),
+                construction_change_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
+        let world_change_pipeline_apply_chunk_change =
+            world_change::queue_apply_chunk_change_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_world_layout.clone(),
+                construction_change_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
+        let world_change_pipeline_apply_block_change =
+            world_change::queue_apply_block_change_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_world_layout.clone(),
+                construction_change_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
+        let world_change_pipeline_apply_voxel_change =
+            world_change::queue_apply_voxel_change_pipeline(
+                &asset_server,
+                pipeline_cache,
+                construction_world_layout.clone(),
+                construction_change_layout.clone(),
+                construction_bounds_layout.clone(),
+            );
+
         NaadfPipelines {
             world_layout,
             frame_layout,
@@ -889,6 +1093,32 @@ impl FromWorld for NaadfPipelines {
             blit_pipelines: HashMap::default(),
             blit_vertex,
             blit_shader,
+            // === Phase-C construction fields (Resolution D merge) ===========
+            generator_model_layout,
+            generator_model_pipeline,
+            construction_world_layout,
+            chunk_calc_pipeline_calc_block,
+            chunk_calc_pipeline_voxel_bounds,
+            chunk_calc_pipeline_block_bounds,
+            map_copy_layout,
+            map_copy_pipeline_copy,
+            map_copy_pipeline_test,
+            construction_bounds_world_layout,
+            construction_bounds_layout,
+            bound_dispatch_indirect_layout,
+            bounds_calc_pipeline_add_initial,
+            bounds_calc_pipeline_prepare,
+            bounds_calc_pipeline_compute,
+            entity_world_layout,
+            construction_entity_layout,
+            entity_update_pipeline_update_chunks,
+            entity_update_pipeline_copy_entity_chunk_instances,
+            entity_update_pipeline_copy_entity_history,
+            construction_change_layout,
+            world_change_pipeline_apply_group_change,
+            world_change_pipeline_apply_chunk_change,
+            world_change_pipeline_apply_block_change,
+            world_change_pipeline_apply_voxel_change,
         }
     }
 }

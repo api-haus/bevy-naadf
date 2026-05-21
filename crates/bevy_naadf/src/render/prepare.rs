@@ -1205,3 +1205,45 @@ pub fn prepare_frame_gpu(
         calc_new_taa_sample_bind_group,
     });
 }
+
+/// Rebuild `WorldGpu.bind_group` against the production W4 entity buffers.
+///
+/// `prepare_world_gpu` builds the world bind group against single-element
+/// placeholder buffers for the three W4 entity slots (entities-off path). Once
+/// the construction-side W4 buffers are allocated (entities-on, post-extract),
+/// `prepare_construction` calls this helper to swap them in. The placeholder
+/// buffers stay alive on `WorldGpu` so a toggle-off rebuild can re-seat them
+/// without reallocating.
+///
+/// Owns the structural shape of the world `@group(0)` layout (D4 territory per
+/// `00-reuse-audit.md`). The construction-side caller (D5 territory) supplies
+/// the W4 buffers; D4 owns the binding order. Pre-Resolution-D, this rebuild
+/// was inlined in `prepare_construction` with a re-declared
+/// `BindGroupLayoutDescriptor` mirror — folding the helper here makes the
+/// cross-write a single named function call rather than a 35-LOC inline
+/// duplicate of the layout (`render/pipelines.rs::NaadfPipelines::world_layout`).
+pub(crate) fn rebuild_world_bind_group_with_entities(
+    render_device: &RenderDevice,
+    pipeline_cache: &PipelineCache,
+    pipelines: &NaadfPipelines,
+    world_gpu: &WorldGpu,
+    entity_chunk_instances: &Buffer,
+    entity_voxel_data: &Buffer,
+    entity_instances_history: &Buffer,
+) -> BindGroup {
+    let bgl = pipeline_cache.get_bind_group_layout(&pipelines.world_layout);
+    render_device.create_bind_group(
+        "naadf_world_bind_group_with_entities",
+        &bgl,
+        &BindGroupEntries::sequential((
+            world_gpu.chunks_buffer.as_entire_buffer_binding(),
+            world_gpu.blocks.buffer().as_entire_buffer_binding(),
+            world_gpu.voxels.buffer().as_entire_buffer_binding(),
+            world_gpu.voxel_types.buffer().as_entire_buffer_binding(),
+            world_gpu.world_meta.as_entire_buffer_binding(),
+            entity_chunk_instances.as_entire_buffer_binding(),
+            entity_voxel_data.as_entire_buffer_binding(),
+            entity_instances_history.as_entire_buffer_binding(),
+        )),
+    )
+}
