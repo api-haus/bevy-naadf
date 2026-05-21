@@ -52,7 +52,7 @@ branch `feat/android-build`.
   - Phase 3 — migrate remaining gates:
     - [x] Phase 3a — 6 gates migrated (dual-path green)
     - [x] Phase 3b — 4 special gates + `nodes_dispatched` verb — 13/13 gates dual-path green
-  - [ ] Phase 4 — repoint Playwright cross-target gate
+  - [x] Phase 4 — repoint Playwright cross-target gate (`just test-wasm` green)
   - [ ] Phase 5 — delete legacy harness
 
 ## Phase 5 carry-forward notes

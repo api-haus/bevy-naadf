@@ -24,9 +24,15 @@ const __dirname = path.dirname(__filename);
  * (≈30 % of the 4096-voxel world depth — matches the symptom exactly).
  *
  * This gate:
- *  1. Spawns `cargo run --bin e2e_render -- --vox-horizon-native` to
- *     capture a native 1280×720 reference framebuffer at the C#-faithful
- *     horizon pose. Writes `target/e2e-screenshots/vox_horizon_native.png`.
+ *  1. Runs `cargo test -p bevy-naadf --features e2e-brp --test
+ *     vox_horizon_native` — the BRP-driven native gate (migrated from the
+ *     legacy `e2e_render --vox-horizon-native` driver mode in the
+ *     `e2e-ipc-rpc-restructure` Phase 3a). That test drives the production
+ *     binary over BRP at the C#-faithful 1280×720 horizon pose and writes
+ *     the native reference PNG as a side effect. Because the test process
+ *     CWD is the `bevy_naadf` crate root, the PNG lands at
+ *     `crates/bevy_naadf/target/e2e-screenshots/vox_horizon_native.png`
+ *     (NOT the worktree-root `target/` the legacy binary used).
  *  2. Loads `/?vox=/test-fixtures/oasis.cvox&pose=horizon` in Playwright
  *     at viewport 1280×720; the `?pose=horizon` URL param triggers the
  *     [`pin_web_horizon_camera`] system to pin the camera at the same
@@ -60,8 +66,29 @@ const SSIM_MIN = 0.91;
 
 const HORIZON_NATIVE_PNG = "vox_horizon_native.png";
 const HORIZON_WEB_PNG = "vox_horizon_web.png";
+
+/**
+ * Worktree-root `target/e2e-screenshots/`. The WASM-side canvas capture and
+ * the per-run funnel sidecars are written here by this spec.
+ */
 const E2E_SCREENSHOT_DIR = path.join(REPO_ROOT, "target", "e2e-screenshots");
 const FUNNEL_DIR = path.join(E2E_SCREENSHOT_DIR, "funnel");
+
+/**
+ * Where the BRP-driven `vox_horizon_native` test writes the native reference
+ * PNG. `cargo test`'s process CWD is the `bevy_naadf` crate root, so the
+ * test's relative `target/e2e-screenshots/...` write resolves under
+ * `crates/bevy_naadf/target/`, NOT the worktree-root `target/` the legacy
+ * `cargo run --bin e2e_render` used (`e2e-ipc-rpc-restructure` Phase 3a /
+ * design §8). This spec reads the native PNG from here.
+ */
+const NATIVE_SCREENSHOT_DIR = path.join(
+  REPO_ROOT,
+  "crates",
+  "bevy_naadf",
+  "target",
+  "e2e-screenshots",
+);
 
 const CANVAS_SETTLE_MS = 30_000;
 
@@ -194,8 +221,14 @@ function buildFunnelSidecar(opts: {
 }
 
 /**
- * Shell out to `cargo run --bin e2e_render -- --vox-horizon-native` to
- * produce the native reference PNG. Returns `{code, stdout, stderr}`.
+ * Run the BRP-driven native horizon gate to produce the native reference
+ * PNG. Invokes `cargo test -p bevy-naadf --features e2e-brp --test
+ * vox_horizon_native` — that test spawns the production `bevy-naadf` binary
+ * as a BRP-controlled SUT, drives it to the C#-faithful 1280×720 horizon
+ * pose, captures, and writes `vox_horizon_native.png` as a side effect (see
+ * `crates/bevy_naadf/tests/vox_horizon_native.rs`). `--nocapture` forwards
+ * the test's stdout so the `[aadf-probe]` lines survive into `native.stdout`.
+ * Returns `{code, stdout, stderr}`.
  */
 async function runNativeHorizonCapture(): Promise<{
   code: number;
@@ -205,7 +238,17 @@ async function runNativeHorizonCapture(): Promise<{
   return new Promise((resolve, reject) => {
     const proc = spawn(
       "cargo",
-      ["run", "--bin", "e2e_render", "--", "--vox-horizon-native"],
+      [
+        "test",
+        "-p",
+        "bevy-naadf",
+        "--features",
+        "e2e-brp",
+        "--test",
+        "vox_horizon_native",
+        "--",
+        "--nocapture",
+      ],
       {
         cwd: REPO_ROOT,
         stdio: ["ignore", "pipe", "pipe"],
@@ -326,10 +369,12 @@ test.describe("Cross-target horizon parity", () => {
 
     // === Phase 1 — produce the native reference PNG ========================
     //
-    // Spawns the e2e_render binary at the C# default horizon pose. The
-    // native release-build path is the user-confirmed correct reference
-    // (Image #2 in the bug report). Generous timeout — building +
-    // running e2e_render against the production W5 chain takes minutes.
+    // Runs the BRP-driven `vox_horizon_native` gate test, which spawns the
+    // production `bevy-naadf` binary as a BRP-controlled SUT and drives it
+    // to the C# default horizon pose. The native release-build path is the
+    // user-confirmed correct reference (Image #2 in the bug report).
+    // Generous timeout — building + running the SUT against the production
+    // W5 chain takes minutes.
     test.setTimeout(10 * 60_000);
     const native = await runNativeHorizonCapture();
     test.info().annotations.push({
@@ -342,10 +387,13 @@ test.describe("Cross-target horizon parity", () => {
     });
     expect(
       native.code,
-      `--vox-horizon-native exited non-zero (${native.code}). ` +
-        `stdout:\n${native.stdout}\nstderr:\n${native.stderr}`,
+      `cargo test --test vox_horizon_native exited non-zero ` +
+        `(${native.code}). stdout:\n${native.stdout}\nstderr:\n${native.stderr}`,
     ).toBe(0);
-    const nativePngPath = path.join(E2E_SCREENSHOT_DIR, HORIZON_NATIVE_PNG);
+    // The BRP-driven test writes the native PNG under the crate-root
+    // `target/` (its process CWD is the crate root) — NOT the worktree-root
+    // `target/` the legacy `e2e_render` binary used.
+    const nativePngPath = path.join(NATIVE_SCREENSHOT_DIR, HORIZON_NATIVE_PNG);
     await fs.access(nativePngPath);
 
     // === Phase 2 — capture the WASM horizon view ===========================

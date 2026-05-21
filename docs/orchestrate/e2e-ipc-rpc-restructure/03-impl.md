@@ -1447,3 +1447,202 @@ targets, not logical — `set` would scale-multiply them) and returns
   edited only: `e2e_brp/{mod,verbs,schema}.rs`, `main.rs`, `naadf_e2e/{sut,scenario}.rs`,
   `tests/standard.rs`, and added 4 new `tests/*.rs` files. The legacy path is
   byte-unchanged and still green.
+
+---
+
+## Phase 4 — repoint Playwright cross-target gate (2026-05-22)
+
+**Verdict: Phase 4 lands clean. The cross-target Playwright gate
+(`e2e/tests/vox-horizon-parity.spec.ts`) now sources its native reference PNG
+from the BRP-driven `cargo test --test vox_horizon_native` instead of the
+legacy `cargo run --bin e2e_render -- --vox-horizon-native` subprocess. `just
+test-wasm` (headed, channel `chrome`) is GREEN — all 6 Playwright tests pass;
+the `vox-horizon-parity` spec reports SSIM 0.917101 ≥ 0.91 floor. `bin/e2e_render`
+was NOT touched — the `--ssim-compare` call stays as-is (that shrink/delete is
+Phase 5, per design §10). The default `cargo build --workspace` stays green.**
+
+The change is entirely a TypeScript / Playwright-spec edit. No Rust was
+touched: `vox_horizon_native.rs` already writes the native PNG to the right
+place (the Phase 3a forward-note was correct), so the repoint was a pure
+spec-side path + command change.
+
+### What changed
+
+One file edited: `e2e/tests/vox-horizon-parity.spec.ts`. Four edits, all in
+that file:
+
+1. **Native-PNG production command.** `runNativeHorizonCapture()` previously
+   `spawn`ed:
+   ```
+   cargo run --bin e2e_render -- --vox-horizon-native
+   ```
+   It now `spawn`s:
+   ```
+   cargo test -p bevy-naadf --features e2e-brp --test vox_horizon_native -- --nocapture
+   ```
+   This runs the Phase-3a BRP-driven gate (`crates/bevy_naadf/tests/vox_horizon_native.rs`),
+   which spawns the production `bevy-naadf` binary as a BRP-controlled SUT,
+   drives it to the C#-faithful 1280×720 horizon pose, captures, and writes the
+   native reference PNG **as a side effect** (the test's step 6 — explicitly
+   labelled "PHASE 4 CONTRACT"). `-- --nocapture` forwards the test's stdout so
+   the `[aadf-probe]` lines still survive into `native.stdout` for the spec's
+   probe-log sidecar diff. Same `cwd: REPO_ROOT`, same `spawn` plumbing,
+   identical `{code, stdout, stderr}` return shape — only the argv changed.
+
+2. **Native-PNG read path.** The legacy `e2e_render` binary (run from the
+   worktree root) wrote `target/e2e-screenshots/vox_horizon_native.png`. The
+   BRP-driven test process CWD is the `bevy_naadf` crate root
+   (`vox_horizon_native.rs` does `fb.save_png("target/e2e-screenshots/...")`
+   with a crate-root CWD), so the PNG now lands at
+   `crates/bevy_naadf/target/e2e-screenshots/vox_horizon_native.png`. A new
+   `NATIVE_SCREENSHOT_DIR` constant (`<REPO_ROOT>/crates/bevy_naadf/target/e2e-screenshots`)
+   was added, and `nativePngPath` in the test body now resolves against it.
+   `E2E_SCREENSHOT_DIR` (worktree-root `target/e2e-screenshots`) is **unchanged**
+   — the wasm-canvas capture (`vox_horizon_web.png`), the funnel sidecars, and
+   the two `*.aadf-probe.log` diagnostic files still write there, co-located.
+
+   Old vs new native-PNG source:
+   | | command | PNG path |
+   |---|---|---|
+   | old (legacy) | `cargo run --bin e2e_render -- --vox-horizon-native` | `<worktree>/target/e2e-screenshots/vox_horizon_native.png` |
+   | new (Phase 4) | `cargo test -p bevy-naadf --features e2e-brp --test vox_horizon_native` | `<worktree>/crates/bevy_naadf/target/e2e-screenshots/vox_horizon_native.png` |
+
+3. **Module + function doc comments** updated to describe the BRP-driven
+   source (step 1 of the gate description, and `runNativeHorizonCapture`'s
+   docstring) and the crate-root vs worktree-root `target/` distinction.
+
+4. **The `expect(native.code).toBe(0)` failure message** reworded from
+   `--vox-horizon-native exited non-zero` to `cargo test --test vox_horizon_native
+   exited non-zero`.
+
+**Unchanged, by design:** the wasm-canvas-capture half (Phase 2 of the spec —
+`?vox=…&pose=horizon&ui=hide` load, `captureSettledCanvas`), the
+`runSsimCompare()` function (still `cargo run --bin e2e_render -- --ssim-compare
+<a> <b> --ssim-min <min>`), the `SSIM_MIN = 0.91` floor, the funnel-sidecar
+machinery, and `e2e/playwright.config.ts` (already headed via the `--headed`
+flag in the `test-wasm` recipe, already `channel: "chrome"` — left alone).
+
+### Gate result
+
+`just test-wasm` (the Playwright cross-target suite, headed, channel `chrome`)
+— **PASS**. Run wrapped in `timeout 900`; finished well inside it.
+
+```
+Running 6 tests using 1 worker
+  ✓  1 [chromium] › sw-chrome-extension.spec.ts … does not intercept chrome-extension URLs
+  ✓  2 [chromium] › sw-chrome-extension.spec.ts … cacheFirst handles http(s) urls (control)
+  ✓  3 [chromium] › vox-horizon-parity.spec.ts:351 › native horizon capture vs WASM horizon capture — SSIM similar (1.1m)
+  ✓  4 [chromium] › vox-loading.spec.ts … captures skybox baseline via ?skybox=1
+  ✓  5 [chromium] › vox-loading.spec.ts … startup-fetches + installs the default .vox, SSIM-asserts dissimilar
+  ✓  6 [chromium] › wasm-smoke.spec.ts … loads without panics and renders the bevy canvas
+  6 passed (1.6m)
+JUST_TEST_WASM_EXIT=0
+```
+
+**The `vox-horizon-parity` spec — the Phase 4 gate proper:** PASS.
+- **SSIM reported: 0.917101** (≥ `SSIM_MIN = 0.91` floor → pass).
+- Native PNG produced by the new BRP `cargo test` path:
+  `crates/bevy_naadf/target/e2e-screenshots/vox_horizon_native.png`
+  (1 634 658 B) — confirmed on disk, freshly written by the run.
+- Wasm-canvas capture: `target/e2e-screenshots/vox_horizon_web.png`
+  (1 526 752 B) — unchanged path.
+
+**Captured logs/console on disk:**
+- `/tmp/phase4-logs/test-wasm.log` — full `just test-wasm` stdout+stderr (the
+  `[wasm-diag]` browser-console lines the spec forwards are teed into it).
+- `target/e2e-screenshots/funnel/vox_horizon_web-20260521T231153-442.txt` —
+  the spec's per-run funnel sidecar: `SSIM: 0.917101`, `pass (>= 0.91)?: yes`,
+  the full `[aadf-probe]` sentinel block, zero panic/error markers.
+- `target/e2e-screenshots/funnel/vox_horizon_web-20260521T231153-442.png` —
+  per-run wasm-canvas capture.
+- `target/e2e-screenshots/vox_horizon_{native,web}.aadf-probe.log` — the
+  native/web probe-line diff sidecars the spec writes.
+
+Build prerequisites for the gate (done in this phase, both green):
+- `just web-build-release` — the wasm release artifact into
+  `crates/bevy_naadf/dist/` (`test-wasm` requires a prior web build);
+  `WEB_BUILD_EXIT=0`, log `/tmp/phase4-web-build.log`.
+- `cargo test -p bevy-naadf --features e2e-brp --test vox_horizon_native
+  --no-run` — pre-compiled the SUT binary + the test so the Playwright run's
+  10-min native-capture budget was not spent on a cold compile;
+  `SUT_BUILD_EXIT=0`, log `/tmp/phase4-sut-build.log`.
+- `cargo build --workspace` (default features) — **PASS**, 0 errors. The
+  production binary is unchanged; Phase 4 touched no Rust.
+
+### Anything Phase 5 must know
+
+- **The Playwright spec still depends on `bin/e2e_render --ssim-compare`.**
+  `runSsimCompare()` in `vox-horizon-parity.spec.ts` shells
+  `cargo run --bin e2e_render -- --ssim-compare <a> <b> --ssim-min <min>` and
+  relies on:
+  1. the exit-code contract — `0` = SSIM ≥ min (gate pass), `1` = SSIM < min
+     (gate fail), `2` = internal error;
+  2. a stdout line matching `^SSIM=<f64>` (parsed by `extractSsimScore()` for
+     the funnel sidecar — `ssim.rs` prints it).
+  When Phase 5 shrinks `e2e_render` to a `--ssim-compare`-only utility, **both
+  the exit-code semantics and the `SSIM=<f64>` stdout line MUST be preserved
+  byte-for-byte** — the Playwright spec is the only remaining external consumer
+  of `e2e_render` and it parses both. The `--ssim-min` flag must stay too.
+- **The native-PNG path is now `crates/bevy_naadf/target/e2e-screenshots/vox_horizon_native.png`.**
+  If Phase 5 (or any later phase) ever changes the `vox_horizon_native` test's
+  write target or its CWD, the spec's `NATIVE_SCREENSHOT_DIR` constant must
+  move with it. The two paths are now deliberately different
+  (`NATIVE_SCREENSHOT_DIR` for the BRP-test-produced native PNG;
+  `E2E_SCREENSHOT_DIR` for everything the spec writes itself) — they are not
+  interchangeable.
+- **`just test-wasm` requires a prior `just web-build-release`.** The recipe
+  itself does not build the wasm artifact (`test-wasm-full` does — it is
+  `web-build-release test-wasm`). Phase 5's final-gate `just test-wasm` run
+  must build the web artifact first (or run `test-wasm-full`).
+
+## Side notes / observations / complaints
+
+- **The Phase 3a forward-note was exactly right and saved the phase.**
+  `vox_horizon_native.rs`'s step 6 already wrote the native PNG to
+  `target/e2e-screenshots/vox_horizon_native.png` with a crate-root CWD, and
+  its module doc explicitly called the crate-root-vs-worktree-root path
+  difference a "PHASE 4 CONTRACT." Phase 4 was a pure spec-side repoint with
+  zero Rust changes — the brief's preference ("adjust the Playwright spec to
+  read the existing path over moving the Rust write target") was the obviously
+  correct call and the migrated test was already shaped for it. Good handoff
+  hygiene from Phase 3a.
+
+- **The design's §9-Phase-4 wording is genuinely misleading and the brief was
+  right to flag it.** §9-Phase-4 opens with "Shrink `bin/e2e_render` to the
+  `--ssim-compare`-only utility (§8)" — but §10's deletion ledger puts the
+  `e2e_render` shrink/delete squarely in "Deleted outright (Phase 5)." Two
+  sections of the same design doc disagree on when `e2e_render` shrinks. The
+  brief reconciled this correctly (§10 is authoritative; Phase 4 only repoints
+  the spec). An agent following §9-Phase-4 literally would have shrunk
+  `e2e_render` in Phase 4 and broken the still-needed `--vox-horizon-native`
+  flag for the legacy path mid-restructure. Recommend the orchestrator amend
+  design §9-Phase-4 in THIS orchestration's docs to drop the "Shrink
+  `bin/e2e_render`" clause and say only "repoint the Playwright spec" — same
+  class of latent design-body inconsistency the Phase 1 log flagged for §5.
+
+- **`vox-horizon-parity` is no longer the "expected to FAIL" gate its module
+  doc still claims it is.** Lines 40-43 of the spec's header say "The gate is
+  expected to FAIL until the WASM chunk-AADF convergence bug is fixed — that's
+  the entire point." But the gate PASSES today (SSIM 0.917 ≥ 0.91), and the
+  `SSIM_MIN` constant has clearly been re-baselined from the doc-stated `0.98`
+  down to `0.91` (the doc comment on `SSIM_MIN` itself still says "**0.98**"
+  while the constant is `0.91`). This is stale documentation predating a
+  wasm-convergence fix or a threshold re-baseline that happened in some other
+  orchestration — NOT a Phase 4 concern, and I deliberately did not touch it
+  (out of brief scope, and editing it would be guessing at history). Flagging
+  it so the orchestrator knows the spec header carries two stale claims
+  (expected-to-fail; `0.98`). A future `/refactor` or docs pass should
+  reconcile the header with the live `SSIM_MIN = 0.91` and the now-passing
+  state.
+
+- **No foundation smell in the repoint itself.** The spec was already
+  cleanly factored — `runNativeHorizonCapture()` and `runSsimCompare()` are
+  separate single-purpose `spawn` wrappers, the path constants are at the top,
+  the native-PNG read is one `path.join`. Swapping the native-capture command
+  and adding one path constant was a four-edit change with no structural
+  disruption. The cross-target gate's native↔wasm bridge shape (native PNG via
+  a subprocess, wasm via Playwright, SSIM via a pure-CPU CLI) is the honest
+  treatment design §8 argued for — Phase 4 just moved the native-PNG
+  subprocess from the legacy binary to the BRP test, which is strictly an
+  improvement (the native side is now the same production-binary-as-SUT path
+  the other 12 gates use).
