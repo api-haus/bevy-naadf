@@ -11,9 +11,10 @@
 //! and returns a unified [`ImportedVox`] — the same shape
 //! [`crate::voxel::grid::install_imported_vox`] consumes for both source
 //! formats. Single-dispatch is the load-bearing invariant: every caller
-//! (`grid::parse_to_imported_vox`, drag-and-drop, autoload, async helpers)
-//! goes through this module, so adding a third format only touches this file
-//! + the new format's parser.
+//! (`grid::install_vox_bytes_in_fixed_world`, drag-and-drop, autoload, async
+//! helpers in `voxel::async_vox` and `voxel::web_vox`) goes through this
+//! module, so adding a third format only touches this file + the new
+//! format's parser.
 
 use crate::voxel::cvox_import::{self, CvoxImportError};
 use crate::voxel::vox_import::{self, ImportedVox, VoxImportError};

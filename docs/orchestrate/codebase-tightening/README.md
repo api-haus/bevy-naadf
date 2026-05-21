@@ -54,14 +54,16 @@
 - [⚠] `04` — implementor D5 — **4/8 steps landed** (escape-hatch subset: probe delete + readback extract + extract/producer extract + e2e fixtures moved to `validation.rs`). mod.rs 11 043 → 2 280 (−8 763 LOC, 79%). Net D5 Rust −1 246. All deterministic gates green; oasis-edit-visual × 4 stable. Steps 4/6/7/8 deferred for follow-up.
 - [⚠] `04` — implementor D4 — **2/6 steps landed**: SSoT scaffolding + dead `MAX_RAY_STEPS_*` deletion + sample-refine 4→1 collapse (C# fidelity restored). Net −39 LOC. ShaderType cutover bailed out per safety rule (recipe in §5). Steps 3/4/5/6 gated on Resolution D shape + D6/D7 pbr_sampling reference-drops.
 - [⚠] `04` — implementor D1 — **7/7 steps landed** (Step 8 by design = cross-domain skip). Net −172 LOC; shortfall vs architect's −400 to −500 = deliberate shim retention for `WorldData::set_voxel`/`set_voxels_batch_oracle` so D2/D5 can drop them in their phases (~390 LOC recoverable). State-bit regime A→B migration bit-pattern-identical; oasis-edit-visual ×3 stable.
-- [ ] `04` — implementor D3 (next)
-- [ ] `04` — implementor D4
-- [ ] `04` — implementor D1
-- [ ] `04` — implementor D2
-- [ ] `04` — implementor D3
-- [ ] `04` — implementor D6
+- [⚠] `04` — implementor D3 — **F1+F2..F7+F9 landed, F8 deferred** (architect's call). Two-dispatch run: first dispatch died with API 529 mid-flight after F1 (voxel_noise crate deletion, −1547 LOC, commit 293ffa8); re-dispatched for F2-F9 (−210 LOC inside `crates/bevy_naadf/src/`, new `camera/poses.rs` arrow-reversal, net D3 Rust ~−1757 across both runs). Build ✓ / 186 lib tests pass / e2e: baseline + --vox-e2e + --oasis-edit-visual all green. Note: 187→186 test count delta — tiled-family test removed with F2 deletion (expected). User-confirmed: CPU `voxel_noise` retires in favour of upcoming GPU compute noise.
+- [ ] `04` — implementor D6 (next — e2e-and-playwright)
 - [ ] `04` — implementor D8
-- [ ] `04` — implementor D7
+- [ ] `04a` — D7 scout: `pub const GiSettings::DEFAULT` + `#[derive(PartialEq)]` pre-land (before D2 impl)
+- [ ] `04` — implementor D2 (after D7 scout)
+- [ ] `04` — implementor D7 (last)
+- [ ] `04F` — D5 follow-up dispatch: Steps 4/6/7/8 (prepare_construction split, .run_if cleanup, encoder relocation, WGSL CELL_DIM naming)
+- [ ] `04F` — D4 follow-up dispatch: ShaderType cutover + prepare.rs split + plugin-per-subsystem + WorldGpu consolidation + pbr_sampling.wgsl deletion (after D6+D7)
+- [ ] `04F` — D5↔D1 SSoT-6 follow-up: re-export `hash_coefficients` in `render/construction/hashing.rs` (~5 LOC win)
+- [ ] `04F` — Resolution D `NaadfPipelines` merge shape (post-D7)
 
 ## Orchestrator discipline
 

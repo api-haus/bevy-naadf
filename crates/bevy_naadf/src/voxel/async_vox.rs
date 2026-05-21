@@ -21,8 +21,9 @@
 
 use bevy::prelude::*;
 
-use crate::voxel::grid::{install_imported_vox, parse_to_imported_vox};
+use crate::voxel::grid::install_imported_vox;
 use crate::voxel::vox_import::ImportedVox;
+use crate::voxel::voxel_dispatch::parse_voxel_bytes;
 
 /// The async parse pump's hand-off resource. **Cfg-gated** — the
 /// `inner` field carries a Bevy `Task<...>` on native (where
@@ -168,7 +169,7 @@ pub fn spawn_native_vox_parse(commands: &mut Commands, path: std::path::PathBuf)
     let pool = bevy::tasks::AsyncComputeTaskPool::get();
     let task = pool.spawn(async move {
         let bytes = std::fs::read(&path).map_err(|e| format!("read failed: {e}"))?;
-        let imp = parse_to_imported_vox(&bytes)?;
+        let imp = parse_voxel_bytes(&bytes).map_err(|e| e.to_string())?;
         Ok((imp, label_for_task))
     });
     commands.insert_resource(PendingVoxParse {
@@ -194,7 +195,7 @@ pub fn spawn_native_vox_parse_from_bytes(
     let label_for_task = source_label.clone();
     let pool = bevy::tasks::AsyncComputeTaskPool::get();
     let task = pool.spawn(async move {
-        let imp = parse_to_imported_vox(&bytes)?;
+        let imp = parse_voxel_bytes(&bytes).map_err(|e| e.to_string())?;
         Ok((imp, label_for_task))
     });
     commands.insert_resource(PendingVoxParse {

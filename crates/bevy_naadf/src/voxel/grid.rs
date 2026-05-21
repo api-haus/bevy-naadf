@@ -69,10 +69,7 @@ pub const DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS: [u32; 3] = GRID_SIZE_IN_CHUNKS;
 /// Startup system: build the hard-coded Phase-A voxel test grid (D2).
 ///
 /// Replaces `main::setup_scene_placeholder`. Inserts the `WorldData` and
-/// `VoxelTypes` resources.
-///
-/// **vox-gpu-rewrite Stage 2 consolidation (2026-05-18):** the dispatch
-/// ladder is gone. Every binary (production + every e2e gate) routes
+/// `VoxelTypes` resources. Every binary (production + every e2e gate) routes
 /// through the C#-faithful fixed-world install path:
 /// - [`GridPreset::Default`] → [`install_default_embedded_in_fixed_world`]
 ///   embeds the small primitive scene at the world centre inside the
@@ -83,42 +80,16 @@ pub const DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS: [u32; 3] = GRID_SIZE_IN_CHUNKS;
 ///   as a [`crate::aadf::generator::ModelData`] resource and the W5 GPU
 ///   producer chain runs `generator_model` + `chunk_calc` per segment to
 ///   build the world directly on the device.
+/// - [`GridPreset::Empty`] / [`GridPreset::WebSkybox`] →
+///   [`install_empty_world`] — pure-sky render. `WebSkybox` is the wasm
+///   `?skybox=1` URL-param surface (mutated into place by
+///   `web_vox::startup_fetch_default_vox` before this system reads it).
 ///
-/// **Stage 14 (2026-05-18):** the `vox_gpu_oracle_cpu_phase` escape hatch
-/// is restored as the SOLE test-only branch that routes `Vox` loads to
-/// [`install_vox_sized_to_model`] (the legacy natural-bound CPU oracle).
-/// The `--vox-gpu-oracle` gate is now an SSIM-based comparison between two
-/// REAL renders (CPU oracle vs production W5 GPU path), replacing the
-/// Stage 13 Shape C tautology that saved the same captured framebuffer as
-/// both `oracle_cpu.png` and `oracle_gpu.png` (which made the per-pixel
-/// diff trivially zero and the gate caught nothing). SSIM (Structural
-/// Similarity Index) tolerates the ~1.5-6% per-pixel TAA/GI shimmer +
-/// atomic-cursor nondeterminism + tiling-vs-natural-bound divergence that
-/// killed the per-pixel ceiling, while still flagging gross renderer
-/// regressions (sky-bleed, dropouts, voxel-type corruption) that would
-/// drop SSIM far below 1.0.
-///
-/// Production callers never set `vox_gpu_oracle_cpu_phase`; the binary's
-/// `--vox` path always routes here with the flag `false` and therefore
-/// always invokes [`install_vox_in_fixed_world`].
-pub fn setup_test_grid(
-    mut commands: Commands,
-    args: Res<AppArgs>,
-    skybox_override: Option<Res<WebSkyboxOverride>>,
-) {
-    // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — the wasm
-    // bootstrap inserts `WebSkyboxOverride` when the URL contains
-    // `?skybox=1`. When present we install the empty world regardless of
-    // what `grid_preset` says — the wasm side has no CLI flags so this is
-    // the only mechanism for selecting the skybox-only preset on web.
-    if skybox_override.is_some() {
-        info!(
-            "voxel/grid: WebSkyboxOverride present — installing empty world \
-             (?skybox=1 URL param)"
-        );
-        install_empty_world(&mut commands);
-        return;
-    }
+/// The `vox_gpu_oracle_cpu_phase` escape hatch is the SOLE test-only branch
+/// that routes `Vox` loads to [`install_vox_sized_to_model`] (the legacy
+/// natural-bound CPU oracle) — used as the CPU phase of the SSIM-based
+/// `--vox-gpu-oracle` gate. Production callers never set this flag.
+pub fn setup_test_grid(mut commands: Commands, args: Res<AppArgs>) {
     match &args.grid_preset {
         GridPreset::Default => {
             install_default_embedded_in_fixed_world(&mut commands);
@@ -137,16 +108,99 @@ pub fn setup_test_grid(
             }
         }
         GridPreset::Empty => {
-            install_empty_world(&mut commands);
+            install_empty_world(&mut commands, "cli-empty");
+        }
+        GridPreset::WebSkybox => {
+            // Web `?skybox=1` URL-param — `web_vox::startup_fetch_default_vox`
+            // mutates `AppArgs.grid_preset` to this arm before
+            // `setup_test_grid` reads it (enforced by the `.before(...)`
+            // ordering at `lib.rs:838-842`).
+            install_empty_world(&mut commands, "skybox-only");
         }
     }
 }
 
-/// Marker resource inserted by the wasm bootstrap (or any other caller) to
-/// force [`setup_test_grid`] to install an empty world regardless of
-/// `AppArgs.grid_preset`. Used by the `?skybox=1` URL query parameter (Q6).
-#[derive(Resource, Default)]
-pub struct WebSkyboxOverride;
+/// Shared install descriptor — every `install_*` adapter computes one of
+/// these and calls [`install_world_at_fixed_size`]. The helper owns the
+/// `WorldData` literal + the `[palette-install]` smoke-detector log + the
+/// `VoxelTypes` insertion, so all install paths share one source of truth
+/// for the `web-vox-color-divergence` regression detector (D3 finding 3).
+struct WorldInstall<'a> {
+    /// World content. Empty `Vec`s for empty-world / .vox-fixed (W5 GPU
+    /// producer fills these).
+    chunks_cpu: Vec<u32>,
+    blocks_cpu: Vec<u32>,
+    voxels_cpu: Vec<u32>,
+    /// Dense type mirror. Empty for every install path that isn't the
+    /// small-default demo (~17 GiB cost at the fixed 4096×512×4096 size).
+    dense_voxel_types: Vec<u16>,
+    /// Palette to install.
+    palette: Vec<VoxelType>,
+    /// Camera pose. Each install fn computes this.
+    camera_pose: Transform,
+    /// Optional W5 generator model. `Some` for `install_imported_vox`,
+    /// `None` otherwise.
+    model_data: Option<crate::aadf::generator::ModelData>,
+    /// Whether to seed the block-hashing handler (the brush undo machinery
+    /// re-hashes on every edit; the empty-world install path skips this).
+    seed_block_hashing: bool,
+    /// Source label for the `[palette-install]` smoke-detector log.
+    /// `&'static` for the static scene paths (`"skybox-only"`,
+    /// `"cli-empty"`, `"default-scene"`) — runtime labels (a path, a URL,
+    /// `"<dropped:foo.vox>"`) borrow into a caller-owned `String`.
+    source_label: &'a str,
+}
+
+fn install_world_at_fixed_size(commands: &mut Commands, install: WorldInstall<'_>) {
+    commands.insert_resource(crate::camera::InitialCameraPose(install.camera_pose));
+
+    if let Some(model_data) = install.model_data {
+        commands.insert_resource(model_data);
+    }
+
+    let mut world_data = WorldData {
+        chunks_cpu: install.chunks_cpu,
+        blocks_cpu: install.blocks_cpu,
+        voxels_cpu: install.voxels_cpu,
+        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
+        bounding_box: IAabb3 {
+            min: IVec3::ZERO,
+            max: IVec3::new(
+                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
+                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
+            ),
+        },
+        pending_edits: Default::default(),
+        dense_voxel_types: install.dense_voxel_types,
+        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
+    };
+    if install.seed_block_hashing {
+        world_data.seed_block_hashing();
+    }
+    commands.insert_resource(world_data);
+
+    // web-vox-color-divergence (2026-05-18) — smoke detector for the
+    // regression where the loaded `.vox` palette and the rendered palette
+    // could drift. Demoted to `debug!` post-fix; reachable via
+    // `RUST_LOG=bevy_naadf=debug`. **DO NOT REMOVE** — one place now, the
+    // three prior duplicated copies collapsed into this helper (D3 F3).
+    {
+        let preview: Vec<(f32, f32, f32)> = install
+            .palette
+            .iter()
+            .take(5)
+            .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
+            .collect();
+        debug!(
+            "[palette-install] label={:?} palette_len={} first_5_color_base={:?}",
+            install.source_label,
+            install.palette.len(),
+            preview,
+        );
+    }
+    commands.insert_resource(VoxelTypes { types: install.palette });
+}
 
 /// Install an EMPTY [`WorldData`] at the fixed world size. The renderer
 /// reads empty `WorldGpu` buffers and produces a pure-sky frame — useful as
@@ -161,10 +215,9 @@ pub struct WebSkyboxOverride;
 ///
 /// `voxel_types` is a single transparent slot (palette index 0) — the
 /// renderer needs at least one entry to bind the storage buffer.
-pub fn install_empty_world(commands: &mut Commands) {
-    let palette = build_palette();
+pub fn install_empty_world(commands: &mut Commands, source_label: &'static str) {
     info!(
-        "voxel/grid: install_empty_world — empty WorldData at fixed world \
+        "voxel/grid: install_empty_world ({source_label}) — empty WorldData at fixed world \
          size {}×{}×{} chunks ({}×{}×{} voxels); GPU producer chain disabled \
          (no ModelData, empty dense_voxel_types); rendered frame is pure sky.",
         WORLD_SIZE_IN_CHUNKS.x,
@@ -179,52 +232,23 @@ pub fn install_empty_world(commands: &mut Commands) {
     // pointed at a reasonable view of the world (the framed pixels will be
     // pure sky anyway, but at least the camera isn't staring at
     // (0, 0, 0) — which is technically empty void inside the world).
-    let cam_pos = Vec3::new(11.0, 7.0, 17.0);
-    let cam_look = Vec3::new(0.0, 4.0, -3.0);
-    commands.insert_resource(crate::camera::InitialCameraPose(
-        Transform::from_translation(cam_pos).looking_at(cam_look, Vec3::Y),
-    ));
+    let camera_pose = Transform::from_translation(Vec3::new(11.0, 7.0, 17.0))
+        .looking_at(Vec3::new(0.0, 4.0, -3.0), Vec3::Y);
 
-    let world_data = WorldData {
-        chunks_cpu: Vec::new(),
-        blocks_cpu: Vec::new(),
-        voxels_cpu: Vec::new(),
-        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
-        bounding_box: IAabb3 {
-            min: IVec3::ZERO,
-            max: IVec3::new(
-                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
-                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
-                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
-            ),
+    install_world_at_fixed_size(
+        commands,
+        WorldInstall {
+            chunks_cpu: Vec::new(),
+            blocks_cpu: Vec::new(),
+            voxels_cpu: Vec::new(),
+            dense_voxel_types: Vec::new(),
+            palette: build_palette(),
+            camera_pose,
+            model_data: None,
+            seed_block_hashing: false,
+            source_label,
         },
-        pending_edits: Default::default(),
-        dense_voxel_types: Vec::new(),
-        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
-    };
-    commands.insert_resource(world_data);
-    // web-vox-color-divergence (2026-05-18) — pairs with the
-    // `[palette-install]` log in the `.vox` + default-scene install sites. The
-    // skybox-only path also installs a default palette; logging it lets us
-    // confirm whether the build-once gate sees the skybox palette in the
-    // `--vox-web-parity-skybox` subprocess. Demoted to `debug!` post-fix
-    // (Decision D-LOGS-DEBUG-NOT-TRACE); reachable via
-    // `RUST_LOG=bevy_naadf=debug` for future regression diagnosis.
-    // **DO NOT REMOVE** — smoke detector for `web-vox-color-divergence`.
-    {
-        let preview: Vec<(f32, f32, f32)> = palette
-            .iter()
-            .take(5)
-            .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
-            .collect();
-        debug!(
-            "[palette-install] install_empty_world label=\"skybox-only\" \
-             palette_len={} first_5_color_base={:?}",
-            palette.len(),
-            preview,
-        );
-    }
-    commands.insert_resource(VoxelTypes { types: palette });
+    );
 }
 
 /// C#-faithful default — build the same primitive scene the small-world path
@@ -297,73 +321,41 @@ fn install_default_embedded_in_fixed_world(commands: &mut Commands) {
     );
     let cam_pos = demo_origin_v + Vec3::new(11.0, 7.0, 17.0);
     let cam_look = demo_origin_v + Vec3::new(0.0, 4.0, -3.0);
-    commands.insert_resource(crate::camera::InitialCameraPose(
-        Transform::from_translation(cam_pos).looking_at(cam_look, Vec3::Y),
-    ));
+    let camera_pose = Transform::from_translation(cam_pos).looking_at(cam_look, Vec3::Y);
 
-    let mut world_data = WorldData {
-        chunks_cpu: composed.chunks,
-        blocks_cpu: composed.blocks,
-        voxels_cpu: composed.voxels,
-        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
-        // `bounding_box` is the **ray-traversal AABB clip** the renderer
-        // uploads as `boundingBoxMin/Max` (`render/prepare.rs:374-380`,
-        // matches C# `WorldData.cs:477-478` which always passes the full
-        // world extent). Sizing it to the full fixed world matters here:
-        // the user can edit voxels anywhere in the 4096×512×4096 container,
-        // and the primary ray must be allowed to reach + intersect those
-        // edits. A tight small-scene box (`64×32×64`) would clip rays before
-        // they hit any edit placed outside the corner — invisible writes
-        // from the user's perspective. Identical to the `.vox`-load path's
-        // bounds (set in `vox_import::build_world_from_vox`).
-        bounding_box: IAabb3 {
-            min: IVec3::ZERO,
-            max: IVec3::new(
-                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
-                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
-                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
-            ),
+    // `bounding_box` is the **ray-traversal AABB clip** the renderer uploads
+    // as `boundingBoxMin/Max` (`render/prepare.rs:374-380`, matches C#
+    // `WorldData.cs:477-478` which always passes the full world extent).
+    // The helper [`install_world_at_fixed_size`] sizes it to the full fixed
+    // world: the user can edit voxels anywhere in the 4096×512×4096
+    // container, and the primary ray must be allowed to reach + intersect
+    // those edits. Identical to the `.vox`-load path's bounds.
+    install_world_at_fixed_size(
+        commands,
+        WorldInstall {
+            chunks_cpu: composed.chunks,
+            blocks_cpu: composed.blocks,
+            voxels_cpu: composed.voxels,
+            dense_voxel_types: Vec::new(),
+            palette,
+            camera_pose,
+            model_data: None,
+            seed_block_hashing: true,
+            source_label: "default-scene",
         },
-        pending_edits: Default::default(),
-        dense_voxel_types: Vec::new(),
-        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
-    };
-    world_data.seed_block_hashing();
-    commands.insert_resource(world_data);
-    // web-vox-color-divergence (2026-05-18) — pairs with the
-    // `[palette-install]` log in `install_imported_vox` so we can tell the
-    // default-scene install (Startup, before any async `.vox` lands) from the
-    // `.vox` install (post-rayon-parse). Demoted to `debug!` post-fix
-    // (Decision D-LOGS-DEBUG-NOT-TRACE); reachable via
-    // `RUST_LOG=bevy_naadf=debug` for future regression diagnosis.
-    // **DO NOT REMOVE** — smoke detector for `web-vox-color-divergence`.
-    {
-        let preview: Vec<(f32, f32, f32)> = palette
-            .iter()
-            .take(5)
-            .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
-            .collect();
-        debug!(
-            "[palette-install] install_default_embedded_in_fixed_world \
-             label=\"default-scene\" palette_len={} first_5_color_base={:?}",
-            palette.len(),
-            preview,
-        );
-    }
-    commands.insert_resource(VoxelTypes { types: palette });
+    );
 }
 
 /// Legacy `.vox` loader — sizes the world to the model's natural bounds.
 ///
-/// **Stage 14 (2026-05-18) status:** reachable ONLY via the test-only
-/// `AppArgs.vox_gpu_oracle_cpu_phase` branch in [`setup_test_grid`] — the
-/// CPU oracle phase of the SSIM-based `--vox-gpu-oracle` gate. The
-/// production binary always routes through [`install_vox_in_fixed_world`].
-/// Kept as a separate path so the CPU-vs-GPU SSIM compare measures two
-/// distinct install paths' renders rather than two captures of the same
-/// render.
+/// Reachable ONLY via the test-only `AppArgs.vox_gpu_oracle_cpu_phase` branch
+/// in [`setup_test_grid`] — the CPU oracle phase of the SSIM-based
+/// `--vox-gpu-oracle` gate. The production binary always routes through
+/// [`install_vox_in_fixed_world`]. Kept as a separate path so the CPU-vs-GPU
+/// SSIM compare measures two distinct install paths' renders rather than two
+/// captures of the same render.
 fn install_vox_sized_to_model(commands: &mut Commands, path: &std::path::Path) {
-    match vox_import::load_vox_tiled(path, 1) {
+    match vox_import::load_vox(path) {
         Ok(imp) => {
             let size_in_chunks = imp.world.size_in_chunks;
             info!(
@@ -450,22 +442,22 @@ fn install_vox_in_fixed_world(commands: &mut Commands, path: &std::path::Path) {
 ///
 /// **Split (web-vox-async-loading Step 3, 2026-05-18):** this function is
 /// the synchronous-convenience wrapper that combines
-/// [`parse_to_imported_vox`] (pure CPU, `Send`-able output — runs in the
-/// async parse task on both web/native) with [`install_imported_vox`] (the
-/// Bevy-resource install pass — must run on the main thread). Callers that
-/// still want a one-shot sync API (e.g. the `--vox-gpu-oracle` and
-/// `--vox-e2e` startup-time installers that tolerate a blocking parse)
-/// keep using this entry point. Async callers
+/// [`crate::voxel::voxel_dispatch::parse_voxel_bytes`] (pure CPU, `Send`-able
+/// output — runs in the async parse task on both web/native) with
+/// [`install_imported_vox`] (the Bevy-resource install pass — must run on the
+/// main thread). Callers that still want a one-shot sync API (e.g. the
+/// `--vox-gpu-oracle` and `--vox-e2e` startup-time installers that tolerate a
+/// blocking parse) keep using this entry point. Async callers
 /// (`voxel::web_vox::apply_pending_vox` + `native_vox_drop_listener` +
-/// `setup_test_grid`'s `GridPreset::Vox` arm) drive
-/// `parse_to_imported_vox` off-thread and call `install_imported_vox` from
-/// the polling system once the parse completes.
+/// `setup_test_grid`'s `GridPreset::Vox` arm) drive `parse_voxel_bytes`
+/// off-thread and call `install_imported_vox` from the polling system once
+/// the parse completes.
 pub fn install_vox_bytes_in_fixed_world(
     commands: &mut Commands,
     bytes: &[u8],
     source_label: &str,
 ) {
-    match parse_to_imported_vox(bytes) {
+    match crate::voxel::voxel_dispatch::parse_voxel_bytes(bytes) {
         Ok(imp) => install_imported_vox(commands, imp, source_label),
         Err(e) => {
             error!(
@@ -475,41 +467,6 @@ pub fn install_vox_bytes_in_fixed_world(
             install_default_embedded_in_fixed_world(commands);
         }
     }
-}
-
-/// Pure-CPU bytes → [`vox_import::ImportedVox`] parse. **`Send`-able output**
-/// — designed to be called from an off-main-thread context
-/// (`bevy::tasks::AsyncComputeTaskPool::spawn` on native, `rayon::spawn` on
-/// web via the `wasm-bindgen-rayon` worker pool).
-///
-/// Wraps `dot_vox::load_bytes` + `vox_import::parse_dot_vox_data` into a
-/// single error-mapped entry point: any failure (malformed bytes, oversize
-/// world, empty model) becomes a `String` so the caller doesn't need to
-/// import the upstream error type. The returned `ImportedVox` owns its
-/// `chunks` / `blocks` / `voxels` `Vec<u32>` buffers and `Vec<VoxelType>`
-/// palette — all are `Send + Sync`, no Bevy or wgpu references.
-///
-/// **Web async path:** the rayon worker reads `&[u8]` (a slice into the
-/// caller-owned `Vec<u8>` of the fetched bytes) and returns the parsed
-/// `ImportedVox` via a `crossbeam_channel::Sender`. The Bevy `Update`
-/// system on the main thread `try_recv()`s the result and invokes
-/// [`install_imported_vox`].
-///
-/// **Native async path:** the `AsyncComputeTaskPool` task reads bytes from
-/// disk + parses, owning the entire chain off-thread. Same hand-off shape
-/// to `install_imported_vox` via a Bevy `Task<...>` polled in an `Update`
-/// system.
-pub fn parse_to_imported_vox(bytes: &[u8]) -> Result<vox_import::ImportedVox, String> {
-    // oasis-vox-instance-count (2026-05-19) — single magic-byte dispatch
-    // entry point. The first 4 bytes select between the MagicaVoxel `.vox`
-    // parser and the NAADF `.cvox` parser; both produce the same
-    // `ImportedVox` shape so every downstream consumer
-    // (`install_vox_bytes_in_fixed_world`, the async parse tasks, the
-    // drag-and-drop path, the web fetch path) inherits dispatch through
-    // this shim with no further changes. See
-    // `crates/bevy_naadf/src/voxel/voxel_dispatch.rs` +
-    // `docs/orchestrate/oasis-vox-instance-count/03-design.md`.
-    crate::voxel::voxel_dispatch::parse_voxel_bytes(bytes).map_err(|e| e.to_string())
 }
 
 /// Install a parsed [`vox_import::ImportedVox`] into the live Bevy `World`
@@ -566,12 +523,11 @@ pub fn install_imported_vox(
     // overridden. If a future user needs the C#-faithful spawn for
     // comparison against C# NAADF, restore the
     // `from_world_voxels(world_voxels)` call and remove this block.
-    let _ = WORLD_SIZE_IN_VOXELS;
-    commands.insert_resource(crate::camera::InitialCameraPose(bevy::prelude::Transform {
-        translation: crate::e2e::vox_horizon_parity::HORIZON_CAMERA_POS,
-        rotation: crate::e2e::vox_horizon_parity::HORIZON_CAMERA_ROT,
-        scale: bevy::prelude::Vec3::ONE,
-    }));
+    let camera_pose = Transform {
+        translation: crate::camera::poses::HORIZON_CAMERA_POS,
+        rotation: crate::camera::poses::HORIZON_CAMERA_ROT,
+        scale: Vec3::ONE,
+    };
 
     // W5.1 — convert ConstructedWorld → ModelData. The `chunks/blocks/voxels`
     // u32 buffers `vox_import` produces are byte-identical to NAADF's
@@ -605,7 +561,6 @@ pub fn install_imported_vox(
         data_voxel,
         size_in_chunks: model_size_in_chunks,
     };
-    commands.insert_resource(model_data);
 
     // W5.1 — install an EMPTY WorldData at the FIXED world size. The renderer
     // still consumes this for bind groups (prepare_world_gpu builds the
@@ -615,51 +570,20 @@ pub fn install_imported_vox(
     // `if meta.dense_voxel_types.is_empty() { return; }` gate at
     // `render/construction/mod.rs:1936-1941` (the W5.3 three-way ladder adds
     // a NEW gate ABOVE that one for ModelDataRender presence).
-    let mut world_data = WorldData {
-        chunks_cpu: Vec::new(),
-        blocks_cpu: Vec::new(),
-        voxels_cpu: Vec::new(),
-        size_in_chunks: WORLD_SIZE_IN_CHUNKS,
-        bounding_box: IAabb3 {
-            min: IVec3::ZERO,
-            max: IVec3::new(
-                WORLD_SIZE_IN_VOXELS.x as i32 - 1,
-                WORLD_SIZE_IN_VOXELS.y as i32 - 1,
-                WORLD_SIZE_IN_VOXELS.z as i32 - 1,
-            ),
-        },
-        pending_edits: Default::default(),
-        dense_voxel_types: Vec::new(),
-        block_hashing: crate::aadf::block_hash::BlockHashingHandler::new(),
-    };
-    world_data.seed_block_hashing();
-    commands.insert_resource(world_data);
-    // web-vox-color-divergence (2026-05-18) — one-shot palette install trace.
-    // Logs the main-world palette insertion with the source label so we can
-    // distinguish the `.vox` install path from
-    // `install_default_embedded_in_fixed_world`. Pair with the
-    // `[palette-upload]` log in `render/prepare.rs` and the new
-    // `[palette-refresh]` log in `render/extract.rs` to verify whether the
-    // refresh path fires on `.vox` install. Demoted to `debug!` post-fix
-    // (Decision D-LOGS-DEBUG-NOT-TRACE); reachable via
-    // `RUST_LOG=bevy_naadf=debug` for future regression diagnosis.
-    // **DO NOT REMOVE** — smoke detector for `web-vox-color-divergence`.
-    {
-        let preview: Vec<(f32, f32, f32)> = imp
-            .palette
-            .iter()
-            .take(5)
-            .map(|t| (t.color_base.x, t.color_base.y, t.color_base.z))
-            .collect();
-        debug!(
-            "[palette-install] install_imported_vox label={:?} palette_len={} \
-             first_5_color_base={:?}",
+    install_world_at_fixed_size(
+        commands,
+        WorldInstall {
+            chunks_cpu: Vec::new(),
+            blocks_cpu: Vec::new(),
+            voxels_cpu: Vec::new(),
+            dense_voxel_types: Vec::new(),
+            palette: imp.palette,
+            camera_pose,
+            model_data: Some(model_data),
+            seed_block_hashing: true,
             source_label,
-            imp.palette.len(),
-            preview,
-        );
-    }
-    commands.insert_resource(VoxelTypes { types: imp.palette });
+        },
+    );
 }
 
 /// Native (desktop) drag-and-drop entry point. Winit emits
@@ -669,9 +593,9 @@ pub fn install_imported_vox(
 /// [`install_vox_bytes_in_fixed_world`] — the same install path used by the
 /// startup loader and (on web) the HTTP-fetch / browser-DnD paths. The actual
 /// format routing (MagicaVoxel `.vox` vs NAADF `.cvox`) happens further
-/// downstream in [`parse_to_imported_vox`] via magic-byte dispatch
-/// (`voxel/voxel_dispatch.rs`); this listener's extension check is only a
-/// UX-level "is this even a voxel file?" filter.
+/// downstream in [`crate::voxel::voxel_dispatch::parse_voxel_bytes`] via
+/// magic-byte dispatch (`voxel/voxel_dispatch.rs`); this listener's
+/// extension check is only a UX-level "is this even a voxel file?" filter.
 ///
 /// Non-voxel drops are ignored with an info log; voxel drops with a read
 /// error are logged as `error!` but the current scene is left intact (the
@@ -711,12 +635,12 @@ pub fn native_vox_drop_listener(
                 // oasis-vox-instance-count (2026-05-19) — accept BOTH
                 // MagicaVoxel `.vox` and NAADF `.cvox`. The downstream
                 // `spawn_native_vox_parse` reads bytes + funnels them
-                // through `parse_to_imported_vox` → the magic-byte
-                // dispatch in `voxel/voxel_dispatch.rs`, so the actual
-                // routing happens on file *content*, not extension. This
-                // extension filter is only the UX-level "did the user
-                // drop a voxel file at all?" gate; it stays
-                // case-insensitive to match the prior `.vox` behaviour.
+                // through `parse_voxel_bytes` (`voxel/voxel_dispatch.rs`)
+                // → the magic-byte dispatch, so the actual routing happens
+                // on file *content*, not extension. This extension filter
+                // is only the UX-level "did the user drop a voxel file at
+                // all?" gate; it stays case-insensitive to match the prior
+                // `.vox` behaviour.
                 let is_voxel = path_buf
                     .extension()
                     .and_then(|e| e.to_str())

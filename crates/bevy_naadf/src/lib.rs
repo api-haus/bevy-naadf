@@ -93,12 +93,15 @@ pub enum GridPreset {
     /// Step 8 / Q5). The gate captures this frame, then captures the
     /// counterpart `GridPreset::Vox` rendering, then SSIM-asserts the two
     /// are **dissimilar** (the loaded vox actually rendered geometry).
-    ///
-    /// Also reachable on web via the `?skybox=1` URL query parameter (Q6) —
-    /// the wasm bootstrap inserts a [`crate::voxel::grid::WebSkyboxOverride`]
-    /// resource which `setup_test_grid` consults before installing the
-    /// default scene.
     Empty,
+    /// **Web `?skybox=1` URL-param surface** — same install behaviour as
+    /// [`GridPreset::Empty`] (empty world, pure-sky render); kept as a
+    /// distinct arm so the wasm bootstrap can express the decision via
+    /// `AppArgs.grid_preset` mutation instead of a separate marker
+    /// resource + ordering constraint on `setup_test_grid`. The
+    /// `[palette-install]` smoke-detector log distinguishes the source
+    /// (`"skybox-only"` vs `"cli-empty"`).
+    WebSkybox,
 }
 
 /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#
@@ -807,10 +810,10 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // (`crate::e2e::add_e2e_systems`).
     //
     // On web, `voxel::web_vox::startup_fetch_default_vox` runs `.before`
-    // `setup_test_grid` so it can insert a `WebSkyboxOverride` resource (Q6
-    // `?skybox=1` URL-param handling) before `setup_test_grid` consults it.
-    // The ordering is enforced by an explicit `.before(setup_test_grid)` on
-    // the web-side registration below.
+    // `setup_test_grid` so it can mutate `AppArgs.grid_preset` to
+    // `GridPreset::WebSkybox` (Q6 `?skybox=1` URL-param handling) before
+    // `setup_test_grid` reads it. The ordering is enforced by an explicit
+    // `.before(setup_test_grid)` on the web-side registration below.
     app.add_systems(Startup, voxel::grid::setup_test_grid);
 
     // web-vox-async-loading Step 4 (2026-05-18) — async `.vox` parse pump.
@@ -848,10 +851,15 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // 2026-05-19 — `?pose=horizon` URL-param camera pin. Runs every frame
     // when the override resource is present; bypasses FreeCamera input so
     // the cross-target SSIM gate's WASM-side capture is deterministic.
+    // `.run_if(resource_exists)` keeps the scheduler from invoking the
+    // system body when the param is absent (the common case).
     .add_systems(
         Update,
         voxel::web_vox::pin_web_horizon_camera
-            .after(voxel::async_vox::poll_pending_vox_parse),
+            .after(voxel::async_vox::poll_pending_vox_parse)
+            .run_if(bevy::ecs::schedule::common_conditions::resource_exists::<
+                voxel::web_vox::WebHorizonPoseOverride,
+            >),
     );
 
     // Native drag-and-drop: drop a `.vox` file onto the window to replace the
@@ -967,7 +975,14 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         // because the system is target-agnostic; only the resource
         // inserter (the `?ui=hide` URL-param resolver) is wasm-only.
         #[cfg(target_arch = "wasm32")]
-        app.add_systems(Update, voxel::web_vox::hide_ui);
+        app.add_systems(
+            Update,
+            voxel::web_vox::hide_ui.run_if(
+                bevy::ecs::schedule::common_conditions::resource_exists::<
+                    voxel::web_vox::UiHiddenOverride,
+                >,
+            ),
+        );
     }
 
     app

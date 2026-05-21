@@ -186,10 +186,9 @@ pub fn resolve_skybox_only_param() -> bool {
 /// 2026-05-19 — detect the `?pose=horizon` URL query parameter. When
 /// present, a Bevy `Update` system pins the camera at the user-captured
 /// pose (`HORIZON_CAMERA_POS` + `HORIZON_CAMERA_ROT` in
-/// `crate::e2e::vox_horizon_parity`) every frame, overriding any
-/// FreeCamera input. Used by the Playwright cross-target SSIM gate so
-/// the WASM canvas screenshot is captured at the exact same pose the
-/// native gate captures.
+/// `crate::camera::poses`) every frame, overriding any FreeCamera input.
+/// Used by the Playwright cross-target SSIM gate so the WASM canvas
+/// screenshot is captured at the exact same pose the native gate captures.
 pub fn resolve_horizon_pose_param() -> bool {
     let Some(window) = web_sys::window() else { return false; };
     let search = window.location().search().unwrap_or_default();
@@ -234,7 +233,6 @@ pub struct WebHorizonPoseOverride;
 /// case byte-identical). Cheap: hits 3 entities per frame, sets
 /// `Visibility` once each.
 pub fn hide_ui(
-    override_resource: Option<Res<UiHiddenOverride>>,
     mut editor_hud: Query<&mut Visibility, With<crate::editor::hud::EditorHudRoot>>,
     mut settings_root: Query<
         &mut Visibility,
@@ -252,9 +250,6 @@ pub fn hide_ui(
         ),
     >,
 ) {
-    if override_resource.is_none() {
-        return;
-    }
     for mut v in editor_hud.iter_mut() {
         *v = Visibility::Hidden;
     }
@@ -271,21 +266,17 @@ pub fn hide_ui(
 /// Bypasses FreeCamera input so the SSIM gate's WASM-side capture is
 /// deterministic.
 pub fn pin_web_horizon_camera(
-    override_resource: Option<Res<WebHorizonPoseOverride>>,
     camera: Option<
         Single<(&mut Transform, &mut crate::camera::position_split::PositionSplit), With<Camera3d>>,
     >,
 ) {
-    if override_resource.is_none() {
-        return;
-    }
     let Some(mut camera) = camera else { return; };
-    // Same constants as the native gate
-    // (`crate::e2e::vox_horizon_parity::{HORIZON_CAMERA_POS,
-    // HORIZON_CAMERA_ROT}`).
+    // Camera pose constants live in `crate::camera::poses` (D3 finding 6 —
+    // dependency-arrow reversal); the native gate
+    // (`crate::e2e::vox_horizon_parity`) reads from the same module.
     let pose = Transform {
-        translation: crate::e2e::vox_horizon_parity::HORIZON_CAMERA_POS,
-        rotation: crate::e2e::vox_horizon_parity::HORIZON_CAMERA_ROT,
+        translation: crate::camera::poses::HORIZON_CAMERA_POS,
+        rotation: crate::camera::poses::HORIZON_CAMERA_ROT,
         scale: Vec3::ONE,
     };
     let (transform, position_split) = &mut *camera;
@@ -391,11 +382,12 @@ fn install_dnd_listeners() -> Result<(), JsValue> {
 /// [`apply_pending_vox`] on the next `Update`.
 ///
 /// **`?skybox=1` short-circuit** (Q6): if the URL contains `skybox=1`, the
-/// HTTP fetch is skipped and the DOM overlay is hidden immediately. The
-/// `setup_test_grid` system (which runs in the same `Startup` schedule)
-/// sees the `WebSkyboxOverride` resource inserted below and installs the
-/// empty world. Used by the Playwright SSIM-baseline capture.
-pub fn startup_fetch_default_vox(mut commands: Commands) {
+/// HTTP fetch is skipped and `AppArgs.grid_preset` is mutated to
+/// [`crate::GridPreset::WebSkybox`]. The `setup_test_grid` system (which
+/// runs in the same `Startup` schedule via the explicit `.before(...)`
+/// ordering at `lib.rs:838-842`) reads the updated preset and installs the
+/// empty skybox-only world. Used by the Playwright SSIM-baseline capture.
+pub fn startup_fetch_default_vox(mut commands: Commands, mut args: ResMut<crate::AppArgs>) {
     install_panic_hook();
     if let Err(e) = install_dnd_listeners() {
         error!("web_vox: failed to attach drag-drop listeners: {:?}", e);
@@ -403,10 +395,11 @@ pub fn startup_fetch_default_vox(mut commands: Commands) {
 
     if resolve_skybox_only_param() {
         info!(
-            "web_vox: ?skybox=1 detected — skipping HTTP fetch + DND-installed \
-             default; setup_test_grid will install the empty skybox-only world"
+            "web_vox: ?skybox=1 detected — skipping HTTP fetch + switching \
+             grid_preset to WebSkybox; setup_test_grid will install the \
+             empty skybox-only world"
         );
-        commands.insert_resource(crate::voxel::grid::WebSkyboxOverride);
+        args.grid_preset = crate::GridPreset::WebSkybox;
         hide_loading_overlay();
         return;
     }
@@ -575,9 +568,9 @@ fn spawn_wasm_vox_parse(commands: &mut Commands, bytes: Vec<u8>, source_label: S
     let (tx, rx) = crossbeam_channel::bounded::<crate::voxel::async_vox::ParseResult>(1);
     let label_for_task = source_label.clone();
     rayon::spawn(move || {
-        let result = match crate::voxel::grid::parse_to_imported_vox(&bytes) {
+        let result = match crate::voxel::voxel_dispatch::parse_voxel_bytes(&bytes) {
             Ok(imp) => Ok((imp, label_for_task)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.to_string()),
         };
         // Best-effort send — if the receiver was dropped (replaced by a
         // newer parse) the result is discarded silently.

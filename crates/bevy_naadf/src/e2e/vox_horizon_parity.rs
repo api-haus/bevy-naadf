@@ -60,25 +60,14 @@ use std::path::{Path, PathBuf};
 use bevy::prelude::*;
 use bevy::winit::WinitSettings;
 
+use crate::camera::poses::{HORIZON_CAMERA_POS, HORIZON_CAMERA_ROT};
 use crate::camera::position_split::PositionSplit;
 use crate::e2e::framebuffer::Framebuffer;
 
 // ---------------------------------------------------------------------------
-// Camera pose — user-captured 2026-05-19 (the pose where the front-face
-// clipping symptom reproduces in `just dev`)
+// Camera pose — `HORIZON_CAMERA_POS` / `HORIZON_CAMERA_ROT` live in
+// [`crate::camera::poses`] (D3 finding 6 — dependency-arrow reversal).
 // ---------------------------------------------------------------------------
-
-/// Horizon camera position (user-captured world coords, voxel units).
-pub const HORIZON_CAMERA_POS: Vec3 = Vec3::new(3880.187, 497.332, 3514.350);
-
-/// Horizon camera rotation (user-captured `Transform.rotation`,
-/// `Quat(x, y, z, w)`). Forward vector ≈ `(-0.924, -0.241, -0.297)`.
-pub const HORIZON_CAMERA_ROT: Quat = Quat::from_xyzw(
-    -0.09791362,
-    0.5846077,
-    0.07135339,
-    0.8022191,
-);
 
 // ---------------------------------------------------------------------------
 // Window resolution — large enough to make the long-distance raymarch visible

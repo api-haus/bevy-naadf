@@ -7,6 +7,7 @@
 //!
 //! [`position_split`] holds NAADF's int+frac camera-relative position type (D1).
 
+pub mod poses;
 pub mod position_split;
 
 use bevy::{

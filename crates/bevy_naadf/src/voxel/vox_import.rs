@@ -156,13 +156,6 @@ pub fn parse_vox_bytes(bytes: &[u8]) -> Result<ImportedVox, VoxImportError> {
     parse_dot_vox_data(&data)
 }
 
-/// Parse `.vox` bytes into an [`ImportedVox`] with `tiles × tiles` XZ tiling
-/// applied. `tiles == 1` is equivalent to [`parse_vox_bytes`].
-pub fn parse_vox_bytes_tiled(bytes: &[u8], tiles: u32) -> Result<ImportedVox, VoxImportError> {
-    let data = dot_vox::load_bytes(bytes).map_err(VoxImportError::Parse)?;
-    parse_dot_vox_data_tiled(&data, tiles)
-}
-
 /// Convenience: load a `.vox` file from disk via `std::fs::read` + parse.
 ///
 /// Used by `voxel/grid.rs::setup_test_grid` when `args.grid_preset` is
@@ -173,106 +166,20 @@ pub fn load_vox(path: impl AsRef<Path>) -> Result<ImportedVox, VoxImportError> {
     parse_vox_bytes(&bytes)
 }
 
-/// Convenience: load a `.vox` file from disk via `std::fs::read` + parse with
-/// `tiles × tiles` XZ tiling applied. `tiles == 1` is equivalent to
-/// [`load_vox`].
-///
-/// **vox-gpu-rewrite Stage 2 (2026-05-18):** retained as the CPU oracle
-/// helper for `--vox-gpu-oracle` only. The production install path uses the
-/// W5 GPU producer chain which tiles via `voxelPos % modelSize` on device;
-/// CPU XZ replication is no longer a runtime option.
-pub fn load_vox_tiled(path: impl AsRef<Path>, tiles: u32) -> Result<ImportedVox, VoxImportError> {
-    let bytes = std::fs::read(path.as_ref())?;
-    parse_vox_bytes_tiled(&bytes, tiles)
-}
-
 /// Convert a parsed `DotVoxData` into [`ImportedVox`].
 ///
 /// Pulled out so unit tests can drive it with a hand-built `DotVoxData`
-/// without going through the binary parser.
+/// without going through the binary parser. The W5 GPU producer chain handles
+/// any C#-faithful `voxelPos % modelSize` tiling on the device; there is no
+/// CPU-side replication path.
 pub fn parse_dot_vox_data(data: &dot_vox::DotVoxData) -> Result<ImportedVox, VoxImportError> {
-    parse_dot_vox_data_tiled(data, 1)
-}
-
-/// Convert a parsed `DotVoxData` into [`ImportedVox`] with `tiles × tiles`
-/// XZ tiling applied. `tiles == 1` is the canonical single-tile path.
-///
-/// **vox-gpu-rewrite Stage 2 (2026-05-18):** the production runtime path no
-/// longer exposes the tile count — `setup_test_grid` always passes 1 (the W5
-/// GPU producer chain handles the C#-faithful `voxelPos % modelSize` tiling
-/// across the fixed 256-chunk world). The `tiles > 1` branch is retained for
-/// the test corpus + the CPU oracle helpers and exercises the block-dedup
-/// HashMap (identical content across tiles collapses to the same `VoxelPtr`
-/// slot, so `voxels_cpu` grows by ~0× with tile count).
-pub fn parse_dot_vox_data_tiled(
-    data: &dot_vox::DotVoxData,
-    tiles: u32,
-) -> Result<ImportedVox, VoxImportError> {
     if data.models.is_empty() {
         return Err(VoxImportError::Empty);
     }
-    let tiles = tiles.max(1);
-    // Parse once → single-tile sparse buckets + tile dims.
-    let (tile_buckets, tile_size_in_chunks) = compose_to_sparse_world(data)?;
-    let buckets = if tiles == 1 {
-        tile_buckets
-    } else {
-        replicate_buckets_xz(&tile_buckets, tile_size_in_chunks, tiles)?
-    };
+    let (buckets, _tile_size_in_chunks) = compose_to_sparse_world(data)?;
     let world = build_constructed_world_sparse(buckets)?;
     let palette = vox_palette_to_voxel_types(&data.palette, &data.materials);
     Ok(ImportedVox { world, palette })
-}
-
-/// Replicate `tile_buckets` (a single `.vox` tile's worth of sparse voxel
-/// data) `tiles × tiles` times across the XZ plane, producing a new
-/// [`ChunkBuckets`] sized at `(tiles × tile_w, tile_h, tiles × tile_d)`.
-///
-/// **Faithful-port note:** this mirrors C#'s startup-time multi-`.vox` load
-/// (where multiple Oasis_Hard_Cover.vox instances are placed in a 4×4 grid).
-/// The block-dedup pass downstream (`build_constructed_world_sparse`'s
-/// HashMap) collapses identical block content across tiles for free.
-fn replicate_buckets_xz(
-    tile_buckets: &ChunkBuckets,
-    tile_size_in_chunks: [u32; 3],
-    tiles: u32,
-) -> Result<ChunkBuckets, VoxImportError> {
-    let [tw, th, td] = tile_size_in_chunks;
-    let new_size = [
-        tw.saturating_mul(tiles),
-        th,
-        td.saturating_mul(tiles),
-    ];
-    validate_caps(new_size)?;
-
-    let mut out = ChunkBuckets::new(new_size);
-    let new_sx = new_size[0] as usize;
-    let new_sy = new_size[1] as usize;
-    let tile_sx = tw as usize;
-    let tile_sy = th as usize;
-
-    for tz in 0..tiles {
-        for tx in 0..tiles {
-            let off_cx = (tx * tw) as usize;
-            let off_cz = (tz * td) as usize;
-            for cz in 0..(td as usize) {
-                for cy in 0..(th as usize) {
-                    for cx in 0..(tw as usize) {
-                        let src_idx = cx + cy * tile_sx + cz * tile_sx * tile_sy;
-                        let Some(bucket) = tile_buckets.chunks[src_idx].as_ref() else {
-                            continue;
-                        };
-                        let dst_cx = cx + off_cx;
-                        let dst_cy = cy;
-                        let dst_cz = cz + off_cz;
-                        let dst_idx = dst_cx + dst_cy * new_sx + dst_cz * new_sx * new_sy;
-                        out.chunks[dst_idx] = Some(bucket.clone());
-                    }
-                }
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// Apply an [`ImportedVox`] to fresh [`crate::world::data::WorldData`] +
@@ -1663,70 +1570,6 @@ mod tests {
             CELL_CHILDREN / 2,
             "expected exactly one unique 32-u32 block (dedup hit); got {} u32s",
             imp.world.voxels.len(),
-        );
-    }
-
-    // -- Test (sparse XZ-tile feature) — replicate one tile N×N in XZ.
-    //
-    // vox-gpu-rewrite Stage 2 (2026-05-18): the runtime path no longer
-    // exposes a tile-count knob, but the helper is still reachable via the
-    // CPU oracle paths; this test pins block-dedup correctness across tiles.
-
-    #[test]
-    fn tiled_load_expands_world_xz_and_dedups_blocks() {
-        // Drive the small-cube fixture through the tiled path at N=3. The
-        // world size in chunks must scale by 3× in X and Z (Y unchanged) and
-        // the block-dedup HashMap must collapse identical content across
-        // tiles, so `voxels_cpu` length stays ≈ the single-tile output's
-        // length (each unique block content appears exactly once regardless
-        // of how many tile copies reference it).
-        let data = build_small_cube();
-        let single = parse_dot_vox_data_tiled(&data, 1).unwrap();
-        let tiled = parse_dot_vox_data_tiled(&data, 3).unwrap();
-
-        let s = single.world.size_in_chunks;
-        let t = tiled.world.size_in_chunks;
-        assert_eq!(t[0], s[0] * 3, "X axis must scale by tiles");
-        assert_eq!(t[1], s[1], "Y axis stays unchanged");
-        assert_eq!(t[2], s[2] * 3, "Z axis must scale by tiles");
-
-        // chunks_cpu grows by tiles² (every tile contributes its own chunks).
-        assert_eq!(
-            tiled.world.chunks.len(),
-            single.world.chunks.len() * 9,
-            "chunks_cpu must scale by tiles² (3×3 = 9)"
-        );
-
-        // voxels_cpu must NOT scale with tile count — dedup collapses
-        // identical block content across tiles.
-        assert_eq!(
-            tiled.world.voxels.len(),
-            single.world.voxels.len(),
-            "voxels_cpu length must be identical between tiled and untiled \
-             (block dedup collapses identical content across tiles)"
-        );
-
-        // Sample-check: the same voxel pattern appears at tile-shifted
-        // positions. The small-cube's distinguished emissive voxel sits at
-        // NAADF coord (3, 3, 3) within the single tile (after Z↔Y swap).
-        // In tile (1, 0) at chunk-offset (s[0]*16, 0, 0), it should appear
-        // at NAADF (s[0]*16 + 3, 3, 3).
-        let tile_w_voxels = s[0] * 16;
-        let tile_d_voxels = s[2] * 16;
-        assert_eq!(
-            decoded_voxel_at(&tiled.world, [3, 3, 3]),
-            decoded_voxel_at(&single.world, [3, 3, 3]),
-            "tile (0,0) voxel must match single-tile output"
-        );
-        assert_eq!(
-            decoded_voxel_at(&tiled.world, [tile_w_voxels + 3, 3, 3]),
-            decoded_voxel_at(&single.world, [3, 3, 3]),
-            "tile (1,0) emissive voxel must match single-tile content"
-        );
-        assert_eq!(
-            decoded_voxel_at(&tiled.world, [3, 3, tile_d_voxels + 3]),
-            decoded_voxel_at(&single.world, [3, 3, 3]),
-            "tile (0,1) emissive voxel must match single-tile content"
         );
     }
 
