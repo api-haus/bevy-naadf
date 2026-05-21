@@ -26,7 +26,7 @@
 use bevy::math::{IVec3, Vec3};
 
 use crate::voxel::{VoxelTypeId, CELL_DIM};
-use crate::world::data::WorldData;
+use crate::world::data::{ChunkUniformEdit, VoxelEdit, WorldData};
 
 /// Classification of a chunk relative to a brush volume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,8 +169,8 @@ fn apply_solid_brush<S: SolidBrushShape>(
     let target_opt: Option<VoxelTypeId> = if is_erase { None } else { Some(ty) };
     let (min_chunk, max_chunk) = brush_chunk_aabb(world_data, pos, radius);
 
-    let mut inside_chunks: Vec<([u32; 3], Option<VoxelTypeId>)> = Vec::new();
-    let mut mixed_chunk_edits: Vec<(IVec3, VoxelTypeId)> = Vec::new();
+    let mut inside_chunks: Vec<ChunkUniformEdit> = Vec::new();
+    let mut mixed_chunk_edits: Vec<VoxelEdit> = Vec::new();
 
     for cz in min_chunk.z..=max_chunk.z {
         for cy in min_chunk.y..=max_chunk.y {
@@ -179,8 +179,10 @@ fn apply_solid_brush<S: SolidBrushShape>(
                 match shape.classify_chunk(chunk_pos, pos, radius) {
                     ChunkClass::Outside => continue,
                     ChunkClass::Inside => {
-                        inside_chunks
-                            .push(([cx as u32, cy as u32, cz as u32], target_opt));
+                        inside_chunks.push(ChunkUniformEdit {
+                            pos: bevy::math::UVec3::new(cx as u32, cy as u32, cz as u32),
+                            ty: target_opt,
+                        });
                     }
                     ChunkClass::Mixed => {
                         let chunk_origin = chunk_pos * CHUNK_VOXELS;
@@ -189,7 +191,10 @@ fn apply_solid_brush<S: SolidBrushShape>(
                                 for lx in 0..CHUNK_VOXELS {
                                     let voxel = chunk_origin + IVec3::new(lx, ly, lz);
                                     if shape.voxel_inside(voxel, pos, radius) {
-                                        mixed_chunk_edits.push((voxel, target));
+                                        mixed_chunk_edits.push(VoxelEdit {
+                                            pos: voxel,
+                                            ty: target,
+                                        });
                                     }
                                 }
                             }
@@ -223,7 +228,7 @@ pub fn paint_brush(world_data: &mut WorldData, pos: Vec3, radius: f32, ty: Voxel
         return;
     }
     let r2 = radius * radius;
-    let mut edits: Vec<(IVec3, VoxelTypeId)> = Vec::new();
+    let mut edits: Vec<VoxelEdit> = Vec::new();
     let (lo, hi) = brush_aabb(world_data, pos, radius);
     for z in lo.z..=hi.z {
         for y in lo.y..=hi.y {
@@ -237,7 +242,7 @@ pub fn paint_brush(world_data: &mut WorldData, pos: Vec3, radius: f32, ty: Voxel
                         .get_voxel_type(voxel)
                         .is_some_and(|t| t != VoxelTypeId::EMPTY)
                     {
-                        edits.push((voxel, ty));
+                        edits.push(VoxelEdit { pos: voxel, ty });
                     }
                 }
             }
@@ -335,8 +340,8 @@ mod tests {
         // Pre-populate two voxels at (4,5,5) and (6,5,5) so the click at
         // (5,5,5) lands inside a populated chunk (the user's OXO scenario).
         wd.set_voxels_batch(&[
-            (IVec3::new(4, 5, 5), VoxelTypeId(1)),
-            (IVec3::new(6, 5, 5), VoxelTypeId(1)),
+            VoxelEdit { pos: IVec3::new(4, 5, 5), ty: VoxelTypeId(1) },
+            VoxelEdit { pos: IVec3::new(6, 5, 5), ty: VoxelTypeId(1) },
         ]);
         // Snapshot all voxels in a 5×3×3 region.
         let mut around: Vec<(IVec3, Option<VoxelTypeId>)> = Vec::new();
@@ -406,10 +411,10 @@ mod tests {
     fn paint_brush_only_replaces_non_empty() {
         let mut wd = make_empty_world(UVec3::new(4, 2, 4));
         // Seed a 5x1x5 ground patch of type 1 at y=2.
-        let mut seed = Vec::new();
+        let mut seed: Vec<VoxelEdit> = Vec::new();
         for z in 4..=8 {
             for x in 4..=8 {
-                seed.push((IVec3::new(x, 2, z), VoxelTypeId(1)));
+                seed.push(VoxelEdit { pos: IVec3::new(x, 2, z), ty: VoxelTypeId(1) });
             }
         }
         wd.set_voxels_batch(&seed);
@@ -436,11 +441,11 @@ mod tests {
     fn erase_with_sphere_clears_voxels() {
         let mut wd = make_empty_world(UVec3::new(4, 2, 4));
         // Seed a full 5x5x5 cube of type 1 around (10, 10, 10).
-        let mut seed = Vec::new();
+        let mut seed: Vec<VoxelEdit> = Vec::new();
         for z in 8..=12 {
             for y in 8..=12 {
                 for x in 8..=12 {
-                    seed.push((IVec3::new(x, y, z), VoxelTypeId(1)));
+                    seed.push(VoxelEdit { pos: IVec3::new(x, y, z), ty: VoxelTypeId(1) });
                 }
             }
         }
@@ -525,7 +530,7 @@ mod tests {
     #[test]
     fn runtime_path_does_not_emit_whole_world_uploads() {
         let mut wd = make_empty_world(UVec3::new(4, 2, 4));
-        wd.set_voxels_batch(&[(IVec3::new(5, 5, 5), VoxelTypeId(3))]);
+        wd.set_voxels_batch(&[VoxelEdit { pos: IVec3::new(5, 5, 5), ty: VoxelTypeId(3) }]);
         let batch = wd
             .pending_edits
             .batches
@@ -545,7 +550,10 @@ mod tests {
     #[test]
     fn set_chunks_uniform_batch_basic() {
         let mut wd = make_empty_world(UVec3::new(2, 2, 2));
-        wd.set_chunks_uniform_batch(&[([0, 0, 0], Some(VoxelTypeId(5)))]);
+        wd.set_chunks_uniform_batch(&[ChunkUniformEdit {
+            pos: bevy::math::UVec3::new(0, 0, 0),
+            ty: Some(VoxelTypeId(5)),
+        }]);
         let batch = wd
             .pending_edits
             .batches

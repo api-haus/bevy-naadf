@@ -12,7 +12,7 @@ pub mod position_split;
 
 use bevy::{
     camera::Hdr,
-    camera_controller::free_camera::FreeCamera,
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::tonemapping::Tonemapping,
     prelude::*,
 };
@@ -158,6 +158,19 @@ pub fn default_free_camera() -> FreeCamera {
     }
 }
 
+/// User-movement drift threshold (squared world units). If the current
+/// camera translation differs from the last-applied [`InitialCameraPose`]
+/// by more than this squared distance, treat it as "user has flown" and do
+/// not snap back. Squared because we compare `length_squared()`; `1.0`
+/// square == 1.0 world-units distance (a single voxel).
+const DRIFT_TRANSLATION_THRESHOLD_SQ: f32 = 1.0;
+
+/// User-movement drift threshold (radians). Companion to
+/// [`DRIFT_TRANSLATION_THRESHOLD_SQ`] but for `rotation.angle_between(last)`.
+/// `0.01` rad ≈ 0.57°: small enough that float-rounding doesn't trigger,
+/// large enough that any deliberate look-around exceeds it.
+const DRIFT_ROTATION_THRESHOLD_RAD: f32 = 0.01;
+
 /// 2026-05-19 — re-apply [`InitialCameraPose`] to the live camera entity
 /// when the resource changes after `Startup`.
 ///
@@ -194,7 +207,9 @@ pub fn apply_initial_camera_pose_changes(
     if let Some(last) = *last_applied {
         let translation_drift = (cam_transform.translation - last.translation).length_squared();
         let rotation_drift = cam_transform.rotation.angle_between(last.rotation);
-        if translation_drift > 1.0 || rotation_drift > 0.01 {
+        if translation_drift > DRIFT_TRANSLATION_THRESHOLD_SQ
+            || rotation_drift > DRIFT_ROTATION_THRESHOLD_RAD
+        {
             return;
         }
     }
@@ -237,6 +252,72 @@ pub fn toggle_dlss(
 /// No-op when the crate is built without DLSS support.
 #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
 pub fn toggle_dlss() {}
+
+/// Plugin owning the camera-side wiring — single registration of
+/// [`sync_position_split`] (replacing the F8 double-register), the
+/// `update_camera_history.after(sync_position_split)` ordering edge, the
+/// production-only [`setup_camera`] startup (skipped under the e2e harness
+/// because `crate::e2e::setup_e2e_camera` spawns the fixed-pose camera
+/// instead), and the free-camera-conditional [`toggle_dlss`] +
+/// [`apply_initial_camera_pose_changes`].
+///
+/// Reads `Res<AppConfig>` for the `add_free_camera` / `add_e2e_systems`
+/// gates — the resource is inserted at the top of
+/// `build_app_with_args` so it is present when this plugin's `build` runs.
+pub struct CameraPlugin;
+
+impl Plugin for CameraPlugin {
+    fn build(&self, app: &mut App) {
+        use crate::AppConfig;
+
+        let cfg = *app
+            .world()
+            .get_resource::<AppConfig>()
+            .expect("CameraPlugin: AppConfig must be inserted before add_plugins");
+
+        // `sync_position_split` is a pure function of `Transform` — always
+        // safe + deterministic. One unconditional registration (F8).
+        app.add_systems(Update, sync_position_split);
+
+        // The camera-history ring update must run after `sync_position_split`
+        // so the ring stores this frame's current camera state
+        // (`06-design-a2.md` §9.3).
+        app.add_systems(
+            Update,
+            crate::render::taa::update_camera_history.after(sync_position_split),
+        );
+
+        // Production-only camera spawn. The e2e harness uses its own
+        // `setup_e2e_camera` (fixed-pose) and ignores `InitialCameraPose`
+        // entirely (see `e2e/gates.rs::e2e_camera_transform`).
+        //
+        // `.after(setup_test_grid)` so the `GridPreset::Vox` arm has had a
+        // chance to insert `InitialCameraPose` (the world-sized C#-faithful
+        // camera pose); `setup_camera` then frames the loaded world.
+        if !cfg.add_e2e_systems {
+            app.add_systems(
+                Startup,
+                setup_camera.after(crate::voxel::grid::setup_test_grid),
+            );
+        }
+
+        // The fly camera + runtime DLSS toggle + initial-pose re-apply —
+        // production only. The e2e config omits `FreeCameraPlugin` so even
+        // though the window is real and receives focus/input, no system
+        // moves the camera. `.before(sync_position_split)` preserves the
+        // pre-refactor chain ordering (each writes `Transform` /
+        // `PositionSplit`; `sync_position_split` then re-derives the latter
+        // from the former).
+        if cfg.add_free_camera {
+            app.add_plugins(FreeCameraPlugin)
+                .add_systems(
+                    Update,
+                    (toggle_dlss, apply_initial_camera_pose_changes)
+                        .before(sync_position_split),
+                );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

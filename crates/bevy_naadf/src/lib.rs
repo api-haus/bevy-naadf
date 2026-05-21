@@ -11,8 +11,11 @@
 //! e2e-render-test.md`).
 
 pub mod aadf;
+pub mod app_args;
+pub mod app_config;
 pub mod app_mode;
 pub mod camera;
+pub mod dev_font;
 pub mod diagnostics;
 pub mod e2e;
 pub mod editor;
@@ -20,25 +23,21 @@ pub mod hud;
 pub mod render;
 pub mod settings;
 pub mod voxel;
+pub mod window_config;
 pub mod world;
+pub mod world_size;
 
-/// Roboto Regular TTF bytes, embedded at compile time. The font is Apache 2.0;
-/// see `src/assets/fonts/Roboto-LICENSE.txt`.
-static ROBOTO_REGULAR_BYTES: &[u8] =
-    include_bytes!("assets/fonts/Roboto-Regular.ttf");
-
-/// Main-world resource — the `FontSource` for the embedded Roboto Regular
-/// font. `hud`, `editor::hud`, and `settings` all query this resource to set
-/// `TextFont.font`.
-///
-/// To add a second font in future: add another `&[u8]` static + another field
-/// here, load it in `load_dev_font`, and store its `FontSource` alongside this one.
-#[derive(Resource)]
-pub struct DevFont(pub FontSource);
+pub use app_args::AppArgs;
+pub use app_config::AppConfig;
+pub use dev_font::{load_dev_font, DevFont};
+pub use window_config::WindowConfig;
+pub use world_size::{
+    WORLD_GEN_SEGMENT_SIZE_IN_GROUPS, WORLD_SIZE_IN_CHUNKS,
+    WORLD_SIZE_IN_SEGMENTS, WORLD_SIZE_IN_VOXELS,
+};
 
 use bevy::{
     asset::AssetPlugin,
-    camera_controller::free_camera::FreeCameraPlugin,
     diagnostic::FrameTimeDiagnosticsPlugin,
     prelude::*,
     render::{diagnostic::RenderDiagnosticsPlugin, RenderPlugin},
@@ -216,78 +215,9 @@ impl GiSettings {
 
 impl Default for GiSettings {
     fn default() -> Self {
-        // The `SettingDataRenderBase` defaults (`WorldRenderBase.cs:14-25`).
-        Self {
-            bounce_count: 3,
-            global_illum_max_accum: 128,
-            spatial_resample_size: 500.0,
-            spatial_visibility_count: 80,
-            denoise_thresh: 400.0,
-            radius_lit_factor: 3.0,
-            noise_suppression_factor: 0.4,
-            skip_samples: true,
-            is_denoise: true,
-            is_sample_leveling: true,
-            is_varying_resampling_radius: true,
-            is_atmosphere_interaction: true,
-            // Sun-shadow tap count — C# default 1 (no loop;
-            // `renderSpatialResampling.fx:322-339` is a single
-            // `getUniformHemisphereSample` + single `shootRay`). The
-            // Phase-D-shadow Dispatch A (`1c35c7f`, 2026-05-15) shipped
-            // N=4 as the paper-§5.2 soft-shadow mitigation; per
-            // `docs/orchestrate/feature-completeness/02d-render-perf-
-            // investigation.md` §1 + user directive 2026-05-15, the
-            // default is reverted to the C# canonical 1 — the multi-tap
-            // path stays available via the quality panel's
-            // `sun_shadow_taps` knob (range 1..32) for users who want
-            // softer penumbras at the perf cost. The shader's
-            // `max(_, 1u)` clamp at `spatial_resampling.wgsl:547`
-            // handles N=1 safely (bit-equivalent to pre-Dispatch-A path
-            // per `20-impl-phase-d-shadow-A.md` §4).
-            sun_shadow_taps: 1,
-            // Quality-panel runtime knobs — defaults bit-equivalent to the
-            // pre-dispatch WGSL `const`s these promotions replaced (the
-            // `MAX_RAY_STEPS_*` consts at `ray_tracing.wgsl:122-126` and the
-            // `12u` literal at `spatial_resampling.wgsl:622`). Verified by the
-            // §6 defaults table of `21-design-quality-panel.md`.
-            max_ray_steps_primary: 120,
-            max_ray_steps_secondary: 100,
-            max_ray_steps_sun: 120,
-            max_ray_steps_sun_secondary: 80,
-            max_ray_steps_visibility: 60,
-            spatial_iter_count: 12,
-        }
+        Self::DEFAULTS
     }
 }
-
-/// C# `WorldHandler.worldSizeToUseInWorldGenSegments` (`WorldHandler.cs:19`).
-///
-/// NAADF's fixed startup world size, expressed in **WorldGenSegment** units.
-/// One segment is `WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4 * 16` voxels per axis
-/// (4 chunks per group × 16 voxels per chunk = 64 voxels per group × 4 groups
-/// per segment = 256 voxels per segment). C# uses `(16, 2, 16)`, which gives
-/// the canonical `(4096, 512, 4096)`-voxel world the original engine boots
-/// into regardless of whether a model file is present.
-pub const WORLD_SIZE_IN_SEGMENTS: UVec3 = UVec3::new(16, 2, 16);
-
-/// C# `WorldHandler.worldGenSegmentSizeInGroups` (`WorldHandler.cs:18`). One
-/// group is `4^3` chunks (= `64^3` voxels); this many groups per segment per
-/// axis. Combined with [`WORLD_SIZE_IN_SEGMENTS`] this pins the fixed world
-/// dimensions.
-pub const WORLD_GEN_SEGMENT_SIZE_IN_GROUPS: u32 = 4;
-
-/// Derived: world size in chunks (`16 * 4 * 4 = 256`, `2 * 4 * 4 = 32`).
-///
-/// The same number `WorldData.cs:64-65` arrives at:
-/// `sizeInVoxels = sizeInWorldGenSegments * worldGenSegmentSizeInVoxels`, then
-/// `sizeInChunks = sizeInVoxels / 16`.
-///
-/// Hardcoded rather than computed because `glam`'s `UVec3` ops are not `const`;
-/// the relationship is enforced by [`tests::fixed_world_size_constants_agree`].
-pub const WORLD_SIZE_IN_CHUNKS: UVec3 = UVec3::new(256, 32, 256);
-
-/// Derived: world size in voxels (`256 * 16 = 4096`, `32 * 16 = 512`).
-pub const WORLD_SIZE_IN_VOXELS: UVec3 = UVec3::new(4096, 512, 4096);
 
 /// The default TAA sample-ring depth — **32**, NAADF's / the paper's depth
 /// (`WorldRenderBase.cs:17`, paper §4.1 / Fig 6).
@@ -302,351 +232,6 @@ pub const WORLD_SIZE_IN_VOXELS: UVec3 = UVec3::new(4096, 512, 4096);
 /// (`render/taa.rs`) — the two MUST agree exactly (a mismatch is silent ring
 /// corruption), so they both read it from here, via `AppArgs.taa_ring_depth`.
 pub const DEFAULT_TAA_RING_DEPTH: u32 = 32;
-
-/// Command-line options, parsed once and stored as a resource (`03-design.md` §4.1).
-///
-/// Track A (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`
-/// — Assumption #5) dropped `Copy` because [`GridPreset::Vox`] carries a
-/// `PathBuf`. Every internal use is by-ref (`Res<AppArgs>` / `&AppArgs`); the
-/// only by-value site is [`build_app_with_args`], where a single move
-/// suffices.
-#[derive(Resource, Clone)]
-pub struct AppArgs {
-    /// Which hard-coded test grid to build (D2).
-    pub grid_preset: GridPreset,
-    /// Long-term TAA. Wired but always `false` in Phase A (D4) — Phase A-2
-    /// turns it on.
-    pub taa: bool,
-    /// The TAA sample-ring depth — the long-term-memory TAA history depth
-    /// (`18-taa-fidelity.md` fix #3). The single config source of truth: it
-    /// feeds BOTH the Rust buffer sizing (`render/taa.rs` — `taa_samples` is
-    /// `pixel_count * taa_ring_depth`) AND the WGSL `#{TAA_SAMPLE_RING_DEPTH}`
-    /// shader-def injected at pipeline specialisation (`render/pipelines.rs`),
-    /// so the loop bounds / `% N` indexing in `taa.wgsl` agree byte-for-byte
-    /// with the buffer size. Default [`DEFAULT_TAA_RING_DEPTH`] (32); 16 / 24
-    /// are the VRAM-lever alternatives. Read on the render side via the
-    /// `TaaRingConfig` render-world resource (`render::taa`).
-    pub taa_ring_depth: u32,
-    /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8).
-    pub gi: GiSettings,
-    /// The Phase-C GPU-construction configuration (`15-design-c.md` §1.8,
-    /// §2.1 W0 row). Same plumbing pattern as `taa_ring_depth`: this main-
-    /// world field is the source of truth; `render::construction::
-    /// ConstructionPlugin::build` mirrors it into the render sub-app as the
-    /// `ConstructionConfig` `Resource` (via `From<&AppArgs>`).
-    ///
-    /// W0 default: GPU construction off / CPU fallback on. W1 flips
-    /// `gpu_construction_enabled` after the bit-exact CPU/GPU oracle is
-    /// green; W4 may flip `entities_enabled`. The CLI flags that mutate
-    /// individual fields land per-workstream — W0 only exposes the struct.
-    pub construction_config: render::construction::ConstructionConfig,
-    /// Phase-C wave-3 — when `true`, [`build_app`] adds a `Startup` system
-    /// that spawns one fixture entity into [`render::construction::MainWorldEntities`]
-    /// (a 4×4×4 emissive-voxel block at the world centre). Combined with
-    /// `construction_config.entities_enabled = true`, this is the load-bearing
-    /// `--entities` mode of `e2e_render`: the entity is uploaded each frame
-    /// + rendered via `ray_tracing.wgsl::shoot_ray`'s entity sub-traversal
-    /// branch, surfacing in the framebuffer as an extra hit on top of the
-    /// world geometry.
-    pub spawn_test_entity: bool,
-    /// When `true`, the e2e driver runs the **resize-blackness reproduction
-    /// test** instead of the standard WARMUP→MOTION→SETTLE→SHOOT flow.
-    ///
-    /// Permanent regression coverage for the GI-bounce-on-resize fix
-    /// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
-    /// `## GI-bounce-on-resize fix (2026-05-16)`). Boots at 800×600,
-    /// settles, screenshots, hyprctl-resizes to 1920×1080, settles,
-    /// screenshots, hyprctl-resizes to 2000×1000, settles, screenshots,
-    /// then compares full-frame luma ratios against
-    /// `E2E_RESIZE_MIN_LUMA_RATIO = 0.7`. Without the
-    /// `MAX_INDIRECT_GROUPS` cap in `sample_refine.wgsl`, wgpu's
-    /// indirect-validation pass zeros the `count_invalid_data` dispatch at
-    /// the larger viewports → GI bounce disappears → ratio collapses to
-    /// ~0.5. See [`crate::e2e::driver`].
-    pub resize_test: bool,
-    /// When `true`, the e2e driver swaps the default `assert_batch_6`
-    /// region gates for the `--vox-e2e` "non-skybox" assertion. The
-    /// default-scene gate rectangles (`solid_block_rect`, `emissive_rect`,
-    /// etc.) are tuned for the hard-coded test grid's content layout, so
-    /// they don't apply when [`GridPreset::Vox`] loaded a different scene.
-    ///
-    /// Permanent regression coverage for the `.vox` ingestion path landed
-    /// in Track A (`docs/orchestrate/feature-completeness/03a-impl-vox-loading.md`)
-    /// — the brief explicitly required an automated assert that the
-    /// framebuffer captures something other than skybox after loading a
-    /// `.vox` file through the production `--vox` path. See
-    /// [`crate::e2e::vox_e2e`].
-    pub vox_e2e_mode: bool,
-    /// `02f-followup` — when `true`, the e2e driver runs the
-    /// **oasis-edit-visual gate**: birdseye over a loaded Oasis VOX scene,
-    /// screenshot A, programmatically erase a sphere at world centre via the
-    /// runtime brush path, wait 5 s for the W2 GPU dispatch + GI / TAA to
-    /// converge, screenshot B, assert framebuffer pixels around the erase
-    /// projection meaningfully changed. Catches the regression class
-    /// `--runtime-edit-mode`'s record-counter gate misses: edits land in the
-    /// W2 batch but never reach the framebuffer (the `81171f9` regression).
-    /// See [`crate::e2e::oasis_edit_visual`].
-    pub oasis_edit_visual_mode: bool,
-    /// `03g` — when `true`, the e2e driver runs the **small-edit-visual
-    /// gate**: birdseye over the default test grid, screenshot A,
-    /// programmatically place a single 1×1×1 voxel via the runtime
-    /// `cube_brush` path with radius=1, count non-empty voxels before vs
-    /// after (must differ by exactly +1 — catches Mode 2 phantom-voxel
-    /// bugs), wait for W2 / W3 / TAA convergence, screenshot B, assert
-    /// framebuffer changed in the click bbox AND did NOT change in
-    /// adjacent bboxes (catches Mode 1 AADF-skip cross-section bugs). See
-    /// [`crate::e2e::small_edit_visual`].
-    pub small_edit_visual_mode: bool,
-    /// `2026-05-17` — when `true`, the e2e driver runs the
-    /// **small-edit-repro gate**: load the Oasis VOX fixture, pin the camera
-    /// to a user-captured pose, programmatically place a single 1×1×1 voxel
-    /// at the user-captured brush position, then assert the post-edit
-    /// framebuffer contains NO pitch-black (RGB == 0,0,0) pixels. Catches
-    /// the user-reported "small edits render as inverted black shapes"
-    /// regression that `--small-edit-visual` does not catch. See
-    /// [`crate::e2e::small_edit_repro`].
-    pub small_edit_repro_mode: bool,
-    /// `vox-gpu-rewrite W5.3-fix Stage 1` — when `true`, the e2e driver runs
-    /// the **vox-gpu-construction production-path gate**: load the Oasis VOX
-    /// fixture through `install_vox_in_fixed_world`'s W5 GPU producer chain
-    /// (Stage 2 consolidation 2026-05-18: the production install path is now
-    /// the ONLY install path; `gpu_construction_enabled = true` is the only
-    /// remaining knob), pin the camera to C#'s literal `(500, 200, 40)` voxel spawn
-    /// (`WorldRender.cs:48-49`), capture frame A, dispatch a sphere brush
-    /// directly in front of the camera, wait ~5 s for W2 / GI / TAA to
-    /// converge, capture frame B, assert the per-pixel RGB Δ over a central
-    /// rect exceeds the floor (the `--oasis-edit-visual` assertion shape).
-    ///
-    /// The gate routes through the same `OasisWarmup → OasisShootBefore →
-    /// OasisApplyEdit → OasisWaitPostEdit → OasisShootAfter → OasisAssert`
-    /// driver phases as `--oasis-edit-visual` (the brush + capture +
-    /// assertion mechanics are identical), but the camera and brush
-    /// position are mode-specific. The flag IS load-bearing: it deviates
-    /// from Q3 (`docs/orchestrate/vox-gpu-rewrite/01-context.md`) which
-    /// rejected this flag, but the user's "why the fuck does this 'e2e'
-    /// test avoid the same production path?" frustration justifies the
-    /// deviation — the production-path-faithful gate is more valuable than
-    /// preserving Q3.
-    pub vox_gpu_construction_mode: bool,
-    /// `vox-gpu-rewrite W5.3-fix Stage 4` — when `true`, the e2e driver runs a
-    /// **CPU oracle render phase** for the `--vox-gpu-oracle` gate: load Oasis
-    /// via the legacy `install_vox_sized_to_model` path (the known-good CPU
-    /// renderer used by `--oasis-edit-visual`), pin a shared in-world camera
-    /// pose, warm up, capture a single screenshot to `oracle_cpu.png`, then
-    /// exit. The oracle gate's compare phase reads this PNG and the matching
-    /// `oracle_gpu.png` from disk and asserts per-pixel diff < small floor.
-    /// See [`crate::e2e::vox_gpu_oracle`].
-    pub vox_gpu_oracle_cpu_phase: bool,
-    /// `vox-gpu-rewrite W5.3-fix Stage 4` — when `true`, the e2e driver runs a
-    /// **GPU producer render phase** for the `--vox-gpu-oracle` gate: load
-    /// Oasis via `install_vox_in_fixed_world` (the W5 GPU producer chain), pin
-    /// the SAME camera pose as the CPU oracle phase (in world voxel coords;
-    /// the camera position must hit the first XZ tile of Oasis so the GPU
-    /// tiling collapses to the same voxel data the CPU oracle holds), warm up,
-    /// capture a single screenshot to `oracle_gpu.png`, then exit. See
-    /// [`crate::e2e::vox_gpu_oracle`].
-    pub vox_gpu_oracle_gpu_phase: bool,
-    /// web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — when `true`,
-    /// boots the e2e harness with `GridPreset::Empty` (skybox baseline) and
-    /// captures a single screenshot to `vox_web_parity_skybox.png`. The
-    /// `--vox-web-parity` top-level mode spawns this as a subprocess.
-    pub vox_web_parity_skybox_phase: bool,
-    /// web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — when `true`,
-    /// boots the e2e harness with `GridPreset::Vox { path: oasis }` (the
-    /// production W5 GPU producer chain) and captures a single screenshot to
-    /// `vox_web_parity_loaded.png`. The `--vox-web-parity` top-level mode
-    /// spawns this as a subprocess; the compare phase SSIM-asserts the two
-    /// captured PNGs are dissimilar.
-    pub vox_web_parity_loaded_phase: bool,
-    /// 2026-05-19 — when `true`, boots the e2e harness with
-    /// `GridPreset::Vox { path: oasis.cvox }` through the production W5 GPU
-    /// producer chain, pins the camera at the C#-faithful horizon pose
-    /// (`InitialCameraPose::from_world_voxels(WORLD_SIZE_IN_VOXELS)`), and
-    /// captures `vox_horizon_native.png` at a 1280×720 window — the
-    /// resolution the Playwright cross-target SSIM gate compares against.
-    /// See [`crate::e2e::vox_horizon_parity`].
-    pub vox_horizon_native_phase: bool,
-}
-
-impl Default for AppArgs {
-    fn default() -> Self {
-        Self {
-            grid_preset: GridPreset::default(),
-            taa: true,
-            taa_ring_depth: DEFAULT_TAA_RING_DEPTH,
-            gi: GiSettings::default(),
-            construction_config: render::construction::ConstructionConfig::default(),
-            spawn_test_entity: false,
-            resize_test: false,
-            vox_e2e_mode: false,
-            oasis_edit_visual_mode: false,
-            small_edit_visual_mode: false,
-            small_edit_repro_mode: false,
-            vox_gpu_construction_mode: false,
-            vox_gpu_oracle_cpu_phase: false,
-            vox_gpu_oracle_gpu_phase: false,
-            vox_web_parity_skybox_phase: false,
-            vox_web_parity_loaded_phase: false,
-            vox_horizon_native_phase: false,
-        }
-    }
-}
-
-/// Window sizing/title knobs that `build_app` threads into the `WindowPlugin`
-/// (`e2e-render-test.md` §9). The production config takes the platform
-/// default; the e2e config pins a small fixed non-resizable window so the
-/// framebuffer readback is fast and every `pixel_count`-sized buffer is
-/// identical run-to-run (§4.2 determinism row).
-#[derive(Clone, Copy, Debug)]
-pub struct WindowConfig {
-    /// Logical resolution. `None` → the Bevy default (`Window::default`).
-    pub resolution: Option<(f32, f32)>,
-    /// Whether the window is user-resizable.
-    pub resizable: bool,
-    /// Window title.
-    pub title: &'static str,
-    /// Wayland `app_id` / X11 `WM_CLASS` (Bevy `Window.name`). `None` lets
-    /// winit pick a default (usually the binary name). The resize-test config
-    /// sets this explicitly so the hyprctl `class:...` selector is
-    /// deterministic.
-    pub name: Option<&'static str>,
-}
-
-impl WindowConfig {
-    /// The production window — platform default size, resizable.
-    fn windowed() -> Self {
-        Self {
-            resolution: None,
-            resizable: true,
-            title: "bevy-naadf",
-            name: None,
-        }
-    }
-
-    /// The e2e window — a small fixed 256×256 non-resizable window
-    /// (`e2e-render-test.md` §4.2 / §9). 256² is large enough for stable
-    /// region gates, small enough for a fast readback + cheap GI dispatch.
-    fn e2e() -> Self {
-        Self {
-            resolution: Some((
-                crate::e2e::E2E_WIDTH as f32,
-                crate::e2e::E2E_HEIGHT as f32,
-            )),
-            // Production e2e config — non-resizable for determinism (every
-            // `pixel_count`-sized buffer identical run-to-run). The
-            // resize-blackness reproduction test forks into
-            // [`WindowConfig::e2e_resize_test`] (resizable: true) instead.
-            resizable: false,
-            title: "bevy-naadf e2e_render",
-            name: None,
-        }
-    }
-
-    /// The e2e window for the horizon-parity gate (2026-05-19). 1280×720 —
-    /// large enough that the long-distance raymarch covers the full
-    /// framebuffer (the standard 256×256 e2e window is too small to make
-    /// horizon-line ray-termination regressions visible), matched to the
-    /// Playwright spec's `viewport: { width: 1280, height: 720 }` so the
-    /// cross-target PNGs SSIM-compare without resize.
-    fn e2e_horizon() -> Self {
-        Self {
-            resolution: Some((
-                crate::e2e::vox_horizon_parity::HORIZON_WIDTH as f32,
-                crate::e2e::vox_horizon_parity::HORIZON_HEIGHT as f32,
-            )),
-            resizable: false,
-            title: "bevy-naadf e2e_render vox-horizon-native",
-            name: None,
-        }
-    }
-
-    /// The e2e window for the resize-blackness reproduction test
-    /// (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
-    /// `## GI-bounce-on-resize fix (2026-05-16)`).
-    ///
-    /// Same 256×256 starting size as [`WindowConfig::e2e`] but with
-    /// `resizable: true` — must be true for hyprctl-driven resize to
-    /// propagate through winit; resize-test mode only.
-    ///
-    /// Without this flag the Hyprland compositor refuses pixel-precise resize
-    /// requests on the surface (winit advertises the surface as fixed-size to
-    /// the compositor when `resizable: false`). The standard e2e harness
-    /// continues to use [`WindowConfig::e2e`] — only the `--resize-test`
-    /// branch picks this up.
-    fn e2e_resize_test() -> Self {
-        Self {
-            // User spec for the three-step resize test (boot → 1920×1080 →
-            // 2000×1000): the *initial* screenshot is taken at 800×600, so
-            // the window boots at exactly that size. Larger than the
-            // standard e2e 256×256 because the user wants visual coverage of
-            // shadow regions across resolution changes.
-            resolution: Some((
-                crate::e2e::E2E_RESIZE_BOOT_WIDTH as f32,
-                crate::e2e::E2E_RESIZE_BOOT_HEIGHT as f32,
-            )),
-            // test-only: must be true for hyprctl-driven resize to propagate
-            // through winit; resize-test mode only.
-            resizable: true,
-            title: "bevy-naadf e2e_render",
-            // test-only: pin Wayland app_id to "e2e_render" so the hyprctl
-            // `class:e2e_render` selector matches deterministically. Without
-            // this, winit picks a default app_id that varies by build and
-            // the hyprctl dispatcher prints "resizeWindow: no window".
-            name: Some("e2e_render"),
-        }
-    }
-}
-
-/// The four deliberate, minimal ways the e2e app differs from the production
-/// app (`e2e-render-test.md` §2.2 / §9). Everything else — `DefaultPlugins`,
-/// `WinitPlugin`, the real window, the asset path, `WorldPlugin`,
-/// `NaadfRenderPlugin`, the diagnostics plugins — is *identical*, so the e2e
-/// run exercises the real boot path, not a near-copy of it.
-#[derive(Clone, Copy, Debug)]
-pub struct AppConfig {
-    /// Add the diagnostics HUD overlay (`setup_hud` / `update_hud`).
-    pub add_hud: bool,
-    /// Add `FreeCameraPlugin` + the runtime DLSS toggle (the fly camera).
-    pub add_free_camera: bool,
-    /// `RenderPlugin { synchronous_pipeline_compilation, .. }` — the e2e config
-    /// flips this on so `PipelineCache` resolves every queued pipeline to
-    /// `Ok`/`Err` within the same `app.update()`, making the bounded-frame run
-    /// deterministic (`e2e-render-test.md` §2.2 point 1).
-    pub synchronous_pipeline_compilation: bool,
-    /// Window sizing/title.
-    pub window: WindowConfig,
-    /// Add the e2e bounded-frame driver + readback + assertion systems + the
-    /// `WinitSettings::game()`-style `Continuous` update mode + the fixed-pose
-    /// camera (`e2e-render-test.md` §4 / §6 / §2.2 point 2).
-    pub add_e2e_systems: bool,
-}
-
-impl AppConfig {
-    /// The production config: HUD on, free camera on, async pipeline
-    /// compilation (no startup hitch), platform-default window, no e2e systems.
-    pub fn windowed() -> Self {
-        Self {
-            add_hud: true,
-            add_free_camera: true,
-            synchronous_pipeline_compilation: false,
-            window: WindowConfig::windowed(),
-            add_e2e_systems: false,
-        }
-    }
-
-    /// The e2e config: HUD off, free camera off, *synchronous* pipeline
-    /// compilation, a 256×256 non-resizable window, e2e systems on
-    /// (`e2e-render-test.md` §2.2 / §9).
-    pub fn e2e() -> Self {
-        Self {
-            add_hud: false,
-            add_free_camera: false,
-            synchronous_pipeline_compilation: true,
-            window: WindowConfig::e2e(),
-            add_e2e_systems: true,
-        }
-    }
-}
 
 /// Build the bevy-naadf `App` from an [`AppConfig`].
 ///
@@ -706,7 +291,10 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // `AppArgs` lost `Copy` in Track A (carries `PathBuf` in
     // `GridPreset::Vox`). The resource gets a clone — `args` is consumed
     // afterwards for the `spawn_test_entity` / `resize_test` reads below.
-    app.insert_resource(args.clone())
+    // `AppConfig` is also inserted so plugins can `.run_if` on its fields
+    // (e.g. `DiagnosticsPlugin` self-skips under e2e).
+    app.insert_resource(cfg)
+        .insert_resource(args.clone())
         // The 128-deep camera-history ring + the monotonic frame counter
         // (`06-design-a2.md` §2.3). Main-world resource, `Default`-seeded,
         // updated each frame by `update_camera_history`.
@@ -782,44 +370,21 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             render::construction::ConstructionPlugin,
         ));
 
-    // The fly camera + runtime DLSS toggle — production only. The e2e config
-    // omits `FreeCameraPlugin` so even though the window is real and can
-    // receive focus/input, no system moves the camera — the fixed `Transform`
-    // never changes (`e2e-render-test.md` §2.2 point 4 / §4.2).
-    if cfg.add_free_camera {
-        app.add_plugins(FreeCameraPlugin).add_systems(
-            Update,
-            (
-                camera::toggle_dlss,
-                camera::apply_initial_camera_pose_changes,
-                camera::sync_position_split,
-            )
-                .chain(),
-        );
-    } else {
-        // No `FreeCameraPlugin`, so `sync_position_split` still needs to run
-        // once (it is a pure function of the `Transform` → deterministic).
-        app.add_systems(Update, camera::sync_position_split);
-    }
+    // Camera plugin — owns `sync_position_split`, `update_camera_history`'s
+    // ordering edge, the production-only `setup_camera` startup, and the
+    // free-camera-conditional fly camera + DLSS toggle. Reads
+    // `Res<AppConfig>` (inserted above) for the `add_free_camera` /
+    // `add_e2e_systems` gates.
+    app.add_plugins(camera::CameraPlugin);
 
-    // Press-P diagnostics dump — production only. Skipped under the e2e
-    // harness (non-interactive; resources it probes may be absent there).
-    if !cfg.add_e2e_systems {
-        app.add_plugins(diagnostics::DiagnosticsPlugin);
-    }
-
-    // 2026-05-19 — `wasm-chunk-aadf-determinism` static device snapshot.
-    // Fires in BOTH configs (production AND e2e) on the first frame the
-    // RenderApp's RenderAdapter/RenderDevice are resolved, writes
-    // `target/diagnostics/device-snapshot-{native,web}.json` on native, and
-    // emits a `[device-snapshot] {json}` sentinel info-log line on wasm32
-    // for the Playwright harness to capture. See
-    // `docs/orchestrate/wasm-chunk-aadf-nondeterminism/01-diagnostics-design.md`.
-    app.add_plugins(diagnostics::device_snapshot::DeviceSnapshotPlugin);
+    // Press-P diagnostics dump. The plugin self-skips under the e2e harness
+    // (`AppConfig.add_e2e_systems` true) via a `.run_if` so registration is
+    // unconditional.
+    app.add_plugins(diagnostics::DiagnosticsPlugin);
 
     // Load the embedded Roboto Regular font into Assets<Font> and store the
     // handle as DevFont. Runs first so setup_hud / setup_panel can query it.
-    app.add_systems(Startup, load_dev_font);
+    app.add_plugins(dev_font::DevFontPlugin);
 
     // The test grid + camera spawn — shared. The e2e config spawns a fixed-pose
     // camera instead of the production `setup_camera`; the e2e systems own that
@@ -900,88 +465,25 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     }
     if cfg.add_e2e_systems {
         e2e::add_e2e_systems(&mut app);
-    } else {
-        // `.after(setup_test_grid)` so the `GridPreset::Vox` arm has had a
-        // chance to insert `InitialCameraPose` (the world-sized C#-faithful
-        // camera pose, `crate::camera::InitialCameraPose`); `setup_camera`
-        // then frames the loaded world instead of falling back to the
-        // hard-coded test-grid pose. The e2e harness uses its own
-        // `setup_e2e_camera` and ignores the resource entirely.
-        app.add_systems(
-            Startup,
-            camera::setup_camera.after(voxel::grid::setup_test_grid),
-        );
     }
-
-    // The camera-history ring update must run *after* `sync_position_split` so
-    // the ring stores this frame's current camera state (`06-design-a2.md`
-    // §9.3).
-    app.add_systems(
-        Update,
-        render::taa::update_camera_history.after(camera::sync_position_split),
-    );
+    // `setup_camera` + `update_camera_history` + `sync_position_split` are
+    // all owned by `camera::CameraPlugin` above. `update_camera_history` is
+    // registered with `.after(sync_position_split)` inside the plugin.
 
     if cfg.add_hud {
-        use crate::app_mode::AppMode;
-        use bevy::state::condition::in_state;
-        use bevy::state::state::{OnEnter, OnExit};
-
+        // HUD overlay (FPS / timings) — independent of `AppMode`.
         app.add_systems(Startup, hud::setup_hud.after(load_dev_font))
             .add_systems(Update, hud::update_hud);
 
-        // Settings overlay + editor HUD — share the `add_hud` gate so the e2e
-        // harness (`AppConfig::e2e`) never sees them. Visibility is driven by
-        // the global `AppMode` state: `Playing` ↔ `Settings` flips on Escape
-        // (`app_mode::toggle_settings_on_escape`). While `Settings` is
-        // active the camera entity carries `Disabled` (markers attached in
-        // `camera::setup_camera`) so `FreeCameraPlugin`'s queries skip it, and
-        // `editor::apply_edit_tool` is gated by `in_state(Playing)`.
-        app.init_state::<AppMode>()
-            .init_resource::<settings::SettingsState>()
-            .init_resource::<settings::SettingsDrag>()
-            .init_resource::<editor::EditorState>()
-            .add_systems(Startup, editor::hud::setup_editor_hud.after(load_dev_font))
-            // Settings spawns AFTER the editor HUD so it ends up later in the
-            // UI document order (a belt-and-suspenders safety net on top of
-            // the GlobalZIndex(1000/1001) markers on the backdrop + root).
-            .add_systems(
-                Startup,
-                settings::setup_settings
-                    .after(load_dev_font)
-                    .after(editor::hud::setup_editor_hud),
-            )
-            .add_systems(
-                OnEnter(AppMode::Settings),
-                (settings::show_settings, app_mode::suspend_camera_input),
-            )
-            .add_systems(
-                OnExit(AppMode::Settings),
-                (settings::hide_settings, app_mode::restore_camera_input),
-            )
-            .add_systems(
-                Update,
-                (
-                    // Esc toggle runs first so the OnEnter/OnExit transition
-                    // is observed in the same frame.
-                    app_mode::toggle_settings_on_escape,
-                    // Editor HUD UI lives always-on (visible behind the
-                    // overlay too — purely visual). Clicks mutate
-                    // EditorState; brush dispatch is gated by AppMode.
-                    editor::hud::refresh_palette_swatches,
-                    editor::hud::handle_hud_clicks,
-                    editor::hud::scroll_palette_with_wheel,
-                    editor::hud::drag_palette_scrollbar,
-                    editor::hud::update_palette_scrollbar,
-                    editor::hud::update_editor_hud,
-                    // Brush input — only active while playing.
-                    editor::apply_edit_tool.run_if(in_state(AppMode::Playing)),
-                    // Settings overlay input — only active while in settings.
-                    settings::adjust_settings.run_if(in_state(AppMode::Settings)),
-                    settings::mouse_interact_settings.run_if(in_state(AppMode::Settings)),
-                    settings::update_settings_text.run_if(in_state(AppMode::Settings)),
-                )
-                    .chain(),
-            );
+        // D2-owned plugins: AppMode state + Escape toggle (AppModePlugin),
+        // editor HUD + brush dispatch (EditorPlugin), and the Escape
+        // settings overlay (SettingsPlugin). Each plugin owns its own
+        // `init_resource` / `init_state` / `add_systems` calls.
+        app.add_plugins((
+            app_mode::AppModePlugin,
+            editor::EditorPlugin,
+            settings::SettingsPlugin,
+        ));
 
         // 2026-05-19 cross-target SSIM gate support — when the
         // `UiHiddenOverride` resource is inserted (web: by the
@@ -1022,48 +524,14 @@ pub fn run_e2e_render() -> AppExit {
 /// `main` toggle `entities_enabled = true` + `spawn_test_entity = true` for
 /// the fixture-entity render path.
 pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
-    // resize-blackness reproduction: swap in the resize-test window
-    // config so the surface is advertised as resizable to the compositor —
-    // a hard prerequisite for hyprctl-driven resize to propagate through
-    // winit. All non-`--resize-test` runs keep `AppConfig::e2e()` unchanged.
+    // The window config follows the active e2e mode; the mapping lives in
+    // [`window_config::window_for_e2e_args`] so adding a new mode is a
+    // one-file edit. All non-`--resize-test` / non-`--small-edit-repro` /
+    // non-`--vox-horizon-native` runs use the standard 256×256 e2e window.
     let mut cfg = AppConfig::e2e();
-    if args.resize_test {
-        cfg.window = WindowConfig::e2e_resize_test();
-    }
-    // `--small-edit-repro` runs at the user's screen size (1920×1080) so the
-    // bug-or-fix signal matches what the user observes in the live binary.
-    // The pitch-black-pixel assertion is resolution-independent in principle,
-    // but the user's report specifies this size; reproduce verbatim.
-    if args.small_edit_repro_mode {
-        cfg.window = WindowConfig {
-            resolution: Some((
-                crate::e2e::small_edit_repro::SMALL_EDIT_REPRO_WIDTH as f32,
-                crate::e2e::small_edit_repro::SMALL_EDIT_REPRO_HEIGHT as f32,
-            )),
-            resizable: false,
-            title: "bevy-naadf e2e_render small-edit-repro",
-            name: None,
-        };
-    }
-    // 2026-05-19 — horizon-parity gate needs a 1280×720 window so the
-    // long-distance raymarch fills the framebuffer (the default 256×256
-    // is too small to surface horizon-line ray-termination regressions).
-    if args.vox_horizon_native_phase {
-        cfg.window = WindowConfig::e2e_horizon();
-    }
+    cfg.window = window_config::window_for_e2e_args(&args);
     let app = build_app_with_args(cfg, args);
     e2e::run_with_app(app)
-}
-
-/// `Startup` system: load the embedded Roboto Regular bytes into `Assets<Font>`
-/// and insert the resulting `Handle<Font>` as the [`DevFont`] resource.
-///
-/// Must run before `setup_hud` and `setup_panel` so those systems can resolve
-/// the resource. Runs unconditionally in both windowed and e2e configs.
-fn load_dev_font(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
-    let font = Font::from_bytes(ROBOTO_REGULAR_BYTES.to_vec(), "Roboto");
-    let handle = fonts.add(font);
-    commands.insert_resource(DevFont(FontSource::Handle(handle)));
 }
 
 /// Phase-C wave-3 — startup system that spawns one W4 fixture entity into
@@ -1125,53 +593,6 @@ fn spawn_phase_c_test_entity(
     );
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `AppArgs::default().taa_ring_depth` MUST be the documented default
-    /// (`18-taa-fidelity.md` fix #3): a mismatch between the const + the
-    /// default would mean the WGSL shader-def and the Rust buffer sizing
-    /// disagree by default, which is silent TAA ring corruption.
-    #[test]
-    fn default_taa_ring_depth_is_32() {
-        assert_eq!(DEFAULT_TAA_RING_DEPTH, 32);
-        assert_eq!(AppArgs::default().taa_ring_depth, DEFAULT_TAA_RING_DEPTH);
-    }
-
-    /// The ring depth must stay in the supported VRAM-lever range — 16 / 24 /
-    /// 32 are the three values the design records (`01-context.md` §2c /
-    /// `design-exploration-qa.md` §6 + the `18-taa-fidelity.md` fix #3
-    /// supersession). Pin the default at 32 so future edits do not silently
-    /// roll back to the old 16-deep value.
-    #[test]
-    fn default_taa_ring_depth_is_a_supported_lever_value() {
-        let depth = AppArgs::default().taa_ring_depth;
-        assert!(
-            matches!(depth, 16 | 24 | 32),
-            "taa_ring_depth = {depth} is not one of the supported 16/24/32 lever values"
-        );
-    }
-
-    /// The derived [`WORLD_SIZE_IN_CHUNKS`] and [`WORLD_SIZE_IN_VOXELS`] must
-    /// match `WORLD_SIZE_IN_SEGMENTS * WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4`
-    /// (chunks) and `× 16` again (voxels). Pinned because the chunks/voxels
-    /// constants are hardcoded for `const`-eval and would silently drift if
-    /// the segment factors changed without updating them.
-    #[test]
-    fn fixed_world_size_constants_agree() {
-        let chunks = WORLD_SIZE_IN_SEGMENTS * WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4;
-        assert_eq!(
-            chunks, WORLD_SIZE_IN_CHUNKS,
-            "WORLD_SIZE_IN_CHUNKS drifted from segments × groups × 4",
-        );
-        assert_eq!(
-            chunks * 16,
-            WORLD_SIZE_IN_VOXELS,
-            "WORLD_SIZE_IN_VOXELS drifted from chunks × 16",
-        );
-        // The C# canonical values — same numbers `WorldHandler.cs:18-19` pins.
-        assert_eq!(WORLD_SIZE_IN_CHUNKS, UVec3::new(256, 32, 256));
-        assert_eq!(WORLD_SIZE_IN_VOXELS, UVec3::new(4096, 512, 4096));
-    }
-}
+// Tests moved with their subjects:
+//   - `default_taa_ring_depth_*` → `app_args.rs::tests`
+//   - `fixed_world_size_constants_agree` → `world_size.rs::tests::world_size_matches_csharp`

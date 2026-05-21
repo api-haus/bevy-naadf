@@ -4556,9 +4556,9 @@ pub fn validate_runtime_edit_mode() -> Result<String, String> {
     // the multi-chunk batched dispatch.
     let new_type = VoxelTypeId(9);
     let edits = [
-        (bevy::prelude::IVec3::new(20, 12, 20), new_type),
-        (bevy::prelude::IVec3::new(21, 12, 20), new_type),
-        (bevy::prelude::IVec3::new(36, 12, 36), new_type),
+        crate::world::data::VoxelEdit { pos: bevy::prelude::IVec3::new(20, 12, 20), ty: new_type },
+        crate::world::data::VoxelEdit { pos: bevy::prelude::IVec3::new(21, 12, 20), ty: new_type },
+        crate::world::data::VoxelEdit { pos: bevy::prelude::IVec3::new(36, 12, 36), ty: new_type },
     ];
     world_data.set_voxels_batch(&edits);
 
@@ -4655,7 +4655,7 @@ pub fn validate_runtime_edit_mode() -> Result<String, String> {
 /// chunks).
 fn built_pre_edit_state(
     volume: &crate::aadf::construct::DenseVolume,
-    _edits: &[(bevy::prelude::IVec3, crate::voxel::VoxelTypeId)],
+    _edits: &[crate::world::data::VoxelEdit],
 ) -> Vec<u32> {
     crate::aadf::construct::construct(volume).chunks
 }

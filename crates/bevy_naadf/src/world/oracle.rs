@@ -28,7 +28,7 @@
 use bevy::math::IVec3;
 
 use crate::voxel::{VoxelTypeId, CELL_DIM};
-use crate::world::data::WorldData;
+use crate::world::data::{VoxelEdit, WorldData};
 
 /// DIAGNOSTIC-ONLY single-voxel edit (`02f` rearch). Runs the whole-world
 /// `recompute_chunk_layer_aadfs` + emits synthetic AADF-changed chunk uploads
@@ -136,7 +136,7 @@ pub(crate) fn set_voxel(world: &mut WorldData, pos: IVec3, ty: VoxelTypeId) {
 /// × 31 × 3) per call.
 ///
 /// **Production brushes call [`WorldData::set_voxels_batch`] instead.**
-pub(crate) fn set_voxels_batch_oracle(world: &mut WorldData, edits: &[(IVec3, VoxelTypeId)]) {
+pub(crate) fn set_voxels_batch_oracle(world: &mut WorldData, edits: &[VoxelEdit]) {
     if edits.is_empty() {
         return;
     }
@@ -150,7 +150,7 @@ pub(crate) fn set_voxels_batch_oracle(world: &mut WorldData, edits: &[(IVec3, Vo
 
     let mut by_chunk: std::collections::HashMap<[u32; 3], Vec<([u32; 3], u16)>> =
         std::collections::HashMap::new();
-    for &(pos, ty) in edits {
+    for &VoxelEdit { pos, ty } in edits {
         if pos.x < 0 || pos.y < 0 || pos.z < 0 {
             continue;
         }

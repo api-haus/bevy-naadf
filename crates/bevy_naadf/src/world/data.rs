@@ -37,18 +37,14 @@ use bevy::prelude::*;
 
 use crate::voxel::{VoxelType, VoxelTypeId, CELL_DIM};
 
-/// A single-voxel edit — the typed alternative to the anonymous
-/// `(IVec3, VoxelTypeId)` tuple that the brush + diagnostic APIs accept.
+/// A single-voxel edit — the named replacement for the anonymous
+/// `(IVec3, VoxelTypeId)` tuple that the brush + diagnostic APIs previously
+/// accepted (UA-1 close-out, D7).
 ///
-/// One of these per voxel a brush touches.  D2's `editor/tools.rs` brushes
+/// One of these per voxel a brush touches. D2's `editor/tools.rs` brushes
 /// construct these values and pass them via [`WorldData::set_voxels_batch`].
-///
-/// The signature of [`WorldData::set_voxels_batch`] continues to accept the
-/// tuple form for source-compat through D1's slot of the orchestration; D2
-/// migrates its call sites to construct `VoxelEdit` literals when it lands
-/// (and the signature flips at that point — `UA-1` close-out). The
-/// `From`/`Into` impls below let callers transparently mix forms during the
-/// transition.
+/// The `From`/`Into` impls below preserve interop with the old tuple form
+/// for any straggling caller.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VoxelEdit {
     /// World-space voxel position. Negative components are silently dropped
@@ -70,12 +66,10 @@ impl From<VoxelEdit> for (IVec3, VoxelTypeId) {
     }
 }
 
-/// A whole-chunk uniform-state edit — the typed alternative to the anonymous
-/// `([u32; 3], Option<VoxelTypeId>)` tuple [`WorldData::set_chunks_uniform_batch`]
-/// accepts. Used by the brush inside-chunk fast path.
-///
-/// As with [`VoxelEdit`], the existing tuple signature is preserved through
-/// D1's slot; D2 adopts the named form when its brushes refactor.
+/// A whole-chunk uniform-state edit — the named replacement for the
+/// anonymous `([u32; 3], Option<VoxelTypeId>)` tuple that
+/// [`WorldData::set_chunks_uniform_batch`] previously accepted (UA-1
+/// close-out, D7). Used by the brush inside-chunk fast path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ChunkUniformEdit {
     /// Chunk position in chunk-space.
@@ -619,7 +613,7 @@ impl WorldData {
     /// recompute + synthetic chunk uploads — the pre-`02c` behaviour), see
     /// [`Self::set_voxels_batch_oracle`]. The `--edit-mode` e2e gate continues
     /// to call [`Self::set_voxel`] which preserves the oracle semantics.
-    pub fn set_voxels_batch(&mut self, edits: &[(IVec3, VoxelTypeId)]) {
+    pub fn set_voxels_batch(&mut self, edits: &[VoxelEdit]) {
         if edits.is_empty() {
             return;
         }
@@ -637,7 +631,7 @@ impl WorldData {
         // semantics — important for tests that mutate the same voxel twice.
         let mut by_chunk: std::collections::HashMap<[u32; 3], Vec<([u32; 3], u16)>> =
             std::collections::HashMap::new();
-        for &(pos, ty) in edits {
+        for &VoxelEdit { pos, ty } in edits {
             if pos.x < 0 || pos.y < 0 || pos.z < 0 {
                 continue;
             }
@@ -999,7 +993,7 @@ impl WorldData {
     /// free-list reuse, sanctioned per `02c` Divergence #4 / Risk #6).
     pub fn set_chunks_uniform_batch(
         &mut self,
-        chunks: &[([u32; 3], Option<VoxelTypeId>)],
+        chunks: &[ChunkUniformEdit],
     ) {
         if chunks.is_empty() {
             return;
@@ -1011,13 +1005,13 @@ impl WorldData {
             return;
         }
         let mut batch = crate::aadf::edit::EditBatch::default();
-        for &(chunk_pos, ty_opt) in chunks {
-            if chunk_pos[0] >= sx || chunk_pos[1] >= sy || chunk_pos[2] >= sz {
+        for &ChunkUniformEdit { pos: chunk_pos, ty: ty_opt } in chunks {
+            if chunk_pos.x >= sx || chunk_pos.y >= sy || chunk_pos.z >= sz {
                 continue;
             }
-            let ci = (chunk_pos[0]
-                + chunk_pos[1] * sx
-                + chunk_pos[2] * sx * sy) as usize;
+            let ci = (chunk_pos.x
+                + chunk_pos.y * sx
+                + chunk_pos.z * sx * sy) as usize;
             if ci >= self.chunks_cpu.len() {
                 continue;
             }
@@ -1037,7 +1031,7 @@ impl WorldData {
             }
             self.chunks_cpu[ci] = new_state;
             batch.changed_chunks.push([
-                crate::aadf::edit::pack_chunk_pos(chunk_pos),
+                crate::aadf::edit::pack_chunk_pos([chunk_pos.x, chunk_pos.y, chunk_pos.z]),
                 new_state,
             ]);
             // SetChunk's AddChangedChunk gate.
@@ -1045,9 +1039,9 @@ impl WorldData {
             let new_has_content = (new_state >> 30) != 0;
             if old_has_content != new_has_content || !new_has_content {
                 self.pending_edits.edited_groups.push([
-                    chunk_pos[0] / CELL_DIM as u32,
-                    chunk_pos[1] / CELL_DIM as u32,
-                    chunk_pos[2] / CELL_DIM as u32,
+                    chunk_pos.x / CELL_DIM as u32,
+                    chunk_pos.y / CELL_DIM as u32,
+                    chunk_pos.z / CELL_DIM as u32,
                 ]);
             }
         }
@@ -1079,7 +1073,7 @@ impl WorldData {
     /// Complexity: O(N_chunks × 31 × 3) per call. For Oasis-class worlds:
     /// ~75 ms per call. Never on the runtime hot path.
     #[doc(hidden)]
-    pub fn set_voxels_batch_oracle(&mut self, edits: &[(IVec3, VoxelTypeId)]) {
+    pub fn set_voxels_batch_oracle(&mut self, edits: &[VoxelEdit]) {
         crate::world::oracle::set_voxels_batch_oracle(self, edits);
     }
 }
@@ -1187,15 +1181,15 @@ mod tests {
     #[test]
     fn set_voxels_batch_byte_equals_per_voxel_loop() {
         let edits = [
-            (IVec3::new(2, 3, 4), VoxelTypeId(1)),
-            (IVec3::new(5, 5, 5), VoxelTypeId(2)),
-            (IVec3::new(7, 1, 2), VoxelTypeId(3)),
-            (IVec3::new(20, 4, 4), VoxelTypeId(4)), // different chunk
+            VoxelEdit { pos: IVec3::new(2, 3, 4), ty: VoxelTypeId(1) },
+            VoxelEdit { pos: IVec3::new(5, 5, 5), ty: VoxelTypeId(2) },
+            VoxelEdit { pos: IVec3::new(7, 1, 2), ty: VoxelTypeId(3) },
+            VoxelEdit { pos: IVec3::new(20, 4, 4), ty: VoxelTypeId(4) }, // different chunk
         ];
 
         // Per-voxel reference run.
         let mut wd_a = make_empty_world(UVec3::new(2, 2, 2));
-        for &(pos, ty) in &edits {
+        for &VoxelEdit { pos, ty } in &edits {
             wd_a.set_voxel(pos, ty);
         }
         // Batched run.
@@ -1206,7 +1200,7 @@ mod tests {
         // about (the raw byte buffers diverge because `set_voxel` appends
         // fresh slots on every call, while `set_voxels_batch` appends once
         // per affected chunk).
-        for &(pos, ty) in &edits {
+        for &VoxelEdit { pos, ty } in &edits {
             let a = wd_a.get_voxel_type(pos);
             let b = wd_b.get_voxel_type(pos);
             assert_eq!(a, b, "voxel at {pos:?}: per-voxel={a:?} batched={b:?}");
@@ -1295,7 +1289,7 @@ mod tests {
         // 4×4×4 world. Place one voxel; the recompute will refresh AADFs on
         // surrounding empty chunks.
         let mut wd = make_empty_world(UVec3::new(4, 4, 4));
-        wd.set_voxels_batch_oracle(&[(IVec3::new(32, 32, 32), VoxelTypeId(5))]);
+        wd.set_voxels_batch_oracle(&[VoxelEdit { pos: IVec3::new(32, 32, 32), ty: VoxelTypeId(5) }]);
         let batch = wd
             .pending_edits
             .batches
@@ -1339,8 +1333,8 @@ mod tests {
         // an "odd voxel-index" position pick voxel (1, 0, 0) of block (0,0,0).
         // Pre-populate surrounding voxels so the chunk is Mixed.
         wd.set_voxels_batch(&[
-            (IVec3::new(0, 0, 0), VoxelTypeId(1)),
-            (IVec3::new(2, 0, 0), VoxelTypeId(1)),
+            VoxelEdit { pos: IVec3::new(0, 0, 0), ty: VoxelTypeId(1) },
+            VoxelEdit { pos: IVec3::new(2, 0, 0), ty: VoxelTypeId(1) },
         ]);
         // Click on (1, 0, 0) — high half of u32 pair (0, 0, 0).
         let mut around: Vec<(IVec3, Option<VoxelTypeId>)> = Vec::new();
@@ -1352,7 +1346,7 @@ mod tests {
                 }
             }
         }
-        wd.set_voxels_batch(&[(IVec3::new(1, 0, 0), VoxelTypeId(2))]);
+        wd.set_voxels_batch(&[VoxelEdit { pos: IVec3::new(1, 0, 0), ty: VoxelTypeId(2) }]);
         assert_eq!(
             wd.get_voxel_type(IVec3::new(1, 0, 0)),
             Some(VoxelTypeId(2)),
@@ -1378,7 +1372,10 @@ mod tests {
     fn small_edit_into_uniform_full_chunk_no_phantoms() {
         let mut wd = make_empty_world(UVec3::new(2, 2, 2));
         // Pre-populate chunk (0,0,0) as UniformFull(1) via set_chunks_uniform_batch.
-        wd.set_chunks_uniform_batch(&[([0, 0, 0], Some(VoxelTypeId(1)))]);
+        wd.set_chunks_uniform_batch(&[ChunkUniformEdit {
+            pos: UVec3::new(0, 0, 0),
+            ty: Some(VoxelTypeId(1)),
+        }]);
         // Now click voxel (5, 5, 5) to type 2.
         let mut around: Vec<(IVec3, Option<VoxelTypeId>)> = Vec::new();
         for x in 3..=7 {
@@ -1389,7 +1386,7 @@ mod tests {
                 }
             }
         }
-        wd.set_voxels_batch(&[(IVec3::new(5, 5, 5), VoxelTypeId(2))]);
+        wd.set_voxels_batch(&[VoxelEdit { pos: IVec3::new(5, 5, 5), ty: VoxelTypeId(2) }]);
         assert_eq!(
             wd.get_voxel_type(IVec3::new(5, 5, 5)),
             Some(VoxelTypeId(2)),
@@ -1428,8 +1425,8 @@ mod tests {
         // Seed a populated context — a 3-voxel row "OXO" around (5, 5, 5)
         // with the centre EMPTY. Voxels at (4,5,5) and (6,5,5) are full.
         wd.set_voxels_batch(&[
-            (IVec3::new(4, 5, 5), VoxelTypeId(1)),
-            (IVec3::new(6, 5, 5), VoxelTypeId(1)),
+            VoxelEdit { pos: IVec3::new(4, 5, 5), ty: VoxelTypeId(1) },
+            VoxelEdit { pos: IVec3::new(6, 5, 5), ty: VoxelTypeId(1) },
         ]);
         // Sanity — middle is empty before the edit.
         assert_eq!(
@@ -1450,7 +1447,7 @@ mod tests {
         }
         // Click in the middle — single voxel set, simulating cube_brush
         // radius=1 with one emitted edit.
-        wd.set_voxels_batch(&[(IVec3::new(5, 5, 5), VoxelTypeId(2))]);
+        wd.set_voxels_batch(&[VoxelEdit { pos: IVec3::new(5, 5, 5), ty: VoxelTypeId(2) }]);
         // The clicked voxel is the target type.
         assert_eq!(
             wd.get_voxel_type(IVec3::new(5, 5, 5)),
