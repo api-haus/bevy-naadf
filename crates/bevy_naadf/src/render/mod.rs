@@ -48,7 +48,7 @@ use bevy::render::{
 use atmosphere::prepare_atmosphere;
 use extract::{
     extract_camera, extract_camera_history, extract_gi_config,
-    extract_invalid_sample_storage_count, extract_taa_config,
+    extract_effective_world_size, extract_invalid_sample_storage_count, extract_taa_config,
     stage_model_data_buildonce, stage_world_gpu_buildonce, ExtractedCameraData,
     ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
 };
@@ -116,20 +116,6 @@ impl Plugin for NaadfRenderPlugin {
             .map(|args| args.taa_ring_depth)
             .unwrap_or(crate::DEFAULT_TAA_RING_DEPTH);
 
-        // Mobile GPU budget — mirror the main-world `EffectiveWorldSize`
-        // resource (inserted defensively by `build_app_with_args`, possibly
-        // overridden by the Android probe routine) into the render sub-app
-        // so the producer node can read it via
-        // `world.get_resource::<RenderEffectiveWorldSize>()` without crossing
-        // the sub-app boundary mid-frame. Same shape as `TaaRingConfig`
-        // above; see `docs/orchestrate/mobile-budget/02-design.md` §3
-        // "Render-sub-app mirror".
-        let effective_world = app
-            .world()
-            .get_resource::<crate::render::budget::EffectiveWorldSize>()
-            .copied()
-            .unwrap_or_else(crate::render::budget::EffectiveWorldSize::canonical);
-
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -138,19 +124,19 @@ impl Plugin for NaadfRenderPlugin {
             .insert_resource(TaaRingConfig {
                 depth: taa_ring_depth,
             })
-            .insert_resource(crate::render::budget::RenderEffectiveWorldSize(
-                effective_world,
-            ))
-            // `RenderInvalidSampleStorageCount` is `init_resource`d — its
-            // `Default` is the C# canonical 8. The real value is copied from
-            // the main-world `InvalidSampleStorageCount` each frame by
-            // `extract_invalid_sample_storage_count` (registered below in
-            // ExtractSchedule). This extract-driven path is what lets the
-            // Android entry's post-`build_app_with_args` override
-            // (`app.insert_resource(InvalidSampleStorageCount(4))`) actually
-            // reach `prepare_gi` — a build-time snapshot would see only the
-            // defensive canonical seed (8). See doc on the mirror struct in
+            // `RenderEffectiveWorldSize` + `RenderInvalidSampleStorageCount` are
+            // `init_resource`d — both default to the C# canonical (world =
+            // `(16, 2, 16)`, invalid_samples = 8). The real values are copied
+            // from the main-world resources each frame by
+            // `extract_effective_world_size` / `extract_invalid_sample_storage_count`
+            // (registered below in ExtractSchedule). This extract-driven path
+            // is what lets the Android entry's post-`build_app_with_args`
+            // overrides (`EffectiveWorldSize::from_segments((6,2,6))`,
+            // `InvalidSampleStorageCount(4)`) actually reach the render-world
+            // consumers — a plugin-build-time snapshot would see only the
+            // defensive canonical seeds. See docs on the mirror structs in
             // `budget.rs`.
+            .init_resource::<crate::render::budget::RenderEffectiveWorldSize>()
             .init_resource::<crate::render::budget::RenderInvalidSampleStorageCount>()
             // `02f` rearch: no `ExtractedWorld` resource. The build-once
             // hand-off goes through `WorldGpuStaging` (transient, dropped
@@ -195,9 +181,11 @@ impl Plugin for NaadfRenderPlugin {
                     extract_taa_config,
                     extract_gi_config,
                     // 2026-05-21 mobile-budget post-deploy fix — copy the
-                    // post-`build_app_with_args`-override main-world value
-                    // into the render-world mirror (see docstring on
-                    // `RenderInvalidSampleStorageCount` in `budget.rs`).
+                    // post-`build_app_with_args`-override main-world values
+                    // into the render-world mirrors (see docstrings on
+                    // `RenderEffectiveWorldSize` + `RenderInvalidSampleStorageCount`
+                    // in `budget.rs`).
+                    extract_effective_world_size,
                     extract_invalid_sample_storage_count,
                 ),
             )

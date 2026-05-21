@@ -476,6 +476,25 @@ pub fn extract_invalid_sample_storage_count(
     }
 }
 
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::render::budget::EffectiveWorldSize`] into the render-world
+/// [`crate::render::budget::RenderEffectiveWorldSize`].
+///
+/// Same rationale as [`extract_invalid_sample_storage_count`]: the Android
+/// entry's `app.insert_resource(EffectiveWorldSize::from_segments(...))` runs
+/// AFTER `build_app_with_args` returns — so a `NaadfRenderPlugin::build`-time
+/// snapshot would capture only the defensive canonical seed `(16, 2, 16)`,
+/// not the budget-selected mobile rung (e.g. `(6, 2, 6)` on Mali-G52). Extract
+/// runs every frame, so the first real frame sees the post-override value.
+pub fn extract_effective_world_size(
+    mut mirror: ResMut<crate::render::budget::RenderEffectiveWorldSize>,
+    src: Extract<Option<Res<crate::render::budget::EffectiveWorldSize>>>,
+) {
+    if let Some(src) = &*src {
+        mirror.0 = **src;
+    }
+}
+
 /// Render-world mirror of `AppArgs.gi` — the Phase-B GI pipeline settings
 /// (`09-design-b.md` §3.8 / §10.2). `AppArgs` is a main-world resource; the
 /// render-world `prepare_gi` system needs these to build `GpuGiParams`, and

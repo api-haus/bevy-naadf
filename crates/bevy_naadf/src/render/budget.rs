@@ -171,13 +171,29 @@ impl Default for EffectiveWorldSize {
     }
 }
 
-/// Render-sub-app mirror of [`EffectiveWorldSize`]. Inserted by
-/// [`crate::render::NaadfRenderPlugin::build`] from the main-world resource
-/// so the producer node can `world.get_resource()` without crossing the
-/// sub-app boundary mid-frame. Mirrors the [`crate::render::taa::TaaRingConfig`]
-/// shape (see `render/mod.rs:105-118`).
+/// Render-sub-app mirror of [`EffectiveWorldSize`].
+///
+/// **Plumbing — extract-driven, NOT plugin-build-snapshot.** Same rationale as
+/// [`RenderInvalidSampleStorageCount`] below: the Android entry's
+/// `app.insert_resource(EffectiveWorldSize::from_segments(...))` runs AFTER
+/// `build_app_with_args` returns, so a snapshot taken at
+/// [`crate::render::NaadfRenderPlugin::build`] would capture only the defensive
+/// canonical seed `(16, 2, 16)`, not the budget-selected mobile rung. The
+/// render-world value is `init_resource`d to canonical and then re-populated
+/// every frame from `ExtractSchedule` via
+/// [`crate::render::extract::extract_effective_world_size`].
+///
+/// The producer node reads this mirror at run-time
+/// (`world.get_resource::<RenderEffectiveWorldSize>()`) so it sees the
+/// post-extract value, not any stale snapshot.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct RenderEffectiveWorldSize(pub EffectiveWorldSize);
+
+impl Default for RenderEffectiveWorldSize {
+    fn default() -> Self {
+        Self(EffectiveWorldSize::canonical())
+    }
+}
 
 /// Runtime override of [`crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT`]
 /// (the C# canonical `globalIllumInvalidSampleStorageCount = 8`).
@@ -213,25 +229,16 @@ impl Default for InvalidSampleStorageCount {
 
 /// Render-sub-app mirror of [`InvalidSampleStorageCount`].
 ///
-/// **Plumbing — extract-driven, NOT plugin-build-snapshot** (2026-05-21
-/// post-deploy correction): the world-size + TAA mirrors are snapshotted at
-/// [`crate::render::NaadfRenderPlugin::build`] from the main-world resource
-/// AT THAT MOMENT. The Android entry's `build_app_with_args` → override-resource
-/// sequence happens AFTER plugin-build, so a snapshot-at-build mirror would
-/// see the defensive canonical seed (8), not the budget-selected mobile value
-/// (typically 4). The world-size mirror works around this because the install
-/// path reads the resource at runtime (`setup_test_grid` is a Startup system
-/// — runs after the override) and the GPU producer reads through the
-/// render-world `RenderEffectiveWorldSize` which IS snapshotted at build but
-/// the producer ALSO reads `extracted.size_in_chunks` which flows from the
-/// post-override `WorldData`.
-///
-/// For `invalid_samples`, `prepare_gi` reads the mirror directly — there is
-/// no `extract`-driven proxy in between. So this mirror is populated by an
-/// `ExtractSchedule` system ([`crate::render::extract::extract_invalid_sample_storage_count`])
-/// that copies the main-world value into the render world each frame. The
-/// first frame sees the post-override value (= the budget-selected 4 on
-/// mobile, the canonical 8 on desktop).
+/// **Plumbing — extract-driven, NOT plugin-build-snapshot.** The Android
+/// entry's `build_app_with_args` → `app.insert_resource(...)` sequence happens
+/// AFTER plugin-build, so any mirror snapshotted at
+/// [`crate::render::NaadfRenderPlugin::build`] would only see the defensive
+/// canonical seed (8 for invalid_samples; `(16, 2, 16)` for world size), not
+/// the budget-selected mobile values. Both [`RenderEffectiveWorldSize`] and
+/// this mirror are `init_resource`d to canonical and re-populated every frame
+/// from `ExtractSchedule` (see [`crate::render::extract::extract_invalid_sample_storage_count`]
+/// and [`crate::render::extract::extract_effective_world_size`]) — first real
+/// frame sees the post-override values.
 ///
 /// `Default` = canonical 8 so the resource is always present (used as the
 /// `init_resource` seed before the first extract).

@@ -1,5 +1,7 @@
-# Cargo build artifacts (workspace-wide target dir)
-/target
+# Cargo build artifacts. Un-anchored so nested target/ dirs (e.g.
+# crates/bevy_naadf/target/ when `cd crates/bevy_naadf && trunk build`
+# or `cd crates/bevy_naadf && cargo ndk` runs) are also excluded.
+target/
 
 # Trunk WebGPU (wasm32) build output for the bevy_naadf crate
 /crates/bevy_naadf/dist

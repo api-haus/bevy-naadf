@@ -95,11 +95,17 @@ web-build:
 web-build-release:
     cd {{naadf_dir}} && trunk build --release
 
-# Serve a pre-built `dist/` with miniserve + the COOP/COEP headers wasm-bindgen-rayon
-# needs for SharedArrayBuffer, then open Chrome. No file watching, no live reload —
-# escape hatch for when `trunk serve` blows up on the inotify limit. Run
-# `just web-build` (or `web-build-release`) first; rerun it when you want a refresh.
-# Requires miniserve: `cargo install miniserve`.
+# Serve a pre-built `dist/` over HTTPS (self-signed cert) with miniserve + the COOP/COEP
+# headers wasm-bindgen-rayon needs for SharedArrayBuffer, then open Chrome. HTTPS is
+# REQUIRED because COOP/COEP are silently ignored on non-secure origins — a LAN-IP URL
+# from a phone over plain HTTP gets the headers stripped by the browser and SharedArrayBuffer
+# stays disabled. Self-signed cert is generated on first run into `target/dev-tls/` (gitignored
+# under cargo's target dir) for the host's LAN IP. On the iPhone/Android tablet you'll have to
+# accept the cert warning once.
+#
+# No file watching, no live reload — escape hatch for when `trunk serve` blows up on the
+# inotify limit. Run `just web-build` (or `web-build-release`) first; rerun it when you want
+# a refresh. Requires miniserve: `cargo install miniserve`.
 web-static: web-build-release
     #!/usr/bin/env bash
     set -euo pipefail
@@ -108,31 +114,46 @@ web-static: web-build-release
         echo "dist/ is empty — run \`just web-build\` or \`just web-build-release\` first." >&2
         exit 1
     fi
-    url="http://{{web_host}}:{{web_port}}"
     lan_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-    echo "miniserve dist → $url   (static, no watch, COOP/COEP enabled)"
+    cert_dir="target/dev-tls"
+    mkdir -p "$cert_dir"
+    if [[ ! -f "$cert_dir/cert.pem" || ! -f "$cert_dir/key.pem" ]]; then
+        echo "Generating self-signed dev TLS cert at $cert_dir/ for ${lan_ip:-127.0.0.1}…"
+        openssl req -x509 -newkey rsa:4096 -nodes -days 365 \
+            -keyout "$cert_dir/key.pem" -out "$cert_dir/cert.pem" \
+            -subj "/CN=${lan_ip:-127.0.0.1}" \
+            -addext "subjectAltName=IP:${lan_ip:-127.0.0.1},IP:127.0.0.1,DNS:localhost" \
+            >/dev/null 2>&1
+        echo "  (re-run this recipe after deleting $cert_dir/ if your LAN IP changes)"
+    fi
+    url="https://{{web_host}}:{{web_port}}"
+    echo "miniserve dist → $url   (HTTPS, COOP/COEP enabled)"
     if [[ -n "$lan_ip" ]]; then
-        echo "                LAN: http://$lan_ip:{{web_port}}   (phone / tablet on same network)"
+        echo "                LAN: https://$lan_ip:{{web_port}}   (phone/tablet — accept the self-signed cert warning)"
     fi
     miniserve dist \
         --index index.html \
         --interfaces 0.0.0.0 \
         --port {{web_port}} \
+        --tls-cert "$cert_dir/cert.pem" \
+        --tls-key "$cert_dir/key.pem" \
         --header "Cross-Origin-Opener-Policy: same-origin" \
         --header "Cross-Origin-Embedder-Policy: require-corp" &
     serve_pid=$!
     trap 'kill "$serve_pid" 2>/dev/null || true' EXIT
     for _ in $(seq 1 150); do
-        if curl -sf -o /dev/null "$url"; then break; fi
+        if curl -skf -o /dev/null "$url"; then break; fi
         sleep 0.2
     done
     # `--enable-unsafe-webgpu --enable-webgpu-developer-features` mirror the
     # Playwright config (`e2e/playwright.config.ts:44-48`) so live dev and
-    # the SSIM gate exercise the same WebGPU surface.
+    # the SSIM gate exercise the same WebGPU surface. `--ignore-certificate-errors`
+    # is required for desktop Chrome to accept the self-signed cert silently.
     setsid {{chrome}} \
         --new-window \
         --enable-unsafe-webgpu \
         --enable-webgpu-developer-features \
+        --ignore-certificate-errors \
         "$url" >/dev/null 2>&1 &
     wait "$serve_pid"
 
