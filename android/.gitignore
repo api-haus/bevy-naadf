@@ -1,0 +1,26 @@
+# Standard Android Gradle ignores. The wrapper + gradlew.bat are tracked so
+# anyone checking out the repo can `./gradlew assembleDebug` without
+# bootstrapping Gradle.
+
+# Build output
+.gradle/
+build/
+**/build/
+
+# Local-machine paths (sdk.dir, ndk.dir). Each developer points these at
+# their own SDK install via this file or via $ANDROID_HOME / $ANDROID_NDK_HOME.
+local.properties
+
+# Cargo-ndk drops `.so` files here at build time; reproducible from `cargo ndk`
+# so no need to track. If you want a CI step that ships a prebuilt .so via
+# this path, comment this rule out and audit the .so sizes (a debug .so is
+# 200+ MiB).
+app/src/main/jniLibs/
+
+# Android Studio
+.idea/
+*.iml
+captures/
+
+# Build script artefacts
+.cxx/

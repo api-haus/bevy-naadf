@@ -56,6 +56,13 @@ rustflags = [
     "-C", "link-arg=--export=__heap_base",
 ]
 
+# aarch64-linux-android — the linker rule that resolves LLVM's outline-atomics
+# helpers (`__aarch64_swp1_acq_rel`, …) is emitted dynamically by
+# `crates/bevy_naadf/build.rs`, which resolves `$ANDROID_NDK_HOME` etc. at
+# build time and globs for the host's clang-major directory. Keeping the
+# host-specific NDK path out of this file makes the build portable across
+# machines and NDK versions. See `build.rs` for the full rationale.
+
 # Rebuild std with atomics support — required by the atomics target-feature
 # above. Only applies when the wasm32 target is being built; native targets
 # are unaffected (Cargo only consults `build-std` when an `--unstable` flag

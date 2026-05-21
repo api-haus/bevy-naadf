@@ -11,6 +11,8 @@
 //! e2e-render-test.md`).
 
 pub mod aadf;
+#[cfg(target_os = "android")]
+pub mod android_main;
 pub mod app_args;
 pub mod app_config;
 pub mod app_mode;

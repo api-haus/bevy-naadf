@@ -7,6 +7,10 @@ license = "MIT"
 # The crate ships three binaries (`bevy-naadf`, `e2e_render`, `bake`); `cargo run`
 # / `just run` resolve to the production app unless another `--bin` is given.
 default-run = "bevy-naadf"
+# Android-only build script. On non-Android targets it returns immediately;
+# the cost is one extra process invocation per `cargo build`. See `build.rs`
+# for why it exists (NDK outline-atomics builtins linking).
+build = "build.rs"
 
 # The crate is a library (`src/lib.rs` — the shared `build_app` app-wiring path)
 # plus three thin binaries over it: `bevy-naadf` (the production app,
@@ -18,6 +22,11 @@ default-run = "bevy-naadf"
 [lib]
 name = "bevy_naadf"
 path = "src/lib.rs"
+# `cdylib` produces the `libbevy_naadf.so` that `cargo-ndk` drops into the
+# Android Gradle project's `jniLibs/arm64-v8a/`. `rlib` keeps the binaries
+# (`bevy-naadf`, `e2e_render`, `bake`) linkable against the same library
+# crate. Mirrors Bevy's own `examples/mobile/Cargo.toml`.
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "bevy-naadf"
@@ -122,6 +131,14 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # user memory).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy = { version = "=0.19.0-rc.1", features = ["asset_processor"] }
+
+# Android — `android-game-activity` selects the modern GameActivity (AGDK) JNI
+# bridge (API 31+), matching Bevy's `examples/mobile/android_example/`. Cargo
+# merges this features list with the base `[dependencies]` and the
+# `cfg(not(wasm32))` entry above, so the final Android build of Bevy carries
+# `["free_camera", "asset_processor", "android-game-activity"]`.
+[target.'cfg(target_os = "android")'.dependencies]
+bevy = { version = "=0.19.0-rc.1", features = ["android-game-activity"] }
 
 # wasm32-only: getrandom ≥0.3 refuses to compile for `wasm32-unknown-unknown`
 # without an explicit backend. `dot_vox`→`ahash` pulls getrandom 0.3.4

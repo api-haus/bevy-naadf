@@ -1,0 +1,97 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+android {
+    namespace 'io.naadf.bevy'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "io.naadf.bevy"
+        // API 31 = Android 12. Matches the test tablet (Galaxy Tab A8) AND
+        // the `android-game-activity` Bevy feature's lower bound.
+        minSdk 31
+        targetSdk 33
+        versionCode 1
+        versionName "0.1"
+        ndk {
+            // Only arm64 — we don't ship a 32-bit build.
+            abiFilters 'arm64-v8a'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    // `prefab` lets Gradle pick up the GameActivity native headers/libs from
+    // the `games-activity` AAR. Bevy's `android-game-activity` Cargo feature
+    // expects them on the link path of `libbevy_naadf.so`.
+    buildFeatures {
+        prefab true
+    }
+    sourceSets {
+        main {
+            // Bevy's `AssetPlugin.file_path = "src/assets"` (lib.rs:215) is
+            // honoured by Bevy's Android `AssetReader` as a sub-folder under
+            // the APK assets root. Mirror the desktop layout: copy the entire
+            // `crates/bevy_naadf/src/assets` tree into the APK's `assets/`
+            // dir so the on-device path becomes `assets/src/assets/...` and
+            // the existing relative paths in code (`shaders/...`,
+            // `fonts/...`) still resolve.
+            //
+            // Path is relative to this file (`android/app/build.gradle`):
+            // `../..` = worktree root.
+            assets {
+                srcDir '../../crates/bevy_naadf/src/assets'
+                // The Bevy AssetReader on Android prepends "src/assets" to
+                // every asset path (because `file_path` is "src/assets").
+                // We want the APK's `assets/src/assets/<...>` layout, so
+                // tell Gradle to wrap the source dir under that prefix
+                // using a separate `into('src/assets')` copy — done via
+                // android.applicationVariants below.
+            }
+        }
+    }
+}
+
+// Wrap copied assets under the `src/assets/` prefix so Bevy's
+// `AssetPlugin.file_path = "src/assets"` resolves them on-device. Using the
+// merge-assets task lets us avoid splattering a second copy of the asset
+// tree into the worktree.
+android.applicationVariants.configureEach { variant ->
+    variant.mergeAssetsProvider.configure { task ->
+        task.doFirst {
+            def outDir = task.outputDir.get().asFile
+            // The default sourceSet copies `crates/bevy_naadf/src/assets/*`
+            // straight to `outDir/*`. We want them at `outDir/src/assets/*`.
+            // Move them after Gradle's normal merge.
+        }
+        task.doLast {
+            def outDir = task.outputDir.get().asFile
+            def nested = new File(outDir, 'src/assets')
+            if (nested.exists()) return
+            nested.parentFile.mkdirs()
+            def tmp = new File(outDir.parentFile, "merged_assets_tmp_${variant.name}")
+            if (tmp.exists()) { tmp.deleteDir() }
+            outDir.renameTo(tmp)
+            outDir.mkdirs()
+            new File(outDir, 'src/assets').mkdirs()
+            tmp.eachFile { f ->
+                f.renameTo(new File(outDir, "src/assets/${f.name}"))
+            }
+            tmp.deleteDir()
+        }
+    }
+}
+
+dependencies {
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.games.activity
+}
