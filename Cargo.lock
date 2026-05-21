@@ -380,6 +380,7 @@ dependencies = [
 name = "bevy-naadf"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bevy",
  "bytemuck",
  "console_error_panic_hook",
@@ -389,6 +390,7 @@ dependencies = [
  "image",
  "image-compare",
  "js-sys",
+ "naadf_e2e",
  "rayon",
  "serde",
  "serde_json",
@@ -3741,6 +3743,17 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "naadf_e2e"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bevy-naadf",
+ "image",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

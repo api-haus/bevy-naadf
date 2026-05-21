@@ -21,10 +21,15 @@ pub mod dev_font;
 pub mod diagnostics;
 pub mod e2e;
 /// BRP (Bevy Remote Protocol) control surface for the external e2e runner.
-/// Entirely behind the `e2e-brp` cargo feature — absent from the default
-/// production build. Phase 0 transport spike, see
-/// `docs/orchestrate/e2e-ipc-rpc-restructure/02-design.md` §2.
-#[cfg(feature = "e2e-brp")]
+///
+/// The module is declared **unconditionally** so its `schema` sub-module — the
+/// plain-`serde` verb wire-format structs — compiles into every build, letting
+/// the external `naadf_e2e` runner crate import the param/return types without
+/// building `bevy_naadf` with the `e2e-brp` feature (design §7.1 D8 / A7). The
+/// BRP *handlers* (`verbs`) and the `install_brp_server` entry point stay
+/// behind `#[cfg(feature = "e2e-brp")]` inside `e2e_brp/mod.rs`, so the default
+/// production build still ships no `bevy_remote` dependency and no socket. See
+/// `docs/orchestrate/e2e-ipc-rpc-restructure/02-design.md` §2 / §7.
 pub mod e2e_brp;
 pub mod editor;
 pub mod hud;

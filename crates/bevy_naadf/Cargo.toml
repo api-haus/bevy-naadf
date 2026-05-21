@@ -48,6 +48,13 @@ path = "src/bin/bake.rs"
 bevy = { version = "=0.19.0-rc.1", features = [
     "free_camera",
 ] }
+# base64 = the wire encoding for the `naadf/await_capture` BRP verb's PNG
+# payload (`src/e2e_brp/verbs.rs`) — a captured framebuffer travels as a
+# base64-encoded PNG inside the JSON-RPC reply. Pinned to the EXACT version
+# Bevy 0.19-rc.1 already pulls in transitively (`Cargo.lock` → base64 0.22.1)
+# so there is no second copy of the crate. Used unconditionally (the verb code
+# is feature-gated, but a small always-compiled dep avoids a feature-scramble).
+base64 = "=0.22.1"
 # bytemuck = #[repr(C)] <-> &[u8] for the GPU-mirror structs (render/gpu_types.rs).
 # Pinned to the version Bevy 0.19-rc.1 re-exports so the `Pod`/`Zeroable` traits
 # match across the crate boundary.
@@ -121,6 +128,17 @@ wgpu = "=29.0.3"
 # (the only codec `System.IO.Compression.ZipArchive.CreateEntry` uses).
 # Pure-rust, no native deps; wasm-compatible.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# dev-dependencies — the BRP-driven e2e gate test files in `tests/` use the
+# external runner library. `naadf_e2e` depends back on this crate (for the
+# `e2e_brp::schema` structs + the pure `e2e::framebuffer` assertion code);
+# that is not a cycle — a `[dev-dependencies]` arrow is allowed to point at a
+# crate that depends on this one's *library* target. The gate test files are
+# same-package as the `bevy-naadf` binary, so Cargo sets `CARGO_BIN_EXE_bevy-naadf`
+# for them — `Sut::spawn` locates the SUT binary with no `cargo build`
+# shell-out (the Phase 2 hybrid-layout decision; design §7).
+[dev-dependencies]
+naadf_e2e = { path = "../naadf_e2e" }
 
 # Native-only — the `bake` binary (`src/bin/bake.rs`) needs Bevy's
 # `AssetProcessor` to opt into `AssetMode::Processed`. Without
