@@ -370,6 +370,10 @@ pub fn run_vox_e2e() -> AppExit {
     //     - The driver's `ASSERT` step swaps the default-scene batch gate
     //       for `assert_vox_geometry_visible` (driver branch on
     //       `args.vox_e2e_mode`).
+    // `vox_e2e_mode` is Bucket A (Decision §3) — it is NOT a flow selector,
+    // so it stays on `AppArgs` until Step 7 (the `--vox-e2e` gate runs the
+    // STANDARD driver flow, hence `gate_mode` is left at the default
+    // `E2eGateMode::Standard`).
     let mut app_args = crate::AppArgs::default();
     app_args.vox_e2e_mode = true;
     // Step 5 of the config-as-resource refactor — `grid_preset` migrated

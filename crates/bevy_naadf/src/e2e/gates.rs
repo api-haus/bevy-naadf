@@ -189,7 +189,7 @@ pub fn e2e_motion_start_transform() -> Transform {
 ///   centre — visible as a large dark band in the lower-left of the frame.
 /// - The atmospheric sky band still occupies the top of the frame.
 ///
-/// Used **only** by the resize-test phases (gated by `AppArgs.resize_test`);
+/// Used **only** by the resize-test phases (gated by `E2eGateMode::Resize`);
 /// the standard Batch-6 harness keeps using [`e2e_camera_transform`]. The
 /// pose is pinned for the entire resize-test sequence — no orbit motion, no
 /// per-phase changes — so any luma collapse between the three captures is

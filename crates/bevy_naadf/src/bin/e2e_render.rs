@@ -19,10 +19,11 @@
 //!    `--validate-gpu-construction-scaled`, `--validate-gpu-construction-production`).
 //!    These run + return an `ExitCode` directly without booting an app.
 //! 2. [`parse_gate_command`] — the boot commands. Each maps to a single
-//!    `bevy_naadf::run_e2e_render*` call. The gate selector
-//!    ([`bevy_naadf::e2e::gate::GateKind`]) is carried through for use by
-//!    later refactors (D6 step 3/4) but currently only flows the legacy
-//!    `AppArgs` boolean.
+//!    `bevy_naadf::e2e` gate entry point that constructs a
+//!    `BootstrapInputs` carrying the gate's
+//!    [`bevy_naadf::e2e::gate::E2eGateMode`] (Step 6 of the
+//!    config-as-resource refactor collapsed the e2e-mode booleans into
+//!    that enum).
 //! 3. [`parse_post_app_validations`] — the orthogonal post-app validation
 //!    tails (`--validate-gpu-construction`, `--entities`, `--edit-mode`,
 //!    `--runtime-edit-mode`). These run *after* the Bevy app exits and
@@ -85,7 +86,7 @@
 use std::process::ExitCode;
 
 use bevy::prelude::AppExit;
-use bevy_naadf::e2e::gate::GateKind;
+use bevy_naadf::e2e::gate::E2eGateMode;
 
 /// Top-level commands that exit WITHOUT booting a Bevy app. Returned by
 /// [`parse_top_level_short_circuit`] when one of their flags is set.
@@ -102,17 +103,19 @@ enum TopLevelShortCircuit {
     ValidateGpuConstructionProduction,
 }
 
-/// Boot-the-app commands. Each maps to a single `bevy_naadf::run_e2e_render*`
-/// call. `gate` carries the [`GateKind`] discriminator introduced by D6 step 2;
-/// currently consumed only for diagnostics (the gate-selection wiring still
-/// reads the legacy `AppArgs` booleans — D6 step 3/4 swaps that over).
+/// Boot-the-app commands. Each maps to a single `bevy_naadf::e2e` gate
+/// entry point. `gate` carries the [`E2eGateMode`] the run dispatches —
+/// surfaced in the boot-dispatch log line for diagnostics; each gate's
+/// own `run_*` function constructs the matching `BootstrapInputs` with
+/// `gate_mode` set (Step 6 of the config-as-resource refactor).
 enum BootCommand {
     /// Run a named gate by delegating to its `run_*` entry point on the
-    /// `bevy_naadf::e2e` module. The matching `AppArgs.<flag>` is set inside
-    /// the entry-point function.
-    NamedGate { gate: GateKind, run: fn() -> AppExit },
+    /// `bevy_naadf::e2e` module. The entry point builds a `BootstrapInputs`
+    /// carrying `gate`.
+    NamedGate { gate: E2eGateMode, run: fn() -> AppExit },
     /// `--resize-test` — wraps the Bevy boot in pre/post Hyprland windowrule
-    /// installation. The resize-test is the canonical Resize-kind gate.
+    /// installation. The resize-test is the canonical `E2eGateMode::Resize`
+    /// gate.
     ResizeTest,
     /// `--entities` boot — sets `ConstructionConfig.entities_enabled` +
     /// inserts `SpawnTestEntity(true)` on the standard gate.
@@ -259,61 +262,64 @@ fn parse_gate_command(args: &[String]) -> BootCommand {
     }
     if args.iter().any(|a| a == "--oasis-edit-visual") {
         return BootCommand::NamedGate {
-            gate: GateKind::OasisEdit,
+            gate: E2eGateMode::OasisEdit,
             run: bevy_naadf::e2e::oasis_edit_visual::run_oasis_edit_visual,
         };
     }
     if args.iter().any(|a| a == "--small-edit-visual") {
         return BootCommand::NamedGate {
-            gate: GateKind::SmallEditVisual,
+            gate: E2eGateMode::SmallEditVisual,
             run: bevy_naadf::e2e::small_edit_visual::run_small_edit_visual,
         };
     }
     if args.iter().any(|a| a == "--small-edit-repro") {
         return BootCommand::NamedGate {
-            gate: GateKind::SmallEditRepro,
+            gate: E2eGateMode::SmallEditRepro,
             run: bevy_naadf::e2e::small_edit_repro::run_small_edit_repro,
         };
     }
     if args.iter().any(|a| a == "--vox-gpu-oracle-cpu") {
         return BootCommand::NamedGate {
-            gate: GateKind::VoxGpuOracle,
+            gate: E2eGateMode::VoxGpuOracleCpu,
             run: bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_cpu_phase,
         };
     }
     if args.iter().any(|a| a == "--vox-gpu-oracle-gpu") {
         return BootCommand::NamedGate {
-            gate: GateKind::VoxGpuOracle,
+            gate: E2eGateMode::VoxGpuOracleGpu,
             run: bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_gpu_phase,
         };
     }
     if args.iter().any(|a| a == "--vox-web-parity-skybox") {
         return BootCommand::NamedGate {
-            gate: GateKind::VoxWebParity,
+            gate: E2eGateMode::VoxWebParitySkybox,
             run: bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_skybox_phase,
         };
     }
     if args.iter().any(|a| a == "--vox-web-parity-loaded") {
         return BootCommand::NamedGate {
-            gate: GateKind::VoxWebParity,
+            gate: E2eGateMode::VoxWebParityLoaded,
             run: bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_loaded_phase,
         };
     }
     if args.iter().any(|a| a == "--vox-horizon-native") {
         return BootCommand::NamedGate {
-            gate: GateKind::VoxWebParity,
+            gate: E2eGateMode::VoxHorizonNative,
             run: bevy_naadf::e2e::vox_horizon_parity::run_vox_horizon_native_phase,
         };
     }
     if args.iter().any(|a| a == "--vox-gpu-construction") {
         return BootCommand::NamedGate {
-            gate: GateKind::VoxGpuConstruction,
+            gate: E2eGateMode::VoxGpuConstruction,
             run: bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction,
         };
     }
     if args.iter().any(|a| a == "--vox-e2e") {
+        // `--vox-e2e` runs the STANDARD driver flow (Decision §3 —
+        // `vox_e2e_mode` is Bucket A, an ASSERT-time tag, not a flow
+        // selector). `run_vox_e2e` carries `vox_e2e_mode` on `AppArgs`.
         return BootCommand::NamedGate {
-            gate: GateKind::Standard,
+            gate: E2eGateMode::Standard,
             run: bevy_naadf::e2e::vox_e2e::run_vox_e2e,
         };
     }
@@ -328,12 +334,11 @@ fn parse_gate_command(args: &[String]) -> BootCommand {
 fn run_boot_command(boot: BootCommand) -> AppExit {
     match boot {
         BootCommand::NamedGate { gate, run } => {
-            // `gate` is carried through for potential diagnostic use + as the
-            // anchor for the D6 step 3/4 driver decomposition (where it
-            // becomes the `ActiveGate` resource value). Currently the gate's
-            // own `run_*` function sets the matching `AppArgs.<flag>` boolean
-            // that the wiring reads.
-            let _ = gate;
+            // `gate` is the `E2eGateMode` the run dispatches; surfaced here
+            // for diagnostics. The gate's own `run_*` function constructs a
+            // `BootstrapInputs` with `gate_mode` set to this same value
+            // (Step 6 of the config-as-resource refactor).
+            eprintln!("e2e_render: boot dispatch — gate mode {gate:?}");
             run()
         }
         BootCommand::ResizeTest => run_resize_test(),
@@ -386,9 +391,15 @@ fn run_resize_test() -> AppExit {
     // e2e path never shells out to hyprctl.
     install_resize_test_windowrule();
 
-    let mut app_args = bevy_naadf::AppArgs::default();
-    app_args.resize_test = true;
-    let exit = bevy_naadf::run_e2e_render_with_args(app_args);
+    // Step 6 of the config-as-resource refactor — the `resize_test` boolean
+    // collapsed into `E2eGateMode::Resize`. Route through the
+    // `BootstrapInputs` fan-out; `window_for_gate_mode` reads the gate mode
+    // to pick the 800×600 resize-boot window.
+    let inputs = bevy_naadf::bootstrap::BootstrapInputs {
+        gate_mode: bevy_naadf::e2e::gate::E2eGateMode::Resize,
+        ..bevy_naadf::bootstrap::BootstrapInputs::default()
+    };
+    let exit = bevy_naadf::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs);
 
     cleanup_resize_test_windowrule();
 

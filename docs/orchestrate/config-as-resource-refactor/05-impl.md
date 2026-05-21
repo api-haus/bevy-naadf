@@ -1038,3 +1038,240 @@ incrementally). Kept as-is; the native + Android callers already match it.
   `construction_config`, `grid_preset`, `spawn_test_entity`) cleanly across
   Steps 2-5 + 8. The remaining work is the genuinely hard step (Step 6, the
   11→1 enum collapse) — but nothing in Steps 2-5/8 has made it harder.
+
+## Step 6 — Collapse e2e-mode booleans into E2eGateMode (2026-05-21)
+
+### Design-vs-reality reconciliation
+
+`02-design.md`'s Step 6 spec was written when `AppArgs` held 11 e2e-mode
+booleans. Steps 2-5 + 8 had since drained the parameter fields; the actual
+`AppArgs` field set found at HEAD `53c37b3` was **11 booleans, of which 10
+are mode booleans and 1 (`vox_e2e_mode`) is Bucket A**:
+
+- `resize_test`, `oasis_edit_visual_mode`, `small_edit_visual_mode`,
+  `small_edit_repro_mode`, `vox_gpu_construction_mode`,
+  `vox_gpu_oracle_cpu_phase`, `vox_gpu_oracle_gpu_phase`,
+  `vox_web_parity_skybox_phase`, `vox_web_parity_loaded_phase`,
+  `vox_horizon_native_phase` — the **10 mode booleans** Step 6 collapsed.
+- `vox_e2e_mode` — left on `AppArgs` (Decision §3 — Bucket A, Step 7's
+  scope). After Step 6 `AppArgs` is a one-field shell.
+
+The design's §3.1 `E2eGateMode` sketch already enumerated exactly 11
+variants (`Standard` + the 10) — it matched reality. The design text says
+"11 booleans" in a couple of places (`### Step 6` heading, the field-list);
+that count was stale (it pre-dated Decision §3 splitting `vox_e2e_mode`
+out). The variant set landed verbatim from the design's §3.1 code block.
+
+### What landed
+
+- **`crates/bevy_naadf/src/e2e/gate.rs`** — promoted the D6-era `GateKind`
+  enum to `E2eGateMode` (Decision §6): renamed; extended from 8 → 11
+  variants (the old enum lumped `VoxGpuOracle` and `VoxWebParity`; the
+  collapse needs them split into `VoxGpuOracleCpu` / `VoxGpuOracleGpu` and
+  `VoxWebParitySkybox` / `VoxWebParityLoaded` / `VoxHorizonNative` so every
+  former boolean maps 1:1); added `#[derive(Resource)]`. Removed the
+  module-level `#![allow(dead_code)]` — `E2eGateMode` is now a live
+  Resource consumed across the crate; the still-dead D6 scaffolding (`Gate`
+  trait, `FrameBudget`, `set_camera_pose`) carries targeted
+  `#[allow(dead_code)]` instead. The `Gate::kind()` return type swapped
+  `GateKind` → `E2eGateMode`.
+- **`crates/bevy_naadf/src/bootstrap.rs`** — added `gate_mode: E2eGateMode`
+  field to `BootstrapInputs` + its `Default` line (`E2eGateMode::Standard`)
+  + the fan-out `app.insert_resource(inputs.gate_mode)`.
+  `run_e2e_render_with_bootstrap_inputs` now picks the e2e window via
+  `window_for_gate_mode(inputs.gate_mode)` instead of
+  `window_for_e2e_args(&inputs.args)`. Pin test updated: the 11
+  `inputs.args.<bool>` asserts collapsed to one
+  `assert_eq!(inputs.gate_mode, E2eGateMode::Standard)` plus the retained
+  `!inputs.args.vox_e2e_mode`.
+- **`crates/bevy_naadf/src/e2e/driver.rs`** — introduced the
+  `#[derive(bevy::ecs::system::SystemParam)] struct E2eDriverConfig<'w>`
+  grouping the driver's three config reads (`app_args`,
+  `spawn_test_entity`, `gate_mode`, all `Option<Res<…>>`). Replaced the
+  Step-8-era ad-hoc `config: (Option<Res<AppArgs>>, Option<Res<SpawnTestEntity>>)`
+  tuple param with `config: E2eDriverConfig`. All 7 mode-detection /
+  filename-selection reads (`resize_test_mode`, `oasis_mode`,
+  `vox_gpu_construction_mode`, `small_edit_mode`, `small_edit_repro_mode`,
+  `vox_gpu_oracle_mode`, `vox_web_parity_mode`, plus the two
+  single-capture filename selectors) swapped from
+  `app_args…is_some_and(|a| a.<bool>)` to `gate_mode` equality / `matches!`
+  checks. The `vox_e2e_mode` ASSERT-time read stays on `app_args`.
+- **`crates/bevy_naadf/src/window_config.rs`** — `window_for_e2e_args(&AppArgs)`
+  → `window_for_gate_mode(E2eGateMode)`; the 3-arm if-ladder on `AppArgs`
+  booleans became a 4-arm `match` on `E2eGateMode`. Import swapped
+  `crate::AppArgs` → `crate::e2e::gate::E2eGateMode`.
+- **`crates/bevy_naadf/src/voxel/grid.rs`** — `setup_test_grid` reads
+  `Res<E2eGateMode>` instead of `Res<AppArgs>`; the test-only CPU-oracle
+  install branch is `*gate_mode == E2eGateMode::VoxGpuOracleCpu`.
+- **8 e2e gate files** — each `run_*` builder dropped its
+  `AppArgs::default()` + mutate-boolean idiom and sets `gate_mode` on the
+  `BootstrapInputs` literal instead; each `pin_*_camera` system reads
+  `Option<Res<E2eGateMode>>`. `vox_e2e.rs` keeps its `AppArgs` local
+  (carries `vox_e2e_mode` — Step 7's scope — and `gate_mode` left at the
+  default `Standard`, since `--vox-e2e` runs the standard driver flow).
+  `small_edit_visual.rs` was the last gate still on the legacy
+  `run_e2e_render_with_args` path — converted to the `BootstrapInputs`
+  fan-out.
+- **`crates/bevy_naadf/src/bin/e2e_render.rs`** — `BootCommand`'s `gate`
+  field typed `E2eGateMode`; `parse_gate_command` maps each flag to its
+  variant (the oracle/parity flags now map to distinct variants);
+  `run_resize_test` builds `BootstrapInputs { gate_mode: Resize }` and
+  routes through the fan-out instead of `run_e2e_render_with_args`. The
+  `NamedGate` arm logs the gate mode for diagnostics.
+- **`crates/bevy_naadf/src/lib.rs`** — deleted `run_e2e_render_with_args`
+  (its only two callers, `run_resize_test` and `run_small_edit_visual`,
+  moved to the `BootstrapInputs` fan-out). Added a defensive
+  `E2eGateMode::default()` seed in `build_app_with_args` (same Step-3/4/5/8
+  pattern — `setup_test_grid` reads `Res<E2eGateMode>` non-Option and the
+  direct `build_app(AppConfig::e2e())` path bypasses the fan-out).
+- **`crates/bevy_naadf/src/app_args.rs`** — deleted the 10 mode-boolean
+  fields + their `Default` lines; `AppArgs` is down to the single
+  `vox_e2e_mode` field. Module + struct docstrings updated.
+- Stale-comment fixups: `e2e/gates.rs`, `voxel/grid.rs` (the
+  `install_vox_sized_to_model` doc), `lib.rs` defensive-seed comments
+  referencing the deleted `run_e2e_render_with_args`.
+
+### The `#[derive(SystemParam)]` struct
+
+`E2eDriverConfig<'w>` — flagged mandatory by the Step 8 side-note. Before
+Step 6, `e2e_driver` was at Bevy's 16-positional-`SystemParam` ceiling and
+Step 8 had grouped two reads into an ad-hoc tuple. Step 6 adds a third
+config read (`E2eGateMode`); a `#[derive(SystemParam)]` struct counts as
+one positional slot regardless of how many resources it groups, so
+`E2eDriverConfig` replaces the tuple and keeps the driver under the
+ceiling with named fields. All three fields are `Option<Res<…>>` (the
+historical reads were all `Option`-tolerant; the driver also runs
+harmlessly in non-e2e `AppConfig`s). No call-site change — Bevy resolves
+the struct's params by type at registration.
+
+### Files touched
+
+| File | Change kind |
+|---|---|
+| `crates/bevy_naadf/src/e2e/gate.rs` | `GateKind` → `E2eGateMode`: rename, 8→11 variants, `#[derive(Resource)]`, drop module dead-code allow |
+| `crates/bevy_naadf/src/bootstrap.rs` | Add `gate_mode` field + `Default` line + fan-out insert; `window_for_gate_mode`; pin test |
+| `crates/bevy_naadf/src/e2e/driver.rs` | New `E2eDriverConfig` `SystemParam` struct; 9 mode reads swapped to `gate_mode` |
+| `crates/bevy_naadf/src/window_config.rs` | `window_for_e2e_args` → `window_for_gate_mode` (match on enum) |
+| `crates/bevy_naadf/src/voxel/grid.rs` | `setup_test_grid` reads `Res<E2eGateMode>`; CPU-oracle branch |
+| `crates/bevy_naadf/src/e2e/oasis_edit_visual.rs` | `run_*` sets `gate_mode`; `pin_*` reads `E2eGateMode` |
+| `crates/bevy_naadf/src/e2e/small_edit_visual.rs` | Legacy `run_e2e_render_with_args` → `BootstrapInputs`; `gate_mode`; `pin_*` |
+| `crates/bevy_naadf/src/e2e/small_edit_repro.rs` | `run_*` sets `gate_mode`; `pin_*` reads `E2eGateMode` |
+| `crates/bevy_naadf/src/e2e/vox_e2e.rs` | `gate_mode` left `Standard`; `vox_e2e_mode` stays on `AppArgs` (Step 7) |
+| `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs` | `run_*` sets `gate_mode`; `pin_*` reads `E2eGateMode` |
+| `crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs` | both `run_*` set `gate_mode`; `pin_*` reads `E2eGateMode` |
+| `crates/bevy_naadf/src/e2e/vox_horizon_parity.rs` | `run_*` sets `gate_mode`; `pin_*` reads `E2eGateMode` |
+| `crates/bevy_naadf/src/e2e/vox_web_parity.rs` | both `run_*` set `gate_mode`; `pin_*` reads `E2eGateMode` |
+| `crates/bevy_naadf/src/bin/e2e_render.rs` | `BootCommand.gate: E2eGateMode`; `parse_gate_command`; `run_resize_test` |
+| `crates/bevy_naadf/src/lib.rs` | Delete `run_e2e_render_with_args`; defensive `E2eGateMode` seed; comment fixups |
+| `crates/bevy_naadf/src/app_args.rs` | Delete 10 mode booleans + `Default` lines; docstrings |
+| `crates/bevy_naadf/src/e2e/gates.rs` | Doc-comment fixup |
+| `docs/orchestrate/config-as-resource-refactor/README.md` | Step 6 ticked |
+
+### Decisions made during impl
+
+1. **`Gate` trait stays dead, with targeted `#[allow(dead_code)]`.** The
+   design's Decision §6 + the module doc say the `Gate` trait / `FrameBudget`
+   / `set_camera_pose` scaffolding is still unconsumed. Removing the
+   module-level `#![allow(dead_code)]` (so `E2eGateMode` — now a live
+   Resource — isn't blanket-allowed) meant putting `#[allow(dead_code)]` on
+   each still-dead item. No behaviour change; just precise dead-code
+   accounting.
+2. **`run_e2e_render_with_args` deleted, not retained.** After Step 6 its
+   only two callers route through `BootstrapInputs`. The design's
+   Assumption #9 anticipated the transitional shapes evaporating; keeping a
+   `pub` entry point with zero callers is rot. `run_e2e_render` (the
+   `Standard`-gate path) is untouched.
+3. **`E2eDriverConfig` over another ad-hoc tuple.** The Step-8 side-note
+   explicitly asked for a real `#[derive(SystemParam)]` struct rather than
+   extending the tuple. Done — named fields, destructured on the driver's
+   first body line.
+4. **`BootCommand`'s `gate` field kept (typed `E2eGateMode`).** The design
+   Assumption #9 says `BootCommand` "evaporates entirely" eventually, but
+   that is a larger parser-shape change beyond Step 6's atomic-commit
+   boundary. Minimal-blast-radius: keep the enum, swap `GateKind` →
+   `E2eGateMode`, and the `gate` field now drives a diagnostic log line
+   (was a bare `let _ = gate;`).
+5. **`vox_e2e` gate → `E2eGateMode::Standard`.** Per Decision §3,
+   `--vox-e2e` runs the standard driver flow; `vox_e2e_mode` is the only
+   surviving `AppArgs` field and stays there for Step 7.
+
+### Verification
+
+- `cargo build --workspace`: PASS (clean — no errors, no warnings).
+- `cargo test --workspace --lib`: PASS (192 passed; 0 failed; 1 ignored).
+  The updated `bootstrap::tests::default_wraps_canonical_app_args_defaults`
+  pin test (now asserting `gate_mode == E2eGateMode::Standard`) is in the
+  passing set.
+- **Every desktop-runnable e2e gate — all PASS:**
+  - `baseline` — region luminance emissive 247.6 / solid 243.7 / sky 202.9.
+  - `--vox-e2e` — vox_geometry centre-rect luminance 250.5, channel max 251.8.
+  - `--oasis-edit-visual` — rect per-pixel RGB Δ=18.07 over the 8.0 floor.
+  - `--small-edit-visual` — click rect max-Δ=18 over floor 15; CPU +1 voxel.
+  - `--small-edit-repro` — 1920×1080; 0 pitch-black pixels before/after.
+  - `--vox-gpu-construction` — rect per-pixel RGB Δ=88.01 over floor 8.0.
+  - `--vox-gpu-oracle-cpu` — `oracle_cpu.png` written (256×256).
+  - `--vox-gpu-oracle-gpu` — `oracle_gpu.png` written (256×256).
+  - `--vox-gpu-oracle` (compare) — SSIM 0.8834 over threshold 0.850.
+  - `--vox-horizon-native` — `vox_horizon_native.png` written (1280×720).
+  - `--vox-web-parity-skybox` — `vox_web_parity_skybox.png` written.
+  - `--vox-web-parity-loaded` — `vox_web_parity_loaded.png` written.
+  - `--vox-web-parity` (compare) — SSIM 0.0179 under dissimilar threshold.
+  - `--entities` — `spawned fixture entity: 4×4×4 green-emissive` line
+    present (proves `SpawnTestEntity(true)` rode the fan-out); entity
+    handler validation PASS.
+  - `--resize-test` — RAN (Hyprland session present); luma ratios 0.9691 /
+    0.9742 over the 0.7 threshold; PASS.
+- Wasm-deploy gates: the `--vox-web-parity-*` family runs natively as
+  single-screenshot capture gates (no wasm build needed) — all ran on
+  desktop above. No gate required a wasm deploy. The in-browser `?skybox=1`
+  / web-parity visual check remains the user's surface (unchanged from
+  Step 5).
+
+### Side notes / observations / complaints
+
+- **The `GateKind` scaffolding held up well.** D6 step 2 set up `GateKind`
+  as exactly the seam Step 6 needed — the design's side-note called this
+  out and it was accurate. The only friction: the D6 enum had 8 variants
+  because it lumped the oracle CPU/GPU pair and the parity
+  skybox/loaded/horizon trio into single `VoxGpuOracle` / `VoxWebParity`
+  variants. The boolean collapse needs a 1:1 boolean→variant mapping, so
+  three variants had to be split out. Mechanical; the `bin/e2e_render.rs`
+  `parse_gate_command` is the one place that benefits — the oracle/parity
+  sub-phases now carry distinct gate modes instead of being told apart by
+  which `run_*` fn-pointer was bundled.
+- **The design's Step 6 spec matched reality** modulo the "11 booleans"
+  count being stale (it's 10 mode booleans + the Decision-§3-exempt
+  `vox_e2e_mode`). The §3.1 `E2eGateMode` variant block was authoritative
+  and landed verbatim. File:line citations had drifted (Steps 2-5/8 shifted
+  lines) but every cited symbol existed; the spec's enumeration of "what
+  Step 6 touches" was an accurate checklist.
+- **The `SystemParam` ceiling was exactly as the Step 8 side-note
+  predicted.** Adding `E2eGateMode` as a 3rd config read would have pushed
+  the tuple-or-positional count over; the `E2eDriverConfig` struct resolves
+  it cleanly. The driver now has *one* named config slot. Note for future
+  steps: the driver is still param-dense — if Step 7's `VoxE2eAssertion`
+  read lands on the driver, it should join `E2eDriverConfig` (one more
+  field on the existing struct, not a new param). Step 9 will drop
+  `app_args` from the struct entirely once `vox_e2e_mode` migrates.
+- **For Step 7:** `vox_e2e_mode` is the sole surviving `AppArgs` field.
+  The driver reads it once at ASSERT time (`driver.rs` ~line 707) via
+  `app_args` on the `E2eDriverConfig` struct; `vox_e2e.rs::run_vox_e2e`
+  sets it on the `AppArgs` local inside the `BootstrapInputs`. Step 7
+  replaces both with a `VoxE2eAssertion` resource + a `BootstrapInputs`
+  field, drops `app_args` from `E2eDriverConfig`, and then Step 9 deletes
+  the `AppArgs` shell.
+- **For Step 9:** after Step 7, `BootstrapInputs.args: AppArgs` and the
+  `build_app_with_args` defensive-seed block (`TaaConfig`, `GiSettings`,
+  `TaaRingConfig`, `ConstructionConfig`, `GridPreset`, `SpawnTestEntity`,
+  `E2eGateMode`) can both go — every caller routes through the fan-out
+  once the legacy `AppArgs` arg is gone. `build_app_with_args` itself
+  becomes a pure resource-fan-out shell; consider folding it into
+  `build_app_with_bootstrap_inputs` at Step 9.
+- **`BootstrapInputs` still has the `args: AppArgs` field** — it carries
+  only `vox_e2e_mode` now. Mildly awkward (one nested boolean) but correct
+  for the incremental boundary; Step 7 drains it.
+- **No foundation rot.** The `BootstrapInputs` carrier + per-domain
+  resources absorbed the largest step (10-boolean enum collapse, ~17 files)
+  with no design re-litigation. The collapse is byte-identical: every gate
+  passed, including the SSIM-compare gates whose thresholds would have
+  caught any pose / window / install-path drift.

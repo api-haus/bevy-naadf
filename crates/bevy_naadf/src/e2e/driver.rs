@@ -43,6 +43,7 @@ use crate::camera::PositionSplit;
 
 use super::checks::{assert_nodes_dispatched, pipeline_scan_result, PipelineScanResult};
 use super::framebuffer::{Framebuffer, Rect};
+use super::gate::E2eGateMode;
 use super::gates::{
     batch_gate, e2e_orbit_camera_transform, e2e_resize_test_camera_transform, expected_spans,
     region_luminance_report, GateState, CURRENT_BATCH,
@@ -78,7 +79,7 @@ pub enum E2ePhase {
     // (`docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
     //  `## GI-bounce-on-resize fix (2026-05-16)`) ---------------------------
     //
-    // Selected when `AppArgs.resize_test == true`. The Warmup branch routes
+    // Selected when `E2eGateMode::Resize` is active. The Warmup branch routes
     // straight into LaunchSettle on tick 0 instead of the production
     // Warmup→Motion→Settle→Shoot→Drain→Assert flow. The camera is pinned at
     // the resize-test pose (see [`super::gates::e2e_resize_test_camera_transform`])
@@ -124,7 +125,7 @@ pub enum E2ePhase {
     // (`crate::e2e::oasis_edit_visual` — `02f-followup`,
     //  the visual-diff edit-pipeline gate) -----------------------------------
     //
-    // Selected when `AppArgs.oasis_edit_visual_mode == true`. The Warmup
+    // Selected when `E2eGateMode::OasisEdit` is active. The Warmup
     // branch routes straight into OasisWarmup on tick 0. The camera is pinned
     // birdseye over the loaded Oasis VOX scene's world centre for the entire
     // sequence; `pin_oasis_camera` overrides whatever pose the standard
@@ -158,7 +159,7 @@ pub enum E2ePhase {
     OasisAssert,
     // --- Small-edit-visual phases (`03g` — single-voxel edit gate) -----------
     //
-    // Selected when `AppArgs.small_edit_visual_mode == true`. The Warmup
+    // Selected when `E2eGateMode::SmallEditVisual` is active. The Warmup
     // branch routes into SmallEditWarmup on tick 0. The camera is pinned
     // birdseye over the default-grid world centre by
     // `small_edit_visual::pin_small_edit_camera`.
@@ -200,8 +201,8 @@ pub enum E2ePhase {
     // --- vox-gpu-oracle phases (Stage 4 — per-pixel CPU oracle vs GPU
     // gate; Stage 14 — SSIM-based comparison restoring real dual-capture) ---
     //
-    // Selected when `AppArgs.vox_gpu_oracle_cpu_phase == true` OR
-    // `AppArgs.vox_gpu_oracle_gpu_phase == true`. Single-screenshot
+    // Selected when `E2eGateMode::VoxGpuOracleCpu` or
+    // `E2eGateMode::VoxGpuOracleGpu` is active. Single-screenshot
     // fast-path: warmup → shoot → drain → save → exit. The driver picks
     // the destination filename (`oracle_cpu.png` for the CPU phase,
     // `oracle_gpu.png` for the GPU phase). No edit phase, no Δ assertion —
@@ -228,8 +229,9 @@ pub enum E2ePhase {
     // --- vox-web-parity phases (web-vox-async-loading 2026-05-18 follow-up
     // Step 8 / Q5 — new native gate) ---------------------------------------
     //
-    // Selected when `AppArgs.vox_web_parity_skybox_phase == true` OR
-    // `AppArgs.vox_web_parity_loaded_phase == true`. Same single-screenshot
+    // Selected when `E2eGateMode::VoxWebParitySkybox`,
+    // `E2eGateMode::VoxWebParityLoaded`, or `E2eGateMode::VoxHorizonNative`
+    // is active. Same single-screenshot
     // fast-path shape as `--vox-gpu-oracle`: warmup → shoot → drain → save
     // → exit. Filename depends on which sub-phase flag is set
     // (`vox_web_parity_skybox.png` vs `vox_web_parity_loaded.png`). The
@@ -360,7 +362,7 @@ fn dispatch_hyprctl_resize(label: &str, width: u32, height: u32) {
 /// (`<resize-args>,<selector>` or `,<selector>` for togglefloating).
 ///
 /// Only called from the resize-test phases (`ResizeA` / `ResizeB`), which
-/// are gated behind `AppArgs.resize_test` — the default e2e harness never
+/// are gated behind `E2eGateMode::Resize` — the default e2e harness never
 /// shells out to hyprctl.
 fn hyprctl_window_selector() -> String {
     "class:e2e_render".to_string()
@@ -436,6 +438,34 @@ fn summarise_clients_for_e2e_render(out: Option<&std::process::Output>) -> Strin
     }
 }
 
+/// Bootstrap-config reads the e2e driver needs, grouped into one
+/// [`SystemParam`] struct.
+///
+/// The driver is at Bevy's 16-positional-`SystemParam` ceiling; Step 6 of
+/// the config-as-resource refactor adds a third config read
+/// ([`E2eGateMode`] — the e2e-mode-boolean collapse) on top of the
+/// Step-8-era `app_args` + `spawn_test_entity` pair. A
+/// `#[derive(SystemParam)]` struct is one positional slot regardless of
+/// how many resources it groups, so this keeps `e2e_driver` under the
+/// ceiling and gives the config reads a name.
+///
+/// All three are `Option<Res<…>>` — the e2e driver also runs (harmlessly)
+/// in non-e2e `AppConfig`s where these resources may be absent, and the
+/// historical reads were all `Option`-tolerant.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct E2eDriverConfig<'w> {
+    /// Residual `AppArgs` — carries only `vox_e2e_mode` after Step 6
+    /// (Bucket A; drains to `VoxE2eAssertion` in Step 7).
+    pub app_args: Option<Res<'w, crate::AppArgs>>,
+    /// Whether the Phase-C `--entities` test fixture was spawned — drives
+    /// the entity-aware ASSERT baseline (Step 8).
+    pub spawn_test_entity: Option<Res<'w, crate::render::construction::SpawnTestEntity>>,
+    /// Which e2e gate flow the run dispatches — the Step-6 collapse of the
+    /// 10 e2e-mode booleans. Drives the per-phase fast-path route-in and
+    /// the single-capture filename selection.
+    pub gate_mode: Option<Res<'w, E2eGateMode>>,
+}
+
 /// The `Update` driver system — advances the state machine one step per tick.
 ///
 /// Also drives the deterministic camera motion: during [`E2ePhase::Motion`] it
@@ -444,10 +474,6 @@ fn summarise_clients_for_e2e_render(out: Option<&std::process::Output>) -> Strin
 /// `sync_position_split` also runs, but the driver writes both so the camera
 /// state is consistent within this very tick — no one-frame lag).
 // Bevy systems legitimately exceed clippy's 7-argument ceiling.
-#[allow(clippy::too_many_arguments)]
-// Bevy systems legitimately exceed clippy's 7-argument ceiling — Phase-C
-// followup #5 adds one read-only `AppArgs` parameter for the entity-pixel
-// gate.
 #[allow(clippy::too_many_arguments)]
 pub fn e2e_driver(
     mut state: ResMut<E2eState>,
@@ -465,24 +491,26 @@ pub fn e2e_driver(
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
-    // Bootstrap-config reads, grouped into one tuple `SystemParam` — the
-    // driver is already at Bevy's 16-param ceiling, so Step 8's new
-    // `SpawnTestEntity` read shares a tuple slot with `app_args` rather than
-    // taking a 17th positional parameter. Steps 6/7 will drain `app_args` (it
-    // still carries the e2e-mode booleans the driver branches on); when that
-    // lands, this tuple can shed `AppArgs` and the grouping can be revisited.
-    config: (
-        Option<Res<crate::AppArgs>>,
-        Option<Res<crate::render::construction::SpawnTestEntity>>,
-    ),
+    // Bootstrap-config reads, grouped into one `#[derive(SystemParam)]`
+    // struct — the driver is at Bevy's 16-positional-param ceiling, so the
+    // three config resources (`app_args`, `spawn_test_entity`, `gate_mode`)
+    // travel in one struct that counts as a single positional slot. Step 6
+    // introduced the struct (replacing the Step-8-era ad-hoc tuple) when it
+    // added the third read, `E2eGateMode`.
+    config: E2eDriverConfig,
 ) {
-    let (app_args, spawn_test_entity) = config;
+    let E2eDriverConfig {
+        app_args,
+        spawn_test_entity,
+        gate_mode,
+    } = config;
     // Resize-test fast-path: at the very first Warmup tick, if --resize-test
     // is set, branch into the resize-test state machine entirely (skips the
     // standard Warmup→Motion→Settle→Shoot→Drain→Assert flow). All assertions
     // are inside the resize-test phases — the standard run_assertions /
     // batch_gate path does NOT run for resize-test runs.
-    let resize_test_mode = app_args.as_deref().is_some_and(|a| a.resize_test);
+    let resize_test_mode =
+        gate_mode.as_deref().copied() == Some(E2eGateMode::Resize);
     if resize_test_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         // Hyprland-only gate. The resize-test triggers the real Wayland
         // resize chain via `hyprctl dispatch resizewindowpixel`, which only
@@ -505,8 +533,8 @@ pub fn e2e_driver(
     }
 
     // `02f-followup` — oasis-edit-visual fast-path. Routes the driver into
-    // the alternate state machine on tick 0 when `AppArgs.oasis_edit_visual_mode`
-    // is set. The camera pose is overwritten every tick by
+    // the alternate state machine on tick 0 when `E2eGateMode::OasisEdit`
+    // is active. The camera pose is overwritten every tick by
     // `super::oasis_edit_visual::pin_oasis_camera` (Update system,
     // `.after(e2e_driver)`), so whatever pose this driver writes is harmless.
     //
@@ -515,12 +543,10 @@ pub fn e2e_driver(
     // camera to C# `(500, 200, 40)` via `pin_vox_gpu_construction_camera`
     // (runs `.after(pin_oasis_camera)`) and substitutes the brush call at
     // `OasisApplyEdit`. The flag is OR'd into the Oasis route-in trigger.
-    let oasis_mode = app_args
-        .as_deref()
-        .is_some_and(|a| a.oasis_edit_visual_mode);
-    let vox_gpu_construction_mode = app_args
-        .as_deref()
-        .is_some_and(|a| a.vox_gpu_construction_mode);
+    let oasis_mode =
+        gate_mode.as_deref().copied() == Some(E2eGateMode::OasisEdit);
+    let vox_gpu_construction_mode =
+        gate_mode.as_deref().copied() == Some(E2eGateMode::VoxGpuConstruction);
     if (oasis_mode || vox_gpu_construction_mode)
         && state.phase == E2ePhase::Warmup
         && state.phase_ticks == 0
@@ -532,9 +558,8 @@ pub fn e2e_driver(
     // `03g` — small-edit-visual fast-path. Routes into SmallEditWarmup on
     // tick 0 when the flag is set. Camera pose owned by
     // `super::small_edit_visual::pin_small_edit_camera`.
-    let small_edit_mode = app_args
-        .as_deref()
-        .is_some_and(|a| a.small_edit_visual_mode);
+    let small_edit_mode =
+        gate_mode.as_deref().copied() == Some(E2eGateMode::SmallEditVisual);
     if small_edit_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::SmallEditWarmup;
         state.phase_ticks = 0;
@@ -543,9 +568,8 @@ pub fn e2e_driver(
     // 2026-05-17 — small-edit-repro fast-path (user-captured Oasis click).
     // Routes into SmallEditReproWarmup on tick 0. Camera pose owned by
     // `super::small_edit_repro::pin_small_edit_repro_camera`.
-    let small_edit_repro_mode = app_args
-        .as_deref()
-        .is_some_and(|a| a.small_edit_repro_mode);
+    let small_edit_repro_mode =
+        gate_mode.as_deref().copied() == Some(E2eGateMode::SmallEditRepro);
     if small_edit_repro_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::SmallEditReproWarmup;
         state.phase_ticks = 0;
@@ -555,9 +579,10 @@ pub fn e2e_driver(
     // into VoxGpuOracleWarmup on tick 0 when either oracle phase flag is set.
     // Camera pose is owned by
     // `super::vox_gpu_oracle::pin_vox_gpu_oracle_camera`.
-    let vox_gpu_oracle_mode = app_args.as_deref().is_some_and(|a| {
-        a.vox_gpu_oracle_cpu_phase || a.vox_gpu_oracle_gpu_phase
-    });
+    let vox_gpu_oracle_mode = matches!(
+        gate_mode.as_deref(),
+        Some(E2eGateMode::VoxGpuOracleCpu | E2eGateMode::VoxGpuOracleGpu)
+    );
     if vox_gpu_oracle_mode && state.phase == E2ePhase::Warmup && state.phase_ticks == 0 {
         state.phase = E2ePhase::VoxGpuOracleWarmup;
         state.phase_ticks = 0;
@@ -567,11 +592,14 @@ pub fn e2e_driver(
     // fast-path. Routes into VoxWebParityWarmup on tick 0 when either parity
     // sub-phase flag is set. Camera pose is owned by
     // `super::vox_web_parity::pin_vox_web_parity_camera`.
-    let vox_web_parity_mode = app_args.as_deref().is_some_and(|a| {
-        a.vox_web_parity_skybox_phase
-            || a.vox_web_parity_loaded_phase
-            || a.vox_horizon_native_phase
-    });
+    let vox_web_parity_mode = matches!(
+        gate_mode.as_deref(),
+        Some(
+            E2eGateMode::VoxWebParitySkybox
+                | E2eGateMode::VoxWebParityLoaded
+                | E2eGateMode::VoxHorizonNative
+        )
+    );
     if vox_web_parity_mode
         && state.phase == E2ePhase::Warmup
         && state.phase_ticks == 0
@@ -1532,12 +1560,10 @@ pub fn e2e_driver(
                         // `oracle_cpu.png`, the GPU phase to
                         // `oracle_gpu.png`; the compare phase loads both
                         // and runs an SSIM comparison.
-                        let is_cpu = app_args
-                            .as_deref()
-                            .is_some_and(|a| a.vox_gpu_oracle_cpu_phase);
-                        let is_gpu = app_args
-                            .as_deref()
-                            .is_some_and(|a| a.vox_gpu_oracle_gpu_phase);
+                        let is_cpu = gate_mode.as_deref().copied()
+                            == Some(E2eGateMode::VoxGpuOracleCpu);
+                        let is_gpu = gate_mode.as_deref().copied()
+                            == Some(E2eGateMode::VoxGpuOracleGpu);
                         let filename = if is_cpu {
                             super::vox_gpu_oracle::ORACLE_CPU_PNG
                         } else if is_gpu {
@@ -1605,15 +1631,12 @@ pub fn e2e_driver(
             if let Some(image) = screenshot.0.take() {
                 match Framebuffer::from_image(&image) {
                     Ok(fb) => {
-                        let is_skybox = app_args
-                            .as_deref()
-                            .is_some_and(|a| a.vox_web_parity_skybox_phase);
-                        let is_loaded = app_args
-                            .as_deref()
-                            .is_some_and(|a| a.vox_web_parity_loaded_phase);
-                        let is_horizon = app_args
-                            .as_deref()
-                            .is_some_and(|a| a.vox_horizon_native_phase);
+                        let is_skybox = gate_mode.as_deref().copied()
+                            == Some(E2eGateMode::VoxWebParitySkybox);
+                        let is_loaded = gate_mode.as_deref().copied()
+                            == Some(E2eGateMode::VoxWebParityLoaded);
+                        let is_horizon = gate_mode.as_deref().copied()
+                            == Some(E2eGateMode::VoxHorizonNative);
                         let filename = if is_horizon {
                             super::vox_horizon_parity::HORIZON_NATIVE_PNG
                         } else if is_skybox {

@@ -184,8 +184,8 @@ pub const VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING: f32 = 0.01;
 /// AND the `--oasis-edit-visual`-shape brush-edit driver flow.
 ///
 /// Returns the harness's `AppExit`. The driver routes through the
-/// `OasisWarmup → ... → OasisAssert` phases (selected when EITHER
-/// `oasis_edit_visual_mode` OR `vox_gpu_construction_mode` is `true`); the
+/// `OasisWarmup → ... → OasisAssert` phases (selected for EITHER
+/// `E2eGateMode::OasisEdit` OR `E2eGateMode::VoxGpuConstruction`); the
 /// camera is overridden by [`pin_vox_gpu_construction_camera`] (which
 /// runs `.after(pin_oasis_camera)` so it takes precedence over the
 /// birdseye); the brush is overridden by `apply_erase_brush`'s mode-aware
@@ -220,7 +220,6 @@ pub fn run_vox_gpu_construction() -> AppExit {
         100.0 * VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING,
     );
 
-    let mut app_args = crate::AppArgs::default();
     // Production W5 path: the only install path. vox-gpu-rewrite Stage 2
     // (2026-05-18) destroyed `fixed_world_size` — `setup_test_grid` always
     // routes `GridPreset::Vox` through `install_vox_in_fixed_world`. The
@@ -233,26 +232,25 @@ pub fn run_vox_gpu_construction() -> AppExit {
     let grid_preset = crate::GridPreset::Vox {
         path: PathBuf::from(&app_path_for_args(&path)),
     };
-    // Route through the Oasis brush-edit driver flow. The driver's
-    // `OasisWarmup` fast-path triggers when EITHER `oasis_edit_visual_mode`
-    // OR `vox_gpu_construction_mode` is set; the brush + assertion mechanics
-    // are identical, the camera + brush position are mode-specific.
-    // NOTE: we deliberately do NOT also set `oasis_edit_visual_mode = true`
-    // — `pin_oasis_camera` would write a birdseye pose every tick that
-    // `pin_vox_gpu_construction_camera` would then override; cleaner to
-    // skip the birdseye write entirely.
-    app_args.vox_gpu_construction_mode = true;
 
     // Step 4 of the config-as-resource refactor — `construction_config`
     // migrated off `AppArgs`. Build the `BootstrapInputs` with the
     // belt-and-braces `gpu_construction_enabled = true` override on the
-    // construction-config field and route through
-    // `run_e2e_render_with_bootstrap_inputs`.
+    // construction-config field.
     let mut construction_config =
         crate::render::construction::ConstructionConfig::for_target_arch();
     construction_config.gpu_construction_enabled = true;
+    // Step 6 of the config-as-resource refactor — the e2e-mode boolean
+    // collapsed into `E2eGateMode`; the gate sets
+    // `gate_mode = VoxGpuConstruction`. The driver's `OasisWarmup`
+    // fast-path triggers for EITHER `E2eGateMode::OasisEdit` OR
+    // `E2eGateMode::VoxGpuConstruction`; the brush + assertion mechanics
+    // are identical, the camera + brush position are mode-specific. Note
+    // the gate is its own variant (NOT `OasisEdit`) so `pin_oasis_camera`
+    // does NOT write a birdseye pose — `pin_vox_gpu_construction_camera`
+    // owns the camera.
     let inputs = crate::bootstrap::BootstrapInputs {
-        args: app_args,
+        gate_mode: crate::e2e::gate::E2eGateMode::VoxGpuConstruction,
         construction_config,
         grid_preset,
         ..crate::bootstrap::BootstrapInputs::default()
@@ -278,17 +276,18 @@ fn app_path_for_args(p: &std::path::Path) -> PathBuf {
 /// branch in `driver.rs` is mode-aware and skips the brush call entirely
 /// for vox-gpu-construction mode.
 ///
-/// Wired only when `AppArgs.vox_gpu_construction_mode == true`; runs
+/// Wired only when `E2eGateMode::VoxGpuConstruction` is active; runs
 /// `.after(pin_oasis_camera)` so it overrides the birdseye pose the
 /// Oasis pin would write (the Oasis driver fast-path doubles as our
 /// fast-path; we need the brush-edit phases but NOT the birdseye camera).
 pub fn pin_vox_gpu_construction_camera(
-    args: Option<Res<crate::AppArgs>>,
+    gate_mode: Option<Res<crate::e2e::gate::E2eGateMode>>,
     oasis: Option<Res<crate::e2e::oasis_edit_visual::OasisEditVisualState>>,
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
 ) {
-    let Some(args) = args else { return; };
-    if !args.vox_gpu_construction_mode {
+    if gate_mode.as_deref().copied()
+        != Some(crate::e2e::gate::E2eGateMode::VoxGpuConstruction)
+    {
         return;
     }
     let promoted = oasis.as_deref().is_some_and(|o| o.edit_applied);

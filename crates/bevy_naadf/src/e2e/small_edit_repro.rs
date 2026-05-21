@@ -144,18 +144,18 @@ pub fn run_small_edit_repro() -> AppExit {
         SMALL_EDIT_REPRO_TY,
     );
 
-    let mut app_args = crate::AppArgs::default();
-    app_args.small_edit_repro_mode = true;
-    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
-    // off `AppArgs` onto `BootstrapInputs.grid_preset`. vox-gpu-rewrite
-    // Stage 2 (2026-05-18): always the W5 GPU producer chain (production
-    // path). The captured camera pose and brush position are absolute
-    // world-voxel coords; the W5 path tiles Oasis at `voxelPos % modelSize`
-    // starting from world origin, so the original user-captured coords
-    // fall inside the first XZ tile and frame the same architecture the
-    // user saw.
+    // Step 6 of the config-as-resource refactor — the e2e-mode boolean
+    // collapsed into `E2eGateMode`; the gate sets `gate_mode = SmallEditRepro`
+    // ([`window_for_gate_mode`] reads it to pick the 1920×1080 window).
+    // Step 5: `grid_preset` rides `BootstrapInputs.grid_preset`.
+    // vox-gpu-rewrite Stage 2 (2026-05-18): always the W5 GPU producer
+    // chain (production path). The captured camera pose and brush position
+    // are absolute world-voxel coords; the W5 path tiles Oasis at
+    // `voxelPos % modelSize` starting from world origin, so the original
+    // user-captured coords fall inside the first XZ tile and frame the same
+    // architecture the user saw.
     let inputs = crate::bootstrap::BootstrapInputs {
-        args: app_args,
+        gate_mode: crate::e2e::gate::E2eGateMode::SmallEditRepro,
         grid_preset: crate::GridPreset::Vox { path },
         ..crate::bootstrap::BootstrapInputs::default()
     };
@@ -167,11 +167,10 @@ pub fn run_small_edit_repro() -> AppExit {
 // ---------------------------------------------------------------------------
 
 pub fn pin_small_edit_repro_camera(
-    args: Option<Res<crate::AppArgs>>,
+    gate_mode: Option<Res<crate::e2e::gate::E2eGateMode>>,
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
 ) {
-    let Some(args) = args else { return; };
-    if !args.small_edit_repro_mode {
+    if gate_mode.as_deref().copied() != Some(crate::e2e::gate::E2eGateMode::SmallEditRepro) {
         return;
     }
     let pose = Transform {

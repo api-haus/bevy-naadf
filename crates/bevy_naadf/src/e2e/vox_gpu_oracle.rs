@@ -278,18 +278,17 @@ pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
         ORACLE_CPU_PNG,
     );
 
-    let mut app_args = crate::AppArgs::default();
-    // vox-gpu-rewrite Stage 14 (2026-05-18): `vox_gpu_oracle_cpu_phase` is
-    // the SOLE test-only escape hatch in `setup_test_grid` that routes to
-    // the legacy `install_vox_sized_to_model` CPU oracle. This is the SOLE
-    // remaining call site of the sized-to-model path and exists
-    // specifically so the oracle gate can compare CPU vs W5 GPU output
-    // via SSIM.
-    app_args.vox_gpu_oracle_cpu_phase = true;
-    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
-    // off `AppArgs` onto `BootstrapInputs.grid_preset`.
+    // Step 6 of the config-as-resource refactor — the e2e-mode boolean
+    // collapsed into `E2eGateMode`; the gate sets
+    // `gate_mode = VoxGpuOracleCpu`. vox-gpu-rewrite Stage 14 (2026-05-18):
+    // `E2eGateMode::VoxGpuOracleCpu` is the SOLE test-only escape hatch in
+    // `setup_test_grid` that routes to the legacy `install_vox_sized_to_model`
+    // CPU oracle — the SOLE remaining call site of the sized-to-model path,
+    // existing specifically so the oracle gate can compare CPU vs W5 GPU
+    // output via SSIM.
+    // Step 5: `grid_preset` rides `BootstrapInputs.grid_preset`.
     let inputs = crate::bootstrap::BootstrapInputs {
-        args: app_args,
+        gate_mode: crate::e2e::gate::E2eGateMode::VoxGpuOracleCpu,
         grid_preset: crate::GridPreset::Vox { path },
         ..crate::bootstrap::BootstrapInputs::default()
     };
@@ -332,20 +331,19 @@ pub fn run_vox_gpu_oracle_gpu_phase() -> AppExit {
         ORACLE_GPU_PNG,
     );
 
-    let mut app_args = crate::AppArgs::default();
-    // The production install path (no oracle-CPU-phase flag) —
-    // `install_vox_in_fixed_world` + W5 GPU producer chain. GPU
-    // construction default-on; explicit assignment for belt-and-braces.
-    app_args.vox_gpu_oracle_gpu_phase = true;
-    // Step 4 of the config-as-resource refactor — `construction_config`
-    // migrated off `AppArgs` onto `BootstrapInputs.construction_config`.
+    // Step 6 of the config-as-resource refactor — the e2e-mode boolean
+    // collapsed into `E2eGateMode`; the gate sets
+    // `gate_mode = VoxGpuOracleGpu`. The production install path (no
+    // oracle-CPU-phase mode) — `install_vox_in_fixed_world` + W5 GPU
+    // producer chain.
+    // Step 4: `construction_config` rides `BootstrapInputs.construction_config`
+    // — GPU construction default-on; explicit assignment for belt-and-braces.
     let mut construction_config =
         crate::render::construction::ConstructionConfig::for_target_arch();
     construction_config.gpu_construction_enabled = true;
-    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
-    // off `AppArgs` onto `BootstrapInputs.grid_preset`.
+    // Step 5: `grid_preset` rides `BootstrapInputs.grid_preset`.
     let inputs = crate::bootstrap::BootstrapInputs {
-        args: app_args,
+        gate_mode: crate::e2e::gate::E2eGateMode::VoxGpuOracleGpu,
         construction_config,
         grid_preset: crate::GridPreset::Vox { path },
         ..crate::bootstrap::BootstrapInputs::default()
@@ -652,16 +650,21 @@ fn load_png_as_framebuffer(path: &Path) -> Result<Framebuffer, String> {
 // ---------------------------------------------------------------------------
 
 /// `Update` system: pin the camera at the shared oracle pose every tick.
-/// Wired only when EITHER `vox_gpu_oracle_cpu_phase` OR
-/// `vox_gpu_oracle_gpu_phase` is `true`. Runs `.after(driver::e2e_driver)`
+/// Wired only when EITHER `E2eGateMode::VoxGpuOracleCpu` OR
+/// `E2eGateMode::VoxGpuOracleGpu` is active. Runs `.after(driver::e2e_driver)`
 /// so the pose pin lands AFTER the driver's pose write but BEFORE
 /// `sync_position_split` consumes the `Transform`.
 pub fn pin_vox_gpu_oracle_camera(
-    args: Option<Res<crate::AppArgs>>,
+    gate_mode: Option<Res<crate::e2e::gate::E2eGateMode>>,
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
 ) {
-    let Some(args) = args else { return; };
-    if !args.vox_gpu_oracle_cpu_phase && !args.vox_gpu_oracle_gpu_phase {
+    if !matches!(
+        gate_mode.as_deref(),
+        Some(
+            crate::e2e::gate::E2eGateMode::VoxGpuOracleCpu
+                | crate::e2e::gate::E2eGateMode::VoxGpuOracleGpu
+        )
+    ) {
         return;
     }
     // Top-down view with `Vec3::X` up (matches `oasis_edit_visual::birdseye_pose`

@@ -207,14 +207,21 @@ pub struct SmallEditVisualState {
 
 /// Boot the e2e harness with `--small-edit-visual` mode active.
 pub fn run_small_edit_visual() -> AppExit {
-    let mut app_args = crate::AppArgs::default();
-    app_args.small_edit_visual_mode = true;
     println!(
         "e2e_render --small-edit-visual: target click voxel {:?}, brush radius {SMALL_EDIT_RADIUS}, \
          paint type {:?}",
         SMALL_EDIT_CLICK_VOXEL, SMALL_EDIT_PAINT_TYPE
     );
-    crate::run_e2e_render_with_args(app_args)
+    // Step 6 of the config-as-resource refactor — the e2e-mode boolean
+    // collapsed into `E2eGateMode`; the gate sets `gate_mode = SmallEditVisual`
+    // and routes through the `BootstrapInputs` fan-out (the legacy
+    // `run_e2e_render_with_args` path was deleted). Default grid preset
+    // (the embedded test grid) — this gate edits the hard-coded scene.
+    let inputs = crate::bootstrap::BootstrapInputs {
+        gate_mode: crate::e2e::gate::E2eGateMode::SmallEditVisual,
+        ..crate::bootstrap::BootstrapInputs::default()
+    };
+    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,14 +258,13 @@ pub fn birdseye_pose() -> Transform {
 
 /// Re-uses the `oasis_edit_visual::pin_oasis_camera` pattern: every tick,
 /// override the camera pose. Wired only when
-/// `AppArgs.small_edit_visual_mode == true`.
+/// `E2eGateMode::SmallEditVisual` is active.
 pub fn pin_small_edit_camera(
-    args: Option<Res<crate::AppArgs>>,
+    gate_mode: Option<Res<crate::e2e::gate::E2eGateMode>>,
     world_data: Option<Res<WorldData>>,
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
 ) {
-    let Some(args) = args else { return; };
-    if !args.small_edit_visual_mode {
+    if gate_mode.as_deref().copied() != Some(crate::e2e::gate::E2eGateMode::SmallEditVisual) {
         return;
     }
     let Some(world_data) = world_data else { return; };

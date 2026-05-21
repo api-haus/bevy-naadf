@@ -38,7 +38,8 @@ use crate::render::budget::EffectiveWorldSize;
 // `EffectiveWorldSize` resource instead of the consts.
 #[cfg(test)]
 use crate::WORLD_SIZE_IN_CHUNKS;
-use crate::{AppArgs, GridPreset};
+use crate::e2e::gate::E2eGateMode;
+use crate::GridPreset;
 
 // Palette indices into `VoxelTypes::types`. Index 0 is the reserved empty
 // placeholder (C# convention) — see `VoxelTypes::default`.
@@ -114,28 +115,28 @@ pub fn demo_origin_v(world_size_in_chunks: UVec3) -> Vec3 {
 ///   `?skybox=1` URL-param surface (mutated into place by
 ///   `web_vox::startup_fetch_default_vox` before this system reads it).
 ///
-/// The `vox_gpu_oracle_cpu_phase` escape hatch is the SOLE test-only branch
-/// that routes `Vox` loads to [`install_vox_sized_to_model`] (the legacy
-/// natural-bound CPU oracle) — used as the CPU phase of the SSIM-based
-/// `--vox-gpu-oracle` gate. Production callers never set this flag.
+/// The [`E2eGateMode::VoxGpuOracleCpu`] escape hatch is the SOLE test-only
+/// branch that routes `Vox` loads to [`install_vox_sized_to_model`] (the
+/// legacy natural-bound CPU oracle) — used as the CPU phase of the
+/// SSIM-based `--vox-gpu-oracle` gate. Production callers never reach this
+/// gate mode.
 pub fn setup_test_grid(
     mut commands: Commands,
     grid_preset: Res<GridPreset>,
-    args: Res<AppArgs>,
+    gate_mode: Res<E2eGateMode>,
     effective_world: Res<EffectiveWorldSize>,
 ) {
     let effective = *effective_world;
-    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
-    // off `AppArgs` onto its own per-domain resource. The legacy
-    // `args.vox_gpu_oracle_cpu_phase` read for the test-only CPU-oracle
-    // branch stays on `AppArgs` until Step 6 collapses the 11 e2e booleans
-    // into `E2eGateMode`.
+    // Step 6 of the config-as-resource refactor — the test-only CPU-oracle
+    // install branch is selected by `E2eGateMode::VoxGpuOracleCpu`, the
+    // per-domain mode resource that collapsed the e2e-mode booleans (the
+    // read was the former `AppArgs.vox_gpu_oracle_cpu_phase`).
     match &*grid_preset {
         GridPreset::Default => {
             install_default_embedded_in_fixed_world(&mut commands, &effective);
         }
         GridPreset::Vox { path } => {
-            if args.vox_gpu_oracle_cpu_phase {
+            if *gate_mode == E2eGateMode::VoxGpuOracleCpu {
                 // Test-only CPU oracle phase for `--vox-gpu-oracle`. The
                 // gate's compare phase pairs this CPU render against the
                 // GPU render of the same fixture through the production W5
@@ -405,7 +406,7 @@ fn install_default_embedded_in_fixed_world(
 
 /// Legacy `.vox` loader — sizes the world to the model's natural bounds.
 ///
-/// Reachable ONLY via the test-only `AppArgs.vox_gpu_oracle_cpu_phase` branch
+/// Reachable ONLY via the test-only `E2eGateMode::VoxGpuOracleCpu` branch
 /// in [`setup_test_grid`] — the CPU oracle phase of the SSIM-based
 /// `--vox-gpu-oracle` gate. The production binary always routes through
 /// [`install_vox_in_fixed_world`]. Kept as a separate path so the CPU-vs-GPU

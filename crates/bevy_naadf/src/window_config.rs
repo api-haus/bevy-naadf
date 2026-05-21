@@ -4,10 +4,10 @@
 //! framebuffer readback is fast and every `pixel_count`-sized buffer is
 //! identical run-to-run (§4.2 determinism row).
 //!
-//! This module also owns the mode→window-config mapping used by
-//! [`crate::run_e2e_render_with_args`] (the lib-root entry point that boots
-//! the e2e binary). Each e2e mode constructor lives next to its peers here so
-//! adding a mode is a one-file edit.
+//! This module also owns the [`E2eGateMode`]→window-config mapping
+//! ([`window_for_gate_mode`]) used by the e2e bootstrap. Each e2e mode
+//! constructor lives next to its peers here so adding a mode is a one-file
+//! edit.
 //!
 //! ## Imports from `crate::e2e` — legitimate consumer, not a dep-arrow bug
 //!
@@ -25,7 +25,7 @@
 //! `WindowConfig::windowed()` constructor — the only one production calls —
 //! reads zero e2e constants.
 
-use crate::AppArgs;
+use crate::e2e::gate::E2eGateMode;
 
 /// Window sizing/title.
 #[derive(Clone, Copy, Debug)]
@@ -145,19 +145,14 @@ impl WindowConfig {
     }
 }
 
-/// Map the active e2e mode (as expressed by the boolean fields on
-/// [`AppArgs`]) to its [`WindowConfig`]. The mapping is mode-disjoint (at
-/// most one e2e flag is true at a time); the order below matches the
-/// historical precedence of the inline if-ladder in
-/// `run_e2e_render_with_args`.
-pub fn window_for_e2e_args(args: &AppArgs) -> WindowConfig {
-    if args.resize_test {
-        WindowConfig::e2e_resize_test()
-    } else if args.small_edit_repro_mode {
-        WindowConfig::e2e_small_edit_repro()
-    } else if args.vox_horizon_native_phase {
-        WindowConfig::e2e_horizon()
-    } else {
-        WindowConfig::e2e()
+/// Map the active [`E2eGateMode`] to its [`WindowConfig`]. Three gate
+/// modes need a non-standard window resolution; every other mode uses the
+/// standard 256×256 fast-readback e2e window.
+pub fn window_for_gate_mode(gate: E2eGateMode) -> WindowConfig {
+    match gate {
+        E2eGateMode::Resize => WindowConfig::e2e_resize_test(),
+        E2eGateMode::SmallEditRepro => WindowConfig::e2e_small_edit_repro(),
+        E2eGateMode::VoxHorizonNative => WindowConfig::e2e_horizon(),
+        _ => WindowConfig::e2e(),
     }
 }

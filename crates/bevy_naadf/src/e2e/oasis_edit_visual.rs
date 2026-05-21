@@ -200,18 +200,17 @@ pub fn run_oasis_edit_visual() -> AppExit {
         std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
     );
 
-    let mut app_args = crate::AppArgs::default();
-    app_args.oasis_edit_visual_mode = true;
-    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
-    // off `AppArgs` onto `BootstrapInputs.grid_preset`. vox-gpu-rewrite
-    // Stage 2 (2026-05-18): always the W5 GPU producer chain. The
-    // brush-edit assertion is on the framebuffer Δ from a
+    // Step 6 of the config-as-resource refactor — the e2e-mode boolean
+    // collapsed into `E2eGateMode`; the gate sets `gate_mode = OasisEdit`.
+    // Step 5: `grid_preset` rides `BootstrapInputs.grid_preset`.
+    // vox-gpu-rewrite Stage 2 (2026-05-18): always the W5 GPU producer
+    // chain. The brush-edit assertion is on the framebuffer Δ from a
     // birdseye-over-world-centre camera; the W5 path tiles Oasis to fill
     // the fixed `(4096, 512, 4096)`-voxel world, so the birdseye sees the
     // tiled architecture and the central edit at world centre still
     // projects to the central screen rect — assertion semantics preserved.
     let inputs = crate::bootstrap::BootstrapInputs {
-        args: app_args,
+        gate_mode: crate::e2e::gate::E2eGateMode::OasisEdit,
         grid_preset: crate::GridPreset::Vox { path },
         ..crate::bootstrap::BootstrapInputs::default()
     };
@@ -308,14 +307,13 @@ pub fn apply_erase_brush(world_data: &mut crate::world::data::WorldData) {
 /// `sync_position_split` consumes the `Transform` (the driver's `.before`
 /// ordering also keeps `sync_position_split` post-pose-update).
 ///
-/// Wired only when `AppArgs.oasis_edit_visual_mode == true`.
+/// Wired only when `E2eGateMode::OasisEdit` is active.
 pub fn pin_oasis_camera(
-    args: Option<Res<crate::AppArgs>>,
+    gate_mode: Option<Res<crate::e2e::gate::E2eGateMode>>,
     world_data: Option<Res<crate::world::data::WorldData>>,
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
 ) {
-    let Some(args) = args else { return; };
-    if !args.oasis_edit_visual_mode {
+    if gate_mode.as_deref().copied() != Some(crate::e2e::gate::E2eGateMode::OasisEdit) {
         return;
     }
     let Some(world_data) = world_data else { return; };

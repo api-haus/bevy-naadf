@@ -15,15 +15,16 @@
 //! struct (e.g. `taa_ring_depth`, `gi`, `construction_overrides`, …) until
 //! `AppArgs` is fully drained and deleted.
 //!
-//! The Step-1 wrappers ([`build_app_with_bootstrap_inputs`],
-//! [`run_e2e_render_with_bootstrap_inputs`]) forward to the existing
-//! [`crate::build_app_with_args`] / [`crate::run_e2e_render_with_args`]
-//! entry points. **No behaviour change at Step 1** — these wrappers are
-//! additive scaffolding; production callers continue to use the existing
-//! entry points until later steps migrate them.
+//! [`build_app_with_bootstrap_inputs`] fans `BootstrapInputs` into the
+//! per-domain resources; [`run_e2e_render_with_bootstrap_inputs`] is the
+//! e2e-gate entry point — it builds the App via the fan-out, picks the
+//! window config from `inputs.gate_mode`, and drives the run to
+//! completion. As of Step 6 every e2e gate routes through these; the
+//! legacy `run_e2e_render_with_args` entry point was deleted.
 
 use bevy::prelude::{App, AppExit};
 
+use crate::e2e::gate::E2eGateMode;
 use crate::render::construction::{ConstructionConfig, SpawnTestEntity};
 use crate::render::taa::{TaaConfig, TaaRingConfig};
 use crate::{AppArgs, AppConfig, GiSettings, GridPreset};
@@ -102,6 +103,18 @@ pub struct BootstrapInputs {
     /// that gates `spawn_phase_c_test_entity` and that the e2e driver reads
     /// to pick the entity-aware ASSERT baseline.
     pub spawn_test_entity: SpawnTestEntity,
+    /// Which e2e gate flow the run dispatches — Bucket B (Mode). Migrated
+    /// out of the 10 mutually-exclusive e2e-mode booleans on `AppArgs`
+    /// (`resize_test`, `oasis_edit_visual_mode`, …, `vox_horizon_native_phase`)
+    /// in Step 6 of the config-as-resource refactor. `E2eGateMode::default()`
+    /// = `E2eGateMode::Standard` (the standard Warmup→Motion→Settle→Shoot
+    /// flow); each per-gate `run_*` builder sets the matching variant. The
+    /// fan-out inserts it as a main-world `Res<E2eGateMode>` that the e2e
+    /// driver state machine and the per-gate `pin_*_camera` systems read,
+    /// and that [`crate::window_config::window_for_gate_mode`] reads to pick
+    /// the e2e window resolution. `vox_e2e_mode` is NOT folded in here — it
+    /// is Bucket A and stays on `AppArgs` until Step 7.
+    pub gate_mode: E2eGateMode,
 }
 
 impl Default for BootstrapInputs {
@@ -121,6 +134,7 @@ impl Default for BootstrapInputs {
             construction_config: ConstructionConfig::for_target_arch(),
             grid_preset: GridPreset::default(),
             spawn_test_entity: SpawnTestEntity::default(),
+            gate_mode: E2eGateMode::default(),
         }
     }
 }
@@ -173,25 +187,31 @@ pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) 
     // has a defensive `SpawnTestEntity::default()` seed; this insert wins
     // for callers routing through the fan-out (the `--entities` e2e boot).
     app.insert_resource(inputs.spawn_test_entity);
+    // Migrated in Step 6 — main-world `E2eGateMode`. The 10 e2e-mode
+    // booleans on `AppArgs` collapsed into this one enum (Bucket B). The
+    // e2e driver state machine branches on it (`Res<E2eGateMode>`), the
+    // per-gate `pin_*_camera` systems read `Option<Res<E2eGateMode>>`, and
+    // `setup_test_grid` reads it for the test-only CPU-oracle install
+    // branch. `build_app_with_args` has a defensive `E2eGateMode::default()`
+    // seed for direct-`build_app` callers; this insert wins for callers
+    // routing through the fan-out (every e2e gate).
+    app.insert_resource(inputs.gate_mode);
     app
 }
 
 /// Boot the bounded windowed e2e render test from a [`BootstrapInputs`] and
 /// return its [`AppExit`].
 ///
-/// Step-2 shape — mirrors [`build_app_with_bootstrap_inputs`]: forward to
-/// [`crate::run_e2e_render_with_args`] for the not-yet-migrated `AppArgs`
-/// fields, then perform a post-build resource insert for fields already
-/// migrated. As more fields migrate, this becomes a pure resource fan-out.
-///
-/// `run_e2e_render_with_args` calls `e2e::run_with_app` which drives the
-/// `AppExit` to completion. To preserve byte-identical determinism after
-/// the resource insert, this wrapper takes the inverted path: build the App
-/// via [`build_app_with_bootstrap_inputs`] (the migrated-resource fan-out)
-/// + the e2e window config + the e2e runner.
+/// The e2e-gate entry point: builds the App via the
+/// [`build_app_with_bootstrap_inputs`] resource fan-out, picks the e2e
+/// window config from `inputs.gate_mode`
+/// ([`crate::window_config::window_for_gate_mode`]), and drives the run to
+/// completion via [`crate::e2e::run_with_app`]. Every per-gate `run_*`
+/// builder under `crate::e2e` constructs a `BootstrapInputs` and calls
+/// this.
 pub fn run_e2e_render_with_bootstrap_inputs(inputs: BootstrapInputs) -> AppExit {
     let mut cfg = AppConfig::e2e();
-    cfg.window = crate::window_config::window_for_e2e_args(&inputs.args);
+    cfg.window = crate::window_config::window_for_gate_mode(inputs.gate_mode);
     let app = build_app_with_bootstrap_inputs(cfg, inputs);
     crate::e2e::run_with_app(app)
 }
@@ -241,17 +261,11 @@ mod tests {
         // `BootstrapInputs.spawn_test_entity` field. The fixture spawner is
         // off by default; the `--entities` e2e boot flips it.
         assert!(!inputs.spawn_test_entity.0);
-        // No e2e gate is active by default.
-        assert!(!inputs.args.resize_test);
+        // Step 6 — the 10 e2e-mode booleans collapsed into the
+        // `E2eGateMode` enum; the default is the standard gate flow.
+        assert_eq!(inputs.gate_mode, crate::e2e::gate::E2eGateMode::Standard);
+        // `vox_e2e_mode` (Bucket A) stays on `AppArgs` until Step 7; off
+        // by default.
         assert!(!inputs.args.vox_e2e_mode);
-        assert!(!inputs.args.oasis_edit_visual_mode);
-        assert!(!inputs.args.small_edit_visual_mode);
-        assert!(!inputs.args.small_edit_repro_mode);
-        assert!(!inputs.args.vox_gpu_construction_mode);
-        assert!(!inputs.args.vox_gpu_oracle_cpu_phase);
-        assert!(!inputs.args.vox_gpu_oracle_gpu_phase);
-        assert!(!inputs.args.vox_web_parity_skybox_phase);
-        assert!(!inputs.args.vox_web_parity_loaded_phase);
-        assert!(!inputs.args.vox_horizon_native_phase);
     }
 }

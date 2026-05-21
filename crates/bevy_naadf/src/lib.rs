@@ -225,11 +225,10 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         primary_window.prevent_default_event_handling = true;
     }
 
-    // `AppArgs` lost `Copy` in Track A (carries `PathBuf` in
-    // `GridPreset::Vox`). The resource gets a clone — `args` is consumed
-    // afterwards for the `spawn_test_entity` / `resize_test` reads below.
-    // `AppConfig` is also inserted so plugins can `.run_if` on its fields
-    // (e.g. `DiagnosticsPlugin` self-skips under e2e).
+    // The `AppArgs` resource is inserted (down to its single residual
+    // `vox_e2e_mode` field after Step 6 — Step 7 drains it, Step 9 deletes
+    // the shell). `AppConfig` is also inserted so plugins can `.run_if` on
+    // its fields (e.g. `DiagnosticsPlugin` self-skips under e2e).
     app.insert_resource(cfg)
         .insert_resource(args.clone())
         // The 128-deep camera-history ring + the monotonic frame counter
@@ -240,9 +239,8 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // Step 3 of the config-as-resource refactor — defensively seed the
     // per-domain `TaaConfig` and `GiSettings` resources at the canonical
     // defaults so the e2e_render binary's direct
-    // `build_app(AppConfig::e2e())` path (`run_e2e_render` /
-    // `run_e2e_render_with_args`, which bypass
-    // `build_app_with_bootstrap_inputs`) still has the resources
+    // `build_app(AppConfig::e2e())` path (`run_e2e_render`, which
+    // bypasses `build_app_with_bootstrap_inputs`) still has the resources
     // `update_camera_history` (`Res<TaaConfig>`) and the settings panel
     // (`ResMut<GiSettings>`) need.  Callers routing through
     // `build_app_with_bootstrap_inputs` overwrite both with their `inputs`
@@ -280,7 +278,7 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     // Step 5 of the config-as-resource refactor — defensive seed for the
     // per-domain `GridPreset`. `setup_test_grid` reads it as `Res<GridPreset>`
     // (non-Option) at `Startup`; the `build_app(AppConfig::e2e())` path
-    // (`run_e2e_render` / `run_e2e_render_with_args`) bypasses
+    // (`run_e2e_render`) bypasses
     // `build_app_with_bootstrap_inputs`, so without the seed the system
     // panics on the missing resource. Canonical default = `GridPreset::Default`
     // (the embedded primitive test scene). Callers routing through the
@@ -302,6 +300,23 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         .contains_resource::<render::construction::SpawnTestEntity>()
     {
         app.insert_resource(render::construction::SpawnTestEntity::default());
+    }
+    // Step 6 of the config-as-resource refactor — defensive seed for the
+    // per-domain `E2eGateMode`. `setup_test_grid` reads it as
+    // `Res<E2eGateMode>` (non-Option) at `Startup`, and the e2e driver
+    // reads it via `Res<E2eGateMode>`; the `build_app(AppConfig::e2e())`
+    // path (`run_e2e_render`) bypasses
+    // `build_app_with_bootstrap_inputs`, so without the seed `setup_test_grid`
+    // panics on the missing resource. Canonical default =
+    // `E2eGateMode::Standard` (the standard gate flow — `baseline`,
+    // `--vox-e2e`, `--entities`). Callers routing through the bootstrap
+    // fan-out overwrite it via `insert_resource` overwrite-in-place. Step 9
+    // deletes this seed once every caller routes through the fan-out.
+    if !app
+        .world()
+        .contains_resource::<crate::e2e::gate::E2eGateMode>()
+    {
+        app.insert_resource(crate::e2e::gate::E2eGateMode::default());
     }
 
     // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#
@@ -484,22 +499,6 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
 /// returned `AppExit` (`e2e-render-test.md` §3 / §7 / §8 / §11 step 7).
 pub fn run_e2e_render() -> AppExit {
     e2e::run_e2e_render()
-}
-
-/// Phase-C wave-3 — boot the windowed e2e with caller-supplied [`AppArgs`].
-///
-/// Mirrors [`run_e2e_render`] but lets the `--entities` flag in `e2e_render`'s
-/// `main` toggle `entities_enabled = true` + `spawn_test_entity = true` for
-/// the fixture-entity render path.
-pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
-    // The window config follows the active e2e mode; the mapping lives in
-    // [`window_config::window_for_e2e_args`] so adding a new mode is a
-    // one-file edit. All non-`--resize-test` / non-`--small-edit-repro` /
-    // non-`--vox-horizon-native` runs use the standard 256×256 e2e window.
-    let mut cfg = AppConfig::e2e();
-    cfg.window = window_config::window_for_e2e_args(&args);
-    let app = build_app_with_args(cfg, args);
-    e2e::run_with_app(app)
 }
 
 // `spawn_phase_c_test_entity` moved to `render::construction::test_fixture`
