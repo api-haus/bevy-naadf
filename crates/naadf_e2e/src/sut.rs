@@ -49,6 +49,28 @@ pub struct SutOpts {
     /// Optional `--e2e-window <w>x<h>` override of the SUT window size
     /// (default 256×256 from the e2e profile).
     pub window: Option<(u32, u32)>,
+    /// `--e2e-vox-oracle-cpu` — route a `--vox` load through the test-only
+    /// natural-bound CPU oracle loader (`E2eGateMode::VoxGpuOracleCpu`) instead
+    /// of the production W5 GPU producer chain. The CPU phase of the
+    /// BRP-driven `vox_gpu_oracle` compare gate (Phase 3b). Boot-time —
+    /// `setup_test_grid` reads it at `Startup`, so it rides the spawn contract.
+    pub vox_oracle_cpu: bool,
+    /// `--e2e-entities` — spawn the Phase-C 4×4×4 emissive-voxel test fixture
+    /// and enable the W4 entity track. The `entities` gate's boot-time config
+    /// (Phase 3b). Both knobs are consumed before `app.run()`, so this rides
+    /// the spawn contract per Forbidden Move #4.
+    pub entities: bool,
+    /// `--e2e-empty-world` — install `GridPreset::Empty` (pure-sky baseline)
+    /// instead of the default embedded test scene. The skybox-baseline phase
+    /// of the BRP-driven `vox_web_parity` compare gate (Phase 3b). Mutually
+    /// exclusive with [`SutOpts::vox`] — a `--vox` path wins.
+    pub empty_world: bool,
+    /// `--e2e-resizable` — make the SUT window user-resizable
+    /// (`Window.resizable = true`). The BRP-driven `resize_test` gate
+    /// (Phase 3b) needs this: winit advertises the surface as fixed-size
+    /// (Wayland compositors refuse the resize) unless `resizable` is `true`,
+    /// so the `naadf/resize_window` verb is a no-op without it.
+    pub resizable: bool,
     /// Explicit BRP port; `None` ⇒ an OS-assigned free port is picked.
     pub port: Option<u16>,
     /// How long [`Sut::spawn`] polls the BRP port for readiness before giving
@@ -71,6 +93,10 @@ impl SutOpts {
             cwd: cwd.into(),
             vox: None,
             window: None,
+            vox_oracle_cpu: false,
+            entities: false,
+            empty_world: false,
+            resizable: false,
             port: None,
             boot_timeout: Duration::from_secs(60),
             inherit_io: true,
@@ -86,6 +112,34 @@ impl SutOpts {
     /// Set the `--e2e-window` size override.
     pub fn window(mut self, width: u32, height: u32) -> Self {
         self.window = Some((width, height));
+        self
+    }
+
+    /// Enable `--e2e-vox-oracle-cpu` — the CPU-oracle install path for the
+    /// `vox_gpu_oracle` compare gate's CPU phase.
+    pub fn vox_oracle_cpu(mut self, enabled: bool) -> Self {
+        self.vox_oracle_cpu = enabled;
+        self
+    }
+
+    /// Enable `--e2e-entities` — the Phase-C entity fixture spawn + W4 entity
+    /// track for the `entities` gate.
+    pub fn entities(mut self, enabled: bool) -> Self {
+        self.entities = enabled;
+        self
+    }
+
+    /// Enable `--e2e-empty-world` — install `GridPreset::Empty` (pure-sky
+    /// baseline) for the `vox_web_parity` gate's skybox phase.
+    pub fn empty_world(mut self, enabled: bool) -> Self {
+        self.empty_world = enabled;
+        self
+    }
+
+    /// Enable `--e2e-resizable` — make the SUT window user-resizable, required
+    /// for the `resize_test` gate's `naadf/resize_window` verb to take effect.
+    pub fn resizable(mut self, enabled: bool) -> Self {
+        self.resizable = enabled;
         self
     }
 
@@ -130,6 +184,18 @@ impl Sut {
         }
         if let Some((w, h)) = opts.window {
             cmd.arg("--e2e-window").arg(format!("{w}x{h}"));
+        }
+        if opts.vox_oracle_cpu {
+            cmd.arg("--e2e-vox-oracle-cpu");
+        }
+        if opts.entities {
+            cmd.arg("--e2e-entities");
+        }
+        if opts.empty_world {
+            cmd.arg("--e2e-empty-world");
+        }
+        if opts.resizable {
+            cmd.arg("--e2e-resizable");
         }
         if opts.inherit_io {
             cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());

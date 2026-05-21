@@ -40,10 +40,17 @@
 //! Every frame-budget constant + camera-pose fn + assertion is reused from the
 //! library **verbatim**: `E2E_WARMUP_FRAMES` / `E2E_MOTION_FRAMES` /
 //! `E2E_SETTLE_FRAMES`, `e2e_orbit_camera_transform`, `check_not_degenerate`,
-//! `check_luminance_alive`, `batch_gate(CURRENT_BATCH, ..)`. The legacy
-//! `assert_nodes_dispatched` (main-world `DiagnosticsStore`) has **no BRP
-//! verb** — `naadf/pipeline_scan` covers the related `PipelineCache` scan; see
-//! the `03-impl.md` Phase 3a side-notes for that gap.
+//! `check_luminance_alive`, `batch_gate(CURRENT_BATCH, ..)`.
+//!
+//! ## 5/5-check parity (Phase 3b)
+//!
+//! The legacy standard-gate `run_assertions` runs five checks. Phase 3a
+//! migrated four (the pure `Framebuffer` / threshold checks) and noted the
+//! fifth — `assert_nodes_dispatched` (the render-graph node-dispatch check
+//! reading the main-world `DiagnosticsStore`) — had **no BRP verb**. Phase 3b
+//! added `naadf/nodes_dispatched` (wrapping the already-`pub`
+//! `assert_nodes_dispatched` + `expected_spans(CURRENT_BATCH)`); this gate now
+//! calls it as step 10, restoring full 5/5-check parity with the legacy gate.
 //!
 //! ## How to run
 //!
@@ -149,9 +156,19 @@ fn standard() {
     batch_gate(CURRENT_BATCH, &gate_state)
         .unwrap_or_else(|msg| panic!("standard gate FAIL — region gate:\n  {msg}"));
 
-    // 10. Pipeline-error scan (`naadf/pipeline_scan` — covers the legacy
-    //     `PipelineCache` scan; the legacy node-dispatch check has no BRP verb).
+    // 10. Pipeline-error scan (`naadf/pipeline_scan` — the legacy
+    //     `PipelineCache` error scan).
     scenario::pipeline_scan(sut.client()).expect("naadf/pipeline_scan reported failures");
 
-    println!("standard: PASS — degenerate floor + luminance liveness + Batch-{CURRENT_BATCH} region gate all green");
+    // 11. Node-dispatch check (`naadf/nodes_dispatched` — the legacy
+    //     `run_assertions` 5th check; restores 5/5-check parity, Phase 3b).
+    //     Asserts every expected render-graph span for `CURRENT_BATCH`
+    //     recorded a `DiagnosticsStore` measurement (the node ran).
+    scenario::nodes_dispatched(sut.client())
+        .expect("naadf/nodes_dispatched reported missing nodes");
+
+    println!(
+        "standard: PASS — degenerate floor + luminance liveness + Batch-{CURRENT_BATCH} \
+         region gate + pipeline scan + node-dispatch check all green (5/5-check parity)"
+    );
 }

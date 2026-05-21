@@ -160,6 +160,26 @@ pub fn pipeline_scan(c: &mut BrpClient) -> BrpResult<()> {
     }
 }
 
+/// Run the SUT's render-graph node-dispatch check (`naadf/nodes_dispatched`).
+/// Returns `Ok(())` when every expected render-graph span for the current
+/// batch recorded a `DiagnosticsStore` measurement (the node ran); an error
+/// carrying the list of missing nodes otherwise.
+///
+/// The `standard` gate's 5th `run_assertions` check (the legacy
+/// `assert_nodes_dispatched`) — Phase 3b closed this parity gap with the
+/// `naadf/nodes_dispatched` verb.
+pub fn nodes_dispatched(c: &mut BrpClient) -> BrpResult<()> {
+    let r: schema::NodesDispatchedResult = c.call_typed("naadf/nodes_dispatched", Value::Null)?;
+    if r.is_ok() {
+        Ok(())
+    } else {
+        Err(BrpClientError::Protocol(format!(
+            "node-dispatch check reported missing nodes: {}",
+            r.result
+        )))
+    }
+}
+
 /// Count the non-empty voxels in the `GridPreset::Default` demo embed
 /// (`naadf/count_demo_voxels`). The `small_edit_visual` gate's Mode-2
 /// phantom-voxel signal — `apply_brush`'s `voxels_delta` measures `voxels_cpu`

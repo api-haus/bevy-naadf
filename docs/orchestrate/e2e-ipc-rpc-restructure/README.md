@@ -51,6 +51,19 @@ branch `feat/android-build`.
   - [x] Phase 2 — full verb set + `naadf_e2e` crate + `oasis_edit_visual` (dual-path green)
   - Phase 3 — migrate remaining gates:
     - [x] Phase 3a — 6 gates migrated (dual-path green)
-    - [ ] Phase 3b — 4 special gates (2 compare + resize + entities) + `nodes_dispatched` verb
+    - [x] Phase 3b — 4 special gates + `nodes_dispatched` verb — 13/13 gates dual-path green
   - [ ] Phase 4 — repoint Playwright cross-target gate
   - [ ] Phase 5 — delete legacy harness
+
+## Phase 5 carry-forward notes
+
+- `E2eGateMode::VoxGpuOracleCpu` is still read by `setup_test_grid` and is load-bearing
+  for the `--e2e-vox-oracle-cpu` spawn flag. `E2eGateMode` is NOT fully dead — Phase 5
+  must replace that one variant's role (a minimal marker / spawn-contract signal) rather
+  than blindly deleting the enum (design Assumption A3 anticipated this).
+- 4 new spawn flags landed on `bin/bevy-naadf`: `--e2e-vox-oracle-cpu`, `--e2e-entities`,
+  `--e2e-empty-world`, `--e2e-resizable`.
+- `resize_test`: the `hyprctl` resize path is a real tiling-Wayland constraint, not rot —
+  a client cannot self-resize on a tiling compositor. The migrated gate keeps `hyprctl`
+  under Hyprland with a BRP-verb fallback elsewhere. D10's "drop Hyprland entirely" is
+  not fully met by design necessity, not by migration shortfall.

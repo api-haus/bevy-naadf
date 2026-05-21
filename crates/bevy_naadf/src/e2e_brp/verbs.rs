@@ -598,11 +598,30 @@ pub fn resize_window(In(params): In<Option<Value>>, world: &mut World) -> BrpRes
             "naadf/resize_window: no unique PrimaryWindow entity",
         ));
     };
+    let scale = window.resolution.scale_factor();
+    let (before_w, before_h) = (
+        window.resolution.physical_width(),
+        window.resolution.physical_height(),
+    );
+    // Set the *physical* resolution directly. `WindowResolution::set` multiplies
+    // the logical size by the scale factor; the runner's `width`/`height` are
+    // the physical-pixel target the gate captures + asserts against, so we want
+    // them applied verbatim, not scale-multiplied.
     window
         .resolution
-        .set(p.width as f32, p.height as f32);
+        .set_physical_resolution(p.width, p.height);
+    info!(
+        "[e2e-brp] naadf/resize_window: Window.resolution physical {}x{} -> {}x{} \
+         (scale_factor {scale}); bevy_winit `changed_windows` issues the winit \
+         request_inner_size next `Last`",
+        before_w, before_h, p.width, p.height,
+    );
 
-    Ok(Value::Null)
+    Ok(json!({
+        "requested_width": p.width,
+        "requested_height": p.height,
+        "scale_factor": scale,
+    }))
 }
 
 // ===========================================================================
@@ -683,6 +702,55 @@ pub fn pipeline_scan(In(_params): In<Option<Value>>, world: &mut World) -> BrpRe
         ));
     };
     let result = crate::e2e::checks::pipeline_scan_result(scan);
+    let result_str = match result {
+        Ok(()) => "ok".to_string(),
+        Err(msg) => msg,
+    };
+    Ok(json!({ "result": result_str }))
+}
+
+// ===========================================================================
+// Node-dispatch check (Phase 3b — standard-gate 5/5-check parity)
+// ===========================================================================
+
+/// `naadf/nodes_dispatched` — instant **main-world** handler. Report the
+/// render-graph node-dispatch check (Phase 3b).
+///
+/// ## Why this verb exists (Phase 3a fidelity gap)
+///
+/// The legacy `standard`-gate `run_assertions` runs five checks. Phase 3a's
+/// migrated `standard` gate ported four — the pure `Framebuffer` / threshold
+/// checks. The fifth, `assert_nodes_dispatched`, reads the main-world
+/// `DiagnosticsStore` and asserts every expected render-graph span for the
+/// current batch recorded a measurement (the node actually ran). It had no
+/// BRP verb, so the migrated gate was at 4/5-check parity. This verb closes
+/// that gap.
+///
+/// ## Implementation
+///
+/// A thin wrapper over the two already-`pub` library fns: it reads the
+/// main-world `DiagnosticsStore` (registered by `FrameTimeDiagnosticsPlugin` /
+/// `RenderDiagnosticsPlugin`, both unconditional in `build_app_core` — so the
+/// store is present in the production SUT) and calls
+/// `e2e::checks::assert_nodes_dispatched` against
+/// `e2e::gates::expected_spans(CURRENT_BATCH)`. `RenderDiagnosticsPlugin`'s
+/// `sync_diagnostics` copies the render-node spans into the main-world store
+/// each frame, so by the time a gate calls this (after its frame budget) the
+/// spans are populated.
+///
+/// Params: `null`. Returns: `{ result: "ok" | <error string> }`.
+pub fn nodes_dispatched(In(_params): In<Option<Value>>, world: &mut World) -> BrpResult {
+    let Some(diagnostics) = world.get_resource::<bevy::diagnostic::DiagnosticsStore>() else {
+        return Err(internal_error(
+            "naadf/nodes_dispatched: DiagnosticsStore not present — \
+             FrameTimeDiagnosticsPlugin / RenderDiagnosticsPlugin did not register \
+             it (build_app_core wiring bug)",
+        ));
+    };
+    let result = crate::e2e::checks::assert_nodes_dispatched(
+        diagnostics,
+        crate::e2e::gates::expected_spans(crate::e2e::gates::CURRENT_BATCH),
+    );
     let result_str = match result {
         Ok(()) => "ok".to_string(),
         Err(msg) => msg,

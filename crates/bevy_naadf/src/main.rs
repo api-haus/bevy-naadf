@@ -36,6 +36,35 @@
 //!   canonical memory budget for deterministic SSIM (see the boot path below).
 //! - `--e2e-window <w>x<h>` — override the SUT window size (default 256×256).
 //!   Only meaningful alongside `--e2e-brp`.
+//! - `--e2e-vox-oracle-cpu` — boot-time knob for the BRP-driven
+//!   `vox_gpu_oracle` compare gate's **CPU-oracle phase**: routes a `--vox`
+//!   load through the test-only `install_vox_sized_to_model` natural-bound CPU
+//!   loader (`E2eGateMode::VoxGpuOracleCpu`) instead of the production W5 GPU
+//!   producer chain. Boot-time because `setup_test_grid` reads it at
+//!   `Startup`; rides the spawn contract per Forbidden Move #4. Only
+//!   meaningful alongside `--e2e-brp` + `--vox`.
+//! - `--e2e-entities` — boot-time knob for the BRP-driven `entities` gate:
+//!   spawns the Phase-C 4×4×4 emissive-voxel test fixture
+//!   (`SpawnTestEntity(true)`) and enables the W4 entity track
+//!   (`ConstructionConfig.entities_enabled = true`). Boot-time config — both
+//!   are consumed before `app.run()` — so it rides the spawn contract. Only
+//!   meaningful alongside `--e2e-brp`.
+//! - `--e2e-empty-world` — boot-time knob for the BRP-driven `vox_web_parity`
+//!   gate's **skybox-baseline phase**: installs `GridPreset::Empty` (an empty
+//!   `WorldData`, no `ModelData`, pure-sky render) instead of the default
+//!   embedded test scene. `setup_test_grid` reads `GridPreset` at `Startup`,
+//!   so it rides the spawn contract. Mutually exclusive with `--vox` (a
+//!   `--vox` path wins). Only meaningful alongside `--e2e-brp`.
+//! - `--e2e-resizable` — boot-time knob for the BRP-driven `resize_test` gate:
+//!   makes the SUT window **user-resizable** (`Window.resizable = true`) and
+//!   pins its Wayland `app_id` / X11 `WM_CLASS` to `bevy_naadf_e2e`
+//!   (`Window.name`). Both are window-creation attributes, so they ride the
+//!   spawn contract. `resizable: true` is required for winit to advertise a
+//!   resizable surface (mirrors the legacy `WindowConfig::e2e_resize_test`);
+//!   the deterministic `app_id` lets the `resize_test` gate target the window
+//!   with a Hyprland `float on` windowrule so a tiling compositor does not
+//!   refuse the `naadf/resize_window` verb's resize (see the gate's module
+//!   doc for the full D10 finding). Only meaningful alongside `--e2e-brp`.
 
 use bevy::prelude::AppExit;
 use bevy_naadf::{AppConfig, GridPreset};
@@ -128,8 +157,71 @@ fn main() -> AppExit {
             if let Some((w, h)) = e2e_window {
                 cfg.window.resolution = Some((w as f32, h as f32));
             }
+            // `--e2e-resizable` — make the SUT window user-resizable AND pin
+            // its app_id. The `resize_test` gate's `naadf/resize_window` verb
+            // drives a winit `request_inner_size`; winit advertises a
+            // fixed-size surface (and a Wayland compositor refuses the resize)
+            // unless `resizable` is `true`, and a *tiling* compositor refuses
+            // it for any non-floating window — so the gate also installs a
+            // `float on` windowrule, which needs a deterministic app_id to
+            // target. Both `resizable` and `name` are window-creation
+            // attributes → boot-time config → spawn contract (this mirrors
+            // the legacy `WindowConfig::e2e_resize_test`, which set the same
+            // two fields).
+            if argv.iter().any(|a| a == "--e2e-resizable") {
+                cfg.window.resizable = true;
+                cfg.window.name = Some("bevy_naadf_e2e");
+            }
+
+            // --- boot-time-knob spawn flags (e2e-ipc-rpc-restructure Phase 3b)
+            // Two `vox_gpu_oracle` / `entities` gate knobs are consumed before
+            // `app.run()` (`setup_test_grid` reads `E2eGateMode` at `Startup`;
+            // `spawn_phase_c_test_entity` reads `SpawnTestEntity` at `Startup`)
+            // — so per Forbidden Move #4 they ride the spawn contract, not a
+            // BRP verb. Bare presence flags, hand-parsed like the others.
+
+            // `--e2e-vox-oracle-cpu` selects the test-only CPU-oracle install
+            // branch: `setup_test_grid` routes a `Vox` load through
+            // `install_vox_sized_to_model` (natural-bound CPU loader) when
+            // `E2eGateMode::VoxGpuOracleCpu` is set. The BRP-driven
+            // `vox_gpu_oracle` compare gate spawns one SUT with this flag (the
+            // CPU phase) and one without (the production W5 GPU phase).
+            let e2e_vox_oracle_cpu = argv.iter().any(|a| a == "--e2e-vox-oracle-cpu");
+
+            // `--e2e-entities` spawns the Phase-C 4×4×4 emissive-voxel test
+            // fixture + enables the W4 entity track — the boot-time config the
+            // legacy `e2e_render --entities` (`EntitiesBoot` arm) sets on its
+            // `BootstrapInputs`.
+            let e2e_entities = argv.iter().any(|a| a == "--e2e-entities");
+
+            // `--e2e-empty-world` installs `GridPreset::Empty` (pure-sky
+            // baseline) — the skybox phase of the BRP-driven `vox_web_parity`
+            // compare gate. A `--vox` path wins (the loaded phase passes
+            // `--vox` and never `--e2e-empty-world`).
+            if argv.iter().any(|a| a == "--e2e-empty-world")
+                && !matches!(grid_preset, GridPreset::Vox { .. })
+            {
+                grid_preset = GridPreset::Empty;
+            }
+
+            let gate_mode = if e2e_vox_oracle_cpu {
+                bevy_naadf::e2e::gate::E2eGateMode::VoxGpuOracleCpu
+            } else {
+                bevy_naadf::e2e::gate::E2eGateMode::default()
+            };
+
+            let mut construction_config =
+                bevy_naadf::render::construction::ConstructionConfig::for_target_arch();
+            if e2e_entities {
+                construction_config.entities_enabled = true;
+            }
+
             let inputs = bevy_naadf::bootstrap::BootstrapInputs {
                 grid_preset,
+                gate_mode,
+                construction_config,
+                spawn_test_entity:
+                    bevy_naadf::render::construction::SpawnTestEntity(e2e_entities),
                 ..Default::default()
             };
             return bevy_naadf::bootstrap::build_app_with_bootstrap_inputs(cfg, inputs)

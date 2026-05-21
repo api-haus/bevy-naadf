@@ -122,7 +122,9 @@ mod install {
             // --- demo-region voxel count (Phase 3a — small_edit_visual gate) -
             .with_method_main("naadf/count_demo_voxels", verbs::count_demo_voxels)
             // --- pipeline scan (Phase 2 — main-world, design correction) -----
-            .with_method_main("naadf/pipeline_scan", verbs::pipeline_scan);
+            .with_method_main("naadf/pipeline_scan", verbs::pipeline_scan)
+            // --- node-dispatch check (Phase 3b — standard-gate 5/5 parity) ---
+            .with_method_main("naadf/nodes_dispatched", verbs::nodes_dispatched);
         app.add_plugins(plugin);
 
         // `RemoteHttpPlugin` — JSON-RPC 2.0 over loopback HTTP. `with_port`
@@ -155,7 +157,7 @@ mod install {
 
         info!(
             "[e2e-brp] BRP HTTP server installed on 127.0.0.1:{port} \
-             (12 naadf/* verbs + built-in world.*/rpc.*; pipeline-scan channel wired)"
+             (13 naadf/* verbs + built-in world.*/rpc.*; pipeline-scan channel wired)"
         );
     }
 }

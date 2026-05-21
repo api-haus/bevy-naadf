@@ -1121,3 +1121,329 @@ Phase 3b migrates the 4 remaining special gates (`vox-gpu-oracle` +
   additions (`naadf/count_demo_voxels`, `advance_one_frame`) were both forced by
   concrete runtime findings, not speculative surface. The restructure is not
   fighting the codebase.
+
+---
+
+## Phase 3b — 4 special gates + nodes_dispatched verb (2026-05-22)
+
+**Verdict: Phase 3b lands. All 4 special gates (`vox_gpu_oracle`,
+`vox_web_parity`, `resize_test`, `entities`) are migrated and green on the new
+BRP path; their legacy equivalents still pass. The `naadf/nodes_dispatched`
+verb closes the Phase-3a `standard`-gate parity gap — the migrated `standard`
+gate is now 5/5-check. Both final builds compile. 13 of the 13 booted-window
+gates are migrated.**
+
+One genuine D10 finding surfaced and is logged loudly below (the `resize_test`
+gate): a programmatic `Window`-resolution change is **refused by a tiling
+Wayland compositor** — the BRP `naadf/resize_window` verb cannot drive a resize
+on Hyprland, exactly as the legacy gate's `hyprctl resizewindowpixel` could not
+without a `float on` windowrule. The migrated gate drives the resize the same
+proven way the legacy gate did. Detailed in the per-gate section + side-notes.
+
+### Part B — `naadf/nodes_dispatched` verb (the 13th verb)
+
+Phase 3a migrated 4 of the legacy `standard`-gate's 5 `run_assertions` checks;
+the 5th — `assert_nodes_dispatched` (reads the main-world `DiagnosticsStore`,
+asserts each expected render-graph span recorded a measurement) — had no BRP
+verb. Phase 3b adds it.
+
+- **`crates/bevy_naadf/src/e2e_brp/verbs.rs`** — added `nodes_dispatched`
+  (instant, main-world handler, ~15 lines as the brief sized it). It reads the
+  main-world `bevy::diagnostic::DiagnosticsStore` and calls the already-`pub`
+  `e2e::checks::assert_nodes_dispatched` against
+  `e2e::gates::expected_spans(e2e::gates::CURRENT_BATCH)`. Returns
+  `{ result: "ok" | <missing-node list> }`. Verified at runtime: the
+  `DiagnosticsStore` is present in the production SUT because
+  `FrameTimeDiagnosticsPlugin` + `RenderDiagnosticsPlugin` are added
+  **unconditionally** in `build_app_core` (`lib.rs:428-429`) — not gated on
+  `add_e2e_systems` — so the verb works on the real production binary.
+- **`crates/bevy_naadf/src/e2e_brp/schema.rs`** — added `NodesDispatchedResult`
+  (`{ result: String }` + `is_ok()`), unconditional like the rest of the
+  schema.
+- **`crates/bevy_naadf/src/e2e_brp/mod.rs`** — registered the verb
+  (`.with_method_main("naadf/nodes_dispatched", verbs::nodes_dispatched)`);
+  the install log line now reads `13 naadf/* verbs`.
+- **`crates/naadf_e2e/src/scenario.rs`** — added the `nodes_dispatched(c)`
+  scenario helper (calls the verb, `Ok(())` on `"ok"`, `Err` carrying the
+  missing-node list otherwise).
+- **`crates/bevy_naadf/tests/standard.rs`** — wired the 5th check in as step
+  11 (`scenario::nodes_dispatched`). The migrated `standard` gate is now
+  5/5-check parity with the legacy gate. Re-verified: **PASS** (see the table).
+
+### Part A — the 4 special gates
+
+#### `vox_gpu_oracle` — compare gate (`tests/vox_gpu_oracle.rs`)
+
+The legacy `--vox-gpu-oracle` was a Layer-1 subprocess orchestrator: it
+spawned two `e2e_render` subprocesses (`--vox-gpu-oracle-cpu` → `oracle_cpu.png`,
+`--vox-gpu-oracle-gpu` → `oracle_gpu.png`), then loaded both PNGs and
+SSIM-compared. The migrated gate collapses all three into **one test body that
+drives the SUT twice** (design §7.3): spawn one SUT in CPU-construction mode,
+capture, drop it; spawn a second in the production W5 GPU-construction mode,
+capture; then SSIM-compare in-process.
+
+- **Boot-time knob → spawn flag.** The CPU/GPU selection is `setup_test_grid`
+  reading `E2eGateMode` at `Startup`: `E2eGateMode::VoxGpuOracleCpu` →
+  `install_vox_sized_to_model` (the test-only natural-bound CPU oracle);
+  anything else → `install_vox_in_fixed_world` (the production W5 chain). Per
+  Forbidden Move #4 this rides the spawn contract — the new `--e2e-vox-oracle-cpu`
+  CLI flag sets `BootstrapInputs.gate_mode = E2eGateMode::VoxGpuOracleCpu`. The
+  GPU phase needs no flag (a bare `--vox` load already routes through W5).
+- **Ported constants — VERBATIM.** `ORACLE_CAMERA_POS` / `ORACLE_CAMERA_LOOK`,
+  `ORACLE_WARMUP_FRAMES = 120`, `ORACLE_SSIM_THRESHOLD = 0.85`. The compare
+  itself is the library's `compare_oracle_frames` (already `pub`) called
+  unchanged — it does the SSIM + the bright/dark sanity guards
+  (`ORACLE_MIN_BRIGHT/DARK_FRACTION`, `ORACLE_BRIGHT/DARK_THRESHOLD`) + the
+  `ORACLE_MEAN_DIFF_FLOOR = 16.0` sanity check. No threshold recalibrated.
+- **Dual-path result.** New BRP path: SSIM **0.8829** ≥ 0.850. Legacy
+  `--vox-gpu-oracle`: SSIM **0.8858** ≥ 0.850. Divergence ~0.003 — TAA/GI
+  shimmer level. Both PASS.
+
+#### `vox_web_parity` — compare gate (`tests/vox_web_parity.rs`)
+
+Same Layer-1-orchestrator collapse: the legacy `--vox-web-parity` spawned a
+skybox-baseline phase (`GridPreset::Empty`) and a vox-loaded phase
+(`GridPreset::Vox`), SSIM-compared, asserting the two are *dissimilar*. The
+migrated gate drives the SUT twice and SSIM-compares in-process.
+
+- **Boot-time knob → spawn flag.** The skybox baseline needs `GridPreset::Empty`
+  (pure-sky world). `setup_test_grid` reads `GridPreset` at `Startup`, so this
+  rides the spawn contract — the new `--e2e-empty-world` CLI flag sets
+  `BootstrapInputs.grid_preset = GridPreset::Empty` (a `--vox` path wins). The
+  loaded phase needs no extra flag (a `--vox` load is the production W5 path).
+- **Ported constants — VERBATIM.** `PARITY_CAMERA_POS` / `PARITY_CAMERA_LOOK`,
+  `PARITY_WARMUP_FRAMES = 120`, `VOX_WEB_PARITY_SSIM_DISSIMILARITY_MAX = 0.85`,
+  `VOX_WEB_PARITY_CHANNEL_MAX_FLOOR = 30.0`. Both legacy assertions ported:
+  (1) the `web-vox-color-divergence` per-channel guard on the loaded frame's
+  central rect (`region_channel_max > 30.0`), then (2) the SSIM dissimilarity
+  check (`ssim_compare_framebuffers < 0.85` — the same `bevy_naadf::e2e::ssim`
+  impl the legacy gate calls). No threshold recalibrated.
+- **Dual-path result.** New BRP path: channel max **186.5** > 30, SSIM
+  **0.0175** < 0.85. Legacy `--vox-web-parity`: channel max **186.9**, SSIM
+  **0.0179**. Divergence sub-1 — TAA/GI shimmer level. Both PASS.
+
+#### `resize_test` — `tests/resize_test.rs` — D10 FINDING, logged loudly
+
+The legacy `--resize-test` boots at 800×600, captures a baseline, resizes the
+window to 1920×1080 then 2000×1000 (300 settle frames each), captures, and
+asserts both post-resize / baseline full-frame luma ratios hold ≥
+`E2E_RESIZE_MIN_LUMA_RATIO` (0.7) — the GI-bounce-on-resize regression repro.
+
+- **Ported constants — VERBATIM.** The three window sizes (`E2E_RESIZE_BOOT/A/B_*`),
+  the camera pose (`e2e_resize_test_camera_transform`, already `pub`), the
+  luma-ratio floor `E2E_RESIZE_MIN_LUMA_RATIO = 0.7`. The `full_frame_luma` +
+  ratio assertion (private fns in `e2e/driver.rs`) ported verbatim into the
+  test file; `Framebuffer::region_luminance` reused unchanged. The 300-frame
+  settle counts reused as `naadf/step` budgets (settle counts, not thresholds).
+
+- **D10 — confirmed half-right; logged loudly.** Design D10 chose the
+  `naadf/resize_window` BRP verb (mutates `Window::resolution` → `bevy_winit`'s
+  `changed_windows` issues a winit `request_inner_size`) to "drop the Hyprland
+  dependency entirely." The migrating agent confirmed against the gate's
+  assertion intent and found:
+  - **The repro is genuinely resize-mechanism-agnostic.** The bug is the TAA/GI
+    ring drain on a swapchain viewport change; the gate asserts on full-frame
+    luma. Nothing in the bug or the assertion is compositor-specific. D10's
+    core judgement holds.
+  - **BUT on a tiling Wayland compositor the BRP verb cannot drive a resize at
+    all.** Verified at runtime in 3 separate runs: (1) with the SUT's default
+    `resizable: false` window the resize was a flat no-op; (2) after adding the
+    `--e2e-resizable` flag (`resizable: true`) the window still would not
+    resize — winit's `request_inner_size` is a client *request* Hyprland
+    refuses; (3) even with a `float on` windowrule making the window *floating*
+    (boot capture confirmed at exactly 800×600, scale 1.0 — i.e. it floated),
+    the verb's `Window::resolution` mutation **still never propagated** — the
+    second resize's verb log showed the "before" size still at the boot size.
+    A tiling Wayland compositor controls window size; a client's runtime
+    `xdg-toplevel` size request is refused. The **legacy gate hit the identical
+    wall** — `run_resize_test` shelled `hyprctl dispatch resizewindowpixel` (a
+    *compositor command* that forcibly resizes) precisely because the client
+    cannot self-resize, and used a `float on` windowrule so the compositor
+    would honour the pixel resize.
+- **Resolution (honest, not papering over).** The migrated gate drives the
+  resize the same proven way the legacy gate did — `hyprctl resizewindowpixel`
+  (compositor-driven) when running under Hyprland, falling back to the
+  `naadf/resize_window` BRP verb otherwise (correct on stacking/floating WMs +
+  X11, where `request_inner_size` is honoured). The verb stays in the codebase
+  as the platform-neutral mechanism; it is simply *insufficient* on a tiling
+  Wayland WM. **D10's "drop the Hyprland dependency entirely" is therefore NOT
+  fully met** — the resize *driver* still needs `hyprctl` under Hyprland. This
+  is a genuine residual coupling, NOT a migration defect: it is a hard fact
+  about tiling-Wayland-compositor behaviour, and the legacy gate carried the
+  identical coupling. The migrated gate also adds a **resize-took-effect guard**
+  (asserts the captures actually changed size) so a future regression of the
+  resize plumbing fails loudly rather than passing trivially on three identical
+  frames. The full reasoning is in the test's module doc.
+- **Spawn flag.** `--e2e-resizable` sets `Window.resizable = true` AND pins the
+  window `app_id` to `bevy_naadf_e2e` (`Window.name`) — both window-creation
+  attributes, so boot-time config → spawn contract. The deterministic `app_id`
+  lets the test's `hyprctl class:` selector + `float on` windowrule target the
+  SUT window. This mirrors the legacy `WindowConfig::e2e_resize_test` (which
+  set the same two fields). The test installs/removes the `float on`
+  windowrule itself (mirroring the legacy `install/cleanup_resize_test_windowrule`).
+- **Dual-path result.** New BRP path: captures **800×600 → 1920×1080 →
+  2000×1000**, luma ratios **0.9695 / 0.9745** ≥ 0.70. Legacy `--resize-test`
+  (this machine has `HYPRLAND_INSTANCE_SIGNATURE` set, so it ran): captures
+  800×600 → 1920×1080 → 2000×1000, luma ratios **0.9692 / 0.9742**. Divergence
+  ~0.0003 — both PASS.
+
+#### `entities` — `tests/entities.rs`
+
+The legacy `--entities` is the `EntitiesBoot` arm in `bin/e2e_render.rs` (no
+`run_*` fn). It runs the **standard** driver flow (warmup → camera-motion sweep
+→ settle → capture) and adds one extra assertion — `assert_entity_pixel`: the
+screen region the 4×4×4 emissive-voxel test-fixture entity projects into is
+brightly lit.
+
+- **Boot-time knob → spawn flag.** The `EntitiesBoot` arm sets
+  `ConstructionConfig.entities_enabled = true` + `SpawnTestEntity(true)` on the
+  `BootstrapInputs` before boot — `spawn_phase_c_test_entity` reads
+  `SpawnTestEntity` at `Startup`, the W4 entity track is a render-graph wiring
+  decision. Per Forbidden Move #4 this rides the spawn contract — the new
+  `--e2e-entities` CLI flag sets both on the SUT's `BootstrapInputs`.
+- **Camera-motion sweep reproduced** exactly as `tests/standard.rs` does —
+  `--entities` runs the standard gate, and `entity_pixel_rect` is calibrated
+  for the post-motion readback pose (`e2e_camera_transform()` =
+  `e2e_orbit_camera_transform(1.0)`). Uses `scenario::advance_one_frame` per
+  motion tick.
+- **Ported constants / assertions — VERBATIM.** `E2E_WARMUP_FRAMES = 96` /
+  `E2E_MOTION_FRAMES = 48` / `E2E_SETTLE_FRAMES = 1`, `e2e_orbit_camera_transform`,
+  the three standard checks (`check_not_degenerate`, `check_luminance_alive`,
+  `batch_gate(CURRENT_BATCH, ..)`), and `assert_entity_pixel` (already `pub` —
+  the `ENTITY_PIXEL_MIN_LUM = 80.0` floor lives inside it). Also runs
+  `naadf/pipeline_scan` + `naadf/nodes_dispatched`. No threshold recalibrated.
+- **Dual-path result.** New BRP path: fixture entity spawned (`4×4×4
+  green-emissive @ Vec3(2046.0, 24.0, 2046.0)`), all 5 standard checks +
+  entity-pixel + node-dispatch green (region luminance: emissive 247.7, solid
+  243.4, sky 203.3). Legacy `--entities`: standard gate PASS + the post-app
+  `validate_entity_handler` PASS. Both PASS. (Note: the legacy `--entities`
+  *also* triggers `PostAppValidations.entities` → the headless
+  `validate_entity_handler` — that headless validator is one of the 9
+  out-of-scope already-headless entries and is NOT migrated; the booted-window
+  `entities` gate behaviour is what Phase 3b owns and migrated.)
+
+### Gate results table
+
+| Gate | New path (`cargo test -p bevy-naadf --features e2e-brp --test <gate>`) | Legacy path | Divergence |
+|---|---|---|---|
+| `vox_gpu_oracle` | PASS — SSIM 0.8829 ≥ 0.85 | PASS — `--vox-gpu-oracle` SSIM 0.8858 | ~0.003 (TAA/GI) |
+| `vox_web_parity` | PASS — ch-max 186.5, SSIM 0.0175 < 0.85 | PASS — `--vox-web-parity` ch-max 186.9, SSIM 0.0179 | sub-1 |
+| `resize_test` | PASS — 800/1920/2000, ratios 0.9695/0.9745 | PASS — `--resize-test` ratios 0.9692/0.9742 | ~0.0003 |
+| `entities` | PASS — 5 checks + entity-pixel + node-dispatch | PASS — `--entities` standard gate + entity-handler | n/a |
+| `standard` (re-run, 5th check) | PASS — degenerate + luminance + region + pipeline-scan + **node-dispatch** (5/5 parity) | (Phase 3a — unchanged) | n/a |
+| `cargo build --workspace` (default) | PASS — 0 errors | — | — |
+| `cargo build -p bevy-naadf --features e2e-brp` | PASS — 0 errors | — | — |
+
+All migrated thresholds ported verbatim; none recalibrated. Every gate is
+dual-path green; the largest fidelity divergence is ~0.003 SSIM
+(`vox_gpu_oracle`), TAA/GI shimmer level.
+
+### Spawn-contract additions — every new CLI flag on `bin/bevy-naadf`
+
+All four are bare presence flags (except none take an argument), hand-parsed in
+`main.rs`'s `--e2e-brp` boot branch alongside the existing `--e2e-brp` /
+`--e2e-window` / `--vox`, consistent with the "no `clap`" doctrine. All only
+meaningful alongside `--e2e-brp`; all native-only (inside the
+`not(target_arch = "wasm32")` block). All set fields on `BootstrapInputs` /
+`AppConfig` *before* `app.run()` — none is a BRP verb (Forbidden Move #4).
+
+| Flag | Effect |
+|---|---|
+| `--e2e-vox-oracle-cpu` | `BootstrapInputs.gate_mode = E2eGateMode::VoxGpuOracleCpu` — routes a `--vox` load through the test-only `install_vox_sized_to_model` CPU oracle. The `vox_gpu_oracle` gate's CPU phase. |
+| `--e2e-entities` | `BootstrapInputs.spawn_test_entity = SpawnTestEntity(true)` + `construction_config.entities_enabled = true` — spawns the Phase-C fixture entity + enables the W4 entity track. The `entities` gate. |
+| `--e2e-empty-world` | `BootstrapInputs.grid_preset = GridPreset::Empty` (pure-sky baseline) — a `--vox` path wins. The `vox_web_parity` gate's skybox phase. |
+| `--e2e-resizable` | `AppConfig.window.resizable = true` + `AppConfig.window.name = Some("bevy_naadf_e2e")` — makes the SUT window resizable + pins its app_id. The `resize_test` gate. |
+
+`naadf_e2e`'s `SutOpts` gained matching builder methods (`vox_oracle_cpu`,
+`entities`, `empty_world`, `resizable`) that append the flag to the spawn
+`Command`. The `naadf/resize_window` verb was also improved: it now calls
+`WindowResolution::set_physical_resolution` (the runner passes physical-pixel
+targets, not logical — `set` would scale-multiply them) and returns
+`{ requested_width, requested_height, scale_factor }` instead of `null`.
+
+### Anything Phase 4 / 5 must know
+
+- **All 13 booted-window gates are now migrated.** Phase 2 (`oasis_edit_visual`)
+  + Phase 3a (`standard`, `vox_e2e`, `small_edit_visual`, `small_edit_repro`,
+  `vox_gpu_construction`, `vox_horizon_native`) + Phase 3b (`vox_gpu_oracle`,
+  `vox_web_parity`, `resize_test`, `entities`) = 13. The BRP verb set is now 13
+  verbs. The `standard` gate is 5/5-check parity. Every gate file lives in
+  `crates/bevy_naadf/tests/<gate>.rs`.
+- **Phase 4 (Playwright cross-target gate).** Unaffected by Phase 3b's changes
+  — Phase 4 repoints `e2e/tests/vox-horizon-parity.spec.ts` onto
+  `cargo test ... --test vox_horizon_native` (Phase 3a) + the shrunk
+  `e2e_render --ssim-compare` utility. The Phase 3a forward-note about the
+  native PNG path (`crates/bevy_naadf/target/e2e-screenshots/vox_horizon_native.png`
+  under the BRP test vs `target/e2e-screenshots/...` under legacy `cargo run`)
+  still stands. Phase 3b added no new Playwright dependency.
+- **Phase 5 (delete the legacy harness).** The legacy `e2e_render` path is
+  untouched and still runnable — confirmed: `--vox-gpu-oracle`,
+  `--vox-web-parity`, `--resize-test`, `--entities` all still pass. Phase 5's
+  deletion ledger (`02-design.md` §10) is unchanged by Phase 3b. **One Phase-3b
+  addition Phase 5 must NOT delete blindly:** the `--e2e-vox-oracle-cpu` /
+  `--e2e-empty-world` / `--e2e-entities` / `--e2e-resizable` spawn flags +
+  their `SutOpts` builders are part of the *new* BRP harness, not the legacy
+  one. Phase 5 deletes `bin/e2e_render`'s parser + `e2e/driver.rs` +
+  `E2eGateMode` etc. — but `E2eGateMode::VoxGpuOracleCpu` is still **read by
+  `setup_test_grid`** (`voxel/grid.rs:139`) and the `--e2e-vox-oracle-cpu` flag
+  still needs it. If Phase 5 deletes `E2eGateMode` entirely it must replace
+  that one `setup_test_grid` branch with a dedicated marker resource the spawn
+  contract sets (design §A3 already flagged this exact `setup_test_grid` reader
+  as needing a replacement signal — Phase 3b confirms it: the CPU-oracle branch
+  is the *only* remaining load-bearing `E2eGateMode` reader the BRP path uses,
+  and it must survive in some form).
+- **`resize_test` keeps a `hyprctl` dependency** (the D10 finding above). Phase 5
+  should be aware the migrated `resize_test` gate is NOT fully
+  compositor-independent — it shells `hyprctl resizewindowpixel` under Hyprland.
+  This is the honest minimum (the legacy gate had the same coupling); the
+  `naadf/resize_window` verb is the platform-neutral fallback for non-tiling
+  WMs. If a future requirement needs a truly headless resize-blackness gate,
+  the fix is rendering to a fixed offscreen target decoupled from the window
+  swapchain — a real architectural change, out of scope here.
+
+## Side notes / observations / complaints
+
+- **D10 was an over-optimistic design call, and it is worth the orchestrator
+  noting the pattern.** D10's "flips the call" clause said *"if the resize bug
+  is specifically a compositor-driven resize, the Hyprland path would be
+  needed."* The bug is NOT compositor-driven — but driving *any* resize at all
+  on a tiling Wayland compositor requires the compositor, because a client
+  cannot self-resize there. D10 conflated "the bug is mechanism-agnostic"
+  (true) with "therefore a programmatic resize suffices" (false on tiling
+  Wayland). The design judged this from reading code, not from running it on
+  the actual compositor — the legacy gate's `hyprctl` + `float on` windowrule
+  were *right there in the code* as evidence that a client-side resize does not
+  work, and D10 read them as "machine-specific rot" rather than "load-bearing
+  workaround for a real constraint." The migrated gate ends up structurally
+  identical to the legacy gate's resize mechanism. No harm done — the gate is
+  green and faithful — but it is a clean example of why a runtime check beats a
+  code-reading judgement for anything touching the windowing system.
+- **`naadf/resize_window` as `set` vs `set_physical_resolution` was a latent
+  bug.** The Phase-2 verb called `WindowResolution::set(w, h)`, which multiplies
+  by the scale factor. A runner passing `1920, 1080` on a HiDPI display would
+  have got a `1920·scale × 1080·scale` physical window — wrong. The runner's
+  `width`/`height` are unambiguously physical-pixel targets (they are what the
+  framebuffer capture is asserted against), so the verb now calls
+  `set_physical_resolution`. This was invisible until Phase 3b because
+  `resize_window` had no gate exercising it before now.
+- **The compare-gate collapse was clean.** Both `vox_gpu_oracle` and
+  `vox_web_parity` reused the library's existing compare logic verbatim —
+  `compare_oracle_frames` and `ssim_compare_framebuffers` are both already
+  `pub` and pure (`&Framebuffer` in, `Result` out). The "drive the SUT twice"
+  shape (spawn → capture → drop → spawn → capture) is the natural expression;
+  `Sut::Drop` killing the subprocess means no port juggling. No new
+  `pub`-visibility additions were needed for either compare gate — `e2e::ssim`
+  and `e2e::vox_gpu_oracle::compare_oracle_frames` were already public.
+- **No new `pub`-visibility additions for any of the 4 gates.** Everything the
+  test files import (`compare_oracle_frames`, `ORACLE_*`,
+  `ssim_compare_framebuffers`, `PARITY_*`, `VOX_WEB_PARITY_*`,
+  `e2e_resize_test_camera_transform`, `E2E_RESIZE_*` were re-declared as test
+  constants verbatim, `assert_entity_pixel`, `batch_gate`, `GateState`,
+  `e2e_orbit_camera_transform`) was already `pub`. The legacy code is genuinely
+  well-factored for this migration — the rot is all in the orchestration glue,
+  exactly as the design's §-side-notes claimed.
+- **`bin/e2e_render`, `e2e/driver.rs`, `e2e/gate.rs`, `E2eGateMode`,
+  `add_e2e_systems`, the per-gate `run_*` fns — all UNTOUCHED.** Phase 3b
+  edited only: `e2e_brp/{mod,verbs,schema}.rs`, `main.rs`, `naadf_e2e/{sut,scenario}.rs`,
+  `tests/standard.rs`, and added 4 new `tests/*.rs` files. The legacy path is
+  byte-unchanged and still green.

@@ -287,3 +287,31 @@ impl PipelineScanResult {
         self.result == "ok"
     }
 }
+
+// ---------------------------------------------------------------------------
+// naadf/nodes_dispatched
+// ---------------------------------------------------------------------------
+
+/// Return of `naadf/nodes_dispatched` — the main-world render-graph
+/// node-dispatch check (Phase 3b — closes the `standard` gate's 5th-check
+/// parity gap; wraps `e2e::checks::assert_nodes_dispatched` +
+/// `e2e::gates::expected_spans`).
+///
+/// Asserts every expected render-graph span for the current batch recorded a
+/// `DiagnosticsStore` measurement — i.e. the node actually ran. A node that
+/// early-returns because its pipeline failed records *no* span, so a missing
+/// span is a second, cheaper "the node never ran" signal complementing the
+/// `naadf/pipeline_scan` `PipelineCache` error scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodesDispatchedResult {
+    /// `"ok"` when every expected render-graph span recorded a measurement;
+    /// otherwise a human-readable list of the missing nodes.
+    pub result: String,
+}
+
+impl NodesDispatchedResult {
+    /// Whether every expected render-graph node dispatched.
+    pub fn is_ok(&self) -> bool {
+        self.result == "ok"
+    }
+}
