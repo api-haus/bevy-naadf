@@ -49,6 +49,8 @@ branch `feat/android-build`.
   - [x] Phase 0 — transport spike (A1 + A2 confirmed)
   - [x] Phase 1 — BRP server scaffold (3 verbs, all gates green)
   - [x] Phase 2 — full verb set + `naadf_e2e` crate + `oasis_edit_visual` (dual-path green)
-  - [ ] Phase 3 — migrate remaining gates (3a: 6 gates · 3b: 4 special gates)
+  - Phase 3 — migrate remaining gates:
+    - [x] Phase 3a — 6 gates migrated (dual-path green)
+    - [ ] Phase 3b — 4 special gates (2 compare + resize + entities) + `nodes_dispatched` verb
   - [ ] Phase 4 — repoint Playwright cross-target gate
   - [ ] Phase 5 — delete legacy harness

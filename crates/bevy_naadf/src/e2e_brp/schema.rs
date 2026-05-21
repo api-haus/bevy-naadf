@@ -254,6 +254,21 @@ pub struct ResizeWindowParams {
 }
 
 // ---------------------------------------------------------------------------
+// naadf/count_demo_voxels
+// ---------------------------------------------------------------------------
+
+/// Return of `naadf/count_demo_voxels` — the non-empty voxel count of the
+/// `GridPreset::Default` demo embed region (Phase 3a — the `small_edit_visual`
+/// gate's Mode-2 phantom-voxel signal; see the verb handler doc for why
+/// `apply_brush`'s `voxels_delta` is the wrong measure).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CountDemoVoxelsResult {
+    /// Non-empty voxels in the demo embed (the full chunk/block/voxel cell
+    /// decode, scoped to the ~131k-voxel demo region).
+    pub count: u64,
+}
+
+// ---------------------------------------------------------------------------
 // naadf/pipeline_scan
 // ---------------------------------------------------------------------------
 

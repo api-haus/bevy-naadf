@@ -119,6 +119,8 @@ mod install {
             .with_method_main("naadf/load_world", verbs::load_world)
             .with_method_main("naadf/region_gate", verbs::region_gate)
             .with_method_main("naadf/resize_window", verbs::resize_window)
+            // --- demo-region voxel count (Phase 3a — small_edit_visual gate) -
+            .with_method_main("naadf/count_demo_voxels", verbs::count_demo_voxels)
             // --- pipeline scan (Phase 2 — main-world, design correction) -----
             .with_method_main("naadf/pipeline_scan", verbs::pipeline_scan);
         app.add_plugins(plugin);
@@ -153,7 +155,7 @@ mod install {
 
         info!(
             "[e2e-brp] BRP HTTP server installed on 127.0.0.1:{port} \
-             (11 naadf/* verbs + built-in world.*/rpc.*; pipeline-scan channel wired)"
+             (12 naadf/* verbs + built-in world.*/rpc.*; pipeline-scan channel wired)"
         );
     }
 }

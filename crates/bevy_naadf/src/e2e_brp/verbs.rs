@@ -606,6 +606,42 @@ pub fn resize_window(In(params): In<Option<Value>>, world: &mut World) -> BrpRes
 }
 
 // ===========================================================================
+// Demo-region voxel count (Phase 3a — small_edit_visual gate)
+// ===========================================================================
+
+/// `naadf/count_demo_voxels` — instant main-world handler. Count the non-empty
+/// voxels in the `GridPreset::Default` demo embed region (Phase 3a — the
+/// `small_edit_visual` gate's Mode-2 phantom-voxel signal).
+///
+/// ## Why this verb exists (Phase 3a migration finding)
+///
+/// The `small_edit_visual` gate's load-bearing Mode-2 check is "a single-voxel
+/// `cube_brush(radius=1)` produces exactly +1 *non-empty voxel*". The
+/// `naadf/apply_brush` verb returns `voxels_delta` — the change in
+/// `WorldData::voxels_cpu` *length* — but `voxels_cpu` is a flat `u32` array
+/// where one 4×4×4 voxel block is a 32-`u32` record (64 voxels, packed
+/// 2-per-`u32`). Editing a previously-empty block allocates the whole 32-`u32`
+/// record, so `voxels_delta` is `32` for a single new voxel — NOT the +1
+/// non-empty-voxel signal the gate's `assert_small_edit_landed` Mode-2 check
+/// needs. This verb wraps `e2e::small_edit_visual::count_non_empty_voxels` —
+/// which decodes the three-layer chunk/block/voxel cells and counts genuine
+/// non-empty voxels, scoped to the ~131k-voxel demo embed (the full
+/// 4096³-voxel world would be ~8.5G iterations / multi-second) — so the test
+/// body gets the exact pre/post count the legacy `apply_small_cube_edit` took.
+///
+/// Params: `null`. Returns: `{ count: u64 }`.
+pub fn count_demo_voxels(In(_params): In<Option<Value>>, world: &mut World) -> BrpResult {
+    let Some(wd) = world.get_resource::<WorldData>() else {
+        return Err(internal_error(
+            "naadf/count_demo_voxels: WorldData resource missing — the world \
+             is not yet installed",
+        ));
+    };
+    let count = crate::e2e::small_edit_visual::count_non_empty_voxels(wd);
+    Ok(json!({ "count": count }))
+}
+
+// ===========================================================================
 // Pipeline scan (Phase 2 — design §6.3 / D7)
 // ===========================================================================
 

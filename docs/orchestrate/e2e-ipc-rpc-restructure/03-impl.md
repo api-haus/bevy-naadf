@@ -810,3 +810,314 @@ Same gate, same rect, same `voxels_delta 6528` brush footprint, Δ divergence
   `default-features = false` dep on `bevy-naadf`; no third crate, no feature
   scramble. The one edit it cost was making `pub mod e2e_brp;` unconditional in
   `lib.rs` and gating `verbs` + `install` *inside* the module — clean.
+
+---
+
+## Phase 3a — migrate 6 gates (2026-05-22)
+
+**Verdict: Phase 3a lands clean. All 6 gates green on BOTH the new BRP path and
+the legacy `e2e_render` path; the default `cargo build --workspace` still
+compiles. One new BRP verb (`naadf/count_demo_voxels`) + two `naadf_e2e`
+scenario helpers were added — both forced by genuine migration findings, both
+detailed below. The 6 migrated gates are
+`crates/bevy_naadf/tests/{standard,vox_e2e,small_edit_visual,small_edit_repro,vox_gpu_construction,vox_horizon_native}.rs`.**
+
+### What changed
+
+**New gate test files (`crates/bevy_naadf/tests/`):**
+
+- `standard.rs`, `vox_e2e.rs`, `small_edit_visual.rs`, `small_edit_repro.rs`,
+  `vox_gpu_construction.rs`, `vox_horizon_native.rs` — one BRP-driven `#[test]`
+  per gate, following the `oasis_edit_visual.rs` Phase-2 template.
+
+**`bevy_naadf` (SUT side) — one new verb, behind `#[cfg(feature = "e2e-brp")]`:**
+
+- `crates/bevy_naadf/src/e2e_brp/verbs.rs` — added `naadf/count_demo_voxels`
+  (`count_demo_voxels` handler). Wraps `e2e::small_edit_visual::count_non_empty_voxels`
+  — the demo-embed-scoped non-empty-voxel decode-count. See "New verb" below.
+- `crates/bevy_naadf/src/e2e_brp/mod.rs` — registered the verb (now 12 verbs);
+  bumped the install log line `11 → 12`.
+- `crates/bevy_naadf/src/e2e_brp/schema.rs` — added `CountDemoVoxelsResult`
+  (`{ count: u64 }`), unconditional like the rest of the schema.
+
+**`naadf_e2e` (runner side) — two new scenario helpers:**
+
+- `crates/naadf_e2e/src/scenario.rs` — `advance_one_frame(c)` (a single-frame
+  `step` + `run_until_idle` with `idle_frames: 1` — the per-frame primitive the
+  `standard` / `vox_e2e` camera-motion sweep needs) and `count_demo_voxels(c)`
+  (wraps the new verb).
+
+`bin/e2e_render`, `e2e/driver.rs`, `e2e/gate.rs`, `E2eGateMode`,
+`add_e2e_systems`, the per-gate `run_*` boot fns — all UNTOUCHED, as the brief
+mandates. No `pub`-visibility additions were needed: every assertion / geometry
+helper the tests import (`gates::{batch_gate, e2e_orbit_camera_transform,
+region_luminance_report, GateState, CURRENT_BATCH}`, `vox_e2e::{write_vox_e2e_fixture_to_temp,
+assert_vox_geometry_visible}`, `small_edit_visual::{birdseye_pose,
+small_edit_click_voxel_world, count_non_empty_voxels, assert_small_edit_landed,
+SMALL_EDIT_*}`, `small_edit_repro::{assert_no_pitch_black_pixels,
+SMALL_EDIT_REPRO_*}`, `vox_gpu_construction::{assert_vox_gpu_construction_landed,
+VOX_GPU_CONSTRUCTION_*}`, `vox_horizon_parity::{HORIZON_*}`, `camera::poses::{HORIZON_CAMERA_*}`)
+was already `pub`.
+
+### New verb — `naadf/count_demo_voxels` (migration finding, NOT speculative)
+
+**The `small_edit_visual` gate forced this.** Its load-bearing **Mode-2**
+(phantom-voxel) check is "a single-voxel `cube_brush(radius=1)` produces exactly
+**+1 non-empty voxel**" — the legacy `apply_small_cube_edit` snapshots
+`count_non_empty_voxels(world_data)` before + after the brush and
+`assert_small_edit_landed` asserts `after == before + 1`.
+
+The first migration draft tried to reuse `naadf/apply_brush`'s existing
+`voxels_delta` return as that signal. **That is wrong, and the run proved it:**
+`voxels_delta` is the change in `WorldData::voxels_cpu` *array length*, and
+`voxels_cpu` packs one 4×4×4 voxel block as a 32-`u32` record. Editing a single
+voxel in a previously-empty block allocates the whole record, so the verb
+reported `voxels_delta = 32` for one new voxel — the `assert_small_edit_landed`
+Mode-2 check fired `count 0 → 32 (Δ=32)` "phantom voxels".
+
+The genuine non-empty-voxel count needs the three-layer chunk/block/voxel cell
+decode (`count_non_empty_voxels`), and that fn is demo-region scoped on purpose
+(~131k iterations; the full 4096³-voxel world is ~8.5G iterations / multi-second
+per call — its own doc says so). There is no way to get this signal from the
+existing 11 verbs. So Phase 3a adds a 12th verb wrapping the library fn
+verbatim. It is a thin wrapper, feature-gated, and the verb's own doc records
+exactly why `apply_brush.voxels_delta` was the wrong measure. Verified at
+runtime: BRP path reports `31216 → 31217 (Δ 1)`, legacy reports identical
+`31216 → 31217 (Δ=1)`.
+
+### New scenario helper — `advance_one_frame` (migration finding)
+
+**The `standard` gate forced this.** A first draft pinned the camera *statically*
+at the `gates::e2e_camera_transform()` readback pose and warmed up the full
+145-frame budget. It FAILED `Framebuffer::check_not_degenerate` with
+`has_dark=false, has_bright=true` — a fully GI-converged static frame has no
+dark geometry, but the gate requires both dark and bright pixels.
+
+Root cause: the legacy standard gate's readback pose is one the camera reaches
+**only by moving** — `E2E_SETTLE_FRAMES` is deliberately `1` (the `e2e/mod.rs`
+const doc: "every extra static frame lets the static-camera running average
+re-converge… and washes the regression out"). The gate's three assertions
+(`check_not_degenerate`, `check_luminance_alive`, `assert_batch_6`'s
+`MIN_GI_BOUNCE_AFTER_MOTION`) are all calibrated for a *post-camera-motion,
+1-settle-frame* readback.
+
+So `standard` and `vox_e2e` (which also runs the standard driver flow) now
+reproduce the legacy driver's three phases verbatim — `Warmup` (96 frames static
+at `e2e_orbit_camera_transform(0.0)`), `Motion` (48 frames, one
+`set_camera(e2e_orbit_camera_transform(tick/48))` + `advance_one_frame` per
+frame, exactly the legacy `E2ePhase::Motion` arm's `t = phase_ticks /
+E2E_MOTION_FRAMES`), `Settle` (1 frame at `t == 1`). With the camera-motion
+sweep reproduced, `standard` passes (`solid` 243.2 vs legacy 243.7).
+
+**Caveat (logged, not papered over):** the BRP SUT free-runs, so one
+`naadf/step{frames:1}` maps to ~1-2 native rendered frames rather than exactly
+one. The motion sweep is therefore *very close to* but not byte-identical to
+the legacy per-`Update`-tick sweep. It is close enough — the readback metrics
+match the legacy path to < 0.5 luminance (table below). If a future gate needs
+exact per-rendered-frame state pinning, the only true fix is a SUT-side verb
+that pumps exactly one frame and blocks (the design's frame-stepping model §4
+does not give the runner that today — `step` queues a *logical* budget the SUT
+drains at native pace). See side-notes.
+
+### Per-gate detail
+
+All assertion thresholds ported **verbatim** — none recalibrated.
+
+- **`standard`** (`tests/standard.rs`) — no `--vox`, 256×256 window. Ported:
+  `E2E_WARMUP_FRAMES=96` / `E2E_MOTION_FRAMES=48` / `E2E_SETTLE_FRAMES=1`, the
+  `e2e_orbit_camera_transform` open-path sweep, and the three pure assertions
+  (`check_not_degenerate`, `check_luminance_alive(CURRENT_BATCH=6)`,
+  `batch_gate(6, ..)`). Dual-path: new `region luminance — emissive 247.7,
+  solid 243.2, sky 203.2`; legacy `emissive 247.7, solid 243.7, sky 202.9`.
+  Δ < 0.5. Both PASS.
+  *Note:* the legacy `assert_nodes_dispatched` (main-world `DiagnosticsStore`)
+  has **no BRP verb** — the migrated gate covers the related `PipelineCache`
+  scan via `naadf/pipeline_scan` but not the per-node dispatch check. See
+  side-notes; not blocking.
+
+- **`vox_e2e`** (`tests/vox_e2e.rs`) — legacy flag `--vox-e2e`. Reuses the
+  library `write_vox_e2e_fixture_to_temp` (synthesises the 2-model `.vox` to
+  `target/e2e-screenshots/vox_e2e_fixture.vox`) + `assert_vox_geometry_visible`
+  (its `SKY_LUMINANCE_CEILING=160` + `VOX_GEOMETRY_CHANNEL_MAX_FLOOR=30`
+  thresholds live inside it). Standard driver flow ⇒ same camera-motion sweep
+  as `standard`. 256×256 window, `--vox <fixture>`. Dual-path: new `luminance
+  250.6, channel max 251.8`; legacy `luminance 250.5, channel max 251.8`.
+  Δ ~0.1. Both PASS.
+
+- **`small_edit_visual`** (`tests/small_edit_visual.rs`) — legacy flag
+  `--small-edit-visual`. No `--vox`, 256×256 window. Ported: `SMALL_EDIT_RADIUS=1.0`,
+  `SMALL_EDIT_PAINT_TYPE=VoxelTypeId(12)`, `SMALL_EDIT_WARMUP_FRAMES=120`,
+  `SMALL_EDIT_POST_EDIT_WAIT_FRAMES=300`, the `birdseye_pose()` camera math,
+  and `assert_small_edit_landed` (Mode-1 + Mode-2). Mode-2 signal via the new
+  `naadf/count_demo_voxels` verb (see above). Dual-path: both report non-empty
+  voxels `31216 → 31217 (Δ 1)`, click rect `max-Δ=17 (floor 15)`, identical
+  rect; adjacent-rect deltas differ by ~0.5 (TAA shimmer). Both PASS.
+
+- **`small_edit_repro`** (`tests/small_edit_repro.rs`) — legacy flag
+  `--small-edit-repro`, **1920×1080 window**. Oasis `.vox` via `--vox`. Ported:
+  `SMALL_EDIT_REPRO_CAM_POS`/`_CAM_QUAT`, `SMALL_EDIT_REPRO_BRUSH_POS`/`_RADIUS`/`_TY`,
+  `SMALL_EDIT_REPRO_WARMUP_FRAMES=120` / `_POST_EDIT_WAIT_FRAMES=300`, and
+  `assert_no_pitch_black_pixels` (`SMALL_EDIT_REPRO_DARK_SUM_THRESHOLD=30`).
+  The legacy gate writes a *raw quaternion* camera rotation; `naadf/set_camera`
+  takes look-at — the test reconstructs the pose via `look_at = pos + quat·(−Z)`,
+  `up = quat·(+Y)` (exact for a unit rotation: `looking_at`'s re-orthonormalisation
+  is a no-op on an already-orthonormal basis). Dual-path: both `dark-before=0,
+  dark-after=0, Δ=0`; `after-min-sum` 111 (new) vs 117 (legacy). Both PASS.
+
+- **`vox_gpu_construction`** (`tests/vox_gpu_construction.rs`) — legacy flag
+  `--vox-gpu-construction`. Oasis `.vox` via `--vox`, 256×256 window. Ported:
+  `VOX_GPU_CONSTRUCTION_CAMERA_POS_A/_B` + `_LOOK_A/_B`, and
+  `assert_vox_gpu_construction_landed` (`DIFF_FLOOR=8.0`,
+  `NEAR_BLACK_THRESHOLD=10.0`, `NEAR_BLACK_FRACTION_CEILING=0.01`). Frame budget
+  is the Oasis flow's `OASIS_WARMUP_FRAMES=120` / `OASIS_POST_EDIT_WAIT_FRAMES=300`.
+  The legacy gate's "camera promotion" (a no-brush A→B move) becomes a plain
+  second `naadf/set_camera`. Dual-path: new `rect Δ=87.99, near-black count=0`;
+  legacy `rect Δ=87.69, near-black count=0`. Δ ~0.3. Both PASS.
+
+- **`vox_horizon_native`** (`tests/vox_horizon_native.rs`) — legacy flag
+  `--vox-horizon-native`, **1280×720 window**. Oasis `.cvox` via `--vox`.
+  Ported: `HORIZON_CAMERA_POS`/`_ROT` (raw-quaternion, reconstructed as in
+  `small_edit_repro`), `HORIZON_WIDTH=1280`/`HORIZON_HEIGHT=720`,
+  `HORIZON_WARMUP_FRAMES`. The legacy gate is a single-capture-save gate (its
+  pass criterion is "the screenshot was captured + saved" — no framebuffer
+  assertion; the SSIM compare is the separate Playwright step). The migrated
+  test asserts the capture delivered + matches 1280×720, then **writes the
+  native PNG** (PHASE 4 CONTRACT — design §8 item 1). Both PASS (the legacy
+  path exits 0 having saved the PNG).
+
+  **PHASE 4 MUST KNOW — the native PNG path differs by run mode.** The BRP test
+  process CWD is the `bevy_naadf` crate root, so it writes
+  `crates/bevy_naadf/target/e2e-screenshots/vox_horizon_native.png`. The legacy
+  `cargo run --bin e2e_render` (run from the worktree root) writes
+  `target/e2e-screenshots/vox_horizon_native.png`. Phase 4's Playwright spec,
+  once repointed to `cargo test ... --test vox_horizon_native`, must read from
+  **`crates/bevy_naadf/target/e2e-screenshots/vox_horizon_native.png`**.
+
+### Gate results table
+
+| Gate | New path (`cargo test --features e2e-brp --test <gate>`) | Legacy path (`cargo run --bin e2e_render -- --<flag>`) | Divergence |
+|---|---|---|---|
+| `standard` | PASS — solid 243.2, sky 203.2 | PASS — solid 243.7, sky 202.9 | < 0.5 luminance |
+| `vox_e2e` | PASS — luminance 250.6, ch-max 251.8 | PASS — luminance 250.5, ch-max 251.8 | ~0.1 |
+| `small_edit_visual` | PASS — voxels Δ1, click max-Δ 17 | PASS — voxels Δ1, click max-Δ 17 | adj-rects ~0.5 (TAA) |
+| `small_edit_repro` | PASS — dark Δ=0, min-sum 111 | PASS — dark Δ=0, min-sum 117 | min-sum 6 (TAA) |
+| `vox_gpu_construction` | PASS — rect Δ 87.99, near-black 0 | PASS — rect Δ 87.69, near-black 0 | ~0.3 |
+| `vox_horizon_native` | PASS — 1280×720 PNG written | PASS — exit 0, PNG saved | n/a (capture-save gate) |
+
+`cargo build --workspace` (default features, no `e2e-brp`): **PASS** —
+`Finished dev profile in 27.09s`, 0 errors. The new `naadf/count_demo_voxels`
+handler is behind `#[cfg(feature = "e2e-brp")]`; only the `CountDemoVoxelsResult`
+schema struct is newly always-compiled (a plain `serde` struct, no
+`bevy_remote` dep).
+
+All 6 gates: dual-path green, divergence sub-1 (TAA/GI shimmer level). Migration
+fidelity holds; no threshold was recalibrated.
+
+### Anything Phase 3b must know
+
+Phase 3b migrates the 4 remaining special gates (`vox-gpu-oracle` +
+`vox-web-parity` as twice-driven bodies, `resize-test`, `entities`).
+
+- **`advance_one_frame` is the per-frame-state primitive.** Any gate that must
+  change SUT state between individual frames (a camera sweep, an incremental
+  resize) uses `scenario::advance_one_frame`. It is `idle_frames: 1`. Note the
+  free-running-SUT caveat (above): one logical step ≈ 1-2 native frames.
+
+- **`resize-test`** drives `naadf/resize_window` (already a Phase-2 verb). The
+  legacy resize-test boots at 800×600, resizes to 1920×1080 then 2000×1000,
+  waits ~300 frames per step, captures three PNGs, and asserts a luma-ratio
+  floor (`E2E_RESIZE_MIN_LUMA_RATIO=0.7`). Spawn the SUT with
+  `--e2e-window 800x600`, then issue `naadf/resize_window` between captures —
+  the same pattern `vox_gpu_construction` uses for its A→B camera move, just
+  with `resize_window` instead of `set_camera`. The legacy resize-test has its
+  own driver phases (`ResizeTestState`) — read `e2e/driver.rs`'s resize arms +
+  `e2e/mod.rs`'s `E2E_RESIZE_*` constants.
+
+- **The two compare gates** (`vox-gpu-oracle`, `vox-web-parity`) drive the SUT
+  twice (or two SUTs) and `ssim`-compare. `Sut` supports multiple concurrent
+  instances (each gets its own OS-assigned port). Reuse `scenario::capture` for
+  both captures and call `bevy_naadf::e2e::ssim` on the two `Framebuffer`s.
+
+- **`--entities` is boot-time config** — the legacy `EntitiesBoot` arm sets
+  `ConstructionConfig.entities_enabled = true` + `SpawnTestEntity(true)` on the
+  `BootstrapInputs` before boot. Per Forbidden Move #4, this rides the spawn
+  contract — it likely needs a small `--e2e-entities` flag in `main.rs` (the
+  design side-note flags this; Phase 3b sizes it). The `gates::assert_entity_pixel`
+  + `entity_pixel_rect` + `ENTITY_PIXEL_MIN_LUM` assertion is `pub`.
+
+- **The `naadf/count_demo_voxels` verb** is available if a Phase-3b gate needs a
+  non-empty-voxel count on the `GridPreset::Default` scene (it is demo-region
+  scoped — `GridPreset::Vox` worlds would need a different/region-scoped verb).
+
+- **Raw-quaternion camera poses** reconstruct exactly via `look_at = pos +
+  quat·(−Z)`, `up = quat·(+Y)` through `naadf/set_camera` — the `small_edit_repro`
+  + `vox_horizon_native` gates both do this; reuse the pattern.
+
+## Side notes / observations / complaints
+
+- **The `standard` gate's camera-motion dependency is the one real friction
+  point in the BRP model, and Phase 3b/4 should be aware of it.** The legacy
+  standard gate is fundamentally a *per-rendered-frame camera-motion* test —
+  its `E2E_SETTLE_FRAMES=1` and `assert_batch_6`'s `MIN_GI_BOUNCE_AFTER_MOTION`
+  are calibrated for a frame the camera reached *by moving*. The BRP SUT
+  free-runs and the design's frame-stepping model (§4) gives the runner a
+  *logical* step budget the SUT drains at native pace — it does NOT give
+  one-`set_camera`-per-rendered-frame pinning. The migrated `standard` /
+  `vox_e2e` gates reproduce the sweep with `advance_one_frame` per motion tick,
+  which lands ~1-2 native frames per logical step — close enough that the
+  readback metrics match the legacy path to < 0.5 luminance, and the gates pass
+  honestly. But this is the gate most sensitive to the native-vs-driver-frame
+  mismatch the Phase-2 log already flagged for `await_capture`. If a future
+  regression makes the standard gate flap, the fix is a SUT-side
+  `step-exactly-one-frame-and-block` verb, not a threshold nudge.
+
+- **`naadf/apply_brush.voxels_delta` is a genuinely misleading return value.**
+  It is named `voxels_delta` and documented as "Change in `WorldData::voxels_cpu`
+  length" — but a caller reasonably reads "voxels_delta" as "how many voxels the
+  brush changed", and it is not that: it is the change in a *packed `u32` array*
+  whose granularity is a 32-`u32`-per-block record. The Phase-2 `oasis_edit_visual`
+  gate happened not to assert on it (it asserts the framebuffer diff), so the
+  trap stayed hidden until `small_edit_visual` needed an exact +1-voxel signal.
+  Not a Phase-3a defect to fix here — but the verb's return field would be
+  honester named `voxels_cpu_len_delta`, or the verb should additionally return
+  a true non-empty-voxel delta. Flagging for a future `/refactor`; Phase 3a
+  worked around it with the dedicated `naadf/count_demo_voxels` verb.
+
+- **The legacy `assert_nodes_dispatched` node-dispatch check has no BRP verb.**
+  The legacy standard-gate `run_assertions` runs five checks; four port cleanly
+  (they are pure `Framebuffer` / threshold code). The fifth — `assert_nodes_dispatched`
+  — reads the main-world `DiagnosticsStore` and asserts each expected render-graph
+  span recorded a measurement. The migrated `standard` gate covers the related
+  `PipelineCache` error scan via `naadf/pipeline_scan` but NOT the per-node
+  dispatch check. This is a small coverage gap, not a blocker — a silently
+  non-dispatched node would also show up as a degenerate / wrong framebuffer,
+  which the other checks catch — but it is an honest gap. If the orchestration
+  wants full parity, a `naadf/nodes_dispatched` verb wrapping `assert_nodes_dispatched`
+  + `expected_spans(CURRENT_BATCH)` is a ~15-line addition (both are already
+  `pub`). I did not add it in Phase 3a because the brief scopes 3a to the 6
+  gates and the gap is non-load-bearing; flagging it for the orchestrator to
+  decide.
+
+- **The migrated `standard` / `vox_e2e` gates do NOT reproduce the legacy
+  driver's camera-motion *TAA reprojection workload* exactly.** They reproduce
+  the *pose path* (`e2e_orbit_camera_transform(t)` for the same `t` sequence)
+  and the gates pass — but because each logical step is ~1-2 native frames, the
+  per-frame camera *delta* the TAA reprojection sees is slightly different from
+  the legacy per-`Update`-tick delta. The gates' assertions
+  (`MIN_GI_BOUNCE_AFTER_MOTION=150`, etc.) have wide enough margins that this is
+  fine (measured `solid` 243 vs threshold 150), and the brief explicitly scopes
+  Phase 3a to reproducing each gate's *assertion*, not the legacy driver's
+  frame-by-frame internals. Recording it so a future agent does not mistake the
+  BRP `standard` gate for a bit-exact reproduction of the legacy TAA-motion
+  coverage.
+
+- **No foundation smell in the 6-gate migration itself.** Every gate's
+  assertion + geometry code was already a `pub` pure fn — `assert_vox_geometry_visible`,
+  `assert_small_edit_landed`, `assert_no_pitch_black_pixels`,
+  `assert_vox_gpu_construction_landed`, `batch_gate`, `e2e_orbit_camera_transform`,
+  `write_vox_e2e_fixture_to_temp`, `count_non_empty_voxels` — the migration was
+  genuinely "delete the driver orchestration, call the pure fns from a
+  straight-line test body", exactly as the design promised. The only two
+  additions (`naadf/count_demo_voxels`, `advance_one_frame`) were both forced by
+  concrete runtime findings, not speculative surface. The restructure is not
+  fighting the codebase.

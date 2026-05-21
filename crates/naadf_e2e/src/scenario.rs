@@ -29,6 +29,21 @@ pub fn advance(c: &mut BrpClient, frames: u32) -> BrpResult<()> {
     advance_with_idle(c, frames, 8)
 }
 
+/// Advance the SUT by exactly one rendered frame, then block until it is back
+/// at rest. The thin per-frame primitive a gate body uses when it must change
+/// SUT state (camera pose, …) *between individual frames* — e.g. the
+/// `standard` gate's camera-motion sweep, which the legacy in-app driver drove
+/// one `Update` tick at a time.
+///
+/// `idle_frames` is `1` (not the [`advance`] default of `8`): the caller is
+/// stepping frame-by-frame and re-issues `naadf/*` calls every iteration, so a
+/// long multi-frame settle window per step would multiply the round-trip count
+/// for no benefit — one idle frame is enough to confirm the single stepped
+/// frame elapsed.
+pub fn advance_one_frame(c: &mut BrpClient) -> BrpResult<()> {
+    advance_with_idle(c, 1, 1)
+}
+
 /// Like [`advance`] but with an explicit `idle_frames` settle count.
 pub fn advance_with_idle(c: &mut BrpClient, frames: u32, idle_frames: u32) -> BrpResult<()> {
     c.call("naadf/step", json!({ "frames": frames }))?;
@@ -143,6 +158,15 @@ pub fn pipeline_scan(c: &mut BrpClient) -> BrpResult<()> {
             scan.result
         )))
     }
+}
+
+/// Count the non-empty voxels in the `GridPreset::Default` demo embed
+/// (`naadf/count_demo_voxels`). The `small_edit_visual` gate's Mode-2
+/// phantom-voxel signal — `apply_brush`'s `voxels_delta` measures `voxels_cpu`
+/// *array length* (32 `u32`s per touched 4×4×4 block), not non-empty voxels.
+pub fn count_demo_voxels(c: &mut BrpClient) -> BrpResult<u64> {
+    let r: schema::CountDemoVoxelsResult = c.call_typed("naadf/count_demo_voxels", Value::Null)?;
+    Ok(r.count)
 }
 
 /// Resize the SUT window (`naadf/resize_window`).
