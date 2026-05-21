@@ -97,9 +97,13 @@ pub enum GridPreset {
     Empty,
     /// **Web `?skybox=1` URL-param surface** — same install behaviour as
     /// [`GridPreset::Empty`] (empty world, pure-sky render); kept as a
-    /// distinct arm so the wasm bootstrap can express the decision via
-    /// `AppArgs.grid_preset` mutation instead of a separate marker
-    /// resource + ordering constraint on `setup_test_grid`. The
+    /// distinct arm so the wasm bootstrap can express the decision via the
+    /// `GridPreset` resource value instead of a separate marker resource.
+    /// Step 5 of the config-as-resource refactor resolves `?skybox=1` into
+    /// `BootstrapInputs.grid_preset = GridPreset::WebSkybox` BEFORE the App
+    /// is built (see `crate::voxel::web_vox::resolve_skybox_only_param`),
+    /// so `setup_test_grid` reads the already-correct `Res<GridPreset>`
+    /// arm with no `Startup`-time mutation or ordering constraint. The
     /// `[palette-install]` smoke-detector log distinguishes the source
     /// (`"skybox-only"` vs `"cli-empty"`).
     WebSkybox,
@@ -272,6 +276,18 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         .contains_resource::<render::construction::ConstructionConfig>()
     {
         app.insert_resource(render::construction::ConstructionConfig::for_target_arch());
+    }
+    // Step 5 of the config-as-resource refactor — defensive seed for the
+    // per-domain `GridPreset`. `setup_test_grid` reads it as `Res<GridPreset>`
+    // (non-Option) at `Startup`; the `build_app(AppConfig::e2e())` path
+    // (`run_e2e_render` / `run_e2e_render_with_args`) bypasses
+    // `build_app_with_bootstrap_inputs`, so without the seed the system
+    // panics on the missing resource. Canonical default = `GridPreset::Default`
+    // (the embedded primitive test scene). Callers routing through the
+    // bootstrap fan-out overwrite it via `insert_resource` overwrite-in-place.
+    // Step 9 deletes this seed once every caller routes through the fan-out.
+    if !app.world().contains_resource::<crate::GridPreset>() {
+        app.insert_resource(crate::GridPreset::default());
     }
 
     // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#

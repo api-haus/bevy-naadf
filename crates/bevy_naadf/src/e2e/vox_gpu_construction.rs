@@ -228,7 +228,9 @@ pub fn run_vox_gpu_construction() -> AppExit {
     // (`ConstructionConfig::for_target_arch()` → `gpu_construction_enabled =
     // true`) keeps the W5 producer chain active; the explicit assignment
     // below is a belt-and-braces guard against a future default flip.
-    app_args.grid_preset = crate::GridPreset::Vox {
+    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
+    // off `AppArgs` onto `BootstrapInputs.grid_preset` (set below).
+    let grid_preset = crate::GridPreset::Vox {
         path: PathBuf::from(&app_path_for_args(&path)),
     };
     // Route through the Oasis brush-edit driver flow. The driver's
@@ -252,6 +254,7 @@ pub fn run_vox_gpu_construction() -> AppExit {
     let inputs = crate::bootstrap::BootstrapInputs {
         args: app_args,
         construction_config,
+        grid_preset,
         ..crate::bootstrap::BootstrapInputs::default()
     };
     crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)

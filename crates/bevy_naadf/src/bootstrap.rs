@@ -80,6 +80,19 @@ pub struct BootstrapInputs {
     /// `gpu_construction_enabled` / `entities_enabled` override construct
     /// their own value off `for_target_arch()` and write it here.
     pub construction_config: ConstructionConfig,
+    /// Which hard-coded test grid `setup_test_grid` installs at `Startup`.
+    /// Migrated out of `AppArgs.grid_preset` in Step 5 of the
+    /// config-as-resource refactor. `GridPreset::default()` =
+    /// `GridPreset::Default` (the embedded primitive test scene).
+    ///
+    /// The native `--vox <path>` flag and the wasm32 `?skybox=1` URL param
+    /// both resolve into this field BEFORE the App is built (the latter via
+    /// [`crate::voxel::web_vox::resolve_skybox_only_param`], which Step 5
+    /// relocated out of the old `Startup`-time `AppArgs.grid_preset`
+    /// mutation in `web_vox::startup_fetch_default_vox`). The fan-out
+    /// inserts it as a main-world `Res<GridPreset>` that `setup_test_grid`
+    /// reads.
+    pub grid_preset: GridPreset,
 }
 
 impl Default for BootstrapInputs {
@@ -97,6 +110,7 @@ impl Default for BootstrapInputs {
             taa: TaaConfig::default(),
             gi: GiSettings::default(),
             construction_config: ConstructionConfig::for_target_arch(),
+            grid_preset: GridPreset::default(),
         }
     }
 }
@@ -135,6 +149,14 @@ pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) 
     // callers). The render sub-app reads its mirror via
     // `extract_construction_config` (mirror of `extract_effective_world_size`).
     app.insert_resource(inputs.construction_config);
+    // Migrated in Step 5 — main-world `GridPreset`. `setup_test_grid` reads
+    // it (`Res<GridPreset>`) at `Startup` to choose which world content to
+    // install. Main-world only — the choice never crosses into the render
+    // world. `build_app_with_args` has a defensive `GridPreset::default()`
+    // seed for direct-`build_app` callers; this overwrite-in-place insert
+    // wins for callers routing through the bootstrap fan-out (e.g. native
+    // `--vox`, wasm32 `?skybox=1`, e2e gates).
+    app.insert_resource(inputs.grid_preset);
     app
 }
 
@@ -195,8 +217,10 @@ mod tests {
             inputs.construction_config,
             crate::render::construction::ConstructionConfig::for_target_arch(),
         );
-        // The default world content is the hard-coded test grid.
-        assert_eq!(inputs.args.grid_preset, GridPreset::Default);
+        // Step 5 — `grid_preset` migrated off `AppArgs` onto the typed
+        // `BootstrapInputs.grid_preset` field. The default world content is
+        // the hard-coded embedded test grid.
+        assert_eq!(inputs.grid_preset, GridPreset::Default);
         // The fixture spawner is off by default; `--entities` flips it.
         assert!(!inputs.args.spawn_test_entity);
         // No e2e gate is active by default.

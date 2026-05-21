@@ -279,7 +279,6 @@ pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
     );
 
     let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path };
     // vox-gpu-rewrite Stage 14 (2026-05-18): `vox_gpu_oracle_cpu_phase` is
     // the SOLE test-only escape hatch in `setup_test_grid` that routes to
     // the legacy `install_vox_sized_to_model` CPU oracle. This is the SOLE
@@ -287,7 +286,14 @@ pub fn run_vox_gpu_oracle_cpu_phase() -> AppExit {
     // specifically so the oracle gate can compare CPU vs W5 GPU output
     // via SSIM.
     app_args.vox_gpu_oracle_cpu_phase = true;
-    crate::run_e2e_render_with_args(app_args)
+    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
+    // off `AppArgs` onto `BootstrapInputs.grid_preset`.
+    let inputs = crate::bootstrap::BootstrapInputs {
+        args: app_args,
+        grid_preset: crate::GridPreset::Vox { path },
+        ..crate::bootstrap::BootstrapInputs::default()
+    };
+    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +333,6 @@ pub fn run_vox_gpu_oracle_gpu_phase() -> AppExit {
     );
 
     let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path };
     // The production install path (no oracle-CPU-phase flag) —
     // `install_vox_in_fixed_world` + W5 GPU producer chain. GPU
     // construction default-on; explicit assignment for belt-and-braces.
@@ -337,9 +342,12 @@ pub fn run_vox_gpu_oracle_gpu_phase() -> AppExit {
     let mut construction_config =
         crate::render::construction::ConstructionConfig::for_target_arch();
     construction_config.gpu_construction_enabled = true;
+    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
+    // off `AppArgs` onto `BootstrapInputs.grid_preset`.
     let inputs = crate::bootstrap::BootstrapInputs {
         args: app_args,
         construction_config,
+        grid_preset: crate::GridPreset::Vox { path },
         ..crate::bootstrap::BootstrapInputs::default()
     };
     crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)

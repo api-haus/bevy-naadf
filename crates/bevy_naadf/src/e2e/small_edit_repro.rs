@@ -145,15 +145,21 @@ pub fn run_small_edit_repro() -> AppExit {
     );
 
     let mut app_args = crate::AppArgs::default();
-    // vox-gpu-rewrite Stage 2 (2026-05-18): always the W5 GPU producer
-    // chain (production path). The captured camera pose and brush position
-    // are absolute world-voxel coords; the W5 path tiles Oasis at
-    // `voxelPos % modelSize` starting from world origin, so the original
-    // user-captured coords fall inside the first XZ tile and frame the
-    // same architecture the user saw.
-    app_args.grid_preset = crate::GridPreset::Vox { path };
     app_args.small_edit_repro_mode = true;
-    crate::run_e2e_render_with_args(app_args)
+    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
+    // off `AppArgs` onto `BootstrapInputs.grid_preset`. vox-gpu-rewrite
+    // Stage 2 (2026-05-18): always the W5 GPU producer chain (production
+    // path). The captured camera pose and brush position are absolute
+    // world-voxel coords; the W5 path tiles Oasis at `voxelPos % modelSize`
+    // starting from world origin, so the original user-captured coords
+    // fall inside the first XZ tile and frame the same architecture the
+    // user saw.
+    let inputs = crate::bootstrap::BootstrapInputs {
+        args: app_args,
+        grid_preset: crate::GridPreset::Vox { path },
+        ..crate::bootstrap::BootstrapInputs::default()
+    };
+    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 // ---------------------------------------------------------------------------

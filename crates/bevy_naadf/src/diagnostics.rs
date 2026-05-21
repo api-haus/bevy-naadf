@@ -15,6 +15,7 @@ use bevy::window::{PrimaryWindow, Window};
 use crate::AppArgs;
 use crate::AppConfig;
 use crate::GiSettings;
+use crate::GridPreset;
 use crate::camera::position_split::PositionSplit;
 use crate::editor::ray::screen_to_ray;
 use crate::render::construction::ConstructionConfig;
@@ -27,6 +28,7 @@ use crate::world::data::{VoxelTypes, WorldData};
 pub fn dump_diagnostics_on_p(
     keys: Res<ButtonInput<KeyCode>>,
     args: Option<Res<AppArgs>>,
+    grid_preset: Option<Res<GridPreset>>,
     taa: Option<Res<TaaConfig>>,
     taa_ring: Option<Res<TaaRingConfig>>,
     gi: Option<Res<GiSettings>>,
@@ -110,10 +112,15 @@ pub fn dump_diagnostics_on_p(
     }
 
     if let Some(a) = args.as_ref() {
-        // Steps 2 + 3 of the config-as-resource refactor: `taa_ring_depth`,
-        // `taa` and `gi` migrated off `AppArgs` onto standalone per-domain
-        // main-world resources. The diagnostics dump fans out — per Q4 of
+        // Steps 2-5 of the config-as-resource refactor: `taa_ring_depth`,
+        // `taa`, `gi`, `construction_config` and `grid_preset` migrated off
+        // `AppArgs` onto standalone per-domain main-world resources. The
+        // diagnostics dump fans out — per Q4 of
         // `docs/orchestrate/config-as-resource-refactor/01-context.md`.
+        let grid_preset_str = grid_preset
+            .as_ref()
+            .map(|g| format!("{:?}", **g))
+            .unwrap_or_else(|| "<GridPreset resource missing>".to_string());
         let taa_ring_depth_str = taa_ring
             .as_ref()
             .map(|r| r.depth.to_string())
@@ -132,13 +139,13 @@ pub fn dump_diagnostics_on_p(
             .unwrap_or_else(|| "<ConstructionConfig resource missing>".to_string());
         let _ = writeln!(
             buf,
-            "args.grid_preset         = {:?}\n\
+            "grid_preset              = {}\n\
              taa                      = {}\n\
              taa_ring_depth           = {}\n\
              args.spawn_test_entity   = {}\n\
              gi                       = {}\n\
              construction_config      = {}",
-            a.grid_preset,
+            grid_preset_str,
             taa_str,
             taa_ring_depth_str,
             a.spawn_test_entity,

@@ -364,29 +364,33 @@ pub fn run_vox_e2e() -> AppExit {
         2
     );
 
-    // 2) Set up `AppArgs` so:
-    //     - `setup_test_grid` reads `GridPreset::Vox { path }` and calls
-    //       `vox_import::load_vox(&path)` (`voxel/grid.rs:75-83`).
+    // 2) Set up the bootstrap inputs so:
+    //     - `setup_test_grid` reads `Res<GridPreset>` = `GridPreset::Vox
+    //       { path }` and calls `vox_import::load_vox(&path)`.
     //     - The driver's `ASSERT` step swaps the default-scene batch gate
     //       for `assert_vox_geometry_visible` (driver branch on
     //       `args.vox_e2e_mode`).
     let mut app_args = crate::AppArgs::default();
-    // vox-gpu-rewrite Stage 2 (2026-05-18): the production install path is
-    // the only install path — the synthesised fixture flows through
-    // `install_vox_in_fixed_world` + the W5 GPU producer chain just like the
-    // production binary's `--vox` flag.
-    app_args.grid_preset = crate::GridPreset::Vox { path };
     app_args.vox_e2e_mode = true;
-    // The W5 GPU producer chain runs `generator_model` + `chunk_calc` per
-    // segment to populate the fixed `(4096, 512, 4096)`-voxel world from
-    // the model's `ModelData`; gpu_construction_enabled is on by default
-    // (`ConstructionConfig::default`), no override needed.
+    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
+    // off `AppArgs` onto `BootstrapInputs.grid_preset`. vox-gpu-rewrite
+    // Stage 2 (2026-05-18): the production install path is the only
+    // install path — the synthesised fixture flows through
+    // `install_vox_in_fixed_world` + the W5 GPU producer chain just like
+    // the production binary's `--vox` flag. The W5 chain runs
+    // `generator_model` + `chunk_calc` per segment to populate the fixed
+    // `(4096, 512, 4096)`-voxel world; `gpu_construction_enabled` is on by
+    // default (`ConstructionConfig::for_target_arch`), no override needed.
 
-    // 3) Run the harness the same way `--entities` does (Phase-C wave-3 —
-    //    surface `AppArgs` overrides to the e2e binary). The standard
+    // 3) Run the harness the same way `--entities` does. The standard
     //    `AppConfig::e2e()` window (256×256 non-resizable) is reused so
     //    the gate rect fractions stay calibrated.
-    crate::run_e2e_render_with_args(app_args)
+    let inputs = crate::bootstrap::BootstrapInputs {
+        args: app_args,
+        grid_preset: crate::GridPreset::Vox { path },
+        ..crate::bootstrap::BootstrapInputs::default()
+    };
+    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 /// The vox-e2e region gate: assert the central screen rectangle (where

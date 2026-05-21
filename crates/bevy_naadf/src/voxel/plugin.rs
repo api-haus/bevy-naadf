@@ -27,10 +27,14 @@ pub struct VoxelIoPlugin;
 
 impl Plugin for VoxelIoPlugin {
     fn build(&self, app: &mut App) {
-        // The test grid + camera spawn — shared. On web,
-        // `startup_fetch_default_vox` runs `.before(setup_test_grid)` so it can
-        // mutate `AppArgs.grid_preset` to `GridPreset::WebSkybox`
-        // (`?skybox=1` URL-param handling) before `setup_test_grid` reads it.
+        // The test grid + camera spawn — shared. `setup_test_grid` reads
+        // `Res<GridPreset>` to choose which world content to install.
+        // Step 5 of the config-as-resource refactor relocated the
+        // `?skybox=1` URL-param resolution out of `startup_fetch_default_vox`
+        // (which used to mutate `AppArgs.grid_preset` at `Startup` time)
+        // into the wasm32 bootstrap — the `GridPreset` resource carries the
+        // resolved value before any `Startup` system runs, so no
+        // `.before(setup_test_grid)` ordering is needed for it any more.
         app.add_systems(Startup, grid::setup_test_grid);
 
         // Async `.vox` parse pump (`web-vox-async-loading Step 4`, 2026-05-18).
@@ -53,10 +57,7 @@ impl Plugin for VoxelIoPlugin {
         // the polling system clears the slot post-install.
         #[cfg(target_arch = "wasm32")]
         {
-            app.add_systems(
-                Startup,
-                web_vox::startup_fetch_default_vox.before(grid::setup_test_grid),
-            )
+            app.add_systems(Startup, web_vox::startup_fetch_default_vox)
             .add_systems(
                 Update,
                 web_vox::apply_pending_vox.after(async_vox::poll_pending_vox_parse),

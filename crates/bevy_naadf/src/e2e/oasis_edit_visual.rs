@@ -201,15 +201,21 @@ pub fn run_oasis_edit_visual() -> AppExit {
     );
 
     let mut app_args = crate::AppArgs::default();
-    // vox-gpu-rewrite Stage 2 (2026-05-18): always the W5 GPU producer
-    // chain. The brush-edit assertion is on the framebuffer Δ from a
+    app_args.oasis_edit_visual_mode = true;
+    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
+    // off `AppArgs` onto `BootstrapInputs.grid_preset`. vox-gpu-rewrite
+    // Stage 2 (2026-05-18): always the W5 GPU producer chain. The
+    // brush-edit assertion is on the framebuffer Δ from a
     // birdseye-over-world-centre camera; the W5 path tiles Oasis to fill
     // the fixed `(4096, 512, 4096)`-voxel world, so the birdseye sees the
     // tiled architecture and the central edit at world centre still
     // projects to the central screen rect — assertion semantics preserved.
-    app_args.grid_preset = crate::GridPreset::Vox { path };
-    app_args.oasis_edit_visual_mode = true;
-    crate::run_e2e_render_with_args(app_args)
+    let inputs = crate::bootstrap::BootstrapInputs {
+        args: app_args,
+        grid_preset: crate::GridPreset::Vox { path },
+        ..crate::bootstrap::BootstrapInputs::default()
+    };
+    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 // ---------------------------------------------------------------------------

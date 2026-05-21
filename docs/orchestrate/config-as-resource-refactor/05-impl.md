@@ -673,3 +673,202 @@ below.
   output — both produce the same clamped values — but per the brief,
   desktop-gate-PASS is the implementor's deliverable; wasm visual is the
   user's.
+
+## Step 5 — Migrate grid_preset (Q3 included) (2026-05-21)
+
+### Phase A — state assessment of the prior checkpoint
+
+This step was started by a prior compound implementer (Steps 3, 4, 5, 8
+were assigned to it). It completed Steps 3 and 4 cleanly, then **stopped
+mid-Step-5**. The Step 5 edits were committed by a *mechanical checkpoint*
+(`7efce79`, `chore(checkpoint): …`) — NOT a verified-gate commit. No
+verification gates were run on it; no Step 5 impl log existed.
+
+**State found:** `cargo build --workspace` on `7efce79` FAILED — 11 errors.
+The checkpoint had done the destructive half of the migration but not the
+constructive half:
+
+- DONE in `7efce79`: removed `grid_preset` from `AppArgs`; added
+  `#[derive(Resource)]` to `GridPreset`; changed `build_app_with_budget`
+  signature to `(cfg, args, grid_preset)`; swapped `setup_test_grid` to read
+  `Res<GridPreset>`; dropped `ResMut<AppArgs>` from
+  `web_vox::startup_fetch_default_vox`; added `resolve_skybox_only_param()`;
+  wired the wasm32 `?skybox=1` resolution into `main.rs`'s bootstrap.
+- MISSING in `7efce79` (the cause of the 11 build errors):
+  1. `BootstrapInputs` had **no `grid_preset` field** — yet `lib.rs:164` and
+     `main.rs:107` constructed `BootstrapInputs` literals with `grid_preset,`
+     in them. The struct definition was never updated.
+  2. 5 e2e gate `run_*` builders still mutated the deleted
+     `app_args.grid_preset` field via the legacy `run_e2e_render_with_args`
+     path (`oasis_edit_visual`, `small_edit_repro`, `vox_e2e`,
+     `vox_gpu_oracle` cpu-phase, `vox_web_parity` skybox-phase).
+  3. 4 e2e gate builders already routed through `BootstrapInputs` (Step 4
+     had converted them) but their struct literals lacked the `grid_preset`
+     field — they still set `app_args.grid_preset`.
+  4. `bootstrap.rs::tests` read `inputs.args.grid_preset` (gone).
+  5. `diagnostics.rs` read `a.grid_preset` (gone).
+
+**Verdict: INCOMPLETE, not contradicting the design.** The checkpoint's
+structural choices — `GridPreset` as a `Resource`, the `grid_preset` field on
+`BootstrapInputs`, the `resolve_skybox_only_param()` helper, the wasm32
+bootstrap relocation — all match `02-design.md`'s Step 5 spec and the
+established Step 2/3/4 pattern. The checkpoint simply stopped before the
+constructive half. The one signature deviation — `build_app_with_budget`
+took `(cfg, args, grid_preset)` rather than the design §3.3 sketch's
+`(cfg, inputs: BootstrapInputs)` — is consistent with Step 2's impl-log
+record (Step 2 kept `build_app_with_budget(cfg, args)` and grew it
+incrementally). Kept as-is; the native + Android callers already match it.
+
+### What landed (Phase B — finishing Step 5)
+
+- `crates/bevy_naadf/src/bootstrap.rs` — added the missing
+  `pub grid_preset: GridPreset` field to `BootstrapInputs` + its line in the
+  hand-written `impl Default` (`GridPreset::default()`). Added the
+  post-`build_app_with_args` `app.insert_resource(inputs.grid_preset)` to the
+  fan-out in `build_app_with_bootstrap_inputs`. Fixed the pin test
+  (`default_wraps_canonical_app_args_defaults`) to assert on
+  `inputs.grid_preset` instead of the gone `inputs.args.grid_preset`.
+- `crates/bevy_naadf/src/lib.rs` — added the defensive `GridPreset::default()`
+  seed in `build_app_with_args` (mirrors the Step-3/4 `TaaConfig` /
+  `ConstructionConfig` seeds). `setup_test_grid` reads `Res<GridPreset>`
+  non-Option, and the `build_app(AppConfig::e2e())` path bypasses the
+  bootstrap fan-out — without the seed, the system panics on the missing
+  resource. Updated the stale `GridPreset::WebSkybox` docstring (it described
+  the old `AppArgs.grid_preset` Startup mutation).
+- 5 e2e gate `run_*` builders converted from the legacy
+  `run_e2e_render_with_args(app_args)` path to building a `BootstrapInputs`
+  with `grid_preset:` set and routing through
+  `crate::bootstrap::run_e2e_render_with_bootstrap_inputs`:
+  `oasis_edit_visual.rs` (`GridPreset::Vox`), `small_edit_repro.rs`
+  (`GridPreset::Vox`), `vox_e2e.rs` (`GridPreset::Vox`), `vox_gpu_oracle.rs`
+  cpu-phase (`GridPreset::Vox`), `vox_web_parity.rs` skybox-phase
+  (`GridPreset::Empty`).
+- 4 e2e gate builders already on the `BootstrapInputs` path (converted in
+  Step 4) had `grid_preset:` added to their struct literals + the dead
+  `app_args.grid_preset =` lines removed: `vox_gpu_construction.rs`,
+  `vox_gpu_oracle.rs` gpu-phase, `vox_horizon_parity.rs`,
+  `vox_web_parity.rs` loaded-phase.
+- `crates/bevy_naadf/src/diagnostics.rs` — added a
+  `grid_preset: Option<Res<GridPreset>>` system parameter (the Q4 fan-out
+  shape); the `KeyP` dump reads it with the defensive missing-resource
+  fallback string, mirroring the Step-2/3/4 `taa_ring` / `taa` / `gi` /
+  `construction` reads. The dump label changed `args.grid_preset` →
+  `grid_preset` (it is no longer an `AppArgs` field).
+- `crates/bevy_naadf/src/voxel/plugin.rs` — removed the now-vestigial
+  `.before(grid::setup_test_grid)` ordering on
+  `web_vox::startup_fetch_default_vox` (the ordering existed only so the
+  old `Startup`-time `AppArgs.grid_preset` mutation landed before
+  `setup_test_grid` read it — that mutation is gone). Updated the two stale
+  comments that described the old mutation.
+
+### Decisions made during impl
+
+1. **`build_app_with_budget` signature kept as `(cfg, args, grid_preset)`.**
+   The design §3.3 sketch shows `(cfg, inputs: BootstrapInputs)`, but Step 2's
+   impl log records `build_app_with_budget` was deliberately kept at
+   `(cfg, args)` and grown incrementally — it constructs the `BootstrapInputs`
+   internally from the budget probe. The checkpoint extended that to
+   `(cfg, args, grid_preset)`. Native `main.rs` + `android_main.rs` already
+   call it with three args. Reverting to the design's `BootstrapInputs`-arg
+   shape would be a Step-6-or-later consolidation touching all callers — out
+   of Step 5's scope. Kept the checkpoint's signature; it is internally
+   consistent and compiles.
+2. **Defensive `GridPreset::default()` seed in `build_app_with_args`** — same
+   pattern Steps 3 and 4 used for `TaaConfig` / `GiSettings` /
+   `ConstructionConfig`. `setup_test_grid` reads `Res<GridPreset>` non-Option;
+   the e2e_render binary's `build_app(AppConfig::e2e())` path bypasses
+   `build_app_with_bootstrap_inputs`. Without the seed the system panics.
+   Step 9 deletes the seed once every caller routes through the fan-out.
+3. **Removed the `.before(setup_test_grid)` ordering on
+   `startup_fetch_default_vox`.** The design's Step 5 spec says "the
+   Startup-time `AppArgs` mutation is deleted." The checkpoint deleted the
+   mutation (and the `ResMut<AppArgs>` parameter) but left the now-meaningless
+   ordering constraint + two stale comments. Cleaned both up — the ordering
+   served only the deleted mutation.
+4. **Diagnostics fan-out, no aggregator** — per design §3.5 + Q4. One more
+   `Option<Res<_>>` parameter; the dump system already had 5 of these from
+   Steps 2-4, so this is rote.
+
+### Verification
+
+- `cargo build --workspace`: PASS (45.99s, clean — the single
+  `warning: unused import: GridPreset` from the broken checkpoint state is
+  resolved now that the field uses the import).
+- `cargo test --workspace --lib`: PASS (192 passed; 0 failed; 1 ignored).
+  The fixed `bootstrap::tests::default_wraps_canonical_app_args_defaults`
+  pin test (now asserting `inputs.grid_preset == GridPreset::Default`) is in
+  the passing set.
+- `cargo run --bin e2e_render -- baseline`: PASS — region luminance
+  `emissive 247.7, solid 243.6, sky 202.9`, in the same band as Steps 1-4.
+- `cargo run --bin e2e_render -- --vox-e2e`: PASS — vox_geometry centre-rect
+  luminance 250.5, channel max 251.8. The `run_vox_e2e` builder's
+  `BootstrapInputs`-route conversion is sound.
+- `cargo run --bin e2e_render -- --vox-horizon-native`: PASS — exit 0,
+  `vox_horizon_native.png` written (1280×720).
+- `cargo run --bin e2e_render -- --vox-gpu-construction`: PASS — rect
+  per-pixel RGB Δ=87.79 over the 8.0 floor; ran as an extra check because
+  the conversion touched the already-`BootstrapInputs` builders too.
+- `just web-static + just test-wasm-full` (the `?skybox=1` URL-param path):
+  **NOT run** — per the brief, wasm32 builds beyond `cargo build --workspace`
+  are out of scope; the in-browser visual check is the user's hard gate.
+
+### Files touched
+
+| File | Change kind |
+|---|---|
+| `crates/bevy_naadf/src/bootstrap.rs` | Add `grid_preset: GridPreset` field + `Default` line + fan-out insert; fix pin test |
+| `crates/bevy_naadf/src/lib.rs` | Defensive `GridPreset::default()` seed in `build_app_with_args`; update stale `WebSkybox` docstring |
+| `crates/bevy_naadf/src/diagnostics.rs` | Add `grid_preset: Option<Res<GridPreset>>` param; dump reads the resource |
+| `crates/bevy_naadf/src/e2e/oasis_edit_visual.rs` | Legacy `run_e2e_render_with_args` → `BootstrapInputs` route with `grid_preset` |
+| `crates/bevy_naadf/src/e2e/small_edit_repro.rs` | Same |
+| `crates/bevy_naadf/src/e2e/vox_e2e.rs` | Same |
+| `crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs` | cpu-phase: legacy → `BootstrapInputs`; gpu-phase: add `grid_preset` to existing literal |
+| `crates/bevy_naadf/src/e2e/vox_web_parity.rs` | skybox-phase: legacy → `BootstrapInputs`; loaded-phase: add `grid_preset` to existing literal |
+| `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs` | Add `grid_preset` to existing `BootstrapInputs` literal |
+| `crates/bevy_naadf/src/e2e/vox_horizon_parity.rs` | Same |
+| `crates/bevy_naadf/src/voxel/plugin.rs` | Remove vestigial `.before(setup_test_grid)` ordering; fix stale comments |
+
+### Side notes / observations / complaints
+
+- **The prior implementer's checkpoint stopped at the worst possible
+  moment** — after the destructive half (field deleted from `AppArgs`, derive
+  added) but before the constructive half (field added to `BootstrapInputs`,
+  consumers updated). The `7efce79` commit message *describes* a complete
+  Step 5 ("`grid_preset: GridPreset` removed from `AppArgs`; `GridPreset`
+  derives `Resource`; `build_app_with_budget` now takes an explicit
+  `GridPreset` arg; … `setup_test_grid` reads `Res<GridPreset>`") — every
+  claim true, but the message omits that `BootstrapInputs` itself was never
+  given the field the new struct literals reference. A mechanical checkpoint
+  commit with a confident message over a non-compiling tree is a trap for
+  the next reader; the build-first discipline in the brief caught it
+  immediately.
+- **The checkpoint's structural choices were all correct** — this was a
+  *stopped* migration, not a *wrong* one. Finishing it was mechanical: every
+  missing piece had an exact precedent in the Steps 2/3/4 logs (the field on
+  `BootstrapInputs`, the fan-out insert, the defensive seed, the diagnostics
+  fan-out param, the e2e-gate `BootstrapInputs` route). No design
+  re-litigation needed.
+- **`build_app_with_budget`'s `(cfg, args, grid_preset)` signature is an
+  incremental wart** — it now takes one loose typed value alongside `args`.
+  As Steps 6-8 migrate more fields, this will either grow more positional
+  args or be consolidated to take a `BootstrapInputs` (the design §3.3
+  shape). Flagging for Step 6: the cleanest consolidation point is when
+  `E2eGateMode` lands, since the e2e binary's call path changes anyway.
+  Not Step 5's job.
+- **The `?skybox=1` relocation is wasm32-affecting** — `resolve_skybox_only_param()`
+  is `#[cfg(target_arch = "wasm32")]`-gated indirectly (it calls
+  `web_sys::window()`). The desktop gates cannot exercise it; the in-browser
+  `?skybox=1` baseline capture is the user's hard gate. The relocation logic
+  is straightforward (read the URL param on the main thread, write
+  `GridPreset::WebSkybox` into `BootstrapInputs` before `build_app_*`), and
+  `startup_fetch_default_vox` still does the HTTP-fetch skip + overlay hide
+  for the skybox path — only the grid-preset mutation moved out.
+- **The design's Step 5 spec matched reality** — the file:line citations had
+  drifted (Steps 3/4 shifted lines) but every cited *symbol* existed; the
+  spec's enumeration of "what Step 5 must contain" was an accurate checklist.
+- **`AppArgs` is now down to 13 fields** — `spawn_test_entity` + `resize_test`
+  + `vox_e2e_mode` + 10 e2e mode booleans. Step 8 (next) drains
+  `spawn_test_entity`; Steps 6/7 drain the rest.
+- **Foundation looks sound.** Same Assumptions from Steps 2-4 hold; the
+  per-domain `GridPreset` resource + the `BootstrapInputs` carrier handle the
+  Q3 wasm32 relocation cleanly. The orchestrator can proceed to Step 8.
