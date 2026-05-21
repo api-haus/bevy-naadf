@@ -312,3 +312,180 @@ below.
   byte-identical; the settings panel partial-split landed clean. Steps
   3-8 should be smooth executions of the same pattern. The orchestrator
   can proceed with confidence.
+
+## Step 3 — taa + gi (2026-05-21)
+
+### What landed
+
+- `crates/bevy_naadf/src/render/taa.rs` — new `TaaConfig { enabled: bool }`
+  main-world resource with `Default::default()` = `TaaConfig { enabled: true }`
+  (matches pre-Step-3 `AppArgs::default().taa`). `update_camera_history`
+  parameter swap from `Res<AppArgs>` → `Res<TaaConfig>` (`args.taa` →
+  `taa.enabled`).
+- `crates/bevy_naadf/src/settings/canonical.rs` — `#[derive(Resource)]` on
+  `GiSettings`. Added module-level docstring note about the promotion. No
+  field changes; `DEFAULTS` const + `Default` impl untouched.
+- `crates/bevy_naadf/src/render/extract.rs` — `extract_taa_config` source
+  swap `Res<AppArgs>` → `Res<TaaConfig>`; `extract_gi_config` source swap
+  `Res<AppArgs>` → `Res<GiSettings>`. Mirror shapes (`ExtractedTaaConfig`,
+  `ExtractedGiConfig`) unchanged. Docstrings updated.
+- `crates/bevy_naadf/src/app_args.rs` — deleted `pub taa: bool` (field +
+  default line) and `pub gi: GiSettings` (field + default line). Pruned
+  `use crate::GiSettings;` from imports. Updated module docstring.
+- `crates/bevy_naadf/src/bootstrap.rs` — added `taa: TaaConfig` and
+  `gi: GiSettings` fields on `BootstrapInputs`. `build_app_with_bootstrap_inputs`
+  now inserts both via Bevy's overwrite-in-place `insert_resource`. Pin test
+  swung onto the typed fields.
+- `crates/bevy_naadf/src/lib.rs` — `build_app_with_budget` uses
+  `..Default::default()` to inherit the new fields. **Added defensive seeds
+  in `build_app_with_args`** for `TaaConfig`, `GiSettings`, and
+  `TaaRingConfig`: the e2e_render binary calls `build_app(AppConfig::e2e())`
+  which bypasses `build_app_with_bootstrap_inputs`, so without the seed
+  `update_camera_history` (`Res<TaaConfig>`) panics on missing resource. See
+  side notes for why this is the right shape and what Step 9 cleans up.
+- `crates/bevy_naadf/src/main.rs` — wasm32 path: `..Default::default()`
+  added to the `BootstrapInputs` struct literal.
+- `crates/bevy_naadf/src/diagnostics.rs` — added `taa: Option<Res<TaaConfig>>`
+  + `gi: Option<Res<GiSettings>>` parameters. Dump block now reads each from
+  its per-domain resource (with a defensive missing-resource fallback string,
+  mirroring the Step-2 pattern for `taa_ring`).
+- `crates/bevy_naadf/src/settings/mod.rs` — added new
+  `KnobKind::ReadonlyFromGi { value: fn(&GiSettings) -> String }` variant +
+  `knob_readonly_gi!` macro (Decision §7 partial extension). Migrated the
+  `global_illum_max_accum` readonly row off the legacy
+  `KnobKind::Readonly { fn(&AppArgs) -> String }`. `KnobKind::Action` signature
+  changed from `fn(&mut AppArgs)` to `fn(&mut GiSettings)`. All system
+  parameters swapped: `adjust_settings` and `mouse_interact_settings` now
+  take `ResMut<GiSettings>`; `apply_drag_delta`, `handle_click_release`,
+  `reset_all_knobs` take `&mut GiSettings`. `update_settings_text` gains
+  `gi: Res<GiSettings>` (the U32/F32/Bool/`ReadonlyFromGi` rows read it)
+  while keeping `args: Res<AppArgs>` (still feeding the legacy
+  `Readonly { fn(&AppArgs) -> String }` rows that pass `|_| const`
+  closures — see side notes). The `reset_all_knobs_restores_defaults` unit
+  test was updated to mutate `GiSettings` directly.
+
+### Decisions made during impl
+
+1. **Defensive seeds in `build_app_with_args` for `TaaConfig`, `GiSettings`,
+   and `TaaRingConfig`** instead of routing every caller through
+   `build_app_with_bootstrap_inputs`. The e2e_render binary's
+   `run_e2e_render` / `run_e2e_render_with_args` build via `build_app`,
+   which calls `build_app_with_args` directly — bypassing the
+   bootstrap fan-out. After Step 3, `update_camera_history` reads
+   `Res<TaaConfig>` (non-Option), so without the seed the system panics on
+   the first frame. The seed mirrors the existing
+   `EffectiveWorldSize::canonical()` / `InvalidSampleStorageCount::canonical()`
+   pattern at the bottom of `build_app_with_args` (`lib.rs:245-258`). Step 9
+   will delete both the seed AND `build_app_with_args` once every caller
+   routes through `build_app_with_bootstrap_inputs`. This is the cleanest
+   incremental shape given Step 2 was permitted to insert `TaaRingConfig`
+   only through the wrapper (Step 2 was bisectable; this regression-of-shape
+   trade-off is what makes Step 3 bisectable too).
+2. **`KnobKind::ReadonlyFromGi` partial split — same shape as
+   `ReadonlyFromTaa` from Step 2.** `update_settings_text` gains one match
+   arm; all other settings-panel match-arms use wildcard fall-throughs and
+   needed no edits. No cascade (Decision §7's "would flip if more than 3-4
+   variants" threshold is far away).
+3. **`update_settings_text` keeps the legacy `args: Res<AppArgs>`
+   parameter.** All remaining `KnobKind::Readonly { fn(&AppArgs) -> String }`
+   rows (`camera_history_depth`, `valid_sample_storage`, …) pass
+   `|_| const` closures — they don't read AppArgs fields, but the closure
+   signature still requires the parameter. Step 9 deletes both the variant
+   and the parameter once `AppArgs` is gone.
+4. **`Default` for `TaaConfig`** = `TaaConfig { enabled: true }` (TAA on),
+   not `#[derive(Default)]` which would give `enabled: false`. Matches the
+   pre-refactor `AppArgs::default().taa = true`. The test
+   `default_wraps_canonical_app_args_defaults` pins this.
+5. **`Action` knob signature `fn(&mut GiSettings)`.** Today there's exactly
+   one action knob: "RESET ALL TO DEFAULTS", which is exactly
+   `reset_all_knobs(&mut GiSettings)`. The signature swap is mechanical;
+   the test was updated.
+
+### Verification
+
+- `cargo build --workspace`: PASS (clean compile, 31.01s, no new warnings).
+- `cargo test --workspace --lib`: PASS (191 passed; 0 failed; 1 ignored).
+  The relocated `reset_all_knobs_restores_defaults` test (now mutating
+  `GiSettings` directly) is in the passing set, validating that Assumption
+  #8 held — the translation was mechanical.
+- `cargo run --bin e2e_render -- baseline`: PASS — `e2e_render: PASS
+  (batch 6) — 96 warmup + 48 camera-motion + 1 settle frames, …`.
+  Region-luminance numbers (`emissive 247.6, solid 243.7, sky 202.9`) are
+  byte-identical to Step 2's baseline output — confirming the extract
+  source swap is lossless.
+- `cargo run --bin e2e_render -- --vox-horizon-native`: PASS — exit 0,
+  screenshot `vox_horizon_native.png` written. TAA-heavy gate; the
+  `update_camera_history` swap to `Res<TaaConfig>` did not perturb the
+  TAA ring.
+
+### Files touched
+
+| File | Lines | Change kind |
+|---|---|---|
+| `crates/bevy_naadf/src/render/taa.rs` | +33 / -8 | Add `TaaConfig` main-world resource; `update_camera_history` signature swap |
+| `crates/bevy_naadf/src/settings/canonical.rs` | +14 / -3 | `#[derive(Resource)]` + module docstring note |
+| `crates/bevy_naadf/src/render/extract.rs` | +18 / -8 | Source swap for `extract_taa_config` + `extract_gi_config` |
+| `crates/bevy_naadf/src/app_args.rs` | +9 / -16 | Delete `taa` / `gi` fields + defaults; docstring update |
+| `crates/bevy_naadf/src/bootstrap.rs` | +30 / -6 | New `taa: TaaConfig` + `gi: GiSettings` fields + fan-out inserts + pin test |
+| `crates/bevy_naadf/src/lib.rs` | +28 / -1 | Defensive seeds + `..Default::default()` on the `build_app_with_budget` literal |
+| `crates/bevy_naadf/src/main.rs` | +1 | `..Default::default()` on wasm32 `BootstrapInputs` literal |
+| `crates/bevy_naadf/src/diagnostics.rs` | +20 / -7 | Add `taa` + `gi` params; defensive missing-resource fallback strings |
+| `crates/bevy_naadf/src/settings/mod.rs` | +56 / -25 | New `ReadonlyFromGi` variant + macro + `ResMut<GiSettings>` swap across all panel systems |
+
+### Side notes / observations / complaints
+
+- **Design's per-step file:line citations matched current code** — Read/Grep
+  verified `args.gi` / `args.taa` consumer counts (21 sites the design
+  predicted, ~21 actually touched) and the `update_camera_history` /
+  `extract_*` / `mouse_interact_settings` / `adjust_settings` /
+  `update_settings_text` / `reset_all_knobs` sites. No drift.
+- **The defensive-seed in `build_app_with_args` discovery is a Step-2 latent
+  bug now patched.** Step 2's impl notes claimed the `from_world` post-extract
+  read was sound because the baseline gate passed. That was true — but only
+  because **nothing in `build_app_with_args`'s call-path read `TaaRingConfig`
+  as `Res<...>` non-Option from the main world** (the `update_settings_text`
+  panel read is gated by `cfg.add_hud`, which is OFF in e2e). Step 3
+  exposed the gap by adding a non-Option `Res<TaaConfig>` consumer that
+  fires on every frame (`update_camera_history`, in `CameraPlugin` which
+  is always added). The fix retrofits `TaaRingConfig` too — even though no
+  Step-2 test surfaced it, the implicit-ordering invariant from
+  `02-design.md`'s side notes was being violated in a corner case
+  (`add_hud + e2e` would have panicked).
+- **Assumption #8 held** — the `reset_all_knobs_restores_defaults` test
+  translated mechanically from `AppArgs::default()` + `args.gi.*` reads to
+  `GiSettings::default()` + direct field reads. Test passes.
+- **Assumption #5 (implicit ordering invariant)** continues to hold — every
+  per-domain resource has a canonical default seed reachable from every
+  `build_app*` entry point. The Step-3 fix tightened this for `TaaConfig` +
+  `GiSettings` + (retroactively) `TaaRingConfig`.
+- **Decision §7 partial extension cascaded cleanly.** Adding
+  `KnobKind::ReadonlyFromGi` mirrored Step 2's `ReadonlyFromTaa` 1:1 — one
+  new variant, one new macro, one new match arm in `update_settings_text`,
+  zero edits to the wildcard fall-throughs in `is_interactive` /
+  `apply_drag_delta` / `handle_click_release` / `mouse_interact_settings` /
+  `adjust_settings`. The macro-based knob table absorbs new readonly-source
+  types gracefully.
+- **The wasm32 `ConstructionConfig` divergence (Decision §5) is unaffected
+  by Step 3** — `From<&AppArgs>` still reads `args.construction_config`;
+  the wasm clamp still lives inside that impl. Step 4 relocates it.
+- **`KnobKind::Action`'s signature change is small but load-bearing.** It
+  pre-emptively prepares the action variant for Step 9's `AppArgs` deletion
+  — today the only action is `reset_all_knobs`, which already only mutates
+  GI fields. Switching to `fn(&mut GiSettings)` now (vs deferring to Step
+  9) avoided one extra round of touch in the same file.
+- **No `from_world`-ordering surprises.** Same as Step 2: `extract_taa_config`
+  and `extract_gi_config` runs in `ExtractSchedule` before any render-world
+  consumer reads the mirror. No silent shader-def disagreement.
+- **`AppArgs` is now down to 14 fields** (was 16 pre-refactor, 15 after
+  Step 1, 14 after Step 2, 14 after Step 3 — wait, that's still 14 because
+  Step 3 deleted 2 fields. Confirmed: `grid_preset` + `construction_config`
+  + `spawn_test_entity` + `resize_test` + 10 e2e mode booleans + 1
+  `vox_e2e_mode` = **14 fields** remaining for Steps 4, 5, 8 to drain).
+- **Subjective:** Step 3 is the largest single-step touch so far in terms
+  of files but the cleanest in terms of pattern — the settings-panel
+  parameter swap is a global find-and-replace of `args` → `gi`, and the
+  extract source swap is one line each. Pattern is starting to feel rote;
+  good sign.
+- **Foundation continues to look sound** — same Assumptions hold; the
+  per-domain `Resource` decomposition cleanly handles runtime-mutable
+  state (GI panel) without forcing a re-litigation of the design.

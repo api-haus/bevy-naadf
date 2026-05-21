@@ -83,6 +83,7 @@ fn main() -> AppExit {
                 taa_ring_depth: bevy_naadf::render::taa::TaaRingConfig {
                     depth: caps.taa_ring_depth,
                 },
+                ..Default::default()
             };
             let mut app = bevy_naadf::bootstrap::build_app_with_bootstrap_inputs(
                 AppConfig::windowed(),

@@ -5,12 +5,24 @@
 //! `GiSettings::DEFAULTS.*` via `From<&AppArgs>`. This file holds the canonical
 //! definition; `lib.rs` re-exports `GiSettings` for source-stability on existing
 //! `crate::GiSettings` imports.
+//!
+//! **Step 3 of the config-as-resource refactor** promoted `GiSettings` to a
+//! Bevy `Resource` (via `#[derive(Resource)]`). The settings panel mutates it
+//! through `ResMut<GiSettings>` and the render-world extract reads it through
+//! `Extract<Option<Res<GiSettings>>>` — `AppArgs.gi` is gone.
+
+use bevy::prelude::Resource;
 
 /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8). The C#
 /// `WorldRenderBase` ImGui sliders (`SettingDataRenderBase`) become these
-/// `AppArgs` constants — there is no GI settings GUI in the port (§1). The
+/// `GiSettings` constants — there is no GI settings GUI in the port (§1). The
 /// values are the C# slider *defaults*.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Step 3 of the config-as-resource refactor promoted this struct to a
+/// `Resource`: bootstrap inserts it via [`crate::bootstrap::BootstrapInputs`];
+/// the settings panel mutates it via `ResMut<GiSettings>`; the render-world
+/// `extract_gi_config` reads it via `Extract<Option<Res<GiSettings>>>`.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct GiSettings {
     /// Max secondary-ray bounce count (C# `bounceCount`).
     pub bounce_count: u32,

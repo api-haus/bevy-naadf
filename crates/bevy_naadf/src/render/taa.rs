@@ -29,6 +29,34 @@ use crate::render::pipelines::NaadfPipelines;
 /// camera-matrix ring is tiny in VRAM, so it stays at NAADF's depth.
 pub const CAMERA_HISTORY_DEPTH: usize = 128;
 
+/// Main-world canonical resource carrying the long-term TAA on/off toggle
+/// (`06-design-a2.md` §6.1, §8.2).
+///
+/// **Step 3 of the config-as-resource refactor** migrated `AppArgs.taa` onto
+/// this per-domain resource. The render-world mirror is the existing
+/// [`crate::render::extract::ExtractedTaaConfig`]; only the extract SOURCE
+/// changed (was `Res<AppArgs>`, now `Res<TaaConfig>`). `update_camera_history`
+/// also moved off `Res<AppArgs>` to `Res<TaaConfig>` for the same reason.
+///
+/// `Default::default()` = `TaaConfig { enabled: true }`, matching the
+/// pre-refactor `AppArgs::default().taa` value. Inserted at bootstrap by
+/// [`crate::bootstrap::build_app_with_bootstrap_inputs`] from a
+/// [`crate::bootstrap::BootstrapInputs`] field; no CLI surface mutates it
+/// today (the design's Decision §10 — `--taa <on|off>` is orthogonal future
+/// work).
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaaConfig {
+    /// Whether long-term TAA is enabled (mirrors the pre-refactor
+    /// `AppArgs.taa`).
+    pub enabled: bool,
+}
+
+impl Default for TaaConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Main-world canonical resource carrying the configured TAA sample-ring
 /// depth (`18-taa-fidelity.md` fix #3 — supersedes the former hard-coded
 /// `TAA_SAMPLE_RING_DEPTH = 16` const).
@@ -231,7 +259,7 @@ pub fn rotation_only_view_proj(camera: &Camera, rotation: Quat) -> Mat4 {
 /// octahedral buffer stale-zero (the out-of-volume streaking artifact).
 pub fn update_camera_history(
     camera: Single<(&Camera, &Transform, &PositionSplit), With<PositionSplit>>,
-    args: Res<crate::AppArgs>,
+    taa: Res<TaaConfig>,
     mut history: ResMut<CameraHistory>,
 ) {
     let (camera, transform, position_split) = *camera;
@@ -241,7 +269,7 @@ pub fn update_camera_history(
 
     // This frame's Halton jitter — zero when TAA is off (`06-design-a2.md`
     // §9.3: TAA-on implies jitter-on; no separate `isTAAJitter` knob).
-    let jitter = if args.taa {
+    let jitter = if taa.enabled {
         halton_jitter(history.frame_count)
     } else {
         Vec2::ZERO

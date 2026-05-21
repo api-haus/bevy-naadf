@@ -435,26 +435,33 @@ pub fn extract_camera_history(
     extracted.valid = true;
 }
 
-/// Render-world mirror of the `AppArgs.taa` runtime toggle
-/// (`06-design-a2.md` §6.1, §8.2). `AppArgs` is a main-world resource; the
-/// render-world prepare / graph systems need the flag to (a) set `FLAG_IS_TAA`
-/// in `GpuRenderParams` so the first-hit pass writes the `taa_samples` ring,
-/// and (b) gate the TAA reproject node's dispatch — when TAA is off the node
-/// early-returns, leaving `taa_sample_accum` bit-identical to Phase A.
+/// Render-world mirror of the [`crate::render::taa::TaaConfig`] runtime toggle
+/// (`06-design-a2.md` §6.1, §8.2). The main-world `TaaConfig` lives on a
+/// per-domain resource (Step 3 of the config-as-resource refactor — was
+/// formerly `AppArgs.taa`); the render-world prepare / graph systems need the
+/// flag to (a) set `FLAG_IS_TAA` in `GpuRenderParams` so the first-hit pass
+/// writes the `taa_samples` ring, and (b) gate the TAA reproject node's
+/// dispatch — when TAA is off the node early-returns, leaving
+/// `taa_sample_accum` bit-identical to Phase A.
 #[derive(Resource, Default, Clone, Copy)]
 pub struct ExtractedTaaConfig {
-    /// Whether long-term TAA is enabled (mirrors `AppArgs.taa`).
+    /// Whether long-term TAA is enabled (mirrors `TaaConfig.enabled`).
     pub enabled: bool,
 }
 
-/// `ExtractSchedule` system: mirror `AppArgs.taa` into the render-world
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::render::taa::TaaConfig`] into the render-world
 /// [`ExtractedTaaConfig`] (`06-design-a2.md` §8.2).
+///
+/// Step 3 of the config-as-resource refactor swapped the source from
+/// `Res<AppArgs>` (reading `args.taa`) to `Res<TaaConfig>` (reading
+/// `taa.enabled`) — the mirror shape is unchanged.
 pub fn extract_taa_config(
     mut extracted: ResMut<ExtractedTaaConfig>,
-    args: Extract<Option<Res<crate::AppArgs>>>,
+    taa: Extract<Option<Res<crate::render::taa::TaaConfig>>>,
 ) {
-    if let Some(args) = &*args {
-        extracted.enabled = args.taa;
+    if let Some(taa) = &*taa {
+        extracted.enabled = taa.enabled;
     }
 }
 
@@ -518,11 +525,15 @@ pub fn extract_taa_ring_depth(
     }
 }
 
-/// Render-world mirror of `AppArgs.gi` — the Phase-B GI pipeline settings
-/// (`09-design-b.md` §3.8 / §10.2). `AppArgs` is a main-world resource; the
-/// render-world `prepare_gi` system needs these to build `GpuGiParams`, and
+/// Render-world mirror of the main-world [`crate::GiSettings`] — the Phase-B
+/// GI pipeline settings (`09-design-b.md` §3.8 / §10.2). The render-world
+/// `prepare_gi` system needs these to build `GpuGiParams`, and
 /// `naadf_denoise_node` (Batch 5) gates on `is_denoise`. Like A-2's
 /// `ExtractedTaaConfig` — a flat `Copy` mirror, re-copied each frame.
+///
+/// Step 3 of the config-as-resource refactor lifted `GiSettings` out of
+/// `AppArgs.gi` onto its own per-domain main-world resource; only the extract
+/// SOURCE changed (was `Res<AppArgs>`, now `Res<GiSettings>`).
 #[derive(Resource, Clone, Copy)]
 #[derive(Default)]
 pub struct ExtractedGiConfig {
@@ -531,13 +542,17 @@ pub struct ExtractedGiConfig {
 }
 
 
-/// `ExtractSchedule` system: mirror `AppArgs.gi` into the render-world
-/// [`ExtractedGiConfig`] (`09-design-b.md` §10.2).
+/// `ExtractSchedule` system: mirror the main-world [`crate::GiSettings`] into
+/// the render-world [`ExtractedGiConfig`] (`09-design-b.md` §10.2).
+///
+/// Step 3 of the config-as-resource refactor swapped the source from
+/// `Res<AppArgs>` (reading `args.gi`) to `Res<GiSettings>` (reading the
+/// resource directly).
 pub fn extract_gi_config(
     mut extracted: ResMut<ExtractedGiConfig>,
-    args: Extract<Option<Res<crate::AppArgs>>>,
+    gi: Extract<Option<Res<crate::GiSettings>>>,
 ) {
-    if let Some(args) = &*args {
-        extracted.settings = args.gi;
+    if let Some(gi) = &*gi {
+        extracted.settings = **gi;
     }
 }

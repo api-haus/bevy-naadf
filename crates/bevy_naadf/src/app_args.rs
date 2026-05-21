@@ -1,21 +1,28 @@
 //! Command-line options, parsed once and stored as a Bevy `Resource`
 //! (`03-design.md` §4.1).
 //!
-//! Carries the production-meaningful knobs (`grid_preset`, `taa`, `gi`,
+//! Carries the remaining production-meaningful knobs (`grid_preset`,
 //! `construction_config`, `spawn_test_entity`) and a flat set of mode/phase
 //! booleans that drive the e2e harness dispatch from `bin/e2e_render.rs`.
 //! At most one e2e flag is true at a time — the enum collapse is deferred to
-//! a future Step 8 (D6+D7 paired) since it crosses 11 mode files.
+//! a future Step 6 (D6+D7 paired) since it crosses 11 mode files.
 //!
 //! **Step 2 of the config-as-resource refactor** migrated the user's named
 //! smell `taa_ring_depth` out of this struct onto the
 //! [`crate::render::taa::TaaRingConfig`] per-domain main-world resource. The
 //! pin tests moved with it to `crates/bevy_naadf/src/render/taa.rs::tests`.
+//!
+//! **Step 3 of the config-as-resource refactor** migrated `taa: bool` and
+//! `gi: GiSettings` onto the per-domain
+//! [`crate::render::taa::TaaConfig`] / [`crate::GiSettings`] resources. The
+//! settings panel, the diagnostics dump, and the render-world extract systems
+//! now read those resources directly; nothing in this file references TAA or
+//! GI any more.
 
 use bevy::prelude::*;
 
 use crate::render;
-use crate::{GiSettings, GridPreset};
+use crate::GridPreset;
 
 /// Command-line options, parsed once and stored as a resource
 /// (`03-design.md` §4.1).
@@ -29,13 +36,6 @@ use crate::{GiSettings, GridPreset};
 pub struct AppArgs {
     /// Which hard-coded test grid to build (D2).
     pub grid_preset: GridPreset,
-    /// Long-term TAA on/off. Default `true` (Phase A-2 turned this on; the
-    /// Phase-A baseline kept it off, but that historic default is irrelevant
-    /// now — both the production binary and the e2e harness boot with TAA
-    /// active).
-    pub taa: bool,
-    /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8).
-    pub gi: GiSettings,
     /// The Phase-C GPU-construction configuration (`15-design-c.md` §1.8,
     /// §2.1 W0 row). Same plumbing pattern as `taa_ring_depth`: this main-
     /// world field is the source of truth; `render::construction::
@@ -180,8 +180,6 @@ impl Default for AppArgs {
     fn default() -> Self {
         Self {
             grid_preset: GridPreset::default(),
-            taa: true,
-            gi: GiSettings::default(),
             construction_config: render::construction::ConstructionConfig::default(),
             spawn_test_entity: false,
             resize_test: false,

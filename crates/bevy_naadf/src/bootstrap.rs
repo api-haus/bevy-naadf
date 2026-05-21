@@ -24,8 +24,8 @@
 
 use bevy::prelude::{App, AppExit};
 
-use crate::render::taa::TaaRingConfig;
-use crate::{AppArgs, AppConfig};
+use crate::render::taa::{TaaConfig, TaaRingConfig};
+use crate::{AppArgs, AppConfig, GiSettings};
 
 /// Transient bootstrap-time configuration carrier.
 ///
@@ -61,6 +61,15 @@ pub struct BootstrapInputs {
     /// the mobile-budget / wasm32 entry points overwrite this with the
     /// budget-selected rung before the fan-out runs.
     pub taa_ring_depth: TaaRingConfig,
+    /// Long-term TAA on/off (`06-design-a2.md` §6.1). Migrated out of
+    /// `AppArgs.taa` in Step 3 of the config-as-resource refactor.
+    /// `TaaConfig::default()` = `TaaConfig { enabled: true }`.
+    pub taa: TaaConfig,
+    /// Phase-B GI pipeline settings (`09-design-b.md` §3.8). Migrated out of
+    /// `AppArgs.gi` in Step 3 of the config-as-resource refactor.
+    /// `GiSettings::default()` = `GiSettings::DEFAULTS`. The settings panel
+    /// mutates this resource at runtime via `ResMut<GiSettings>`.
+    pub gi: GiSettings,
 }
 
 /// Build the bevy-naadf `App` from an [`AppConfig`] and a [`BootstrapInputs`].
@@ -82,6 +91,15 @@ pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) 
     // `NaadfPipelines::from_world` reads the render-world mirror for the
     // `#{TAA_SAMPLE_RING_DEPTH}` shader-def.
     app.insert_resource(inputs.taa_ring_depth);
+    // Migrated in Step 3 — `TaaConfig` (the long-term TAA on/off toggle) +
+    // `GiSettings` (the Phase-B GI pipeline knobs the settings panel mutates).
+    // Each is read by an extract system (`extract_taa_config`,
+    // `extract_gi_config`) that pulls into the render sub-app per frame; the
+    // settings panel takes `ResMut<GiSettings>` to mutate the GI knobs at
+    // runtime. Like `taa_ring_depth`, these are inserted post-`build_app_with_args`
+    // so any caller that overrode `BootstrapInputs::default()` wins.
+    app.insert_resource(inputs.taa);
+    app.insert_resource(inputs.gi);
     app
 }
 
@@ -108,7 +126,7 @@ pub fn run_e2e_render_with_bootstrap_inputs(inputs: BootstrapInputs) -> AppExit 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GridPreset, DEFAULT_TAA_RING_DEPTH};
+    use crate::{GiSettings, GridPreset, DEFAULT_TAA_RING_DEPTH};
 
     /// `BootstrapInputs::default()` must produce the same canonical defaults
     /// as today's `AppArgs::default()` (for fields still on `AppArgs`) plus
@@ -118,7 +136,8 @@ mod tests {
     ///
     /// Step 2 of the config-as-resource refactor migrated `taa_ring_depth`
     /// off `AppArgs` onto the `taa_ring_depth: TaaRingConfig` field on this
-    /// struct; the pin moved to the typed field.
+    /// struct; Step 3 migrated `taa` and `gi` onto `taa: TaaConfig` and
+    /// `gi: GiSettings`. The pins moved to the typed fields.
     #[test]
     fn default_wraps_canonical_app_args_defaults() {
         let inputs = BootstrapInputs::default();
@@ -127,7 +146,12 @@ mod tests {
         // Step 2.
         assert_eq!(inputs.taa_ring_depth.depth, DEFAULT_TAA_RING_DEPTH);
         // TAA on by default (Phase A-2; both production and e2e boot TAA on).
-        assert!(inputs.args.taa);
+        // Step 3 — migrated from `AppArgs.taa` onto `BootstrapInputs.taa`.
+        assert!(inputs.taa.enabled);
+        // GI defaults match `GiSettings::DEFAULTS`; the round-trip is pinned
+        // by `settings::tests::defaults_match_gi_settings_default`. Step 3
+        // moved this field off `AppArgs.gi`.
+        assert_eq!(inputs.gi, GiSettings::default());
         // The default world content is the hard-coded test grid.
         assert_eq!(inputs.args.grid_preset, GridPreset::Default);
         // The fixture spawner is off by default; `--entities` flips it.

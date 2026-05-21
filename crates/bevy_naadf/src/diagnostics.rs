@@ -14,17 +14,21 @@ use bevy::window::{PrimaryWindow, Window};
 
 use crate::AppArgs;
 use crate::AppConfig;
+use crate::GiSettings;
 use crate::camera::position_split::PositionSplit;
 use crate::editor::ray::screen_to_ray;
-use crate::render::taa::TaaRingConfig;
+use crate::render::taa::{TaaConfig, TaaRingConfig};
 use crate::world::data::{VoxelTypes, WorldData};
 
 /// `Update` system: on `KeyP` just_pressed, log a single multi-line
 /// diagnostics block covering camera, cursor → voxel raycast, and `AppArgs`.
+#[allow(clippy::too_many_arguments)]
 pub fn dump_diagnostics_on_p(
     keys: Res<ButtonInput<KeyCode>>,
     args: Option<Res<AppArgs>>,
+    taa: Option<Res<TaaConfig>>,
     taa_ring: Option<Res<TaaRingConfig>>,
+    gi: Option<Res<GiSettings>>,
     world_data: Option<Res<WorldData>>,
     voxel_types: Option<Res<VoxelTypes>>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -104,27 +108,35 @@ pub fn dump_diagnostics_on_p(
     }
 
     if let Some(a) = args.as_ref() {
-        // Step 2 of the config-as-resource refactor: `taa_ring_depth` migrated
-        // off `AppArgs` onto the standalone `TaaRingConfig` main-world
-        // resource. The diagnostics dump fans out — per Q4 of
+        // Steps 2 + 3 of the config-as-resource refactor: `taa_ring_depth`,
+        // `taa` and `gi` migrated off `AppArgs` onto standalone per-domain
+        // main-world resources. The diagnostics dump fans out — per Q4 of
         // `docs/orchestrate/config-as-resource-refactor/01-context.md`.
         let taa_ring_depth_str = taa_ring
             .as_ref()
             .map(|r| r.depth.to_string())
             .unwrap_or_else(|| "<TaaRingConfig resource missing>".to_string());
+        let taa_str = taa
+            .as_ref()
+            .map(|t| t.enabled.to_string())
+            .unwrap_or_else(|| "<TaaConfig resource missing>".to_string());
+        let gi_str = gi
+            .as_ref()
+            .map(|g| format!("{:#?}", **g))
+            .unwrap_or_else(|| "<GiSettings resource missing>".to_string());
         let _ = writeln!(
             buf,
             "args.grid_preset         = {:?}\n\
-             args.taa                 = {}\n\
+             taa                      = {}\n\
              taa_ring_depth           = {}\n\
              args.spawn_test_entity   = {}\n\
-             args.gi                  = {:#?}\n\
+             gi                       = {}\n\
              args.construction_config = {:#?}",
             a.grid_preset,
-            a.taa,
+            taa_str,
             taa_ring_depth_str,
             a.spawn_test_entity,
-            a.gi,
+            gi_str,
             a.construction_config
         );
     } else {

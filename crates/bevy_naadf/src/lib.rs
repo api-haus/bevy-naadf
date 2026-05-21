@@ -164,6 +164,7 @@ pub fn build_app_with_budget(cfg: AppConfig, args: AppArgs) -> App {
         taa_ring_depth: crate::render::taa::TaaRingConfig {
             depth: caps.taa_ring_depth,
         },
+        ..Default::default()
     };
     let mut app = crate::bootstrap::build_app_with_bootstrap_inputs(cfg, inputs);
     app.insert_resource(crate::render::budget::EffectiveWorldSize::from_segments(
@@ -230,6 +231,34 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         // (`06-design-a2.md` §2.3). Main-world resource, `Default`-seeded,
         // updated each frame by `update_camera_history`.
         .init_resource::<render::taa::CameraHistory>();
+
+    // Step 3 of the config-as-resource refactor — defensively seed the
+    // per-domain `TaaConfig` and `GiSettings` resources at the canonical
+    // defaults so the e2e_render binary's direct
+    // `build_app(AppConfig::e2e())` path (`run_e2e_render` /
+    // `run_e2e_render_with_args`, which bypass
+    // `build_app_with_bootstrap_inputs`) still has the resources
+    // `update_camera_history` (`Res<TaaConfig>`) and the settings panel
+    // (`ResMut<GiSettings>`) need.  Callers routing through
+    // `build_app_with_bootstrap_inputs` overwrite both with their `inputs`
+    // values via Bevy's `insert_resource` overwrite-in-place semantic. Same
+    // shape as the `EffectiveWorldSize::canonical()` /
+    // `InvalidSampleStorageCount::canonical()` defensive seeds below. Step 9
+    // deletes these once every caller routes through the bootstrap fan-out.
+    if !app.world().contains_resource::<render::taa::TaaConfig>() {
+        app.insert_resource(render::taa::TaaConfig::default());
+    }
+    if !app.world().contains_resource::<crate::GiSettings>() {
+        app.insert_resource(crate::GiSettings::default());
+    }
+    // Same defensive seed for the Step-2 `TaaRingConfig` — the settings
+    // panel readonly knob reads it via `Res<TaaRingConfig>` (non-Option) when
+    // the panel is open. Today the e2e harness disables HUD/settings so the
+    // gap was invisible; defensively seeding keeps the future
+    // `cfg.add_hud + e2e` combination from regressing.
+    if !app.world().contains_resource::<render::taa::TaaRingConfig>() {
+        app.insert_resource(render::taa::TaaRingConfig::default());
+    }
 
     // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#
     // canonical value if no caller (Android entry / future probe-mode CLI)
