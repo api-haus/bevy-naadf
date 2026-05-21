@@ -12,9 +12,9 @@ default-run = "bevy-naadf"
 # plus three thin binaries over it: `bevy-naadf` (the production app,
 # `src/main.rs`), `e2e_render` (the bounded windowed render-test harness,
 # `src/bin/e2e_render.rs`), and `bake` (the headless asset-processor runner,
-# `src/bin/bake.rs` — see `src/texture_array/`). All the unit tests live in the
-# library; `cargo test` runs them. See `docs/orchestrate/naadf-bevy-port/
-# e2e-render-test.md` §9.
+# `src/bin/bake.rs` — retained as an InstaMAT pre-bake scaffold). All the unit
+# tests live in the library; `cargo test` runs them. See
+# `docs/orchestrate/naadf-bevy-port/e2e-render-test.md` §9.
 [lib]
 name = "bevy_naadf"
 path = "src/lib.rs"
@@ -34,9 +34,8 @@ path = "src/bin/bake.rs"
 [dependencies]
 # free_camera = the prebuilt fly-camera from bevy_camera_controller (off by default).
 # The `dlss` feature is forwarded from this crate's own `[features]` below;
-# `basis-universal` (Bevy's runtime Basis transcoder) is added native-only in the
-# `[target.'cfg(not(wasm32))']` section below — its C++ cannot cross-compile to
-# the `wasm32-unknown-unknown` web target.
+# the `asset_processor` Bevy feature is added native-only in the
+# `[target.'cfg(not(wasm32))']` section below (required by the `bake` binary).
 bevy = { version = "=0.19.0-rc.1", features = [
     "free_camera",
 ] }
@@ -52,13 +51,11 @@ bytemuck = { version = "=1.25.0", features = ["derive"] }
 # `docs/orchestrate/feature-completeness/02a-design-vox-loading.md`.
 dot_vox = "5.2"
 # image = PNG encoding for the e2e harness's persistent screenshot-to-disk
-# (`src/e2e/framebuffer.rs` `Framebuffer::save_png`) plus PNG/JPEG *decoding* for
-# the texture-array loader's source maps (`src/texture_array/loader.rs`). Pinned
-# to the exact version Bevy 0.19-rc.1 already pulls in transitively (so there is
-# no second copy of the crate).
+# (`src/e2e/framebuffer.rs` `Framebuffer::save_png`). Pinned to the exact
+# version Bevy 0.19-rc.1 already pulls in transitively (so there is no
+# second copy of the crate).
 image = { version = "=0.25.10", default-features = false, features = [
     "png",
-    "jpeg",
 ] }
 # image-compare = SSIM (Structural Similarity Index) implementation, consumed by
 # the `--vox-gpu-oracle` gate (`src/e2e/vox_gpu_oracle.rs`, Stage 14 — see
@@ -77,14 +74,11 @@ image-compare = "0.5"
 # the trait impl resolves against the same `Layer` type Bevy uses.
 tracing = "0.1"
 tracing-subscriber = "0.3"
-# ron = the `*.texarray.ron` texture-array definition format
-# (`src/texture_array/def.rs`). Bevy already pulls `ron` transitively at this
-# minor version.
-ron = "0.12"
-# serde = derive `Deserialize` for the `*.texarray.ron` definition types
-# (`src/texture_array/def.rs`). thiserror = the loader/saver error enums
-# (`src/texture_array/{loader,saver}.rs`). Both are already in Bevy's tree at
-# these majors, so neither adds a second copy.
+# serde = derive surface (`#[derive(Serialize)]` used by the press-P
+# device-snapshot dump in `src/diagnostics.rs`). thiserror = the
+# error enums in `voxel/vox_import.rs` + `voxel/cvox_import.rs` +
+# `voxel/voxel_dispatch.rs`. Both are already in Bevy's tree at these
+# majors, so neither adds a second copy.
 serde = { version = "1", features = ["derive"] }
 # serde_json — single-line JSON emit for the `[device-snapshot]` static
 # diagnostic surface (`src/diagnostics.rs`). Pulled in transitively already
@@ -119,29 +113,15 @@ wgpu = "=29.0.3"
 # Pure-rust, no native deps; wasm-compatible.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-# Native-only support for the texture-array Basis pipeline (`src/texture_array/`,
-# `src/bin/bake.rs`):
-#   * `bevy/asset_processor` — gates Bevy's `AssetProcessor` itself; without it
-#     `AssetMode::Processed` only *reads* a pre-built `imported_assets/`, it
-#     never runs the processor. The `bake` binary needs it; the production app
-#     stays `Unprocessed` and just ignores the extra (unused) processor code.
-#   * `bevy/basis-universal` — Bevy's runtime transcoder, so `ImageLoader` can
-#     decode the baked `.basis` files and transcode them per-GPU at load.
-#   * `basis-universal` — the encoder half, used by the processor's saver
-#     (`src/texture_array/saver.rs`); version tracks the `0.3` Bevy 0.19 uses.
-# Native-only on purpose: `basis-universal-sys` compiles the encoder C++
-# unconditionally, and that does not cross-compile to bare
-# `wasm32-unknown-unknown` (no C sysroot for `<stdlib.h>`). The web build
-# therefore drops Basis entirely and loads `*.texarray.ron` uncompressed through
-# `TextureArrayLoader` — see `src/texture_array/`. A single compressed artifact
-# for both targets would need either a wasm C sysroot or a `bevy_voxel_world`
-# style dual-format (BC7 + ETC2) pre-transcoding baker.
+# Native-only — the `bake` binary (`src/bin/bake.rs`) needs Bevy's
+# `AssetProcessor` to opt into `AssetMode::Processed`. Without
+# `bevy/asset_processor` Bevy only *reads* a pre-built `imported_assets/`;
+# it never runs the processor. The production app + the e2e harness stay
+# `Unprocessed` and ignore the extra processor code. Retained as
+# InstaMAT pre-bake-to-disk scaffold (see the `instamat-bake-to-disk`
+# user memory).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-bevy = { version = "=0.19.0-rc.1", features = [
-    "asset_processor",
-    "basis-universal",
-] }
-basis-universal = "0.3"
+bevy = { version = "=0.19.0-rc.1", features = ["asset_processor"] }
 
 # wasm32-only: getrandom ≥0.3 refuses to compile for `wasm32-unknown-unknown`
 # without an explicit backend. `dot_vox`→`ahash` pulls getrandom 0.3.4
@@ -226,9 +206,10 @@ force_disable_dlss = ["bevy/force_disable_dlss"]
 # wins). Build with `--features webgpu` for the wasm32 target.
 webgpu = ["bevy/webgpu"]
 
-# The texture-array Basis pipeline needs no cargo feature: `AssetMode::Processed`
-# lives entirely in the dedicated `bake` binary (`src/bin/bake.rs`), so the
-# production app / e2e harness / wasm build are unaffected by it.
+# The `bake` binary opts into `AssetMode::Processed` directly via the
+# `bevy/asset_processor` feature added in the native-only deps block above; no
+# crate-level cargo feature is needed. The production app / e2e harness / wasm
+# build stay `Unprocessed` and ignore the extra processor code.
 
 # NOTE: the `[profile.*]` fast-iteration tweaks live in the workspace-root
 # `Cargo.toml` — Cargo only honours profile overrides in the root manifest.

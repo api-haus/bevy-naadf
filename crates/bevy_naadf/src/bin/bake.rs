@@ -1,24 +1,22 @@
 //! `bake` — runs Bevy's [`AssetProcessor`] over `src/assets/` once, then exits.
 //!
-//! The production app (`bevy-naadf`) and the e2e harness both run in
-//! `AssetMode::Unprocessed`; a Bevy `AssetProcessor` is app-global and racing it
-//! against the render pipeline's shader loads is fragile, so this binary is the
-//! *only* thing that flips on `AssetMode::Processed`. It builds a headless,
-//! render-less app — just the task pools, the asset pipeline, and
-//! [`TextureArrayPlugin`] — lets the processor turn every source under
-//! `src/assets/` into `imported_assets/Default/` (each `*.texarray.ron` baked
-//! into a Basis-supercompressed `.basis` array by `TextureArrayBasisSaver`),
-//! and exits as soon as the processor reports [`ProcessorState::Finished`].
+//! Retained as an InstaMAT pre-bake-to-disk scaffold (see
+//! `instamat-bake-to-disk` user memory): a headless, render-less Bevy app that
+//! boots the asset pipeline in `AssetMode::Processed` and exits when the
+//! processor reports `ProcessorState::Finished`. The runtime baked-material
+//! consumer lives on a separate PBR branch; on master this binary processes no
+//! assets — it is the template the future InstaMAT integration plugs into.
 //!
-//! Native-only: the Basis encoder does not cross-compile to wasm — see the
-//! [`crate::texture_array`](bevy_naadf::texture_array) module docs.
+//! Native-only: the production app (`bevy-naadf`) and the e2e harness both
+//! run in `AssetMode::Unprocessed`; a Bevy `AssetProcessor` is app-global and
+//! racing it against the render pipeline's shader loads is fragile.
 //!
 //! Run it with `cargo run --bin bake` (or `just bake-texarrays`).
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    // The web build never bakes — the Basis encoder is native-only.
-    panic!("`bake` is a native-only binary; the web build cannot run the Basis encoder");
+    // The web build never bakes — the asset processor is native-only.
+    panic!("`bake` is a native-only binary; the web build cannot run the asset processor");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,7 +31,6 @@ fn main() -> bevy::app::AppExit {
     use bevy::prelude::*;
     use bevy::tasks::block_on;
     use bevy::MinimalPlugins;
-    use bevy_naadf::texture_array::TextureArrayPlugin;
 
     /// Poll the [`AssetProcessor`] every `Update`; exit `Success` once it has
     /// finished, or `Error` if it stalls (a malformed source `.meta` must not
@@ -70,9 +67,11 @@ fn main() -> bevy::app::AppExit {
             // counter, time, and a headless run loop — no window, no renderer.
             MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(10))),
             LogPlugin::default(),
-            // Same asset root as `build_app`, but `Processed` so the
-            // `AssetProcessor` resource exists for `TextureArrayPlugin` to
-            // register its processor against.
+            // `AssetMode::Processed` boots Bevy's `AssetProcessor` resource —
+            // the InstaMAT-pattern entry point. With no asset-processor
+            // plugins registered the processor finishes immediately
+            // (`ProcessorState::Finished` on the first poll); future
+            // InstaMAT integration registers its processor here.
             AssetPlugin {
                 file_path: "src/assets".to_string(),
                 mode: AssetMode::Processed,
@@ -81,15 +80,14 @@ fn main() -> bevy::app::AppExit {
             // Sets up the `Image` asset type. It only *pre*-registers
             // `ImageLoader` — see the explicit registration below.
             ImagePlugin::default(),
-            TextureArrayPlugin,
         ))
         // `bevy_image::ImagePlugin` only *pre*-registers `ImageLoader`; the real
         // registration normally lives in `bevy_render` (it needs the GPU's
         // compressed-format list). This headless bake app has no renderer, so
         // register `ImageLoader` directly — the processor needs it to
-        // deserialize the source PNGs' `Load`-action `.meta` sidecars. Empty
-        // compressed-format support is fine: the bake only *copies* those PNGs
-        // (their `.meta` opts them out of decoding/compression entirely).
+        // deserialize source PNGs' `Load`-action `.meta` sidecars. Empty
+        // compressed-format support is fine: any future InstaMAT processor
+        // declares its own format support.
         .register_asset_loader(ImageLoader::new(CompressedImageFormats::empty()))
         .add_systems(Update, exit_when_finished)
         .run()

@@ -12,7 +12,6 @@
 
 pub mod aadf;
 pub mod app_mode;
-pub mod baked_material;
 pub mod camera;
 pub mod diagnostics;
 pub mod e2e;
@@ -20,7 +19,6 @@ pub mod editor;
 pub mod hud;
 pub mod render;
 pub mod settings;
-pub mod texture_array;
 pub mod voxel;
 pub mod world;
 
@@ -722,9 +720,9 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
                     // Stays `AssetMode::Unprocessed` for the production app and
                     // the e2e harness: a Bevy `AssetProcessor` is app-global and
                     // racing it against the render pipeline's shader loads is
-                    // fragile. The texture-array Basis pipeline runs out-of-band
-                    // in the dedicated `bake` binary instead (`src/bin/bake.rs`,
-                    // `just bake`) — see `crate::texture_array`.
+                    // fragile. The dedicated `bake` binary (`src/bin/bake.rs`,
+                    // `just bake-texarrays`) opts into `AssetMode::Processed`
+                    // instead — retained as an InstaMAT pre-bake scaffold.
                     ..default()
                 })
                 .set(RenderPlugin {
@@ -753,17 +751,6 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // succeeds (same ordering as `NaadfRenderPlugin`'s
             // `init_gpu_resource::<NaadfPipelines>()`).
             render::construction::ConstructionPlugin,
-            // `material.ron` loader — registers `MaterialRonLoader` so
-            // `materials/<name>/material.ron` resolves to a `StandardMaterial`.
-            // Infrastructure only: nothing in the scene consumes a baked
-            // material yet (wiring baked PBR into the custom voxel render path
-            // is a separate future effort).
-            baked_material::BakedMaterialPlugin,
-            // Registers the `*.texarray.ron` asset loader. The plugin also wires
-            // the native Basis `AssetProcessor`, but that only activates when an
-            // `AssetProcessor` resource exists — i.e. in the `bake` binary's
-            // `AssetMode::Processed` app, not here. See `crate::texture_array`.
-            texture_array::TextureArrayPlugin,
         ));
 
     // The fly camera + runtime DLSS toggle — production only. The e2e config
