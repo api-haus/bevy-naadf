@@ -17,6 +17,7 @@ use crate::AppConfig;
 use crate::GiSettings;
 use crate::camera::position_split::PositionSplit;
 use crate::editor::ray::screen_to_ray;
+use crate::render::construction::ConstructionConfig;
 use crate::render::taa::{TaaConfig, TaaRingConfig};
 use crate::world::data::{VoxelTypes, WorldData};
 
@@ -29,6 +30,7 @@ pub fn dump_diagnostics_on_p(
     taa: Option<Res<TaaConfig>>,
     taa_ring: Option<Res<TaaRingConfig>>,
     gi: Option<Res<GiSettings>>,
+    construction: Option<Res<ConstructionConfig>>,
     world_data: Option<Res<WorldData>>,
     voxel_types: Option<Res<VoxelTypes>>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -124,6 +126,10 @@ pub fn dump_diagnostics_on_p(
             .as_ref()
             .map(|g| format!("{:#?}", **g))
             .unwrap_or_else(|| "<GiSettings resource missing>".to_string());
+        let construction_str = construction
+            .as_ref()
+            .map(|c| format!("{:#?}", **c))
+            .unwrap_or_else(|| "<ConstructionConfig resource missing>".to_string());
         let _ = writeln!(
             buf,
             "args.grid_preset         = {:?}\n\
@@ -131,13 +137,13 @@ pub fn dump_diagnostics_on_p(
              taa_ring_depth           = {}\n\
              args.spawn_test_entity   = {}\n\
              gi                       = {}\n\
-             args.construction_config = {:#?}",
+             construction_config      = {}",
             a.grid_preset,
             taa_str,
             taa_ring_depth_str,
             a.spawn_test_entity,
             gi_str,
-            a.construction_config
+            construction_str,
         );
     } else {
         buf.push_str("args: <AppArgs resource missing>\n");

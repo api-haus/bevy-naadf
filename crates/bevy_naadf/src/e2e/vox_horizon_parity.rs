@@ -155,9 +155,18 @@ pub fn run_vox_horizon_native_phase() -> AppExit {
 
     let mut app_args = crate::AppArgs::default();
     app_args.grid_preset = crate::GridPreset::Vox { path };
-    app_args.construction_config.gpu_construction_enabled = true;
     app_args.vox_horizon_native_phase = true;
-    crate::run_e2e_render_with_args(app_args)
+    // Step 4 of the config-as-resource refactor — `construction_config`
+    // migrated off `AppArgs` onto `BootstrapInputs.construction_config`.
+    let mut construction_config =
+        crate::render::construction::ConstructionConfig::for_target_arch();
+    construction_config.gpu_construction_enabled = true;
+    let inputs = crate::bootstrap::BootstrapInputs {
+        args: app_args,
+        construction_config,
+        ..crate::bootstrap::BootstrapInputs::default()
+    };
+    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 // ---------------------------------------------------------------------------

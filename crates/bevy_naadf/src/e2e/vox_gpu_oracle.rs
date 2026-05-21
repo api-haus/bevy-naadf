@@ -331,9 +331,18 @@ pub fn run_vox_gpu_oracle_gpu_phase() -> AppExit {
     // The production install path (no oracle-CPU-phase flag) —
     // `install_vox_in_fixed_world` + W5 GPU producer chain. GPU
     // construction default-on; explicit assignment for belt-and-braces.
-    app_args.construction_config.gpu_construction_enabled = true;
     app_args.vox_gpu_oracle_gpu_phase = true;
-    crate::run_e2e_render_with_args(app_args)
+    // Step 4 of the config-as-resource refactor — `construction_config`
+    // migrated off `AppArgs` onto `BootstrapInputs.construction_config`.
+    let mut construction_config =
+        crate::render::construction::ConstructionConfig::for_target_arch();
+    construction_config.gpu_construction_enabled = true;
+    let inputs = crate::bootstrap::BootstrapInputs {
+        args: app_args,
+        construction_config,
+        ..crate::bootstrap::BootstrapInputs::default()
+    };
+    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 // ---------------------------------------------------------------------------

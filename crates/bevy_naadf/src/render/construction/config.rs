@@ -193,6 +193,46 @@ impl Default for ConstructionConfig {
 /// asserts + the entity-history-ring allocation in `prepare_construction`.
 pub const DEFAULT_MAX_ENTITY_INSTANCES: u32 = 16384;
 
+impl ConstructionConfig {
+    /// Return a `ConstructionConfig` tailored to the current `target_arch`.
+    ///
+    /// **Step 4 of the config-as-resource refactor** (Decision §5): the
+    /// wasm32 platform divergence previously living inside
+    /// `From<&AppArgs> for ConstructionConfig` (a now-deleted `From` impl)
+    /// moved here. The desktop arm returns the canonical
+    /// [`ConstructionConfig::default()`]; the wasm32 arm applies the
+    /// load-bearing `max_group_bound_dispatch` clamp + `n_bounds_rounds = 1`
+    /// fix (see [`WASM_MAX_GROUP_BOUND_DISPATCH`] docblock).
+    ///
+    /// Encapsulates the divergence in one place — bootstrap callers
+    /// (`build_app_with_bootstrap_inputs`, e2e gate builders, the const-pin
+    /// at the bottom of this file) all read from this one constructor; the
+    /// `#[cfg(target_arch = "wasm32")]` branching lives nowhere else.
+    pub fn for_target_arch() -> Self {
+        #[allow(unused_mut)]
+        let mut cfg = Self::default();
+        #[cfg(target_arch = "wasm32")]
+        {
+            cfg.max_group_bound_dispatch =
+                cfg.max_group_bound_dispatch.min(WASM_MAX_GROUP_BOUND_DISPATCH);
+            // 2026-05-20 brute-force iter-4 (HU) — drop n_bounds_rounds to 1
+            // on wasm. Multiple rounds per frame → multiple compute passes in
+            // the same encoder → Dawn must insert intra-encoder cross-pass
+            // barriers between consecutive compute writes to chunks. If
+            // Dawn's intra-encoder barrier is empirically broken (per the
+            // 12 prior refutations), then n=1 sidesteps it: one pass per
+            // frame, then end-of-encoder + submit (with Bevy's render-graph
+            // submit) gives a host-observable sync boundary that's known to
+            // work for buffer-state propagation. Over 60+ frames of W3
+            // running at 1 round/frame, we accumulate ~60 rounds of
+            // expansion — less than n=5's 300, but with potentially
+            // reliable cross-frame propagation.
+            cfg.n_bounds_rounds = 1;
+        }
+        cfg
+    }
+}
+
 /// 2026-05-19 web-vox ray-termination fix — wasm32 cap on
 /// `max_group_bound_dispatch`. The wasm regime-2 path direct-dispatches
 /// `compute_group_bounds` (see
@@ -249,43 +289,14 @@ pub const DEFAULT_MAX_ENTITY_INSTANCES: u32 = 16384;
 #[cfg(target_arch = "wasm32")]
 pub const WASM_MAX_GROUP_BOUND_DISPATCH: u32 = 4096;
 
-impl From<&crate::AppArgs> for ConstructionConfig {
-    /// Mirror `TaaRingConfig::depth = args.taa_ring_depth` pattern: read the
-    /// embedded `construction_config` straight out of `AppArgs`.
-    ///
-    /// W0 keeps `AppArgs.construction_config` as a plain `ConstructionConfig`
-    /// field (default `ConstructionConfig::default()`); the conversion is a
-    /// `Copy`. Later workstreams (W1 / W4) extend `AppArgs` with CLI flags
-    /// that mutate specific fields; the `From<&AppArgs>` lift stays the
-    /// single seam between the main-world args and the render-side resource.
-    ///
-    /// **2026-05-19 web-vox ray-termination fix** — on wasm32, clamps
-    /// `max_group_bound_dispatch` to [`WASM_MAX_GROUP_BOUND_DISPATCH`]. See
-    /// that const's docblock for the rationale + perf budget.
-    fn from(args: &crate::AppArgs) -> Self {
-        #[allow(unused_mut)]
-        let mut cfg = args.construction_config;
-        #[cfg(target_arch = "wasm32")]
-        {
-            cfg.max_group_bound_dispatch =
-                cfg.max_group_bound_dispatch.min(WASM_MAX_GROUP_BOUND_DISPATCH);
-            // 2026-05-20 brute-force iter-4 (HU) — drop n_bounds_rounds to 1
-            // on wasm. Multiple rounds per frame → multiple compute passes in
-            // the same encoder → Dawn must insert intra-encoder cross-pass
-            // barriers between consecutive compute writes to chunks. If
-            // Dawn's intra-encoder barrier is empirically broken (per the
-            // 12 prior refutations), then n=1 sidesteps it: one pass per
-            // frame, then end-of-encoder + submit (with Bevy's render-graph
-            // submit) gives a host-observable sync boundary that's known to
-            // work for buffer-state propagation. Over 60+ frames of W3
-            // running at 1 round/frame, we accumulate ~60 rounds of
-            // expansion — less than n=5's 300, but with potentially
-            // reliable cross-frame propagation.
-            cfg.n_bounds_rounds = 1;
-        }
-        cfg
-    }
-}
+// Step 4 of the config-as-resource refactor (
+// `docs/orchestrate/config-as-resource-refactor/02-design.md` §4 Step 4):
+// `impl From<&crate::AppArgs> for ConstructionConfig` deleted. The wasm32
+// divergence moved into [`ConstructionConfig::for_target_arch`] (Decision §5);
+// bootstrap now inserts `ConstructionConfig` directly via
+// `BootstrapInputs.construction_config`, and the e2e gates that mutated
+// individual fields construct their own `ConstructionConfig` value off
+// `for_target_arch()` and write it into `BootstrapInputs`.
 
 // Compile-time pin of the NAADF defaults so a careless future edit can't
 // silently drift the build path away from the canonical methodology
@@ -293,6 +304,13 @@ impl From<&crate::AppArgs> for ConstructionConfig {
 // runtime test asserts — they cost zero binary size and fail at build time
 // rather than test-run time. W0 stays at the "+1 test" budget the brief sets
 // (the new test is `construction_params_layout` in `gpu_types.rs`).
+//
+// Step 4 of the config-as-resource refactor (`02-design.md` side note #2):
+// the pin now asserts the literal field values against the **desktop arm of
+// `ConstructionConfig::for_target_arch()`** rather than against
+// `ConstructionConfig::default()` standalone. The const pins the desktop
+// build path's view of the config (i.e. the values reached on every native
+// target — see Decision §5 for the wasm32 arm).
 const _: () = {
     let cfg = ConstructionConfig {
         // vox-gpu-rewrite W5.3-fix Stage 2 — see the runtime default's
@@ -324,3 +342,32 @@ const _: () = {
     // W4 — verify the cap-derived stride for the history-ring buffer.
     let _ = cfg.max_entity_instances;
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Step 4 side-note #2 — the literal-field const-pin must agree with
+    /// the **desktop arm of `for_target_arch()`**. The const-pin block above
+    /// hard-codes the canonical-default values; this runtime test re-asserts
+    /// they equal `for_target_arch()`'s desktop output. The wasm32 arm
+    /// applies the documented `max_group_bound_dispatch` clamp +
+    /// `n_bounds_rounds = 1` divergence (Decision §5) — pinned separately
+    /// at the `WASM_MAX_GROUP_BOUND_DISPATCH` const docblock.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn for_target_arch_desktop_matches_canonical_pin() {
+        let cfg = ConstructionConfig::for_target_arch();
+        assert_eq!(cfg.initial_hash_map_size, 1 << 20);
+        assert_eq!(cfg.wanted_empty_ratio, 0.5);
+        assert_eq!(cfg.probe_cap, 250);
+        assert_eq!(cfg.max_group_bound_dispatch, 512 * 64);
+        assert_eq!(cfg.n_bounds_rounds, 5);
+        assert!(cfg.gpu_construction_enabled);
+        assert!(!cfg.entities_enabled);
+        assert!(cfg.cpu_fallback);
+        assert!(!cfg.run_worldgen_only);
+        assert_eq!(cfg.max_entity_instances, DEFAULT_MAX_ENTITY_INSTANCES);
+        assert!(!cfg.entity_history_enabled);
+    }
+}

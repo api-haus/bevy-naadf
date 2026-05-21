@@ -224,14 +224,13 @@ pub fn run_vox_gpu_construction() -> AppExit {
     // Production W5 path: the only install path. vox-gpu-rewrite Stage 2
     // (2026-05-18) destroyed `fixed_world_size` — `setup_test_grid` always
     // routes `GridPreset::Vox` through `install_vox_in_fixed_world`. The
-    // GPU construction default-on (`ConstructionConfig::default()` →
-    // `gpu_construction_enabled = true`) keeps the W5 producer chain
-    // active; the explicit assignment below is a belt-and-braces guard
-    // against a future default flip.
+    // GPU construction default-on
+    // (`ConstructionConfig::for_target_arch()` → `gpu_construction_enabled =
+    // true`) keeps the W5 producer chain active; the explicit assignment
+    // below is a belt-and-braces guard against a future default flip.
     app_args.grid_preset = crate::GridPreset::Vox {
         path: PathBuf::from(&app_path_for_args(&path)),
     };
-    app_args.construction_config.gpu_construction_enabled = true;
     // Route through the Oasis brush-edit driver flow. The driver's
     // `OasisWarmup` fast-path triggers when EITHER `oasis_edit_visual_mode`
     // OR `vox_gpu_construction_mode` is set; the brush + assertion mechanics
@@ -242,7 +241,20 @@ pub fn run_vox_gpu_construction() -> AppExit {
     // skip the birdseye write entirely.
     app_args.vox_gpu_construction_mode = true;
 
-    crate::run_e2e_render_with_args(app_args)
+    // Step 4 of the config-as-resource refactor — `construction_config`
+    // migrated off `AppArgs`. Build the `BootstrapInputs` with the
+    // belt-and-braces `gpu_construction_enabled = true` override on the
+    // construction-config field and route through
+    // `run_e2e_render_with_bootstrap_inputs`.
+    let mut construction_config =
+        crate::render::construction::ConstructionConfig::for_target_arch();
+    construction_config.gpu_construction_enabled = true;
+    let inputs = crate::bootstrap::BootstrapInputs {
+        args: app_args,
+        construction_config,
+        ..crate::bootstrap::BootstrapInputs::default()
+    };
+    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 /// Re-export the resolved path for the `AppArgs::grid_preset`. Mirrors the

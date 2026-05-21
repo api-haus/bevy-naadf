@@ -24,6 +24,7 @@
 
 use bevy::prelude::{App, AppExit};
 
+use crate::render::construction::ConstructionConfig;
 use crate::render::taa::{TaaConfig, TaaRingConfig};
 use crate::{AppArgs, AppConfig, GiSettings};
 
@@ -44,7 +45,7 @@ use crate::{AppArgs, AppConfig, GiSettings};
 /// `App`s, which is the e2e-determinism requirement
 /// (`docs/orchestrate/config-as-resource-refactor/01-context.md` —
 /// "E2e-path byte-identical defaults").
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct BootstrapInputs {
     /// Transient carrier for the [`AppArgs`] fields not yet migrated to
     /// per-domain resources. As fields move out of `AppArgs` in subsequent
@@ -70,6 +71,34 @@ pub struct BootstrapInputs {
     /// `GiSettings::default()` = `GiSettings::DEFAULTS`. The settings panel
     /// mutates this resource at runtime via `ResMut<GiSettings>`.
     pub gi: GiSettings,
+    /// Phase-C GPU-construction configuration (`15-design-c.md` §1.8).
+    /// Migrated out of `AppArgs.construction_config` in Step 4 of the
+    /// config-as-resource refactor. The default is
+    /// [`ConstructionConfig::for_target_arch()`] — the same wasm32 clamp
+    /// that previously lived inside the deleted `From<&AppArgs>` impl
+    /// (Decision §5). E2e gates that need a non-default
+    /// `gpu_construction_enabled` / `entities_enabled` override construct
+    /// their own value off `for_target_arch()` and write it here.
+    pub construction_config: ConstructionConfig,
+}
+
+impl Default for BootstrapInputs {
+    fn default() -> Self {
+        // Step 4 of the config-as-resource refactor: the construction-config
+        // default is `for_target_arch()`, NOT `ConstructionConfig::default()`,
+        // because the wasm32 divergence must travel through the bootstrap
+        // (Decision §5). The desktop arm of `for_target_arch()` IS
+        // `ConstructionConfig::default()`, so on native targets the value is
+        // byte-identical to pre-Step-4. All other fields use their own
+        // `Default` impls.
+        Self {
+            args: AppArgs::default(),
+            taa_ring_depth: TaaRingConfig::default(),
+            taa: TaaConfig::default(),
+            gi: GiSettings::default(),
+            construction_config: ConstructionConfig::for_target_arch(),
+        }
+    }
 }
 
 /// Build the bevy-naadf `App` from an [`AppConfig`] and a [`BootstrapInputs`].
@@ -100,6 +129,12 @@ pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) 
     // so any caller that overrode `BootstrapInputs::default()` wins.
     app.insert_resource(inputs.taa);
     app.insert_resource(inputs.gi);
+    // Migrated in Step 4 — main-world `ConstructionConfig`. Inserted
+    // post-`build_app_with_args` (which has a defensive
+    // `ConstructionConfig::for_target_arch()` seed for direct-`build_app`
+    // callers). The render sub-app reads its mirror via
+    // `extract_construction_config` (mirror of `extract_effective_world_size`).
+    app.insert_resource(inputs.construction_config);
     app
 }
 
@@ -152,6 +187,14 @@ mod tests {
         // by `settings::tests::defaults_match_gi_settings_default`. Step 3
         // moved this field off `AppArgs.gi`.
         assert_eq!(inputs.gi, GiSettings::default());
+        // Step 4 — `construction_config` migrated off `AppArgs` onto the
+        // typed `BootstrapInputs.construction_config` field. The default is
+        // `for_target_arch()` so the wasm32 clamp travels through the
+        // bootstrap (Decision §5).
+        assert_eq!(
+            inputs.construction_config,
+            crate::render::construction::ConstructionConfig::for_target_arch(),
+        );
         // The default world content is the hard-coded test grid.
         assert_eq!(inputs.args.grid_preset, GridPreset::Default);
         // The fixture spawner is off by default; `--entities` flips it.

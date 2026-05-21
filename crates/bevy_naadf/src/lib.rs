@@ -259,6 +259,19 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     if !app.world().contains_resource::<render::taa::TaaRingConfig>() {
         app.insert_resource(render::taa::TaaRingConfig::default());
     }
+    // Step 4 of the config-as-resource refactor — defensive seed for the
+    // per-domain `ConstructionConfig`. `run_gpu_construction_startup` and the
+    // `extract_construction_config` system both need it; on the
+    // `build_app(AppConfig::e2e())` path we don't go through
+    // `build_app_with_bootstrap_inputs`, so the seed is the canonical
+    // `for_target_arch()` value (the wasm32 arm applies the documented
+    // clamp). Callers routing through the bootstrap fan-out overwrite it.
+    if !app
+        .world()
+        .contains_resource::<render::construction::ConstructionConfig>()
+    {
+        app.insert_resource(render::construction::ConstructionConfig::for_target_arch());
+    }
 
     // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#
     // canonical value if no caller (Android entry / future probe-mode CLI)

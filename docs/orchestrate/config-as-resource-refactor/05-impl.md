@@ -489,3 +489,187 @@ below.
 - **Foundation continues to look sound** — same Assumptions hold; the
   per-domain `Resource` decomposition cleanly handles runtime-mutable
   state (GI panel) without forcing a re-litigation of the design.
+
+## Step 4 — construction_config + wasm32 divergence relocation (2026-05-21)
+
+### What landed
+
+- `crates/bevy_naadf/src/render/construction/config.rs` — added
+  `ConstructionConfig::for_target_arch() -> Self` constructor (Decision §5);
+  body is `Default::default()` on native + the documented wasm32 clamp
+  (`max_group_bound_dispatch.min(WASM_MAX_GROUP_BOUND_DISPATCH)` +
+  `n_bounds_rounds = 1`) on `target_arch = "wasm32"`. Deleted
+  `impl From<&crate::AppArgs> for ConstructionConfig`. Moved the const-pin's
+  meaning (`02-design.md` side note #2) — added a new
+  `for_target_arch_desktop_matches_canonical_pin` runtime test under
+  `#[cfg(not(target_arch = "wasm32"))]` that asserts the constructor's
+  desktop output equals every literal-field value the const block pins.
+- `crates/bevy_naadf/src/render/construction/mod.rs` — `ConstructionPlugin::build`
+  no longer reads `Res<AppArgs>` + applies `From<&AppArgs>` to lift the
+  config into the render sub-app. Instead, the render sub-app calls
+  `init_resource::<ConstructionConfig>()`; `extract_construction_config`
+  carries the main-world value across every frame.
+  `run_gpu_construction_startup` parameter swap from `Res<AppArgs>` to
+  `Res<ConstructionConfig>` (`args.construction_config.gpu_construction_enabled`
+  → `cc.gpu_construction_enabled`).
+- `crates/bevy_naadf/src/render/extract.rs` — added
+  `extract_construction_config` (1:1 mirror of `extract_effective_world_size`
+  — `ResMut<ConstructionConfig>` + `Extract<Option<Res<ConstructionConfig>>>`).
+- `crates/bevy_naadf/src/render/mod.rs` — wired
+  `extract_construction_config` into the `ExtractSchedule` tuple alongside
+  `extract_taa_ring_depth` / `extract_effective_world_size` / etc.; updated
+  the docblock to call out the Step-4 brought-onto-pattern.
+- `crates/bevy_naadf/src/app_args.rs` — deleted
+  `pub construction_config: render::construction::ConstructionConfig`
+  field + the matching default-impl line. Pruned `use crate::render;` import
+  (now unused). Docstring updated.
+- `crates/bevy_naadf/src/bootstrap.rs` — added
+  `construction_config: ConstructionConfig` field on `BootstrapInputs`.
+  Removed `#[derive(Default)]` and wrote a hand `impl Default for
+  BootstrapInputs` so the construction-config default is
+  `ConstructionConfig::for_target_arch()` (not `default()`), keeping the
+  wasm32 divergence on the bootstrap path. `build_app_with_bootstrap_inputs`
+  inserts `inputs.construction_config` post-`build_app_with_args`. Pin test
+  swung onto the typed field.
+- `crates/bevy_naadf/src/lib.rs` — added a defensive seed in
+  `build_app_with_args` for `ConstructionConfig::for_target_arch()` so the
+  direct `build_app(AppConfig::e2e())` path (`run_e2e_render` /
+  `run_e2e_render_with_args`) still has a `ConstructionConfig` resource —
+  `run_gpu_construction_startup` reads it as `Res<...>` non-Option and
+  `extract_construction_config` needs the main-world source. Same shape as
+  Step 3's defensive seeds.
+- `crates/bevy_naadf/src/diagnostics.rs` — added
+  `construction: Option<Res<ConstructionConfig>>` parameter; dump reads
+  from the resource with a defensive missing-resource fallback string.
+- `crates/bevy_naadf/src/bin/e2e_render.rs` — `BootCommand::EntitiesBoot`
+  arm builds a `BootstrapInputs` with `construction_config.entities_enabled
+  = true` and routes through `run_e2e_render_with_bootstrap_inputs`.
+  (`spawn_test_entity` stays on `AppArgs` until Step 8.)
+- 4 e2e gate `run_*` builders: `vox_gpu_construction.rs:223-263`,
+  `vox_gpu_oracle.rs:329-345`, `vox_horizon_parity.rs:156-172`,
+  `vox_web_parity.rs:198-214` — each moved from
+  `app_args.construction_config.gpu_construction_enabled = true;
+  crate::run_e2e_render_with_args(app_args)` to building a
+  `BootstrapInputs` with the same field override on
+  `construction_config: ConstructionConfig::for_target_arch()` and routing
+  through `crate::bootstrap::run_e2e_render_with_bootstrap_inputs`.
+
+### Decisions made during impl
+
+1. **Hand `impl Default for BootstrapInputs` instead of `#[derive(Default)]`**
+   — the design's Decision §5 requires the construction-config default to be
+   `for_target_arch()` (so the wasm32 divergence travels through bootstrap),
+   not `ConstructionConfig::default()`. The hand-impl spells out every
+   field's seed explicitly. Today desktop's `for_target_arch()` == `default()`
+   so the value is byte-identical on native; wasm32 picks up the documented
+   clamp.
+2. **The const-pin stays as literal field values** + a new sibling runtime
+   test asserts `for_target_arch()`'s desktop output equals those values.
+   This is the design's side-note #2 directive ("move the pin to assert
+   against the desktop arm"). The literal const-pin can't be moved verbatim
+   into a `const _: () = assert!(ConstructionConfig::for_target_arch() == ...);`
+   because const-eval can't evaluate `#[cfg(target_arch = "wasm32")]` bodies
+   inside the constructor (the `mut` + cfg-gated assignment is non-const).
+   The runtime test is the same teeth at test-run-time rather than build-time;
+   the literal const block + the runtime test together pin both surfaces.
+3. **The 4 e2e gates' `gpu_construction_enabled = true` overrides are
+   belt-and-braces** (the default is already `true`). Kept the override
+   explicit in case a future default flip would silently turn them off. The
+   only meaningful override in the workspace is `EntitiesBoot`'s
+   `entities_enabled = true`.
+4. **Defensive seed pattern matches Step 3.** `build_app_with_args` seeds
+   `ConstructionConfig::for_target_arch()` only if no caller already
+   inserted one. Step 9 deletes the seed once every caller routes through
+   `build_app_with_bootstrap_inputs`.
+5. **Render sub-app `init_resource::<ConstructionConfig>()`** uses
+   `Default::default()` (canonical desktop) as the seed; the first
+   `ExtractSchedule` overwrites it with the main-world value (which IS the
+   `for_target_arch()` value on wasm32, post-bootstrap). The render-side
+   first-frame difference is invisible — on desktop the seed equals the
+   extracted value; on wasm32 the extract runs before any consumer reads
+   the resource for a render-graph dispatch, same first-frame story as
+   `RenderEffectiveWorldSize`.
+
+### Verification
+
+- `cargo build --workspace`: PASS (47.31s, clean compile, no new warnings).
+- `cargo test --workspace --lib`: PASS (192 passed; 0 failed; 1 ignored).
+  The new `for_target_arch_desktop_matches_canonical_pin` test under
+  `render::construction::config::tests` is in the passing set — pins
+  `for_target_arch()` desktop output to the literal const-pin values.
+- `cargo run --bin e2e_render -- --validate-gpu-construction`: PASS — GPU
+  construction byte-equal to CPU oracle: 388 bytes compared. Region
+  luminance band identical to Steps 1-3.
+- `cargo run --bin e2e_render -- --vox-gpu-construction`: PASS —
+  brush-projection rect Δ over floor. The full pipeline-build/extract path
+  through `ConstructionConfig` works on Oasis.
+
+### Files touched
+
+| File | Lines | Change kind |
+|---|---|---|
+| `crates/bevy_naadf/src/render/construction/config.rs` | +75 / -38 | Add `for_target_arch` constructor; delete `From<&AppArgs>`; add runtime test pinning desktop arm to const-pin values |
+| `crates/bevy_naadf/src/render/construction/mod.rs` | +13 / -16 | `init_resource::<ConstructionConfig>()` replaces `From<&AppArgs>` lift; `run_gpu_construction_startup` param swap |
+| `crates/bevy_naadf/src/render/extract.rs` | +20 | Add `extract_construction_config` |
+| `crates/bevy_naadf/src/render/mod.rs` | +7 / -4 | Wire `extract_construction_config` into `ExtractSchedule` tuple |
+| `crates/bevy_naadf/src/app_args.rs` | +9 / -16 | Delete `construction_config` field + default; docstring update |
+| `crates/bevy_naadf/src/bootstrap.rs` | +37 / -2 | New typed field + hand `Default` impl + post-build insert + pin test |
+| `crates/bevy_naadf/src/lib.rs` | +12 | Defensive `ConstructionConfig::for_target_arch()` seed |
+| `crates/bevy_naadf/src/diagnostics.rs` | +6 / -3 | Read `Res<ConstructionConfig>` |
+| `crates/bevy_naadf/src/bin/e2e_render.rs` | +12 / -3 | `EntitiesBoot` builds `BootstrapInputs` |
+| `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs` | +12 / -4 | Route through `run_e2e_render_with_bootstrap_inputs` |
+| `crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs` | +12 / -3 | Same |
+| `crates/bevy_naadf/src/e2e/vox_horizon_parity.rs` | +11 / -3 | Same |
+| `crates/bevy_naadf/src/e2e/vox_web_parity.rs` | +11 / -3 | Same |
+
+### Side notes / observations / complaints
+
+- **Design's per-step file:line citations matched current code** — verified
+  every cited line by Read/Grep before editing. The only drift was that
+  `From<&AppArgs>` lived at `config.rs:252` (design said `:252-288`);
+  fine.
+- **Decision §5 (`for_target_arch()` encapsulation) is the cleanest factoring.**
+  The 30-line wasm32 cfg block previously inside the `From` impl now lives
+  in one named function. The IoC violation called out in `02-design.md`'s
+  side notes is fixed.
+- **The const-pin migration was non-trivial.** The architect's side note
+  #2 said "move the pin to assert against the desktop arm of
+  `for_target_arch()`" — but const-eval can't evaluate the `#[cfg(target_arch
+  = "wasm32")]` body inside the constructor (the body is `mut` + conditional
+  assignment, not const-fn). Solution: keep the literal const-pin AND add a
+  sibling runtime test that asserts `for_target_arch()` (desktop) produces
+  those same values. Both surfaces pinned, no const-fn semantics relied on.
+  This was a clean deviation from the design's exact wording.
+- **The render sub-app `init_resource::<ConstructionConfig>()` seed is
+  canonical desktop on wasm32 too** — `Default::default()` doesn't apply the
+  wasm clamp. That's intentional: the seed is overwritten by the first
+  extract from the main-world resource (which IS `for_target_arch()` on
+  wasm32 because bootstrap inserts it), well before any consumer reads. Same
+  first-frame story as `RenderEffectiveWorldSize`.
+- **`BootstrapInputs::default()` byte-identity contract** holds on native
+  (`for_target_arch()` == `Default::default()` on desktop). On wasm32 it
+  holds against the post-refactor expected value (the clamp applies), NOT
+  the pre-refactor `AppArgs::default().construction_config` (which the old
+  `From<&AppArgs>` lift would then apply the clamp to). Net: byte-identical
+  to pre-refactor on every target.
+- **The 4 e2e gates went from 4 lines (`AppArgs::default()` + 1 mutate +
+  `run_e2e_render_with_args`) to ~9 lines (build inputs, override, route
+  through bootstrap).** Step 6's gate-collapse work will fold the per-gate
+  constructor pattern into `BootstrapInputs::for_<gate>()` factories per
+  the design's §3.2.
+- **Assumption #5 (resource insertion ordering)** continues to hold.
+  Defensive seeds in `build_app_with_args` keep the contract.
+- **Subjective:** Step 4 had the most novel work (the platform-divergence
+  encapsulation), but the design's prescription was sharp enough that it
+  fell out cleanly. The hand `Default` impl is a small but explicit
+  upgrade — `BootstrapInputs` now spells out every field's seed instead of
+  relying on derive, which makes the wasm32 contract visible.
+- **Wasm32 deploy is the user's hard-gate.** This implementation passed
+  the desktop gates; the design's expected on-wasm behaviour
+  (`max_group_bound_dispatch.min(4096)` + `n_bounds_rounds = 1`) is now
+  the `for_target_arch()` wasm arm and `BootstrapInputs::default()` /
+  e2e-gate overrides reach the resource. Nothing in this step's
+  implementation should change wasm behaviour vs the pre-refactor `From<&AppArgs>`
+  output — both produce the same clamped values — but per the brief,
+  desktop-gate-PASS is the implementor's deliverable; wasm visual is the
+  user's.

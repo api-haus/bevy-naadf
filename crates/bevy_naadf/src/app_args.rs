@@ -18,10 +18,17 @@
 //! settings panel, the diagnostics dump, and the render-world extract systems
 //! now read those resources directly; nothing in this file references TAA or
 //! GI any more.
+//!
+//! **Step 4 of the config-as-resource refactor** migrated
+//! `construction_config: ConstructionConfig` onto the per-domain
+//! [`crate::render::construction::ConstructionConfig`] resource. Bootstrap
+//! inserts it from `BootstrapInputs.construction_config`; the render sub-app
+//! mirror is extract-driven; the wasm32 divergence (previously inside the
+//! deleted `From<&AppArgs>` impl) now lives on
+//! `ConstructionConfig::for_target_arch()` (Decision §5).
 
 use bevy::prelude::*;
 
-use crate::render;
 use crate::GridPreset;
 
 /// Command-line options, parsed once and stored as a resource
@@ -36,17 +43,6 @@ use crate::GridPreset;
 pub struct AppArgs {
     /// Which hard-coded test grid to build (D2).
     pub grid_preset: GridPreset,
-    /// The Phase-C GPU-construction configuration (`15-design-c.md` §1.8,
-    /// §2.1 W0 row). Same plumbing pattern as `taa_ring_depth`: this main-
-    /// world field is the source of truth; `render::construction::
-    /// ConstructionPlugin::build` mirrors it into the render sub-app as the
-    /// `ConstructionConfig` `Resource` (via `From<&AppArgs>`).
-    ///
-    /// W0 default: GPU construction off / CPU fallback on. W1 flips
-    /// `gpu_construction_enabled` after the bit-exact CPU/GPU oracle is
-    /// green; W4 may flip `entities_enabled`. The CLI flags that mutate
-    /// individual fields land per-workstream — W0 only exposes the struct.
-    pub construction_config: render::construction::ConstructionConfig,
     /// Phase-C wave-3 — when `true`, [`crate::build_app`] adds a `Startup`
     /// system that spawns one fixture entity into
     /// [`render::construction::MainWorldEntities`] (a 4×4×4 emissive-voxel
@@ -180,7 +176,6 @@ impl Default for AppArgs {
     fn default() -> Self {
         Self {
             grid_preset: GridPreset::default(),
-            construction_config: render::construction::ConstructionConfig::default(),
             spawn_test_entity: false,
             resize_test: false,
             vox_e2e_mode: false,

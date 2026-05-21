@@ -503,6 +503,27 @@ pub fn extract_effective_world_size(
 }
 
 /// `ExtractSchedule` system: mirror the main-world
+/// [`crate::render::construction::ConstructionConfig`] into the render-world
+/// `ConstructionConfig`.
+///
+/// Step 4 of the config-as-resource refactor (`docs/orchestrate/config-as-
+/// resource-refactor/02-design.md` §3.4): replaces the
+/// `From<&AppArgs>`-driven plugin-build snapshot at
+/// `render/construction/mod.rs:1832-1836` with an extract-driven copy,
+/// mirroring the [`extract_effective_world_size`] precedent. The render-world
+/// resource is `init_resource`d to the canonical desktop `Default`; this
+/// extract overwrites it from the main-world value every frame. `Copy`,
+/// fixed-size — cheap.
+pub fn extract_construction_config(
+    mut mirror: ResMut<crate::render::construction::ConstructionConfig>,
+    src: Extract<Option<Res<crate::render::construction::ConstructionConfig>>>,
+) {
+    if let Some(src) = &*src {
+        *mirror = **src;
+    }
+}
+
+/// `ExtractSchedule` system: mirror the main-world
 /// [`crate::render::taa::TaaRingConfig`] into the render-world
 /// [`crate::render::taa::RenderTaaRingConfig`].
 ///

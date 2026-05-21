@@ -47,9 +47,10 @@ use bevy::render::{
 
 use atmosphere::prepare_atmosphere;
 use extract::{
-    extract_camera, extract_camera_history, extract_gi_config,
-    extract_effective_world_size, extract_invalid_sample_storage_count,
-    extract_taa_config, extract_taa_ring_depth, stage_model_data_buildonce,
+    extract_camera, extract_camera_history, extract_construction_config,
+    extract_effective_world_size, extract_gi_config,
+    extract_invalid_sample_storage_count, extract_taa_config,
+    extract_taa_ring_depth, stage_model_data_buildonce,
     stage_world_gpu_buildonce, ExtractedCameraData, ExtractedCameraHistory,
     ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
 };
@@ -125,7 +126,9 @@ impl Plugin for NaadfRenderPlugin {
             // structs in `budget.rs` + `taa.rs`. Step 2 of the
             // config-as-resource refactor (`docs/orchestrate/config-as-resource-
             // refactor/02-design.md` §3.4) brought `RenderTaaRingConfig` onto
-            // this pattern.
+            // this pattern; Step 4 brought `ConstructionConfig` onto it too
+            // (`init_resource`d on the render sub-app inside
+            // `ConstructionPlugin::build` — see that plugin).
             .init_resource::<RenderTaaRingConfig>()
             .init_resource::<crate::render::budget::RenderEffectiveWorldSize>()
             .init_resource::<crate::render::budget::RenderInvalidSampleStorageCount>()
@@ -183,6 +186,11 @@ impl Plugin for NaadfRenderPlugin {
                     // snapshot at this spot). Mirrors the budget-resource
                     // pattern; see `extract_taa_ring_depth` docstring.
                     extract_taa_ring_depth,
+                    // Step 4 of the config-as-resource refactor — the
+                    // construction config is now extracted (was
+                    // plugin-build snapshot via `From<&AppArgs>`). Same
+                    // pattern as `extract_taa_ring_depth`.
+                    extract_construction_config,
                 ),
             )
             // Prepare: create + upload GPU resources, build bind groups,

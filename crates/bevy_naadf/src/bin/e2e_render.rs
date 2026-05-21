@@ -338,10 +338,23 @@ fn run_boot_command(boot: BootCommand) -> AppExit {
         }
         BootCommand::ResizeTest => run_resize_test(),
         BootCommand::EntitiesBoot => {
+            // Step 4 of the config-as-resource refactor — the
+            // `construction_config.entities_enabled = true` override moved
+            // from `AppArgs` onto `BootstrapInputs.construction_config`. The
+            // `spawn_test_entity` flag still lives on `AppArgs` until Step 8.
+            // Route through `run_e2e_render_with_bootstrap_inputs` so both
+            // the entities flag and the bootstrap fan-out reach the App.
             let mut app_args = bevy_naadf::AppArgs::default();
-            app_args.construction_config.entities_enabled = true;
             app_args.spawn_test_entity = true;
-            bevy_naadf::run_e2e_render_with_args(app_args)
+            let mut construction_config =
+                bevy_naadf::render::construction::ConstructionConfig::for_target_arch();
+            construction_config.entities_enabled = true;
+            let inputs = bevy_naadf::bootstrap::BootstrapInputs {
+                args: app_args,
+                construction_config,
+                ..bevy_naadf::bootstrap::BootstrapInputs::default()
+            };
+            bevy_naadf::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
         }
         BootCommand::Standard => bevy_naadf::run_e2e_render(),
     }
