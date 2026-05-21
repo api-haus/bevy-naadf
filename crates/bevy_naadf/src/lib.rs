@@ -20,6 +20,12 @@ pub mod camera;
 pub mod dev_font;
 pub mod diagnostics;
 pub mod e2e;
+/// BRP (Bevy Remote Protocol) control surface for the external e2e runner.
+/// Entirely behind the `e2e-brp` cargo feature — absent from the default
+/// production build. Phase 0 transport spike, see
+/// `docs/orchestrate/e2e-ipc-rpc-restructure/02-design.md` §2.
+#[cfg(feature = "e2e-brp")]
+pub mod e2e_brp;
 pub mod editor;
 pub mod hud;
 pub mod render;
@@ -498,6 +504,21 @@ pub fn build_app_core(cfg: AppConfig) -> App {
                 >,
             ),
         );
+    }
+
+    // --- Phase 0 transport spike (e2e-ipc-rpc-restructure) -------------------
+    // BRP server install point per design §2.2: end of `build_app_core`, the
+    // single funnel both production and e2e route through, AFTER `DefaultPlugins`
+    // (incl. `RenderPlugin`) so the render sub-app exists. Behind the `e2e-brp`
+    // cargo feature; the opt-in is the `--e2e-brp <port>` argv flag parsed by
+    // `main.rs`, which sets `BEVY_NAADF_E2E_BRP_PORT`. SPIKE: this gate is a
+    // temporary env-var read; Phase 1 replaces it with an `AppConfig::brp_port`
+    // field. None of this compiles into the default-feature production binary.
+    #[cfg(feature = "e2e-brp")]
+    if let Ok(port) = std::env::var("BEVY_NAADF_E2E_BRP_PORT") {
+        if let Ok(port) = port.parse::<u16>() {
+            crate::e2e_brp::install_brp_server(&mut app, port);
+        }
     }
 
     app

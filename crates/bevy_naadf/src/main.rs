@@ -56,6 +56,26 @@ fn main() -> AppExit {
         }
     }
 
+    // --- Phase 0 transport spike (e2e-ipc-rpc-restructure) -------------------
+    // `--e2e-brp <port>` is the temporary spike opt-in: it sets the
+    // `BEVY_NAADF_E2E_BRP_PORT` env var that `build_app_core` reads (behind the
+    // `e2e-brp` cargo feature) to install the BRP HTTP server. SPIKE: a flag +
+    // env var, not the design's `AppConfig::e2e_sut` profile — Phase 1 replaces
+    // this with a proper `AppConfig::brp_port` field. With the `e2e-brp` feature
+    // off, the flag is parsed but the env var is simply ignored (no BRP code is
+    // compiled), so the production binary's behaviour is unchanged.
+    if let Some(idx) = argv.iter().position(|a| a == "--e2e-brp") {
+        match argv.get(idx + 1) {
+            Some(port) if port.parse::<u16>().is_ok() => {
+                std::env::set_var("BEVY_NAADF_E2E_BRP_PORT", port);
+            }
+            _ => {
+                eprintln!("error: --e2e-brp flag requires a numeric port argument");
+                return AppExit::error();
+            }
+        }
+    }
+
     // Native: sync probe path (`probe_and_select` → spin up a throwaway Bevy
     // render App, read `device.limits()`, drop it). Picks canonical defaults
     // on desktop with a ≥ 1.35 GiB storage-buffer-binding cap; picks mobile

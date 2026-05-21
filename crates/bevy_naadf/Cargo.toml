@@ -211,6 +211,17 @@ web-sys = { version = "0.3", features = [
 
 [features]
 default = []
+# e2e-brp = the native-only Bevy Remote Protocol control surface for the
+# external e2e test runner. Forwards to Bevy's `bevy_remote` umbrella feature,
+# which pulls `bevy_remote` (with `bevy_asset` + `bevy_render`, so the
+# render-world custom-method hook is available) and its `http` default feature
+# (so `RemoteHttpPlugin` exists). The shipped production binary must NOT carry
+# a remote-control socket, so this is opt-in: `cargo build --workspace` (the
+# project verification gate) compiles the default set; the e2e runner builds
+# the SUT with `--features e2e-brp`. All BRP code is behind
+# `#[cfg(feature = "e2e-brp")]`. Phase 0 transport spike — see
+# `docs/orchestrate/e2e-ipc-rpc-restructure/02-design.md` §2.
+e2e-brp = ["bevy/bevy_remote"]
 # DLSS Ray Reconstruction. Forwards to Bevy's `dlss` feature, whose transitive
 # `dlss_wgpu` build step needs the NVIDIA DLSS SDK + Vulkan + clang. Opt-in —
 # the integration is not wired up yet, so leave off for normal builds.

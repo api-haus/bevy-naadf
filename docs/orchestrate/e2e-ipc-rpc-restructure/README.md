@@ -45,4 +45,10 @@ branch `feat/android-build`.
 - [x] Step 3/4 — method presented + architectural framing
 - [x] Step 5 — `01-context.md` written
 - [x] Design phase — `02-design.md` complete
-- [ ] Implementation phase (scope confirmed at the design hard gate)
+- Implementation phase (`03-impl.md`):
+  - [x] Phase 0 — transport spike (A1 + A2 confirmed)
+  - [ ] Phase 1 — BRP server scaffold
+  - [ ] Phase 2 — full verb set + `naadf_e2e` skeleton + first gate
+  - [ ] Phase 3 — migrate remaining 12 gates
+  - [ ] Phase 4 — repoint Playwright cross-target gate
+  - [ ] Phase 5 — delete legacy harness
