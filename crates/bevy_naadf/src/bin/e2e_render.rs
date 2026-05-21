@@ -114,8 +114,8 @@ enum BootCommand {
     /// `--resize-test` — wraps the Bevy boot in pre/post Hyprland windowrule
     /// installation. The resize-test is the canonical Resize-kind gate.
     ResizeTest,
-    /// `--entities` boot — flips `entities_enabled` + `spawn_test_entity` on
-    /// the standard gate.
+    /// `--entities` boot — sets `ConstructionConfig.entities_enabled` +
+    /// inserts `SpawnTestEntity(true)` on the standard gate.
     EntitiesBoot,
     /// Standard gate (no flags) — `bevy_naadf::run_e2e_render()`.
     Standard,
@@ -338,20 +338,19 @@ fn run_boot_command(boot: BootCommand) -> AppExit {
         }
         BootCommand::ResizeTest => run_resize_test(),
         BootCommand::EntitiesBoot => {
-            // Step 4 of the config-as-resource refactor — the
-            // `construction_config.entities_enabled = true` override moved
-            // from `AppArgs` onto `BootstrapInputs.construction_config`. The
-            // `spawn_test_entity` flag still lives on `AppArgs` until Step 8.
-            // Route through `run_e2e_render_with_bootstrap_inputs` so both
-            // the entities flag and the bootstrap fan-out reach the App.
-            let mut app_args = bevy_naadf::AppArgs::default();
-            app_args.spawn_test_entity = true;
+            // Steps 4 + 8 of the config-as-resource refactor — the
+            // `construction_config.entities_enabled = true` override (Step 4)
+            // and the `spawn_test_entity` flag (Step 8) both moved off
+            // `AppArgs` onto typed `BootstrapInputs` fields. Route through
+            // `run_e2e_render_with_bootstrap_inputs` so the bootstrap fan-out
+            // inserts both as per-domain resources.
             let mut construction_config =
                 bevy_naadf::render::construction::ConstructionConfig::for_target_arch();
             construction_config.entities_enabled = true;
             let inputs = bevy_naadf::bootstrap::BootstrapInputs {
-                args: app_args,
                 construction_config,
+                spawn_test_entity:
+                    bevy_naadf::render::construction::SpawnTestEntity(true),
                 ..bevy_naadf::bootstrap::BootstrapInputs::default()
             };
             bevy_naadf::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)

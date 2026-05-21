@@ -313,8 +313,8 @@ const ENTITY_PIXEL_MIN_LUM: f32 = 80.0;
 
 /// Phase-C followup #5 — entity-pixel luminance gate.
 ///
-/// Fires only in `--entities` mode (the driver gates the call on
-/// `AppArgs::spawn_test_entity`). Asserts the screen region the fixture
+/// Fires only in `--entities` mode (the driver gates the call on the
+/// `SpawnTestEntity` resource). Asserts the screen region the fixture
 /// entity projects into is brightly lit (mean luminance ≥
 /// [`ENTITY_PIXEL_MIN_LUM`]) — proves both (a) the rest of the renderer
 /// is producing usable framebuffer content at the entity's screen position

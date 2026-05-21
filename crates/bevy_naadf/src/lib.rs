@@ -289,6 +289,20 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     if !app.world().contains_resource::<crate::GridPreset>() {
         app.insert_resource(crate::GridPreset::default());
     }
+    // Step 8 of the config-as-resource refactor — defensive seed for the
+    // per-domain `SpawnTestEntity`. The `spawn_phase_c_test_entity` gate
+    // uses `Option<Res<SpawnTestEntity>>` so it is resource-absent tolerant,
+    // but the e2e driver and a clean diagnostics dump expect the resource to
+    // exist. Canonical default = `SpawnTestEntity(false)` (fixture off).
+    // Callers routing through the bootstrap fan-out overwrite it; the
+    // `--entities` e2e boot inserts `SpawnTestEntity(true)`. Step 9 deletes
+    // this seed once every caller routes through the fan-out.
+    if !app
+        .world()
+        .contains_resource::<render::construction::SpawnTestEntity>()
+    {
+        app.insert_resource(render::construction::SpawnTestEntity::default());
+    }
 
     // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#
     // canonical value if no caller (Android entry / future probe-mode CLI)

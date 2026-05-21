@@ -24,7 +24,7 @@
 
 use bevy::prelude::{App, AppExit};
 
-use crate::render::construction::ConstructionConfig;
+use crate::render::construction::{ConstructionConfig, SpawnTestEntity};
 use crate::render::taa::{TaaConfig, TaaRingConfig};
 use crate::{AppArgs, AppConfig, GiSettings, GridPreset};
 
@@ -93,6 +93,15 @@ pub struct BootstrapInputs {
     /// inserts it as a main-world `Res<GridPreset>` that `setup_test_grid`
     /// reads.
     pub grid_preset: GridPreset,
+    /// Whether the Phase-C `--entities` test fixture (one 4×4×4
+    /// emissive-voxel block at world centre) is spawned at `Startup`.
+    /// Migrated out of `AppArgs.spawn_test_entity` in Step 8 of the
+    /// config-as-resource refactor. `SpawnTestEntity::default()` =
+    /// `SpawnTestEntity(false)`; the `e2e_render --entities` boot flips it
+    /// on. The fan-out inserts it as a main-world `Res<SpawnTestEntity>`
+    /// that gates `spawn_phase_c_test_entity` and that the e2e driver reads
+    /// to pick the entity-aware ASSERT baseline.
+    pub spawn_test_entity: SpawnTestEntity,
 }
 
 impl Default for BootstrapInputs {
@@ -111,6 +120,7 @@ impl Default for BootstrapInputs {
             gi: GiSettings::default(),
             construction_config: ConstructionConfig::for_target_arch(),
             grid_preset: GridPreset::default(),
+            spawn_test_entity: SpawnTestEntity::default(),
         }
     }
 }
@@ -157,6 +167,12 @@ pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) 
     // wins for callers routing through the bootstrap fan-out (e.g. native
     // `--vox`, wasm32 `?skybox=1`, e2e gates).
     app.insert_resource(inputs.grid_preset);
+    // Migrated in Step 8 — main-world `SpawnTestEntity`. Gates the
+    // `spawn_phase_c_test_entity` `Startup` system; the e2e driver also
+    // reads it for the entity-aware ASSERT baseline. `build_app_with_args`
+    // has a defensive `SpawnTestEntity::default()` seed; this insert wins
+    // for callers routing through the fan-out (the `--entities` e2e boot).
+    app.insert_resource(inputs.spawn_test_entity);
     app
 }
 
@@ -221,8 +237,10 @@ mod tests {
         // `BootstrapInputs.grid_preset` field. The default world content is
         // the hard-coded embedded test grid.
         assert_eq!(inputs.grid_preset, GridPreset::Default);
-        // The fixture spawner is off by default; `--entities` flips it.
-        assert!(!inputs.args.spawn_test_entity);
+        // Step 8 — `spawn_test_entity` migrated off `AppArgs` onto the typed
+        // `BootstrapInputs.spawn_test_entity` field. The fixture spawner is
+        // off by default; the `--entities` e2e boot flips it.
+        assert!(!inputs.spawn_test_entity.0);
         // No e2e gate is active by default.
         assert!(!inputs.args.resize_test);
         assert!(!inputs.args.vox_e2e_mode);

@@ -49,6 +49,21 @@ pub struct MainWorldEntities {
     pub voxel_data_generation: u32,
 }
 
+/// Phase-C wave-3 — main-world flag: when `true`, the `Startup` system
+/// [`super::test_fixture::spawn_phase_c_test_entity`] runs and populates
+/// [`MainWorldEntities`] with one 4×4×4 emissive-voxel fixture block.
+///
+/// Migrated out of `AppArgs.spawn_test_entity` in **Step 8** of the
+/// config-as-resource refactor (`docs/orchestrate/config-as-resource-refactor/02-design.md`,
+/// Decision §4 — kept as a plain `bool` newtype, not `Option<TestEntityFixture>`,
+/// because the fixture is content-static with no per-fixture parameters).
+/// `SpawnTestEntity::default()` = `SpawnTestEntity(false)` — the fixture is
+/// off unless `e2e_render --entities` flips it on. Main-world only; the
+/// e2e driver also reads it via `Option<Res<SpawnTestEntity>>` to pick the
+/// entity-aware ASSERT baseline.
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnTestEntity(pub bool);
+
 /// Phase-C wave-3 — render-world resource holding the W4 `EntityHandler`
 /// state (across-frame: per-chunk entity-count u32 table + last-frame
 /// overlapped chunks list). Lives in the render world so the `ExtractSchedule`

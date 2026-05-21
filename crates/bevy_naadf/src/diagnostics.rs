@@ -12,23 +12,24 @@ use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, Window};
 
-use crate::AppArgs;
 use crate::AppConfig;
 use crate::GiSettings;
 use crate::GridPreset;
 use crate::camera::position_split::PositionSplit;
 use crate::editor::ray::screen_to_ray;
-use crate::render::construction::ConstructionConfig;
+use crate::render::construction::{ConstructionConfig, SpawnTestEntity};
 use crate::render::taa::{TaaConfig, TaaRingConfig};
 use crate::world::data::{VoxelTypes, WorldData};
 
 /// `Update` system: on `KeyP` just_pressed, log a single multi-line
-/// diagnostics block covering camera, cursor → voxel raycast, and `AppArgs`.
+/// diagnostics block covering camera, cursor → voxel raycast, and the
+/// per-domain configuration resources (`GridPreset`, `TaaConfig`,
+/// `TaaRingConfig`, `SpawnTestEntity`, `GiSettings`, `ConstructionConfig`).
 #[allow(clippy::too_many_arguments)]
 pub fn dump_diagnostics_on_p(
     keys: Res<ButtonInput<KeyCode>>,
-    args: Option<Res<AppArgs>>,
     grid_preset: Option<Res<GridPreset>>,
+    spawn_test_entity: Option<Res<SpawnTestEntity>>,
     taa: Option<Res<TaaConfig>>,
     taa_ring: Option<Res<TaaRingConfig>>,
     gi: Option<Res<GiSettings>>,
@@ -111,16 +112,23 @@ pub fn dump_diagnostics_on_p(
         buf.push_str("camera: <no Camera3d entity found>\n");
     }
 
-    if let Some(a) = args.as_ref() {
-        // Steps 2-5 of the config-as-resource refactor: `taa_ring_depth`,
-        // `taa`, `gi`, `construction_config` and `grid_preset` migrated off
-        // `AppArgs` onto standalone per-domain main-world resources. The
-        // diagnostics dump fans out — per Q4 of
-        // `docs/orchestrate/config-as-resource-refactor/01-context.md`.
+    // Steps 2-5 + 8 of the config-as-resource refactor: `taa_ring_depth`,
+    // `taa`, `gi`, `construction_config`, `grid_preset` and
+    // `spawn_test_entity` migrated off `AppArgs` onto standalone per-domain
+    // main-world resources. The diagnostics dump fans out — per Q4 of
+    // `docs/orchestrate/config-as-resource-refactor/01-context.md`. The
+    // dump no longer reads `AppArgs` at all (the remaining `AppArgs` fields
+    // are e2e mode booleans the dump never showed; the `DiagnosticsPlugin`
+    // self-skips under e2e regardless).
+    {
         let grid_preset_str = grid_preset
             .as_ref()
             .map(|g| format!("{:?}", **g))
             .unwrap_or_else(|| "<GridPreset resource missing>".to_string());
+        let spawn_test_entity_str = spawn_test_entity
+            .as_ref()
+            .map(|s| s.0.to_string())
+            .unwrap_or_else(|| "<SpawnTestEntity resource missing>".to_string());
         let taa_ring_depth_str = taa_ring
             .as_ref()
             .map(|r| r.depth.to_string())
@@ -142,18 +150,16 @@ pub fn dump_diagnostics_on_p(
             "grid_preset              = {}\n\
              taa                      = {}\n\
              taa_ring_depth           = {}\n\
-             args.spawn_test_entity   = {}\n\
+             spawn_test_entity        = {}\n\
              gi                       = {}\n\
              construction_config      = {}",
             grid_preset_str,
             taa_str,
             taa_ring_depth_str,
-            a.spawn_test_entity,
+            spawn_test_entity_str,
             gi_str,
             construction_str,
         );
-    } else {
-        buf.push_str("args: <AppArgs resource missing>\n");
     }
 
     buf.push_str("===========================");

@@ -1,11 +1,11 @@
 //! Command-line options, parsed once and stored as a Bevy `Resource`
 //! (`03-design.md` §4.1).
 //!
-//! Carries the remaining production-meaningful knob (`spawn_test_entity`,
-//! migrating in Step 8) and a flat set of mode/phase booleans that drive the
-//! e2e harness dispatch from `bin/e2e_render.rs`. At most one e2e flag is
-//! true at a time — the enum collapse is deferred to a future Step 6
-//! (D6+D7 paired) since it crosses 11 mode files.
+//! After Step 8 of the config-as-resource refactor this carries ONLY the
+//! flat set of e2e mode/phase booleans that drive the e2e harness dispatch
+//! from `bin/e2e_render.rs`. At most one e2e flag is true at a time — the
+//! enum collapse is deferred to a future Step 6 (D6+D7 paired) since it
+//! crosses 11 mode files. Steps 6/7/9 drain the remaining shell.
 //!
 //! **Step 2 of the config-as-resource refactor** migrated the user's named
 //! smell `taa_ring_depth` out of this struct onto the
@@ -38,22 +38,11 @@ use bevy::prelude::*;
 /// Command-line options, parsed once and stored as a resource
 /// (`03-design.md` §4.1).
 ///
-/// After Steps 2-5 of the config-as-resource refactor only the
-/// `spawn_test_entity` parameter (Bucket A, migrates in Step 8) and the
-/// 11 e2e mode booleans + `vox_e2e_mode` (Bucket B, migrate in Step 6 /
-/// Step 7) remain here. Steps 6-9 drain the shell.
+/// After Steps 2-5 + 8 of the config-as-resource refactor only the
+/// 10 e2e mode booleans + `vox_e2e_mode` (Bucket B, migrate in Step 6 /
+/// Step 7) remain here. Steps 6/7/9 drain the shell.
 #[derive(Resource, Clone)]
 pub struct AppArgs {
-    /// Phase-C wave-3 — when `true`, [`crate::build_app`] adds a `Startup`
-    /// system that spawns one fixture entity into
-    /// [`render::construction::MainWorldEntities`] (a 4×4×4 emissive-voxel
-    /// block at the world centre). Combined with
-    /// `construction_config.entities_enabled = true`, this is the load-bearing
-    /// `--entities` mode of `e2e_render`: the entity is uploaded each frame
-    /// + rendered via `ray_tracing.wgsl::shoot_ray`'s entity sub-traversal
-    /// branch, surfacing in the framebuffer as an extra hit on top of the
-    /// world geometry.
-    pub spawn_test_entity: bool,
     /// When `true`, the e2e driver runs the **resize-blackness reproduction
     /// test** instead of the standard WARMUP→MOTION→SETTLE→SHOOT flow.
     ///
@@ -176,7 +165,6 @@ pub struct AppArgs {
 impl Default for AppArgs {
     fn default() -> Self {
         Self {
-            spawn_test_entity: false,
             resize_test: false,
             vox_e2e_mode: false,
             oasis_edit_visual_mode: false,

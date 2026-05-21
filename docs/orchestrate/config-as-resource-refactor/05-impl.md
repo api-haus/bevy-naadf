@@ -872,3 +872,169 @@ incrementally). Kept as-is; the native + Android callers already match it.
 - **Foundation looks sound.** Same Assumptions from Steps 2-4 hold; the
   per-domain `GridPreset` resource + the `BootstrapInputs` carrier handle the
   Q3 wasm32 relocation cleanly. The orchestrator can proceed to Step 8.
+
+## Step 8 — Extract spawn_test_entity (2026-05-21)
+
+### What landed
+
+- `crates/bevy_naadf/src/render/construction/extract.rs` — new
+  `SpawnTestEntity(pub bool)` newtype `Resource`
+  (`#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]`),
+  placed adjacent to `MainWorldEntities` (the design said "adjacent to
+  `MainWorldEntities`"; that resource lives in `extract.rs`, not `mod.rs` as
+  the design's §3.1 / Step 8 text said — verified by Grep, see side notes).
+  `SpawnTestEntity::default()` = `SpawnTestEntity(false)`. Decision §4 — a
+  plain `bool` newtype, not `Option<TestEntityFixture>`.
+- `crates/bevy_naadf/src/render/construction/mod.rs` — extended the
+  `pub use extract::{…}` re-export with `SpawnTestEntity`. Changed the
+  `spawn_phase_c_test_entity` `Startup` gate from
+  `.run_if(|args: Res<crate::AppArgs>| args.spawn_test_entity)` to
+  `.run_if(|s: Option<Res<SpawnTestEntity>>| s.is_some_and(|s| s.0))` — the
+  exact shape the design's Step 8 spec prescribes (resource-absent tolerant).
+- `crates/bevy_naadf/src/bootstrap.rs` — added
+  `pub spawn_test_entity: SpawnTestEntity` field on `BootstrapInputs` + its
+  line in the hand `Default` impl + the post-`build_app_with_args`
+  `app.insert_resource(inputs.spawn_test_entity)` fan-out insert. Fixed the
+  pin test to assert `!inputs.spawn_test_entity.0` (was
+  `!inputs.args.spawn_test_entity`).
+- `crates/bevy_naadf/src/lib.rs` — defensive `SpawnTestEntity::default()`
+  seed in `build_app_with_args` (same Step-3/4/5 pattern).
+- `crates/bevy_naadf/src/e2e/driver.rs` — `e2e_driver`'s ASSERT-phase
+  `entities_mode` read swung from `app_args…spawn_test_entity` to a new
+  `Option<Res<SpawnTestEntity>>`. Adding the parameter pushed `e2e_driver`
+  to 17 system params — over Bevy's 16-param ceiling — so `app_args` and the
+  new `spawn_test_entity` are grouped into one tuple `SystemParam`
+  `config: (Option<Res<AppArgs>>, Option<Res<SpawnTestEntity>>)`, destructured
+  at the top of the body. See side notes + Decision below.
+- `crates/bevy_naadf/src/bin/e2e_render.rs` — `BootCommand::EntitiesBoot`
+  arm now inserts `SpawnTestEntity(true)` on the `BootstrapInputs` instead of
+  `app_args.spawn_test_entity = true`. The `AppArgs::default()` local is gone
+  (the arm no longer mutates any `AppArgs` field). `EntitiesBoot` doc comment
+  updated.
+- `crates/bevy_naadf/src/diagnostics.rs` — added
+  `spawn_test_entity: Option<Res<SpawnTestEntity>>` param; the dump reads it
+  with the defensive missing-resource fallback string. `dump_diagnostics_on_p`
+  **no longer takes `Option<Res<AppArgs>>` at all** — after Step 8 the dump
+  reads zero `AppArgs` fields (the remaining `AppArgs` fields are e2e mode
+  booleans the dump never showed), so the parameter + the `use crate::AppArgs`
+  import were removed. This matches the design §3.5 Q4 directive ("the dump
+  becomes one system with N `Option<Res<_>>` parameters … drops
+  `Option<Res<AppArgs>>`").
+- `crates/bevy_naadf/src/app_args.rs` — deleted `pub spawn_test_entity: bool`
+  field + its `Default`-impl line. Updated the module + struct docstrings:
+  `AppArgs` is now down to **11 fields** (10 e2e mode booleans + `vox_e2e_mode`).
+- Doc-comment fixups: `render/construction/test_fixture.rs`,
+  `e2e/gates.rs:317` — updated the `AppArgs::spawn_test_entity` references to
+  point at the `SpawnTestEntity` resource.
+
+### Decisions made during impl
+
+1. **`SpawnTestEntity` placed in `extract.rs`, not `mod.rs`.** The design's
+   Step 8 spec said "adjacent to the existing `MainWorldEntities` resource …
+   at `render/construction/mod.rs`." Grep showed `MainWorldEntities` is
+   actually *defined* at `extract.rs:36` and only *re-exported* through
+   `mod.rs:88`. Placed `SpawnTestEntity` next to the real definition in
+   `extract.rs` and extended the same re-export — this is "adjacent to
+   `MainWorldEntities`" in the sense the design intended.
+2. **`bool` newtype, not `Option<TestEntityFixture>`** — Decision §4
+   verbatim. The fixture is content-static (4×4×4 emissive block at world
+   centre, all voxel-type 11); there are no per-fixture parameters to carry.
+3. **`Copy + Debug + PartialEq + Eq` derives on `SpawnTestEntity`.** `Copy`
+   because it wraps a `bool`; `Debug`/`PartialEq`/`Eq` because the diagnostics
+   dump and any future test want them and they cost nothing on a `bool`
+   newtype. (Mirrors `InvalidSampleStorageCount`, the precedent the design
+   cites — that one is `#[derive(Resource, Clone, Copy, …)]`.)
+4. **`e2e_driver`'s config-tuple grouping — the 16-param ceiling.** Adding
+   `Option<Res<SpawnTestEntity>>` as a 17th positional `SystemParam` failed
+   to compile (`e2e_driver` is not a system — Bevy's `SystemParam` tuple impl
+   tops out at 16). Bevy's idiomatic answer is to nest params into a tuple
+   (a tuple of `SystemParam`s is itself one `SystemParam`). Grouped `app_args`
+   + `spawn_test_entity` into `config: (Option<Res<AppArgs>>,
+   Option<Res<SpawnTestEntity>>)`, destructured on the first body line. This
+   is the minimum-blast-radius fix — no call-site changes (the driver is
+   registered by name in `e2e/mod.rs`, Bevy resolves the params). **Flagged
+   for Steps 6/7:** when `E2eGateMode` lands and `app_args` is fully drained,
+   this tuple should shed `AppArgs` and the grouping can be flattened or
+   re-thought; the driver is param-pressured and Step 6 adds `E2eGateMode` to
+   it, so Step 6 will hit the same ceiling and must plan for it.
+
+### Verification
+
+- `cargo build --workspace`: PASS (clean — no warnings; the removed
+  `use crate::AppArgs` in `diagnostics.rs` left no dangling reference).
+- `cargo test --workspace --lib`: PASS (192 passed; 0 failed; 1 ignored).
+  The fixed `bootstrap::tests::default_wraps_canonical_app_args_defaults`
+  pin test (now asserting `!inputs.spawn_test_entity.0`) is in the passing
+  set.
+- `cargo run --bin e2e_render -- --entities`: PASS — the log shows
+  `phase-c wave-3 — spawned fixture entity: 4×4×4 green-emissive @
+  Vec3(2046.0, 24.0, 2046.0)` (proving the `SpawnTestEntity(true)` resource
+  gate fires `spawn_phase_c_test_entity`), `e2e_render: PASS (batch 6)`, and
+  `entity handler validation PASS: frame A: 8 chunk_updates, 1
+  entity_chunk_instances, 1 history`.
+- `cargo run --bin e2e_render -- baseline`: PASS — and **no**
+  `spawned fixture entity` line, confirming the default
+  `SpawnTestEntity(false)` correctly gates the spawner OFF on the
+  non-`--entities` path. (Run as a negative check that the resource gate is
+  actually load-bearing, not always-on.)
+
+### Files touched
+
+| File | Change kind |
+|---|---|
+| `crates/bevy_naadf/src/render/construction/extract.rs` | New `SpawnTestEntity(pub bool)` Resource |
+| `crates/bevy_naadf/src/render/construction/mod.rs` | Re-export `SpawnTestEntity`; `.run_if` gate swap |
+| `crates/bevy_naadf/src/bootstrap.rs` | Add `spawn_test_entity` field + `Default` line + fan-out insert; fix pin test |
+| `crates/bevy_naadf/src/lib.rs` | Defensive `SpawnTestEntity::default()` seed |
+| `crates/bevy_naadf/src/e2e/driver.rs` | `entities_mode` reads `SpawnTestEntity`; config-tuple grouping for the 16-param ceiling |
+| `crates/bevy_naadf/src/bin/e2e_render.rs` | `EntitiesBoot` inserts `SpawnTestEntity(true)`; doc fixup |
+| `crates/bevy_naadf/src/diagnostics.rs` | Add `spawn_test_entity` param; **drop `Option<Res<AppArgs>>`** (dump no longer reads `AppArgs`) |
+| `crates/bevy_naadf/src/app_args.rs` | Delete `spawn_test_entity` field + default; docstring update |
+| `crates/bevy_naadf/src/render/construction/test_fixture.rs` | Docstring — gate is `SpawnTestEntity` resource |
+| `crates/bevy_naadf/src/e2e/gates.rs` | Docstring — gate is `SpawnTestEntity` resource |
+
+### Side notes / observations / complaints
+
+- **The design's Step 8 spec said `SpawnTestEntity` lives in
+  `render/construction/mod.rs` — it doesn't fit there.** `MainWorldEntities`
+  (the "adjacent" anchor the spec names) is defined in `extract.rs` and
+  re-exported through `mod.rs`. The design's §3.1 entry for `SpawnTestEntity`
+  also said `mod.rs`. This is a minor file:line drift of the kind the brief
+  warned about — verified with Grep before placing the type. Net effect: zero
+  — the resource is `pub use`-exported through the same path either way.
+- **The 16-param `SystemParam` ceiling is a real foundation concern for
+  Step 6.** `e2e_driver` was *already* at 16 params before Step 8; my one new
+  read tipped it to 17 and forced the tuple-grouping. Step 6 adds an
+  `E2eGateMode` read to this same driver (the design's Step 6 text says
+  "Driver code at `e2e/driver.rs` … read `Res<E2eGateMode>`"). Step 6 will
+  hit the identical ceiling. The Step-6 implementer should plan a real
+  `#[derive(SystemParam)]` struct for the driver's config reads rather than
+  another ad-hoc tuple — and Step 6 *also* drains the 11 e2e booleans off
+  `AppArgs`, so `app_args` leaves the driver entirely, which frees the slot.
+  Flagging so Step 6 doesn't rediscover this mid-flight.
+- **`dump_diagnostics_on_p` no longer reads `AppArgs` at all.** Step 8 was
+  the last `AppArgs` field the diagnostics dump consumed (`spawn_test_entity`).
+  Dropping the `Option<Res<AppArgs>>` parameter is the design's §3.5
+  intent ("the dump … drops `Option<Res<AppArgs>>`"), realised one step early
+  because `spawn_test_entity` happened to be the last dumped field. Clean.
+- **`AppArgs` is now down to 11 fields** — `resize_test`, `vox_e2e_mode`, and
+  9 other e2e mode booleans. Exactly what the brief said to expect ("`AppArgs`
+  will still have ~11 fields after your work — that is correct and expected").
+  Steps 6 (10 booleans → `E2eGateMode`), 7 (`vox_e2e_mode` →
+  `VoxE2eAssertion`), 9 (delete the shell) finish the job.
+- **The extract-resource pattern reused verbatim from Steps 3/4/5.** New
+  newtype Resource → `BootstrapInputs` field → hand `Default` line →
+  fan-out insert → defensive seed in `build_app_with_args` → consumer swap.
+  Five steps in, this is rote. No design re-litigation; the design's Step 8
+  spec matched reality bar the one `mod.rs`-vs-`extract.rs` file drift.
+- **Decision §4 (`bool` over `Option<TestEntityFixture>`) was the right
+  call.** There genuinely are no per-fixture parameters — `spawn_phase_c_test_entity`
+  hard-codes the 4×4×4 size, voxel-type 11, and the demo-relative position.
+  An `Option<TestEntityFixture { }>` with a zero-field inner type would have
+  been pure ceremony.
+- **No foundation rot.** Step 8 is the last per-field migration before the
+  e2e-mode collapse (Steps 6/7). The `BootstrapInputs` carrier + per-domain
+  resources have absorbed 6 fields (`taa_ring_depth`, `taa`, `gi`,
+  `construction_config`, `grid_preset`, `spawn_test_entity`) cleanly across
+  Steps 2-5 + 8. The remaining work is the genuinely hard step (Step 6, the
+  11→1 enum collapse) — but nothing in Steps 2-5/8 has made it harder.

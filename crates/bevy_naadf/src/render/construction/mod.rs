@@ -85,7 +85,9 @@ use crate::render::pipelines::NaadfPipelines;
 
 pub use chunk_calc::build_segment_voxel_buffer_from_dense;
 pub use config::ConstructionConfig;
-pub use extract::{extract_world_changes, MainWorldEntities, RenderWorldEntityState};
+pub use extract::{
+    extract_world_changes, MainWorldEntities, RenderWorldEntityState, SpawnTestEntity,
+};
 pub use producer::naadf_gpu_producer_node;
 pub use readback::{
     populate_cpu_mirror_from_gpu_producer, CpuMirrorReadback, ReadbackStage,
@@ -1838,15 +1840,18 @@ impl Plugin for ConstructionPlugin {
         app.init_resource::<MainWorldEntities>();
 
         // Phase-C wave-3 — `--entities` fixture spawner. Self-gates on
-        // `AppArgs::spawn_test_entity` so registration is unconditional; the
-        // scheduler skips the system body when the flag is `false`. Runs
-        // after `voxel::grid::setup_test_grid` so the world dimensions are
-        // known before the fixture computes its demo-relative position.
+        // `SpawnTestEntity` so registration is unconditional; the scheduler
+        // skips the system body when the flag is `false` (or the resource is
+        // absent). Runs after `voxel::grid::setup_test_grid` so the world
+        // dimensions are known before the fixture computes its demo-relative
+        // position. Step 8 of the config-as-resource refactor migrated the
+        // gate off `AppArgs::spawn_test_entity` onto the `SpawnTestEntity`
+        // resource.
         app.add_systems(
             Startup,
             test_fixture::spawn_phase_c_test_entity
                 .after(crate::voxel::grid::setup_test_grid)
-                .run_if(|args: Res<crate::AppArgs>| args.spawn_test_entity),
+                .run_if(|s: Option<Res<SpawnTestEntity>>| s.is_some_and(|s| s.0)),
         );
 
         // Main-world `Startup` driver (regime-1, `15-design-c.md` §1.2). W0

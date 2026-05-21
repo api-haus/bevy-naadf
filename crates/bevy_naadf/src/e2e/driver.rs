@@ -465,8 +465,18 @@ pub fn e2e_driver(
     mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
-    app_args: Option<Res<crate::AppArgs>>,
+    // Bootstrap-config reads, grouped into one tuple `SystemParam` — the
+    // driver is already at Bevy's 16-param ceiling, so Step 8's new
+    // `SpawnTestEntity` read shares a tuple slot with `app_args` rather than
+    // taking a 17th positional parameter. Steps 6/7 will drain `app_args` (it
+    // still carries the e2e-mode booleans the driver branches on); when that
+    // lands, this tuple can shed `AppArgs` and the grouping can be revisited.
+    config: (
+        Option<Res<crate::AppArgs>>,
+        Option<Res<crate::render::construction::SpawnTestEntity>>,
+    ),
 ) {
+    let (app_args, spawn_test_entity) = config;
     // Resize-test fast-path: at the very first Warmup tick, if --resize-test
     // is set, branch into the resize-test state machine entirely (skips the
     // standard Warmup→Motion→Settle→Shoot→Drain→Assert flow). All assertions
@@ -675,9 +685,11 @@ pub fn e2e_driver(
             // Phase-C followup #5 — surface `--entities` mode to the
             // assertions so the entity-pixel luminance gate fires only when
             // a fixture entity was spawned (the gate baseline is
-            // entity-mode-specific).
+            // entity-mode-specific). Step 8 of the config-as-resource
+            // refactor migrated this off `AppArgs.spawn_test_entity` onto the
+            // `SpawnTestEntity` resource.
             let entities_mode =
-                app_args.as_deref().is_some_and(|a| a.spawn_test_entity);
+                spawn_test_entity.as_deref().is_some_and(|s| s.0);
             // vox-e2e mode — swap the default-scene `assert_batch_6` region
             // gate for the `assert_vox_geometry_visible` non-skybox gate.
             // The default-scene gate rects (`solid_block_rect`,

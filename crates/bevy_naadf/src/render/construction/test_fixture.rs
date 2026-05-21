@@ -8,9 +8,11 @@
 //! (`naadf_entity_update_node` + the `ray_tracing.wgsl::shoot_ray` entity
 //! sub-traversal) folds it into the framebuffer.
 //!
-//! Gated on `AppArgs::spawn_test_entity = true` via a `.run_if` registered
-//! in [`super::ConstructionPlugin::build`]. The flag is set by `--entities`
-//! in `bin/e2e_render.rs`.
+//! Gated on the [`super::SpawnTestEntity`] resource (`SpawnTestEntity(true)`)
+//! via a `.run_if` registered in [`super::ConstructionPlugin::build`]. The
+//! resource is set by the `--entities` boot in `bin/e2e_render.rs`. Step 8 of
+//! the config-as-resource refactor migrated the gate off the former
+//! `AppArgs::spawn_test_entity` boolean onto this per-domain resource.
 //!
 //! **Dependency note**: this fn reads
 //! [`crate::voxel::grid::demo_origin_v`] to translate the
