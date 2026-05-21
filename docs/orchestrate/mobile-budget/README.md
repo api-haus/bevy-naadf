@@ -42,9 +42,9 @@ Design and ship a **startup-time GPU budget preselection routine** that reads `d
 - [x] Step 3 — method presented to user
 - [x] Step 4 — Q&A (4 decisions locked)
 - [x] Step 5 — context files written
-- [ ] Step 6a — checkpoint commit before architect
-- [ ] Step 6b — architect dispatch
-- [ ] Step 7a — synthesize architect result; hard gate for user approval (esp. C# divergence shape)
+- [x] Step 6a — checkpoint commit before architect (`76463ed`)
+- [x] Step 6b — architect dispatch (delegate-architect — 02-design.md, 9 sections, 10 decisions, 10 assumptions, 10 side notes)
+- [x] Step 7a — synthesize architect result; user approved Mali pick `(taa=8, world=(6,2,6))`, design as-is. Context-doc fix: `taa_sample_accum` corrected (3 big bindings, not 4).
 - [ ] Step 6c — checkpoint commit before impl
 - [ ] Step 6d — impl dispatch
 - [ ] Step 7b — synthesize impl result; hard gate for visual check on Mali-G52 device

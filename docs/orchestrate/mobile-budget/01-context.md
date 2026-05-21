@@ -6,7 +6,7 @@ All file paths below are relative to that worktree unless otherwise stated.
 
 ## Restated goal (verbatim user words preserved)
 
-> Design and ship a **startup-time GPU budget preselection routine** that reads `device.limits()` and picks safe sizes for the four oversized storage-buffer bindings (`voxels`, `blocks`, `taa_sample_accum`, `taa_samples`) BEFORE the world install fires — so the full Naadf world runs on mobile (Android Mali / iOS Safari WebGPU), where `max_storage_buffer_binding_size = 256 MiB` is the universal hard cap.
+> Design and ship a **startup-time GPU budget preselection routine** that reads `device.limits()` and picks safe sizes for the oversized storage-buffer bindings (`voxels`, `blocks`, `taa_samples` — see "What's broken" below; `taa_sample_accum` is NOT depth-scaled and does NOT exceed the cap) BEFORE the world install fires — so the full Naadf world runs on mobile (Android Mali / iOS Safari WebGPU), where `max_storage_buffer_binding_size = 256 MiB` is the universal hard cap.
 
 User's tightening of scope (2026-05-21, mid-orchestration):
 
@@ -31,14 +31,16 @@ User's tightening of scope (2026-05-21, mid-orchestration):
 
 **Headroom target: ≤ 75% × 256 MiB = 192 MiB per binding.**
 
-## What's broken (current state in `crates/bevy_naadf/src/render/prepare/world.rs:320-346`)
+## What's broken (current state in `crates/bevy_naadf/src/render/prepare/world.rs:320-346` + `render/taa.rs:476-505`)
+
+**Correction (architect, 2026-05-21):** the original handoff (`docs/todo/android-build.md:41`) claimed four bindings exceed the cap. After verification at `crates/bevy_naadf/src/render/taa.rs:489-495`, only **three** bindings exceed it. `taa_sample_accum` is sized `pixel_count × 8 B` (NOT depth-scaled) → ~24 MiB at 3 MP, fits any mobile cap.
 
 | buffer | current sizing | mobile cap (256 MiB) | over by |
 |---|---|---|---|
 | `voxels` | 1024 MiB (`chunk_count × 128 × 4`) | 256 MiB | 4× |
 | `blocks` | 512 MiB (`chunk_count × 64 × 4`) | 256 MiB | 2× |
-| `taa_sample_accum` @ iPhone-like res | ~720 MiB (`pixels × 32 × 8`) | 256 MiB | ~2.8× |
-| `taa_samples` @ same | ~720 MiB | 256 MiB | ~2.8× |
+| `taa_samples` @ iPhone-like res | ~720 MiB (`pixels × 32 × 8`) | 256 MiB | ~2.8× |
+| `taa_sample_accum` @ same | ~24 MiB (`pixels × 8`, NOT depth-scaled) | 256 MiB | **fits** |
 | `chunks` | 2.1 MiB | 256 MiB | fits |
 
 Mali OOMs the kernel and reboots the device on first launch. iOS Safari WebGPU refuses the binding outright.
