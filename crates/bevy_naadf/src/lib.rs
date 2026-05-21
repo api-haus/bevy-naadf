@@ -506,19 +506,17 @@ pub fn build_app_core(cfg: AppConfig) -> App {
         );
     }
 
-    // --- Phase 0 transport spike (e2e-ipc-rpc-restructure) -------------------
-    // BRP server install point per design §2.2: end of `build_app_core`, the
-    // single funnel both production and e2e route through, AFTER `DefaultPlugins`
-    // (incl. `RenderPlugin`) so the render sub-app exists. Behind the `e2e-brp`
-    // cargo feature; the opt-in is the `--e2e-brp <port>` argv flag parsed by
-    // `main.rs`, which sets `BEVY_NAADF_E2E_BRP_PORT`. SPIKE: this gate is a
-    // temporary env-var read; Phase 1 replaces it with an `AppConfig::brp_port`
-    // field. None of this compiles into the default-feature production binary.
+    // --- BRP server install (e2e-ipc-rpc-restructure, Phase 1) ---------------
+    // Install point per design §2.2: end of `build_app_core`, the single funnel
+    // both production and e2e route through, AFTER `DefaultPlugins` (incl.
+    // `RenderPlugin`) so the render sub-app exists. Behind the `e2e-brp` cargo
+    // feature; the opt-in is the `AppConfig::brp_port` field (set by
+    // `AppConfig::e2e_sut`, selected by `main.rs`'s `--e2e-brp <port>` flag).
+    // With the feature off, `cfg.brp_port` is an inert `None` and none of this
+    // compiles into the default-feature production binary.
     #[cfg(feature = "e2e-brp")]
-    if let Ok(port) = std::env::var("BEVY_NAADF_E2E_BRP_PORT") {
-        if let Ok(port) = port.parse::<u16>() {
-            crate::e2e_brp::install_brp_server(&mut app, port);
-        }
+    if let Some(port) = cfg.brp_port {
+        crate::e2e_brp::install_brp_server(&mut app, port);
     }
 
     app

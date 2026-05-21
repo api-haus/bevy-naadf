@@ -27,6 +27,15 @@
 //!   the fixed `(256, 32, 256)`-chunk world (matches C# `generatorModel.fx`);
 //!   load failures log + fall back to the embedded primitive scene. Minimal
 //!   `std::env::args` parsing — no `clap`.
+//!
+//! - `--e2e-brp <port>` — boot as the e2e *system-under-test*: select
+//!   `AppConfig::e2e_sut` (the e2e determinism profile) and, when built
+//!   `--features e2e-brp`, install the Bevy Remote Protocol HTTP server on
+//!   `127.0.0.1:<port>` so the external `naadf_e2e` runner can drive the app.
+//!   Native-only. Skips the production GPU budget probe — the SUT forces the
+//!   canonical memory budget for deterministic SSIM (see the boot path below).
+//! - `--e2e-window <w>x<h>` — override the SUT window size (default 256×256).
+//!   Only meaningful alongside `--e2e-brp`.
 
 use bevy::prelude::AppExit;
 use bevy_naadf::{AppConfig, GridPreset};
@@ -56,32 +65,76 @@ fn main() -> AppExit {
         }
     }
 
-    // --- Phase 0 transport spike (e2e-ipc-rpc-restructure) -------------------
-    // `--e2e-brp <port>` is the temporary spike opt-in: it sets the
-    // `BEVY_NAADF_E2E_BRP_PORT` env var that `build_app_core` reads (behind the
-    // `e2e-brp` cargo feature) to install the BRP HTTP server. SPIKE: a flag +
-    // env var, not the design's `AppConfig::e2e_sut` profile — Phase 1 replaces
-    // this with a proper `AppConfig::brp_port` field. With the `e2e-brp` feature
-    // off, the flag is parsed but the env var is simply ignored (no BRP code is
-    // compiled), so the production binary's behaviour is unchanged.
-    if let Some(idx) = argv.iter().position(|a| a == "--e2e-brp") {
-        match argv.get(idx + 1) {
-            Some(port) if port.parse::<u16>().is_ok() => {
-                std::env::set_var("BEVY_NAADF_E2E_BRP_PORT", port);
-            }
-            _ => {
-                eprintln!("error: --e2e-brp flag requires a numeric port argument");
-                return AppExit::error();
-            }
-        }
-    }
-
     // Native: sync probe path (`probe_and_select` → spin up a throwaway Bevy
     // render App, read `device.limits()`, drop it). Picks canonical defaults
     // on desktop with a ≥ 1.35 GiB storage-buffer-binding cap; picks mobile
     // rungs on Android Mali (256 MiB).
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // --- e2e SUT spawn contract (e2e-ipc-rpc-restructure, Phase 1) -------
+        // `--e2e-brp <port>` boots the production binary as the system-under-
+        // test for the external BRP-driven e2e runner: it selects
+        // `AppConfig::e2e_sut` instead of `AppConfig::windowed()` (the e2e
+        // determinism profile + the BRP server on `port`). `--e2e-window
+        // <w>x<h>` optionally overrides the SUT window size (default 256×256
+        // from the e2e profile). Both are hand-parsed alongside `--vox`,
+        // matching `main.rs`'s "no `clap`" doctrine (design §5). Native-only:
+        // the spawn contract / BRP transport are native-only (design §3
+        // forbidden moves) — the wasm arm never reads these flags.
+        //
+        // The BRP server itself is behind the `e2e-brp` cargo feature; with
+        // that feature off `AppConfig::e2e_sut`'s `brp_port` is read by no
+        // compiled code. The flags are still parsed (so a typo'd flag fails
+        // cleanly with a clear error rather than silently changing the
+        // production boot) and `e2e_sut` still selects the determinism profile
+        // — but a default-feature build launched with `--e2e-brp` simply runs
+        // the determinism profile with no remote-control socket. The runner
+        // always builds the SUT `--features e2e-brp`, so this is a
+        // developer-ergonomics edge, not the real path.
+        let mut e2e_brp_port: Option<u16> = None;
+        if let Some(idx) = argv.iter().position(|a| a == "--e2e-brp") {
+            match argv.get(idx + 1).map(|p| p.parse::<u16>()) {
+                Some(Ok(port)) => e2e_brp_port = Some(port),
+                _ => {
+                    eprintln!("error: --e2e-brp flag requires a numeric port argument");
+                    return AppExit::error();
+                }
+            }
+        }
+        let mut e2e_window: Option<(u32, u32)> = None;
+        if let Some(idx) = argv.iter().position(|a| a == "--e2e-window") {
+            match argv.get(idx + 1).and_then(|spec| parse_window_spec(spec)) {
+                Some(dims) => e2e_window = Some(dims),
+                None => {
+                    eprintln!(
+                        "error: --e2e-window flag requires a `<width>x<height>` \
+                         argument (e.g. 1280x720)"
+                    );
+                    return AppExit::error();
+                }
+            }
+        }
+
+        if let Some(port) = e2e_brp_port {
+            // e2e SUT boot. Route through the bootstrap fan-out directly —
+            // NOT `build_app_with_budget` — so the SUT FORCES the canonical
+            // memory budget and skips the production `probe_and_select`,
+            // exactly as the legacy `e2e_render` path does (`lib.rs`
+            // `run_e2e_render` → `build_app`, which bypasses the probe).
+            // Rationale: e2e gates need canonical world / TAA rungs for
+            // deterministic SSIM across runs and machines (the design's
+            // hard-gate resolution; `lib.rs` `build_app_with_budget` doc).
+            let mut cfg = AppConfig::e2e_sut(port);
+            if let Some((w, h)) = e2e_window {
+                cfg.window.resolution = Some((w as f32, h as f32));
+            }
+            let inputs = bevy_naadf::bootstrap::BootstrapInputs {
+                grid_preset,
+                ..Default::default()
+            };
+            return bevy_naadf::bootstrap::build_app_with_bootstrap_inputs(cfg, inputs)
+                .run();
+        }
         bevy_naadf::build_app_with_budget(
             AppConfig::windowed(),
             grid_preset,
@@ -143,4 +196,20 @@ fn main() -> AppExit {
         });
         AppExit::Success
     }
+}
+
+/// Parse a `--e2e-window` argument of the form `<width>x<height>`
+/// (e.g. `1280x720`) into `(width, height)`. Returns `None` for any
+/// malformed spec — missing `x`, a non-numeric or zero component, or extra
+/// segments. Native-only: the `--e2e-window` flag is part of the native-only
+/// e2e SUT spawn contract (design §5).
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_window_spec(spec: &str) -> Option<(u32, u32)> {
+    let (w, h) = spec.split_once('x')?;
+    let w: u32 = w.parse().ok()?;
+    let h: u32 = h.parse().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
 }

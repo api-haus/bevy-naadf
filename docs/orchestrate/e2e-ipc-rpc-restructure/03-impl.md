@@ -240,3 +240,262 @@ env-var opt-in with the `AppConfig::brp_port` field.
   `naadf/capture` return a blank frame and costs a debugging session if the
   runner harness gets it wrong. It is not a design flaw, just an integration
   detail the design does not currently mention.
+
+---
+
+## Phase 1 — BRP server scaffold (2026-05-22)
+
+**Verdict: Phase 1 lands clean. All three verification gates green. The
+default-feature production binary is byte-identical to today; the `e2e-brp`
+build compiles; the legacy `e2e_render --vox-e2e` gate still passes. The three
+Phase-1 verbs answer correctly over loopback HTTP (optional sanity check
+performed, results below).**
+
+### What changed
+
+Five files — three edited, two written (one of which was the Phase 0 seed,
+now rewritten into the real scaffold).
+
+1. **`crates/bevy_naadf/src/app_config.rs`** — added the
+   `AppConfig::brp_port: Option<u16>` field (design §2.2); set it to `None` in
+   both existing constructors (`windowed()`, `e2e()`); added the new
+   `AppConfig::e2e_sut(port: u16)` constructor (design §2.4 / §5) — the e2e
+   determinism profile (HUD off, free camera off, synchronous pipeline
+   compilation, fixed 256×256 window) with `add_e2e_systems: false` (no in-app
+   driver — the SUT is driven externally over BRP) and `brp_port: Some(port)`.
+
+2. **`crates/bevy_naadf/src/e2e_brp/mod.rs`** — rewrote the Phase 0 spike
+   `install_brp_server` into the real scaffold (design §2.3): `RemotePlugin::default()`
+   with the three custom verbs chained (`with_method_main` ×2 +
+   `with_watching_method_main` ×1), `RemoteHttpPlugin::default().with_port(port)`,
+   `WinitSettings::Continuous` (§2.4, A2), `E2eControl` + `RunUntilIdleWatch`
+   resources via `init_resource`, and the `advance_e2e_control` system in
+   `Update`. Added `pub mod verbs;`.
+
+3. **`crates/bevy_naadf/src/e2e_brp/verbs.rs`** (NEW) — the three Phase-1
+   verbs + their support types: `E2eControl` (frame counter + step budget),
+   `RunUntilIdleWatch` (single-slot per-watch state), `advance_e2e_control`
+   (the `Update` ticker), and `step` / `run_until_idle` / `get_state`.
+
+4. **`crates/bevy_naadf/src/lib.rs`** — replaced the Phase 0 temporary
+   `BEVY_NAADF_E2E_BRP_PORT` env-var gate at the end of `build_app_core` with
+   the design's `if let Some(port) = cfg.brp_port` field gate (still
+   `#[cfg(feature = "e2e-brp")]`, still the same install point). The module
+   doc comment for `e2e_brp` is unchanged (already generic).
+
+5. **`crates/bevy_naadf/src/main.rs`** — replaced the Phase 0 env-var bridge
+   with the real `--e2e-brp <port>` / `--e2e-window <w>x<h>` flags (design §5),
+   moved into the `not(target_arch = "wasm32")` block (native-only spawn
+   contract). `--e2e-brp` now selects `AppConfig::e2e_sut(port)` and boots via
+   the bootstrap fan-out directly (see budget handling below). Added the
+   `parse_window_spec` helper (native-only). Updated the file's `## CLI flags`
+   doc section.
+
+`bin/e2e_render`, `e2e/driver.rs`, `e2e/gate.rs`, `E2eGateMode`,
+`add_e2e_systems` — all UNTOUCHED, as the brief mandates.
+
+### The three verbs
+
+All three are **main-world** handlers (`with_method_main` /
+`with_watching_method_main`, verified against `bevy_remote 0.19.0-rc.1`
+`src/lib.rs:591,632`). They are ordinary Bevy systems with the BRP handler
+shape — `fn(In(Option<Value>), &mut World) -> BrpResult` for the two instant
+verbs, `-> BrpResult<Option<Value>>` for the watching one.
+
+**The `E2eControl` mechanics.** `E2eControl { frame: u64, frames_remaining:
+u32 }` is the in-SUT frame-stepping gate (design §4.1). `advance_e2e_control`
+runs once per `Update` — `frame += 1`, `frames_remaining =
+saturating_sub(1)`. The SUT always ticks (it is `WinitSettings::Continuous`);
+`frames_remaining` is a *logical* step budget — "at rest" ⇔
+`frames_remaining == 0`. Every counted frame is a genuine winit-paced rendered
+frame; the design's D3 decision (counter + watching method, not a
+schedule-pumping handler) is followed verbatim.
+
+- **`naadf/step`** (instant) — parses `{ frames: u32 }`, `saturating_add`s it
+  to `E2eControl.frames_remaining`, returns `{ frame: u64 }` (the frame count
+  *now*, before the queued frames elapse). It does NOT pump the schedule. A
+  missing/non-integer `frames` field returns JSON-RPC `-32602 Invalid params`.
+
+- **`naadf/run_until_idle`** (watching) — parses `{ max_frames: u32,
+  idle_frames: u32 }`. `process_ongoing_watching_requests` re-runs the handler
+  every frame; per the verified `bevy_remote` contract (`src/lib.rs:1431-1435`)
+  `Ok(None)` sends nothing (runner keeps blocking), `Ok(Some(v))` delivers `v`
+  as the next SSE chunk, `Err` delivers an error chunk. The handler returns
+  `Ok(None)` every frame while running, and exactly one
+  `Ok(Some({ done: true, frame, timed_out }))` once either `frames_remaining
+  == 0` has held for `idle_frames` consecutive frames (`timed_out: false`) or
+  `max_frames` frames have elapsed since the watch began (`timed_out: true` —
+  the hard ceiling so a hung SUT fails fast, per the e2e-fail-fast memory).
+
+  **The watching method for `run_until_idle`** — a watching handler has no
+  per-request storage in the `World`, so the "consecutive idle" / "frames
+  since watch began" counters live in the `RunUntilIdleWatch` resource
+  (single-slot: `started_at_frame: Option<u64>` + `consecutive_idle: u32`).
+  On the first run of a watch the slot is anchored to the current frame; once
+  the watch settles or times out the slot is cleared so the next
+  `run_until_idle` anchors fresh. Phase 1's runner issues one `run_until_idle`
+  at a time (synchronous test code), so a single slot is correct; a
+  concurrent-watch design is explicitly out of Phase 1 scope and documented as
+  such in the verb's doc comment. If a fresh watch observes a stale slot it
+  takes it over (last-writer-wins) — benign for the one-at-a-time runner.
+
+- **`naadf/get_state`** (instant) — ignores params, returns
+  `{ frame, frames_remaining, world_loaded, pipeline_errors, tracing_errors }`.
+  `world_loaded` = `world.contains_resource::<WorldData>()`.
+  `tracing_errors` = `e2e::tracing_error_counter::tracing_error_count()` (a
+  process-global static — always readable). `pipeline_errors` reads the
+  main-world side of the `PipelineScanResult` `Arc<Mutex>` channel *if the
+  resource is present* (`get_resource`, Option-tolerant); in Phase 1 it is
+  always `null` because that channel is wired by `add_e2e_systems` (off in
+  the `e2e_sut` profile) and the render-world `naadf/pipeline_scan` verb that
+  feeds it is Phase 2. `null` here means "not scanned", not "no errors" —
+  documented in the verb. Self-contained: Phase 1 did NOT need to wire the
+  `PipelineScanResult` channel into `install_brp_server`.
+
+### `e2e_sut` budget handling
+
+The brief's hard-gate resolution is binding: **the e2e SUT forces the
+canonical memory budget — it does NOT run the production `probe_and_select`.**
+
+Verified mechanism for how the legacy `e2e_render` path skips the probe:
+`run_e2e_render` (`lib.rs:535`) → `e2e::run_e2e_render` (`e2e/mod.rs:398`) →
+`build_app(AppConfig::e2e())` (`e2e/mod.rs:399`). `build_app` (`lib.rs:142`)
+calls `build_app_core` *directly* — it never touches
+`crate::render::budget::probe_and_select` (which is only called inside
+`build_app_with_budget`, `lib.rs:168`). So the legacy e2e path skips the probe
+purely by not routing through `build_app_with_budget`; the canonical budget
+then comes from `build_app_core`'s defensive `EffectiveWorldSize::canonical()`
+/ `InvalidSampleStorageCount::canonical()` seeds (`lib.rs:353,361`).
+
+**Mirrored mechanism for `--e2e-brp`:** `main.rs`'s `--e2e-brp` branch boots
+via `bevy_naadf::bootstrap::build_app_with_bootstrap_inputs(cfg, inputs)` —
+NOT `build_app_with_budget`. `build_app_with_bootstrap_inputs` calls
+`build_app_core` and fans out the `BootstrapInputs` (so `--vox` still installs
+its world), but it never calls `probe_and_select`. The `BootstrapInputs` is
+constructed `{ grid_preset, ..Default::default() }`, so `taa_ring_depth` is
+the canonical `TaaRingConfig::default()` (= `DEFAULT_TAA_RING_DEPTH` = 32).
+Net: the `--e2e-brp` boot path uses the canonical world / TAA / invalid-sample
+rungs, exactly as `e2e_render` does today. The design §5's prose ("still
+`build_app_with_budget`") is superseded by the brief's hard-gate resolution —
+this implementation follows the brief.
+
+This was confirmed at runtime: the optional sanity check (below) showed the
+SUT's `prepare_world_gpu` allocating the canonical
+`chunks=2097152 / blocks=512 MiB / voxels=1024 MiB` buffers — the canonical
+256×32×256-chunk world, not a mobile rung.
+
+### Gate results
+
+All three gates from the brief, exact outcomes:
+
+1. **`cargo build --workspace` (default features, no `e2e-brp`)** — PASS.
+   `Finished dev profile in 1m 00s`, 0 errors, 0 warnings. The default
+   production build compiles; all BRP code is behind `#[cfg(feature =
+   "e2e-brp")]`.
+
+2. **`cargo build -p bevy-naadf --features e2e-brp`** — PASS.
+   `Finished dev profile in 44.29s`, 0 errors, 0 warnings. The BRP server
+   scaffold + the three verbs compile against `bevy_remote 0.19.0-rc.1`.
+
+3. **`timeout 180s cargo run --bin e2e_render -- --vox-e2e`** — PASS,
+   **exit status 0**, well within the 180s budget. Output tail:
+   ```
+   e2e_render --vox-e2e: vox_geometry channel max (max of mean_R / G / B) = 251.8 (threshold > 30 ...)
+   e2e_render: PASS (batch 6) — 96 warmup + 48 camera-motion + 1 settle frames,
+     framebuffer read back & non-degenerate, per-batch region gate green through
+     camera motion, every pipeline created cleanly, every expected render-graph
+     node dispatched.
+   ```
+   The legacy in-app e2e path is unbroken — Phase 1 did not regress it.
+
+**Optional sanity check (performed).** Booted the `e2e-brp` build
+`target/debug/bevy-naadf --e2e-brp 15799` and curled the three verbs over
+loopback HTTP:
+- `naadf/get_state` → `{"frame":4573,"frames_remaining":0,"pipeline_errors":null,"tracing_errors":0,"world_loaded":true}`
+- `naadf/step {frames:30}` → `{"frame":4574}`
+- `naadf/run_until_idle {max_frames:200,idle_frames:5}` → streamed exactly one
+  final chunk `{"done":true,"frame":4608,"timed_out":false}` (`4574 + 30`
+  queued + the idle window ⇒ settled at 4608, not budget-hit — `timed_out:false`).
+- `naadf/step` with `params:{}` → JSON-RPC `error {"code":-32602,"message":"naadf/step requires an integer \`frames\` field"}`.
+All four behaved exactly as designed. (Note: the SUT was run from
+`crates/bevy_naadf/` with the binary at `target/debug/`, so the
+Phase-0-documented asset-path CWD warning appeared — irrelevant to the
+transport test, which is what this sanity check covers.)
+
+### Anything Phase 2 must know
+
+- **The verb-builder chain holds.** `RemotePlugin::default()
+  .with_method_main(...).with_watching_method_main(...)` chains cleanly;
+  Phase 2 adds the remaining 8 verbs to the same chain in `install_brp_server`.
+  The render-world verb `naadf/pipeline_scan` uses `with_method_render` — the
+  render sub-app exists at the `build_app_core`-tail install point (verified:
+  `DefaultPlugins` incl. `RenderPlugin` is added earlier in `build_app_core`).
+
+- **`get_state.pipeline_errors` is a Phase 2 wiring point.** It is `null` in
+  Phase 1 by design. Phase 2 (per design §6.3) moves the `PipelineScanResult`
+  `Arc<Mutex>` channel + the render-world scan system into
+  `install_brp_server`'s setup; once that lands, `get_state` will surface real
+  pipeline health. The `get_state` handler already reads the channel
+  Option-tolerantly (`get_resource`), so Phase 2 only needs to *insert* the
+  resource — no `get_state` change required.
+
+- **`run_until_idle` is single-watch.** `RunUntilIdleWatch` is one slot. If
+  Phase 2+ ever needs concurrent `run_until_idle` watches (it should not — the
+  runner is synchronous), the slot must become a per-request map. Flagged in
+  the verb's doc comment.
+
+- **`E2eControl` / `RunUntilIdleWatch` / `advance_e2e_control` live in
+  `e2e_brp::verbs`** and are `pub` — Phase 2's `e2e_brp::schema` module and
+  the `naadf_e2e` runner crate can reference them if needed (though the design
+  keeps the wire schema as plain serde structs, separate from these
+  resources).
+
+- **Design §5 vs the brief on the budget probe.** Design §5 prose says the
+  `--e2e-brp` path is "still `build_app_with_budget`"; the brief's binding
+  hard-gate resolution says the SUT forces canonical budget and must NOT route
+  through `probe_and_select`. This implementation follows the brief — see the
+  `e2e_sut` budget handling section. Phase 2+ agents reading design §5 should
+  treat that one sentence as superseded.
+
+## Side notes / observations / complaints
+
+- **The Phase 0 seed was a genuinely good seed.** `install_brp_server`'s
+  shape, the install point, the `WinitSettings::Continuous` placement, the
+  feature gating — all carried into Phase 1 unchanged in intent; Phase 1 only
+  *filled in* the verb set and swapped the env-var opt-in for the
+  `AppConfig::brp_port` field. No rework, no fighting the seed. The Phase 0
+  recommendation ("keep the edits as the Phase 1 seed") was correct.
+
+- **The `--e2e-brp` flag behaviour with the feature OFF is a deliberate, mild
+  oddity worth naming.** With `e2e-brp` off, `cargo run --bin bevy-naadf --
+  --e2e-brp 15799` parses the flag, selects `AppConfig::e2e_sut(15799)`, and
+  boots the **e2e determinism profile with no BRP socket** (the `brp_port`
+  field is read by no compiled code). It does not error and does not behave
+  like `windowed()`. This is intentional and documented in `main.rs` — the
+  flag failing cleanly on a typo'd port is worth more than silent
+  feature-gated divergence, and the runner always builds the SUT `--features
+  e2e-brp` so the real path is unaffected. But it is a (small) behavioural
+  fork the orchestrator should be aware of: a developer who runs `--e2e-brp`
+  on a default build gets a windowed app in the e2e profile (256×256, HUD off,
+  no fly camera) and may be briefly confused. Not a defect — flagging it as a
+  conscious tradeoff.
+
+- **`build_app_with_budget`'s doc comment is now slightly stale.** It says
+  "Production callers: Desktop + WebGPU/wasm32 — `src/main.rs::fn main()`" —
+  still true for the non-`--e2e-brp` path, but `main.rs` now has a *second*
+  native boot path (`--e2e-brp` → `build_app_with_bootstrap_inputs`) that
+  deliberately bypasses it. I did not edit that doc comment (it is not wrong,
+  just incomplete, and the `e2e_sut` doc comment + this log cover the new
+  path). A future `/refactor` pass could tidy it; not worth a Phase 1 edit.
+
+- **No foundation smell.** The `AppConfig` "deliberate deltas" carrier took a
+  fifth field idiomatically; the boot funnel (`build_app_core` /
+  `build_app_with_bootstrap_inputs`) had the exact seam the design named; the
+  `bevy_remote` API matched the design's §0 first-hand reading. The
+  restructure is not fighting the codebase. The only thing I'd push the
+  orchestrator on is the design-§5-vs-brief contradiction above — it is
+  resolved correctly here, but it is the kind of latent inconsistency that
+  would have produced the wrong implementation if an agent followed design §5
+  literally without the brief's hard-gate resolution. The brief caught it;
+  the design body should be amended (in THIS orchestration's docs) so Phase 2+
+  does not re-trip on it.

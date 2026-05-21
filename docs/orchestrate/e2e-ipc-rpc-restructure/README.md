@@ -47,7 +47,7 @@ branch `feat/android-build`.
 - [x] Design phase — `02-design.md` complete
 - Implementation phase (`03-impl.md`):
   - [x] Phase 0 — transport spike (A1 + A2 confirmed)
-  - [ ] Phase 1 — BRP server scaffold
+  - [x] Phase 1 — BRP server scaffold (3 verbs, all gates green)
   - [ ] Phase 2 — full verb set + `naadf_e2e` skeleton + first gate
   - [ ] Phase 3 — migrate remaining 12 gates
   - [ ] Phase 4 — repoint Playwright cross-target gate
