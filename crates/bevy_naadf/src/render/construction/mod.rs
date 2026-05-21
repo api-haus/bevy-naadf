@@ -80,6 +80,7 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{GpuResourceAppExt, Render, RenderApp, RenderSystems};
 
+pub use chunk_calc::build_segment_voxel_buffer_from_dense;
 pub use config::ConstructionConfig;
 pub use extract::{extract_world_changes, MainWorldEntities, RenderWorldEntityState};
 pub use producer::naadf_gpu_producer_node;
@@ -2188,93 +2189,23 @@ impl Plugin for ConstructionPlugin {
             // no-op on every other frame.
             .add_systems(
                 ExtractSchedule,
-                (extract_world_changes, populate_cpu_mirror_from_gpu_producer),
+                (
+                    extract_world_changes,
+                    populate_cpu_mirror_from_gpu_producer
+                        .run_if(bevy::ecs::schedule::common_conditions::resource_exists::<
+                            ConstructionGpu,
+                        >)
+                        .run_if(bevy::ecs::schedule::common_conditions::resource_exists::<
+                            crate::render::prepare::WorldGpu,
+                        >),
+                ),
             );
     }
 }
 
-/// Phase-C followup #1 — runtime helper that builds the full-world
-/// `segment_voxel_buffer` from a dense `u16` voxel-type stream
-/// (`world_size_in_voxels.x*y*z` entries, indexed
-/// `x + y*world_sx_v + z*world_sx_v*world_sy_v`).
-///
-/// `world_size_in_chunks` is the REAL world extent the dense buffer covers.
-/// `segment_size_in_chunks` is the size of the segment to build (≥ world; for
-/// non-cubic worlds, segment is padded to `max(world_dim)` so the shader's
-/// cubic `(seg, seg, seg)` workgroup dispatch reads stay in bounds). Padded
-/// chunks (outside the world) return 0 (all-empty) for every voxel.
-///
-/// The encoding matches [`build_segment_voxel_buffer`]: 2048 u32s per chunk
-/// (64 blocks × 32 u32s/block; 2 voxels per u32 packed as `lo | (hi << 16)`);
-/// each voxel encodes as `(1u << 15) | type` for non-empty, `0` for empty.
-pub fn build_segment_voxel_buffer_from_dense(
-    dense_voxel_types: &[u16],
-    world_size_in_chunks: [u32; 3],
-    segment_size_in_chunks: [u32; 3],
-) -> Vec<u32> {
-    let world_sx_v = world_size_in_chunks[0] * 16;
-    let world_sy_v = world_size_in_chunks[1] * 16;
-    let world_sz_v = world_size_in_chunks[2] * 16;
-    let seg_chunks =
-        (segment_size_in_chunks[0] * segment_size_in_chunks[1] * segment_size_in_chunks[2]) as usize;
-    let total_u32s = seg_chunks * 2048;
-    let mut out = vec![0u32; total_u32s];
-    let voxel_at = |v: [u32; 3]| -> u16 {
-        // Out-of-real-world voxel positions read as empty (padding chunks).
-        if v[0] >= world_sx_v || v[1] >= world_sy_v || v[2] >= world_sz_v {
-            return 0;
-        }
-        let idx = (v[0] + v[1] * world_sx_v + v[2] * world_sx_v * world_sy_v) as usize;
-        if idx >= dense_voxel_types.len() {
-            return 0;
-        }
-        let ty = dense_voxel_types[idx];
-        if ty == 0 {
-            0
-        } else {
-            crate::voxel::VOXEL_FULL_FLAG | (ty & crate::voxel::VOXEL_PAYLOAD_MASK)
-        }
-    };
-    for cz in 0..segment_size_in_chunks[2] as usize {
-        for cy in 0..segment_size_in_chunks[1] as usize {
-            for cx in 0..segment_size_in_chunks[0] as usize {
-                let chunk_index = cx
-                    + cy * segment_size_in_chunks[0] as usize
-                    + cz * segment_size_in_chunks[0] as usize
-                        * segment_size_in_chunks[1] as usize;
-                let chunk_base = chunk_index * 2048;
-                for bz in 0..4 {
-                    for by in 0..4 {
-                        for bx in 0..4 {
-                            let block_index = bx + by * 4 + bz * 16;
-                            let block_base = chunk_base + block_index * 32;
-                            for vi in 0..32 {
-                                let vi_lo = vi * 2;
-                                let vi_hi = vi * 2 + 1;
-                                let lvx = vi_lo % 4;
-                                let lvy = (vi_lo / 4) % 4;
-                                let lvz = vi_lo / 16;
-                                let hvx = vi_hi % 4;
-                                let hvy = (vi_hi / 4) % 4;
-                                let hvz = vi_hi / 16;
-                                let lo = voxel_at([
-                                    (cx * 16 + bx * 4 + lvx) as u32,
-                                    (cy * 16 + by * 4 + lvy) as u32,
-                                    (cz * 16 + bz * 4 + lvz) as u32,
-                                ]);
-                                let hi = voxel_at([
-                                    (cx * 16 + bx * 4 + hvx) as u32,
-                                    (cy * 16 + by * 4 + hvy) as u32,
-                                    (cz * 16 + bz * 4 + hvz) as u32,
-                                ]);
-                                out[block_base + vi] = (lo as u32) | ((hi as u32) << 16);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
+// `build_segment_voxel_buffer_from_dense` moved to `chunk_calc.rs` (Step 7 —
+// canonical home with the rest of the W1 encode/dispatch chain). Re-exported
+// at the top of this file so production callers
+// (`bevy_naadf::render::construction::build_segment_voxel_buffer_from_dense`)
+// resolve unchanged.
 

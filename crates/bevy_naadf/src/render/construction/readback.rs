@@ -135,14 +135,16 @@ pub struct CpuMirrorReadback {
 /// `blocks_cpu.len() = block_voxel_count[1]` directly.
 pub fn populate_cpu_mirror_from_gpu_producer(
     main_world: ResMut<bevy::render::MainWorld>,
-    mut gpu: Option<ResMut<ConstructionGpu>>,
-    world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
+    mut gpu: ResMut<ConstructionGpu>,
+    world_gpu: Res<crate::render::prepare::WorldGpu>,
     // Only run on the W5 install path — the path where the CPU mirror was
     // installed EMPTY in `install_vox_in_fixed_world`. For the legacy default
     // / sized-to-model paths the CPU mirror is built from CPU `construct()`
     // and overwriting it with the GPU output would defeat the legacy paths'
     // bit-exact CPU oracle (and would propagate any GPU producer bug into
     // the CPU mirror, breaking the editor where it currently works).
+    // Stays `Option<…>` — the body branches on `.is_none()` (legacy-path
+    // detection), not a precondition.
     model_data: Option<Res<crate::render::extract::ModelDataRender>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -150,7 +152,6 @@ pub fn populate_cpu_mirror_from_gpu_producer(
     use bevy::render::render_resource::{MapMode, PollType};
     use std::sync::atomic::Ordering;
 
-    let Some(gpu) = gpu.as_mut() else { return; };
     if !gpu.gpu_producer_has_run || gpu.cpu_mirror_populated {
         return;
     }
@@ -163,8 +164,6 @@ pub fn populate_cpu_mirror_from_gpu_producer(
         gpu.cpu_mirror_readback.stage = ReadbackStage::Done;
         return;
     }
-
-    let Some(world_gpu) = world_gpu else { return; };
 
     // web-vox-async-loading Q3 (follow-up dispatch 2026-05-18) — cross-frame
     // CPU-mirror readback state machine. Replaces the sync

@@ -142,6 +142,14 @@ const MASK_PY: u32 = 0x3Bu;
 const MASK_MZ: u32 = 0x1Fu;
 const MASK_PZ: u32 = 0x2Fu;
 
+// Paper §3.1 cell dimensions — the linear / cubic constants that describe a
+// 4³ cell's voxel count. Single SSoT for `CELL_DIM=4` / `CELL_CHILDREN=64`
+// inside this file; the Rust mirror lives at `voxel/mod.rs:63-65`. Bare `4u`
+// / `64u` literals elsewhere in this file are intentionally bit-shift /
+// nibble-stride amounts unrelated to the cell-dimension semantic.
+const CELL_DIM: u32 = 4u;
+const CELL_CHILDREN: u32 = 64u;
+
 // `groupshared uint cachedCell[64]` (`boundsCommon.fxh:13`).
 var<workgroup> cached_cell: array<u32, 64>;
 
@@ -293,7 +301,7 @@ fn get_voxel_pointer(hash: u32, voxel_raw_start: u32) -> u32 {
             // We claimed an empty slot. Reserve 64 voxels (= 32 u32 pairs) in
             // the global voxel buffer via the cursor in `block_voxel_count[0]`.
             atomicAdd(&hash_map[hash_bounds].use_count, 1u);
-            let original_index = atomicAdd(&block_voxel_count[0], 64u);
+            let original_index = atomicAdd(&block_voxel_count[0], CELL_CHILDREN);
             // The HLSL stores `originalIndex /= 2;` then writes
             // `voxels[originalIndex + i] = segmentVoxelBuffer[voxelRawStart + i]`
             // for i in 0..32 — converting from voxel-count units to packed-u32
@@ -420,7 +428,7 @@ fn calc_block_from_raw_data(
             );
             state = first_voxel_type | (s << 30u);
         } else {
-            let new_base = atomicAdd(&block_voxel_count[1], 64u);
+            let new_base = atomicAdd(&block_voxel_count[1], CELL_CHILDREN);
             atomicStore(&insert_block_index, new_base);
             state = new_base | (BLOCK_STATE_CHILD << 30u);
         }
@@ -477,7 +485,7 @@ fn compute_voxel_bounds(
         + group_id.x
         + group_id.y * num_workgroups_in.x
         + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
-    let voxel_index = block_index * 64u + local_index;
+    let voxel_index = block_index * CELL_CHILDREN + local_index;
 
     let cur_voxel_pair = voxels[voxel_index / 2u];
     let cur_voxel: u32 = select(
@@ -489,9 +497,9 @@ fn compute_voxel_bounds(
     let state = cur_voxel >> 15u;
 
     let voxel_pos_in_block = vec3<i32>(
-        i32(local_index % 4u),
-        i32((local_index / 4u) % 4u),
-        i32((local_index / 16u) % 4u),
+        i32(local_index % CELL_DIM),
+        i32((local_index / CELL_DIM) % CELL_DIM),
+        i32((local_index / 16u) % CELL_DIM),
     );
 
     cached_cell[local_index] = cur_voxel;
@@ -531,16 +539,16 @@ fn compute_block_bounds(
         + group_id.x
         + group_id.y * num_workgroups_in.x
         + group_id.z * num_workgroups_in.x * num_workgroups_in.y;
-    let block_index = chunk_index * 64u + local_index;
+    let block_index = chunk_index * CELL_CHILDREN + local_index;
 
     let cur_block = blocks[block_index];
     let orig_block = cur_block;
     let state = cur_block >> 30u;
 
     let block_pos_in_chunk = vec3<i32>(
-        i32(local_index % 4u),
-        i32((local_index / 4u) % 4u),
-        i32((local_index / 16u) % 4u),
+        i32(local_index % CELL_DIM),
+        i32((local_index / CELL_DIM) % CELL_DIM),
+        i32((local_index / 16u) % CELL_DIM),
     );
 
     cached_cell[local_index] = cur_block;

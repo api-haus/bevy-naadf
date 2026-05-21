@@ -27,11 +27,15 @@
 //! starting Algorithm 1) and by W2's editing path (decides whether to grow
 //! between batches of edits).
 
-/// Compute the 65-entry hash-coefficient table used by `chunkCalc.fx`'s 64-
-/// voxel block hash (`BlockHashingHandler.cs:50-55`).
+/// SSoT-6 re-export — the 65-entry hash-coefficient table used by
+/// `chunkCalc.fx`'s 64-voxel block hash (`BlockHashingHandler.cs:50-55`) lives
+/// in [`crate::aadf::block_hash::hash_coefficients`] (D1's canonical home for
+/// the `BlockHashingHandler` port). D5 re-exports it here so the construction
+/// submodule's nine import sites continue to resolve at the existing path
+/// (`render::construction::hashing::hash_coefficients`).
 ///
 /// `c[64] = 1`; `c[i] = (c[i+1] * 31) mod 2^32` for `i = 63..0`. The hash of a
-/// 64-voxel block is then:
+/// 64-voxel block is:
 ///
 /// ```text
 /// H = c[0] + Σᵢ c[i*2+1] * (v[i] & 0x7FFF)
@@ -40,14 +44,7 @@
 ///
 /// where `v[i]` is the i-th `u32` of the 32-element packed-voxel block
 /// (`chunkCalc.fx:126-136`).
-pub fn hash_coefficients() -> [u32; 65] {
-    let mut c = [0u32; 65];
-    c[64] = 1;
-    for i in (0..64).rev() {
-        c[i] = c[i + 1].wrapping_mul(31);
-    }
-    c
-}
+pub use crate::aadf::block_hash::hash_coefficients;
 
 /// Compute the initial hash-map size for a given segment size, mirroring the
 /// C# `BlockHashingHandler` constructor's doubling loop

@@ -177,6 +177,12 @@ const MASK_PY: u32 = 0x3Bu;
 const MASK_MZ: u32 = 0x1Fu;
 const MASK_PZ: u32 = 0x2Fu;
 
+// Paper §3.1 cell dimensions — same SSoT as `chunk_calc.wgsl` /
+// `world_change.wgsl`. Bare `4u` literals elsewhere in this file are bit-shift
+// amounts unrelated to the cell-dimension semantic.
+const CELL_DIM: u32 = 4u;
+const CELL_CHILDREN: u32 = 64u;
+
 // `groupshared bool anyBoundsIncrease = false;` — `boundsCalc.fx:34`.
 // Diagnostic-only; the C# never reads it back outside the kernel.
 var<workgroup> any_bounds_increase: atomic<u32>;
@@ -427,9 +433,9 @@ fn compute_group_bounds(
 
     // Per-chunk position inside the 4³ group.
     let chunk_pos = vec3<i32>(
-        i32(gp.x * 4u + local_id.x),
-        i32(gp.y * 4u + local_id.y),
-        i32(gp.z * 4u + local_id.z),
+        i32(gp.x * CELL_DIM + local_id.x),
+        i32(gp.y * CELL_DIM + local_id.y),
+        i32(gp.z * CELL_DIM + local_id.z),
     );
     // Web-WebGPU migration: chunks is `array<vec2<u32>>`. `chunk_pos` is
     // `vec3<i32>` constructed from `gp * 4 + local_id` (both non-negative);

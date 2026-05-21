@@ -171,6 +171,12 @@ const MASK_PY: u32 = 0x3Bu;
 const MASK_MZ: u32 = 0x1Fu;
 const MASK_PZ: u32 = 0x2Fu;
 
+// Paper §3.1 cell dimensions — same SSoT as `chunk_calc.wgsl` /
+// `bounds_calc.wgsl`. Bare `4u` literals elsewhere in this file are bit-shift
+// amounts unrelated to the cell-dimension semantic.
+const CELL_DIM: u32 = 4u;
+const CELL_CHILDREN: u32 = 64u;
+
 // ─── boundsCommon.fxh helpers — inlined (same as `chunk_calc.wgsl`) ───────────
 
 // `groupshared uint cachedCell[64]` — used by `apply_block_change` /
@@ -316,9 +322,9 @@ fn apply_group_change(
         + group_position.y * params.group_size_in_groups.x
         + group_position.z * params.group_size_in_groups.x * params.group_size_in_groups.y;
     let chunk_pos = vec3<u32>(
-        group_position.x * 4u + local_id.x,
-        group_position.y * 4u + local_id.y,
-        group_position.z * 4u + local_id.z,
+        group_position.x * CELL_DIM + local_id.x,
+        group_position.y * CELL_DIM + local_id.y,
+        group_position.z * CELL_DIM + local_id.z,
     );
     // `worldChange.fx:44` — `CHUNKTYPE curChunk = chunks[chunkPos];`. With W4's
     // chunks-pair, `.x` carries the construction state + AADF, `.y` carries
