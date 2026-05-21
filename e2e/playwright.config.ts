@@ -2,11 +2,17 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests",
-  // Evict any stale `node serve.mjs` from a deleted worktree before
-  // Playwright's webServer block runs.  Without this, reuseExistingServer
-  // silently picks up a squatter that 404s every request.  See
-  // docs/orchestrate/wasm-chunk-aadf-nondeterminism/15-playwright-stale-server-fix.md
-  globalSetup: "./kill-stale-server.mjs",
+  // Stale-server footgun: a `node serve.mjs` left from a deleted worktree
+  // can squat on :4173. The earlier fix (globalSetup: kill-stale-server.mjs)
+  // didn't work because Playwright runs globalSetup AFTER webServer is
+  // started — the hook killed the just-spawned serve.mjs, breaking every
+  // run. Switched to `reuseExistingServer: false` below: Playwright always
+  // spawns a fresh server and manages its lifecycle, so the footgun only
+  // surfaces if the user manually started serve.mjs (in which case
+  // Playwright fails with a clear "port in use" error rather than silently
+  // 404'ing). Original analysis: docs/orchestrate/wasm-chunk-aadf-nondeterminism/15-playwright-stale-server-fix.md
+  // — note that doc's lifecycle-order claim is wrong; this comment carries
+  // the correction.
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: 0,
@@ -59,7 +65,7 @@ export default defineConfig({
   webServer: {
     command: "node serve.mjs",
     port: 4173,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     // Give the server time to stat the WASM file on slow CI
     timeout: 10_000,
   },
