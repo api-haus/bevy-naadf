@@ -410,3 +410,10 @@ deterministic (no `--oasis-edit-visual`-style ≥3× rule needed).
   exactly as quoted (`00-reuse-audit.md:163-193, 278-288`; impl log
   `:1460-1495, 1736-1746`; `voxel/grid.rs:66-89`; `e2e/gates.rs:23-30`;
   `test_fixture.rs:11-22, 61-66`). No source claims required correction.
+
+---
+
+## Closing note (2026-05-21)
+
+Module docstring at `crates/bevy_naadf/src/window_config.rs:1-27` updated
+to document the legitimate consumer relationship — closes item 5.
