@@ -39,7 +39,7 @@ Handoff source: `/tmp/codebase-tightening-followup-handoff.md`.
 - [x] Step 3 — present method to user
 - [x] Step 4 — architectural Q&A
 - [x] Step 5 — write shared-context files (`README.md`, `01-context.md`)
-- [ ] Step 6 — dispatch 5 parallel investigators (with checkpoint commit prelude)
+- [x] Step 6 — dispatch 5 parallel investigators (checkpoint `a33567e`); all 5 returned
 - [ ] Step 7 — synthesize per-item findings at hard gate; user direction per item
 - [ ] (Conditional) follow-up dispatches per user direction
 
