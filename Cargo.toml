@@ -2,17 +2,12 @@
 #
 #   crates/bevy_naadf   — the Bevy 0.19 NAADF voxel renderer (lib + `bevy-naadf`
 #                         production binary + `e2e_render` test harness).
-#   crates/voxel_noise  — the FastNoise2 wrapper: a native Rust API plus a
-#                         C-ABI surface built to `wasm32-unknown-emscripten`
-#                         for the in-browser JS bridge. Carried over from
-#                         bevy_voxel_world; NOT yet wired into the renderer.
 #
 # `.cargo/config.toml` (workspace root) carries the native `mold` linker
-# config. The wasm32 builds are driven out-of-band: Trunk for bevy_naadf
-# (`crates/bevy_naadf/Trunk.toml`), the Emscripten Makefile for voxel_noise
-# (`crates/voxel_noise/Makefile`).
+# config. The wasm32 build is driven out-of-band: Trunk for bevy_naadf
+# (`crates/bevy_naadf/Trunk.toml`).
 [workspace]
-members = ["crates/bevy_naadf", "crates/voxel_noise"]
+members = ["crates/bevy_naadf"]
 resolver = "2"
 
 # Bevy's standard fast-iteration tweak: optimise dependencies even in dev

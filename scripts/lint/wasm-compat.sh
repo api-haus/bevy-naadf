@@ -6,7 +6,7 @@
 set -euo pipefail
 
 found=0
-for dir in crates/bevy_naadf/src crates/voxel_noise/src; do
+for dir in crates/bevy_naadf/src; do
     # Match actual code usage, skip comment lines
     if grep -rn --include='*.rs' -E 'std::time::\{[^}]*Instant|std::time::Instant' "$dir" 2>/dev/null | grep -Ev '^[^:]+:[0-9]+:\s*//'; then
         echo "ERROR: std::time::Instant found in $dir (breaks WASM runtime)"

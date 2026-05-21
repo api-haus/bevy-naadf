@@ -2125,15 +2125,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "codespan-reporting"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2649,26 +2640,6 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
-]
-
-[[package]]
-name = "fastnoise2"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1191ac78756e5828769fb75692e7a07a8eb6d3e5804bba381e19610b0d6fc8c0"
-dependencies = [
- "fastnoise2-sys",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "fastnoise2-sys"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20fa0afa01858a91a057e67e03f505d4e08f2fba9a9995e7c2b7dfa70220d633"
-dependencies = [
- "bindgen",
- "cmake",
 ]
 
 [[package]]
@@ -5429,13 +5400,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "voxel_noise"
-version = "0.1.0"
-dependencies = [
- "fastnoise2",
-]
 
 [[package]]
 name = "walkdir"

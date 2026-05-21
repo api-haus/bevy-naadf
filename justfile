@@ -2,7 +2,6 @@
 #
 # Workspace layout:
 #   crates/bevy_naadf   — the Bevy 0.19 NAADF voxel renderer
-#   crates/voxel_noise  — the FastNoise2 wrapper (native API + Emscripten module)
 
 # Trunk dev-server bind address — keep in sync with crates/bevy_naadf/Trunk.toml.
 web_host := "127.0.0.1"
@@ -132,20 +131,6 @@ web-static: web-build-release
         --enable-webgpu-developer-features \
         "$url" >/dev/null 2>&1 &
     wait "$serve_pid"
-
-# ── voxel_noise (FastNoise2 — native API + Emscripten C-ABI module) ─────────
-
-# Build the voxel_noise Emscripten module → crates/voxel_noise/dist/ (needs emsdk).
-noise-build:
-    cd crates/voxel_noise && make build
-
-# Run the voxel_noise native test suites.
-noise-test:
-    cargo test -p voxel_noise
-
-# Clean the voxel_noise Emscripten build artifacts.
-noise-clean:
-    cd crates/voxel_noise && make clean
 
 # ── e2e (Playwright smoke test against the web build) ───────────────────────
 #

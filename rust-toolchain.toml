@@ -15,5 +15,4 @@
 channel = "nightly-2026-04-01"
 components = ["rustfmt", "clippy", "rust-src"]
 # wasm32-unknown-unknown — the bevy_naadf WebGPU build (Trunk).
-# wasm32-unknown-emscripten — the voxel_noise FastNoise2 C-ABI module (Makefile).
-targets = ["wasm32-unknown-unknown", "wasm32-unknown-emscripten"]
+targets = ["wasm32-unknown-unknown"]
