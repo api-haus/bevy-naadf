@@ -13,6 +13,7 @@ use bevy::{
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::diagnostic::DiagnosticPath;
 
+use crate::editor::ui_theme::{text_style, FG_PRIMARY};
 use crate::DevFont;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -115,12 +116,7 @@ pub fn setup_hud(mut commands: Commands, dev_font: Res<DevFont>) {
     commands.spawn((
         HudText,
         Text::default(),
-        TextColor(Color::WHITE),
-        TextFont {
-            font: dev_font.0.clone(),
-            font_size: FontSize::Px(14.0),
-            ..default()
-        },
+        text_style(&dev_font, FG_PRIMARY, 14.0),
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
         Node {
             position_type: PositionType::Absolute,

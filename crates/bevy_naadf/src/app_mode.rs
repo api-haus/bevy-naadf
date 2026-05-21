@@ -93,3 +93,16 @@ pub fn restore_camera_input(
         commands.entity(entity).insert(default_free_camera());
     }
 }
+
+/// Plugin owning the global `AppMode` state + the Escape toggle. Prepared by
+/// D2 (codebase-tightening side-note 11) ahead of D7's `lib.rs` decomposition;
+/// D7 wires this via `app.add_plugins(AppModePlugin)` in place of the inline
+/// registration block at `lib.rs:900-971`.
+pub struct AppModePlugin;
+
+impl Plugin for AppModePlugin {
+    fn build(&self, app: &mut App) {
+        app.init_state::<AppMode>()
+            .add_systems(Update, toggle_settings_on_escape);
+    }
+}

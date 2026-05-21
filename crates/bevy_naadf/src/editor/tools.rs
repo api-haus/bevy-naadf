@@ -81,42 +81,129 @@ fn brush_chunk_aabb(world_data: &WorldData, pos: Vec3, radius: f32) -> (IVec3, I
     (lo, hi)
 }
 
-/// Sphere chunk classification. Verbatim port of `EditingToolSphere.cs:69-74`:
-/// `radiusInsideSqr = max(0, radius - |(7.5,7.5,7.5)|)²`,
-/// `radiusOutsideSqr = max(0, radius + |(7.5,7.5,7.5)|)²`. Distance is from
-/// chunk center `chunk_pos * 16 + (8,8,8)` to `pos`, squared.
-fn sphere_chunk_classify(chunk_pos: IVec3, pos: Vec3, radius: f32) -> ChunkClass {
-    let chunk_center = (chunk_pos * CHUNK_VOXELS).as_vec3() + Vec3::splat(8.0);
-    let dist_sqr = (chunk_center - pos).length_squared();
-    let diag = Vec3::splat(7.5).length(); // √(3·7.5²) ≈ 12.99
-    let r_inside = (radius - diag).max(0.0);
-    let r_outside = (radius + diag).max(0.0);
-    let r_inside_sqr = r_inside * r_inside;
-    let r_outside_sqr = r_outside * r_outside;
-    if dist_sqr < r_inside_sqr {
-        ChunkClass::Inside
-    } else if dist_sqr < r_outside_sqr {
-        ChunkClass::Mixed
-    } else {
-        ChunkClass::Outside
+/// Solid-fill brush shape — the inside/mixed/outside chunk classification +
+/// per-voxel inclusion test trio that [`cube_brush`] and [`sphere_brush`]
+/// share. [`paint_brush`] does NOT implement this trait — Paint has no
+/// inside-chunk fast path and gates on `get_voxel_type` non-empty.
+trait SolidBrushShape {
+    /// Classify a chunk's relation to the brush volume.
+    fn classify_chunk(&self, chunk_pos: IVec3, pos: Vec3, radius: f32) -> ChunkClass;
+    /// Per-voxel inclusion test (mixed-chunk inner loop). `voxel_world_pos`
+    /// is the integer voxel position; the brush adds `+0.5` to centre it.
+    fn voxel_inside(&self, voxel_world_pos: IVec3, pos: Vec3, radius: f32) -> bool;
+}
+
+/// Cube brush — Chebyshev distance `< r`.
+struct CubeShape;
+impl SolidBrushShape for CubeShape {
+    /// Verbatim port of `EditingToolCube.cs:58-59,68-73`: Chebyshev distance
+    /// with cushions `radiusInside = max(0, radius - 16)` and
+    /// `radiusOutside = max(0, radius + 16)`.
+    fn classify_chunk(&self, chunk_pos: IVec3, pos: Vec3, radius: f32) -> ChunkClass {
+        let chunk_center = (chunk_pos * CHUNK_VOXELS).as_vec3() + Vec3::splat(8.0);
+        let d = chunk_center - pos;
+        let cheb = d.x.abs().max(d.y.abs()).max(d.z.abs());
+        let r_inside = (radius - 16.0).max(0.0);
+        let r_outside = (radius + 16.0).max(0.0);
+        if cheb < r_inside {
+            ChunkClass::Inside
+        } else if cheb < r_outside {
+            ChunkClass::Mixed
+        } else {
+            ChunkClass::Outside
+        }
+    }
+
+    fn voxel_inside(&self, voxel: IVec3, pos: Vec3, radius: f32) -> bool {
+        let d = (voxel.as_vec3() + Vec3::splat(0.5)) - pos;
+        d.x.abs().max(d.y.abs()).max(d.z.abs()) < radius
     }
 }
 
-/// Cube chunk classification. Verbatim port of `EditingToolCube.cs:58-59,68-73`:
-/// uses Chebyshev (max-abs) distance with cushions `radiusInside = max(0,
-/// radius - 16)` and `radiusOutside = max(0, radius + 16)`.
-fn cube_chunk_classify(chunk_pos: IVec3, pos: Vec3, radius: f32) -> ChunkClass {
-    let chunk_center = (chunk_pos * CHUNK_VOXELS).as_vec3() + Vec3::splat(8.0);
-    let d = chunk_center - pos;
-    let cheb = d.x.abs().max(d.y.abs()).max(d.z.abs());
-    let r_inside = (radius - 16.0).max(0.0);
-    let r_outside = (radius + 16.0).max(0.0);
-    if cheb < r_inside {
-        ChunkClass::Inside
-    } else if cheb < r_outside {
-        ChunkClass::Mixed
-    } else {
-        ChunkClass::Outside
+/// Sphere brush — Euclidean distance `< r`.
+struct SphereShape;
+impl SolidBrushShape for SphereShape {
+    /// Verbatim port of `EditingToolSphere.cs:69-74`:
+    /// `radiusInsideSqr = max(0, radius - |(7.5,7.5,7.5)|)²`,
+    /// `radiusOutsideSqr = max(0, radius + |(7.5,7.5,7.5)|)²`. Distance is
+    /// from chunk center `chunk_pos * 16 + (8,8,8)` to `pos`, squared.
+    fn classify_chunk(&self, chunk_pos: IVec3, pos: Vec3, radius: f32) -> ChunkClass {
+        let chunk_center = (chunk_pos * CHUNK_VOXELS).as_vec3() + Vec3::splat(8.0);
+        let dist_sqr = (chunk_center - pos).length_squared();
+        let diag = Vec3::splat(7.5).length(); // √(3·7.5²) ≈ 12.99
+        let r_inside = (radius - diag).max(0.0);
+        let r_outside = (radius + diag).max(0.0);
+        let r_inside_sqr = r_inside * r_inside;
+        let r_outside_sqr = r_outside * r_outside;
+        if dist_sqr < r_inside_sqr {
+            ChunkClass::Inside
+        } else if dist_sqr < r_outside_sqr {
+            ChunkClass::Mixed
+        } else {
+            ChunkClass::Outside
+        }
+    }
+
+    fn voxel_inside(&self, voxel: IVec3, pos: Vec3, radius: f32) -> bool {
+        let d = (voxel.as_vec3() + Vec3::splat(0.5)) - pos;
+        d.length_squared() < radius * radius
+    }
+}
+
+/// Drive a solid-fill brush: classify chunks, bulk-fill inside-chunks via
+/// [`WorldData::set_chunks_uniform_batch`], per-voxel test mixed-chunks via
+/// [`WorldData::set_voxels_batch`]. Owns the iteration skeleton that
+/// [`cube_brush`] and [`sphere_brush`] previously duplicated.
+fn apply_solid_brush<S: SolidBrushShape>(
+    shape: &S,
+    world_data: &mut WorldData,
+    pos: Vec3,
+    radius: f32,
+    ty: VoxelTypeId,
+    is_erase: bool,
+) {
+    if radius <= 0.0 {
+        return;
+    }
+    let target = if is_erase { VoxelTypeId::EMPTY } else { ty };
+    let target_opt: Option<VoxelTypeId> = if is_erase { None } else { Some(ty) };
+    let (min_chunk, max_chunk) = brush_chunk_aabb(world_data, pos, radius);
+
+    let mut inside_chunks: Vec<([u32; 3], Option<VoxelTypeId>)> = Vec::new();
+    let mut mixed_chunk_edits: Vec<(IVec3, VoxelTypeId)> = Vec::new();
+
+    for cz in min_chunk.z..=max_chunk.z {
+        for cy in min_chunk.y..=max_chunk.y {
+            for cx in min_chunk.x..=max_chunk.x {
+                let chunk_pos = IVec3::new(cx, cy, cz);
+                match shape.classify_chunk(chunk_pos, pos, radius) {
+                    ChunkClass::Outside => continue,
+                    ChunkClass::Inside => {
+                        inside_chunks
+                            .push(([cx as u32, cy as u32, cz as u32], target_opt));
+                    }
+                    ChunkClass::Mixed => {
+                        let chunk_origin = chunk_pos * CHUNK_VOXELS;
+                        for lz in 0..CHUNK_VOXELS {
+                            for ly in 0..CHUNK_VOXELS {
+                                for lx in 0..CHUNK_VOXELS {
+                                    let voxel = chunk_origin + IVec3::new(lx, ly, lz);
+                                    if shape.voxel_inside(voxel, pos, radius) {
+                                        mixed_chunk_edits.push((voxel, target));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !inside_chunks.is_empty() {
+        world_data.set_chunks_uniform_batch(&inside_chunks);
+    }
+    if !mixed_chunk_edits.is_empty() {
+        world_data.set_voxels_batch(&mixed_chunk_edits);
     }
 }
 
@@ -165,6 +252,7 @@ pub fn paint_brush(world_data: &mut WorldData, pos: Vec3, radius: f32, ty: Voxel
 /// Chebyshev cube). `is_erase = true` writes `VoxelTypeId::EMPTY`.
 /// Faithful port of `EditingToolCube.cs:76-90` with the **chunk inside/mixed
 /// split** (`02c` Part 3 / `EditingToolCube.cs:62-101`).
+#[inline]
 pub fn cube_brush(
     world_data: &mut WorldData,
     pos: Vec3,
@@ -172,55 +260,7 @@ pub fn cube_brush(
     ty: VoxelTypeId,
     is_erase: bool,
 ) {
-    if radius <= 0.0 {
-        return;
-    }
-    let target = if is_erase { VoxelTypeId::EMPTY } else { ty };
-    let target_opt: Option<VoxelTypeId> = if is_erase { None } else { Some(ty) };
-    let (min_chunk, max_chunk) = brush_chunk_aabb(world_data, pos, radius);
-
-    let mut inside_chunks: Vec<([u32; 3], Option<VoxelTypeId>)> = Vec::new();
-    let mut mixed_chunk_edits: Vec<(IVec3, VoxelTypeId)> = Vec::new();
-
-    for cz in min_chunk.z..=max_chunk.z {
-        for cy in min_chunk.y..=max_chunk.y {
-            for cx in min_chunk.x..=max_chunk.x {
-                let chunk_pos = IVec3::new(cx, cy, cz);
-                match cube_chunk_classify(chunk_pos, pos, radius) {
-                    ChunkClass::Outside => continue,
-                    ChunkClass::Inside => {
-                        inside_chunks.push((
-                            [cx as u32, cy as u32, cz as u32],
-                            target_opt,
-                        ));
-                    }
-                    ChunkClass::Mixed => {
-                        // Per-voxel Chebyshev test, only over the chunk's
-                        // 16-voxel local range.
-                        let chunk_origin = chunk_pos * CHUNK_VOXELS;
-                        for lz in 0..CHUNK_VOXELS {
-                            for ly in 0..CHUNK_VOXELS {
-                                for lx in 0..CHUNK_VOXELS {
-                                    let voxel = chunk_origin + IVec3::new(lx, ly, lz);
-                                    let d = (voxel.as_vec3() + Vec3::splat(0.5)) - pos;
-                                    let cheb = d.x.abs().max(d.y.abs()).max(d.z.abs());
-                                    if cheb < radius {
-                                        mixed_chunk_edits.push((voxel, target));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if !inside_chunks.is_empty() {
-        world_data.set_chunks_uniform_batch(&inside_chunks);
-    }
-    if !mixed_chunk_edits.is_empty() {
-        world_data.set_voxels_batch(&mixed_chunk_edits);
-    }
+    apply_solid_brush(&CubeShape, world_data, pos, radius, ty, is_erase);
 }
 
 /// Sphere brush — Euclidean `r²` distance check. Solid (writes ALL voxels
@@ -228,6 +268,7 @@ pub fn cube_brush(
 /// `VoxelTypeId::EMPTY`. Faithful port of `EditingToolSphere.cs:76-89` with
 /// the **chunk inside/mixed split** (`02c` Part 3 /
 /// `EditingToolSphere.cs:62-100`).
+#[inline]
 pub fn sphere_brush(
     world_data: &mut WorldData,
     pos: Vec3,
@@ -235,55 +276,7 @@ pub fn sphere_brush(
     ty: VoxelTypeId,
     is_erase: bool,
 ) {
-    if radius <= 0.0 {
-        return;
-    }
-    let target = if is_erase { VoxelTypeId::EMPTY } else { ty };
-    let target_opt: Option<VoxelTypeId> = if is_erase { None } else { Some(ty) };
-    let r2 = radius * radius;
-    let (min_chunk, max_chunk) = brush_chunk_aabb(world_data, pos, radius);
-
-    let mut inside_chunks: Vec<([u32; 3], Option<VoxelTypeId>)> = Vec::new();
-    let mut mixed_chunk_edits: Vec<(IVec3, VoxelTypeId)> = Vec::new();
-
-    for cz in min_chunk.z..=max_chunk.z {
-        for cy in min_chunk.y..=max_chunk.y {
-            for cx in min_chunk.x..=max_chunk.x {
-                let chunk_pos = IVec3::new(cx, cy, cz);
-                match sphere_chunk_classify(chunk_pos, pos, radius) {
-                    ChunkClass::Outside => continue,
-                    ChunkClass::Inside => {
-                        inside_chunks.push((
-                            [cx as u32, cy as u32, cz as u32],
-                            target_opt,
-                        ));
-                    }
-                    ChunkClass::Mixed => {
-                        // Per-voxel Euclidean test, only over the chunk's
-                        // 16-voxel local range.
-                        let chunk_origin = chunk_pos * CHUNK_VOXELS;
-                        for lz in 0..CHUNK_VOXELS {
-                            for ly in 0..CHUNK_VOXELS {
-                                for lx in 0..CHUNK_VOXELS {
-                                    let voxel = chunk_origin + IVec3::new(lx, ly, lz);
-                                    let d = (voxel.as_vec3() + Vec3::splat(0.5)) - pos;
-                                    if d.length_squared() < r2 {
-                                        mixed_chunk_edits.push((voxel, target));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if !inside_chunks.is_empty() {
-        world_data.set_chunks_uniform_batch(&inside_chunks);
-    }
-    if !mixed_chunk_edits.is_empty() {
-        world_data.set_voxels_batch(&mixed_chunk_edits);
-    }
+    apply_solid_brush(&SphereShape, world_data, pos, radius, ty, is_erase);
 }
 
 #[cfg(test)]
@@ -577,20 +570,20 @@ mod tests {
         let _diag = Vec3::splat(7.5).length(); // ≈ 12.99 (commentary only)
         // Brush AT chunk center, r=30 → dist=0, r-diag ≈ 17 → inside.
         assert_eq!(
-            sphere_chunk_classify(chunk_pos, center, 30.0),
+            SphereShape.classify_chunk(chunk_pos, center, 30.0),
             ChunkClass::Inside
         );
         // Brush AT chunk center, r=10 → dist=0, r-diag=-2.99 → r_inside=0 →
         // dist_sqr=0 < r_inside_sqr=0 is FALSE; r+diag=22.99 → dist_sqr=0 <
         // r_outside_sqr=528 → Mixed.
         assert_eq!(
-            sphere_chunk_classify(chunk_pos, center, 10.0),
+            SphereShape.classify_chunk(chunk_pos, center, 10.0),
             ChunkClass::Mixed
         );
         // Brush far from chunk, r=5 — dist=100>>r_outside=18 → Outside.
         let far = Vec3::new(100.0, 100.0, 100.0);
         assert_eq!(
-            sphere_chunk_classify(chunk_pos, far, 5.0),
+            SphereShape.classify_chunk(chunk_pos, far, 5.0),
             ChunkClass::Outside
         );
     }

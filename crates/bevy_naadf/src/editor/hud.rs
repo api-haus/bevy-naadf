@@ -23,6 +23,12 @@ use bevy::prelude::*;
 use bevy::ui::{ComputedNode, FocusPolicy, RelativeCursorPosition, ScrollPosition};
 use bevy::window::PrimaryWindow;
 
+use crate::editor::ui_theme::{
+    text_style, BG_BUTTON, BG_BUTTON_DISABLED, BG_BUTTON_HOVER, BG_BUTTON_SELECTED,
+    BG_HUD, BORDER_BUTTON, BORDER_BUTTON_SELECTED, FG_DISABLED, FG_MUTED, FG_PRIMARY,
+    SCROLLBAR_THUMB, SCROLLBAR_TRACK, SLIDER_FILL, SLIDER_TRACK, SWATCH_BORDER,
+    SWATCH_BORDER_SELECTED,
+};
 use crate::editor::{EditTool, EditorState};
 use crate::voxel::VoxelTypeId;
 use crate::world::data::VoxelTypes;
@@ -106,23 +112,6 @@ const SWATCH_GAP_PX: f32 = 4.0;
 const SLIDER_WIDTH_PX: f32 = 220.0;
 const SLIDER_HEIGHT_PX: f32 = 22.0;
 
-const COL_HUD_BG: Color = Color::srgba(0.05, 0.05, 0.08, 0.82);
-const COL_BTN_BG: Color = Color::srgba(0.10, 0.10, 0.14, 1.0);
-const COL_BTN_BG_HOVER: Color = Color::srgba(0.18, 0.18, 0.24, 1.0);
-const COL_BTN_BG_SELECTED: Color = Color::srgba(0.95, 0.75, 0.20, 1.0);
-const COL_BTN_BG_DISABLED: Color = Color::srgba(0.08, 0.08, 0.10, 1.0);
-const COL_BTN_BORDER: Color = Color::srgba(0.30, 0.30, 0.34, 1.0);
-const COL_BTN_BORDER_SELECTED: Color = Color::srgba(1.0, 0.85, 0.30, 1.0);
-const COL_TEXT_PRIMARY: Color = Color::WHITE;
-const COL_TEXT_MUTED: Color = Color::srgba(0.65, 0.65, 0.70, 1.0);
-const COL_TEXT_DISABLED: Color = Color::srgba(0.35, 0.35, 0.38, 1.0);
-const COL_SLIDER_TRACK: Color = Color::srgba(0.10, 0.10, 0.14, 1.0);
-const COL_SLIDER_FILL: Color = Color::srgba(0.40, 0.65, 0.95, 1.0);
-const COL_SWATCH_BORDER_SELECTED: Color = Color::WHITE;
-const COL_SWATCH_BORDER: Color = Color::srgba(0.20, 0.20, 0.24, 1.0);
-const COL_SCROLLBAR_TRACK: Color = Color::srgba(0.06, 0.06, 0.08, 1.0);
-const COL_SCROLLBAR_THUMB: Color = Color::srgba(0.40, 0.40, 0.50, 1.0);
-
 /// Scrollbar dimensions.
 const SCROLLBAR_HEIGHT_PX: f32 = 8.0;
 const SCROLLBAR_THUMB_MIN_PX: f32 = 24.0;
@@ -163,7 +152,7 @@ pub fn setup_editor_hud(mut commands: Commands, dev_font: Res<DevFont>) {
                 border: px(1.0).all(),
                 ..default()
             },
-            BackgroundColor(COL_HUD_BG),
+            BackgroundColor(BG_HUD),
             BorderColor::all(Color::srgba(0.0, 0.0, 0.0, 0.0)),
             FocusPolicy::Block,
         ))
@@ -248,7 +237,7 @@ pub fn setup_editor_hud(mut commands: Commands, dev_font: Res<DevFont>) {
                 height: px(SCROLLBAR_HEIGHT_PX),
                 ..default()
             },
-            BackgroundColor(COL_SCROLLBAR_TRACK),
+            BackgroundColor(SCROLLBAR_TRACK),
             Interaction::default(),
             RelativeCursorPosition::default(),
             FocusPolicy::Block,
@@ -264,7 +253,7 @@ pub fn setup_editor_hud(mut commands: Commands, dev_font: Res<DevFont>) {
                 left: Val::Px(0.0),
                 ..default()
             },
-            BackgroundColor(COL_SCROLLBAR_THUMB),
+            BackgroundColor(SCROLLBAR_THUMB),
             Pickable::IGNORE,
         ))
         .id();
@@ -276,12 +265,7 @@ pub fn setup_editor_hud(mut commands: Commands, dev_font: Res<DevFont>) {
     commands.spawn((
         HoverInfoText,
         Text::default(),
-        TextColor(COL_TEXT_PRIMARY),
-        TextFont {
-            font: dev_font.0.clone(),
-            font_size: FontSize::Px(12.0),
-            ..default()
-        },
+        text_style(&dev_font, FG_PRIMARY, 12.0),
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
         Node {
             position_type: PositionType::Absolute,
@@ -332,8 +316,8 @@ fn spawn_tool_button(
                 border: px(2.0).all(),
                 ..default()
             },
-            BackgroundColor(COL_BTN_BG),
-            BorderColor::all(COL_BTN_BORDER),
+            BackgroundColor(BG_BUTTON),
+            BorderColor::all(BORDER_BUTTON),
             Interaction::default(),
             RelativeCursorPosition::default(),
             FocusPolicy::Block,
@@ -344,12 +328,7 @@ fn spawn_tool_button(
     let label_text = commands
         .spawn((
             Text::new(label),
-            TextColor(COL_TEXT_PRIMARY),
-            TextFont {
-                font: dev_font.0.clone(),
-                font_size: FontSize::Px(10.0),
-                ..default()
-            },
+            text_style(dev_font, FG_PRIMARY, 10.0),
             Pickable::IGNORE,
         ))
         .id();
@@ -434,12 +413,7 @@ fn spawn_radius_slider(commands: &mut Commands, dev_font: &DevFont) -> Entity {
     let static_label = commands
         .spawn((
             Text::new("Brush"),
-            TextColor(COL_TEXT_MUTED),
-            TextFont {
-                font: dev_font.0.clone(),
-                font_size: FontSize::Px(11.0),
-                ..default()
-            },
+            text_style(dev_font, FG_MUTED, 11.0),
             Pickable::IGNORE,
         ))
         .id();
@@ -447,12 +421,7 @@ fn spawn_radius_slider(commands: &mut Commands, dev_font: &DevFont) -> Entity {
         .spawn((
             RadiusSliderLabel,
             Text::default(),
-            TextColor(COL_TEXT_PRIMARY),
-            TextFont {
-                font: dev_font.0.clone(),
-                font_size: FontSize::Px(11.0),
-                ..default()
-            },
+            text_style(dev_font, FG_PRIMARY, 11.0),
             Pickable::IGNORE,
         ))
         .id();
@@ -469,7 +438,7 @@ fn spawn_radius_slider(commands: &mut Commands, dev_font: &DevFont) -> Entity {
                 height: px(SLIDER_HEIGHT_PX),
                 ..default()
             },
-            BackgroundColor(COL_SLIDER_TRACK),
+            BackgroundColor(SLIDER_TRACK),
             Interaction::default(),
             RelativeCursorPosition::default(),
             FocusPolicy::Block,
@@ -483,7 +452,7 @@ fn spawn_radius_slider(commands: &mut Commands, dev_font: &DevFont) -> Entity {
                 height: Val::Percent(100.0),
                 ..default()
             },
-            BackgroundColor(COL_SLIDER_FILL),
+            BackgroundColor(SLIDER_FILL),
             Pickable::IGNORE,
         ))
         .id();
@@ -509,8 +478,8 @@ fn spawn_toggle_button<M: Component>(
                 justify_content: JustifyContent::Center,
                 ..default()
             },
-            BackgroundColor(COL_BTN_BG),
-            BorderColor::all(COL_BTN_BORDER),
+            BackgroundColor(BG_BUTTON),
+            BorderColor::all(BORDER_BUTTON),
             Interaction::default(),
             RelativeCursorPosition::default(),
             FocusPolicy::Block,
@@ -519,12 +488,7 @@ fn spawn_toggle_button<M: Component>(
     let text = commands
         .spawn((
             Text::new(label),
-            TextColor(COL_TEXT_PRIMARY),
-            TextFont {
-                font: dev_font.0.clone(),
-                font_size: FontSize::Px(12.0),
-                ..default()
-            },
+            text_style(dev_font, FG_PRIMARY, 12.0),
             Pickable::IGNORE,
         ))
         .id();
@@ -571,7 +535,7 @@ pub fn refresh_palette_swatches(
                     ..default()
                 },
                 BackgroundColor(color),
-                BorderColor::all(COL_SWATCH_BORDER),
+                BorderColor::all(SWATCH_BORDER),
                 Interaction::default(),
                 RelativeCursorPosition::default(),
                 FocusPolicy::Block,
@@ -729,6 +693,21 @@ pub fn drag_palette_scrollbar(
     scroll.x = frac * max_scroll;
 }
 
+/// Compute the (bg, border, text) colour triple for a toggle button given its
+/// affordance state. Used by both the Erase and Continuous toggle update
+/// loops in [`update_editor_hud`] (previously open-coded twice with drift risk).
+fn toggle_button_style(is_on: bool, hovered: bool, disabled: bool) -> (Color, Color, Color) {
+    if disabled {
+        (BG_BUTTON_DISABLED, BORDER_BUTTON, FG_DISABLED)
+    } else if is_on {
+        (BG_BUTTON_SELECTED, BORDER_BUTTON_SELECTED, FG_PRIMARY)
+    } else if hovered {
+        (BG_BUTTON_HOVER, BORDER_BUTTON, FG_PRIMARY)
+    } else {
+        (BG_BUTTON, BORDER_BUTTON, FG_PRIMARY)
+    }
+}
+
 /// `Update` system — read every interactive element's `Interaction` state and
 /// mutate `EditorState` on click.
 #[allow(clippy::too_many_arguments)]
@@ -822,56 +801,42 @@ pub fn update_editor_hud(
         let selected = button.0 == state.tool;
         let hovered = matches!(*interaction, Interaction::Hovered | Interaction::Pressed);
         *bg = BackgroundColor(if selected {
-            COL_BTN_BG_SELECTED
+            BG_BUTTON_SELECTED
         } else if hovered {
-            COL_BTN_BG_HOVER
+            BG_BUTTON_HOVER
         } else {
-            COL_BTN_BG
+            BG_BUTTON
         });
-        *border = BorderColor::all(if selected { COL_BTN_BORDER_SELECTED } else { COL_BTN_BORDER });
+        *border = BorderColor::all(if selected { BORDER_BUTTON_SELECTED } else { BORDER_BUTTON });
     }
 
     for (swatch, mut border) in &mut swatches {
         let selected = swatch.0 == state.selected_type;
-        *border = BorderColor::all(if selected { COL_SWATCH_BORDER_SELECTED } else { COL_SWATCH_BORDER });
+        *border = BorderColor::all(if selected { SWATCH_BORDER_SELECTED } else { SWATCH_BORDER });
     }
 
     for (interaction, mut bg, mut border, children) in &mut erase_buttons {
         let hovered = matches!(*interaction, Interaction::Hovered | Interaction::Pressed);
-        let (target_bg, target_border, text_color) = if !erase_affects {
-            (COL_BTN_BG_DISABLED, COL_BTN_BORDER, COL_TEXT_DISABLED)
-        } else if state.is_erase {
-            (COL_BTN_BG_SELECTED, COL_BTN_BORDER_SELECTED, COL_TEXT_PRIMARY)
-        } else if hovered {
-            (COL_BTN_BG_HOVER, COL_BTN_BORDER, COL_TEXT_PRIMARY)
-        } else {
-            (COL_BTN_BG, COL_BTN_BORDER, COL_TEXT_PRIMARY)
-        };
-        *bg = BackgroundColor(target_bg);
-        *border = BorderColor::all(target_border);
+        let (bg_c, border_c, text_c) =
+            toggle_button_style(state.is_erase, hovered, !erase_affects);
+        *bg = BackgroundColor(bg_c);
+        *border = BorderColor::all(border_c);
         for &child in children {
             if let Ok(mut tc) = text_colors.get_mut(child) {
-                *tc = TextColor(text_color);
+                *tc = TextColor(text_c);
             }
         }
     }
 
     for (interaction, mut bg, mut border, children) in &mut cont_buttons {
         let hovered = matches!(*interaction, Interaction::Hovered | Interaction::Pressed);
-        let (target_bg, target_border, text_color) = if !erase_affects {
-            (COL_BTN_BG_DISABLED, COL_BTN_BORDER, COL_TEXT_DISABLED)
-        } else if state.is_continuous {
-            (COL_BTN_BG_SELECTED, COL_BTN_BORDER_SELECTED, COL_TEXT_PRIMARY)
-        } else if hovered {
-            (COL_BTN_BG_HOVER, COL_BTN_BORDER, COL_TEXT_PRIMARY)
-        } else {
-            (COL_BTN_BG, COL_BTN_BORDER, COL_TEXT_PRIMARY)
-        };
-        *bg = BackgroundColor(target_bg);
-        *border = BorderColor::all(target_border);
+        let (bg_c, border_c, text_c) =
+            toggle_button_style(state.is_continuous, hovered, !erase_affects);
+        *bg = BackgroundColor(bg_c);
+        *border = BorderColor::all(border_c);
         for &child in children {
             if let Ok(mut tc) = text_colors.get_mut(child) {
-                *tc = TextColor(text_color);
+                *tc = TextColor(text_c);
             }
         }
     }

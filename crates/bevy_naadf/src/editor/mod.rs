@@ -27,6 +27,7 @@
 pub mod hud;
 pub mod ray;
 pub mod tools;
+pub mod ui_theme;
 
 use bevy::camera::Camera3d;
 use bevy::input::ButtonInput;
@@ -98,18 +99,6 @@ impl Default for EditorState {
             pos: Vec3::ZERO,
             stroke_just_started: false,
             last_hover_hit: None,
-        }
-    }
-}
-
-impl EditorState {
-    /// Map a u32 cycle value (0/1/2) to an EditTool — wraps via modulo.
-    pub fn tool_from_u32(v: u32) -> EditTool {
-        match v % 3 {
-            0 => EditTool::Paint,
-            1 => EditTool::Cube,
-            2 => EditTool::Sphere,
-            _ => EditTool::Paint,
         }
     }
 }
@@ -227,6 +216,39 @@ pub fn apply_edit_tool(
     state.stroke_just_started = false;
 }
 
+/// Plugin owning the in-game editor HUD + brush-input wiring. Prepared by D2
+/// (codebase-tightening side-note 11) ahead of D7's `lib.rs` decomposition;
+/// D7 wires this via `app.add_plugins(EditorPlugin)` in place of the inline
+/// registration block at `lib.rs:900-971`. The `.after(toggle_settings_on_escape)`
+/// edge on `apply_edit_tool` preserves the same-frame state-transition
+/// observation the original 9-system chain depended on.
+pub struct EditorPlugin;
+
+impl Plugin for EditorPlugin {
+    fn build(&self, app: &mut App) {
+        use crate::app_mode::{toggle_settings_on_escape, AppMode};
+        use bevy::state::condition::in_state;
+
+        app.init_resource::<EditorState>()
+            .add_systems(Startup, hud::setup_editor_hud.after(crate::load_dev_font))
+            .add_systems(
+                Update,
+                (
+                    hud::refresh_palette_swatches,
+                    hud::handle_hud_clicks,
+                    hud::scroll_palette_with_wheel,
+                    hud::drag_palette_scrollbar,
+                    hud::update_palette_scrollbar,
+                    hud::update_editor_hud,
+                    apply_edit_tool
+                        .run_if(in_state(AppMode::Playing))
+                        .after(toggle_settings_on_escape),
+                )
+                    .chain(),
+            );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,15 +261,6 @@ mod tests {
         assert!(s.is_continuous);
         assert!(!s.is_erase);
         assert_eq!(s.tool, EditTool::Paint);
-    }
-
-    /// `EditTool::tool_from_u32` round-trips.
-    #[test]
-    fn edit_tool_from_u32_total() {
-        assert_eq!(EditorState::tool_from_u32(0), EditTool::Paint);
-        assert_eq!(EditorState::tool_from_u32(1), EditTool::Cube);
-        assert_eq!(EditorState::tool_from_u32(2), EditTool::Sphere);
-        assert_eq!(EditorState::tool_from_u32(123), EditTool::Paint);
     }
 
     /// C# `EditingToolPaint.cs:38` lerp formula uses `gameTime` in
