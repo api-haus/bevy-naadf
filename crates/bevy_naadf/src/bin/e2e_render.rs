@@ -10,6 +10,24 @@
 //! validation result into a single explicit numeric exit code (W0 switched
 //! away from `AppExit: Termination` so this binary has one mapping site).
 //!
+//! ## Dispatch shape (D6 step 5 — codebase-tightening refactor)
+//!
+//! CLI args are parsed in three layers:
+//!
+//! 1. [`parse_top_level_short_circuit`] — the no-Bevy-boot commands
+//!    (`--vox-gpu-oracle`, `--vox-web-parity`, `--ssim-compare`,
+//!    `--validate-gpu-construction-scaled`, `--validate-gpu-construction-production`).
+//!    These run + return an `ExitCode` directly without booting an app.
+//! 2. [`parse_gate_command`] — the boot commands. Each maps to a single
+//!    `bevy_naadf::run_e2e_render*` call. The gate selector
+//!    ([`bevy_naadf::e2e::gate::GateKind`]) is carried through for use by
+//!    later refactors (D6 step 3/4) but currently only flows the legacy
+//!    `AppArgs` boolean.
+//! 3. [`parse_post_app_validations`] — the orthogonal post-app validation
+//!    tails (`--validate-gpu-construction`, `--entities`, `--edit-mode`,
+//!    `--runtime-edit-mode`). These run *after* the Bevy app exits and
+//!    compose with any gate command above.
+//!
 //! ## Phase-C flag — `--validate-gpu-construction` (`15-design-c.md` §1.6, W1)
 //!
 //! W0 plumbed the flag end-to-end with a placeholder body; **W1 fills the
@@ -67,337 +85,380 @@
 use std::process::ExitCode;
 
 use bevy::prelude::AppExit;
+use bevy_naadf::e2e::gate::GateKind;
+
+/// Top-level commands that exit WITHOUT booting a Bevy app. Returned by
+/// [`parse_top_level_short_circuit`] when one of their flags is set.
+enum TopLevelShortCircuit {
+    /// `--vox-gpu-oracle` — spawn CPU + GPU sub-phases as subprocesses, SSIM-compare.
+    VoxGpuOracleCompare,
+    /// `--vox-web-parity` — spawn skybox + loaded sub-phases as subprocesses, SSIM-compare.
+    VoxWebParityCompare,
+    /// `--ssim-compare <a.png> <b.png> [--ssim-min … --ssim-max …]` — pure PNG diff.
+    SsimCompare,
+    /// `--validate-gpu-construction-scaled` — fixture sweep through W5 chunk_calc.
+    ValidateGpuConstructionScaled,
+    /// `--validate-gpu-construction-production` — production-scale voxels[] readback.
+    ValidateGpuConstructionProduction,
+}
+
+/// Boot-the-app commands. Each maps to a single `bevy_naadf::run_e2e_render*`
+/// call. `gate` carries the [`GateKind`] discriminator introduced by D6 step 2;
+/// currently consumed only for diagnostics (the gate-selection wiring still
+/// reads the legacy `AppArgs` booleans — D6 step 3/4 swaps that over).
+enum BootCommand {
+    /// Run a named gate by delegating to its `run_*` entry point on the
+    /// `bevy_naadf::e2e` module. The matching `AppArgs.<flag>` is set inside
+    /// the entry-point function.
+    NamedGate { gate: GateKind, run: fn() -> AppExit },
+    /// `--resize-test` — wraps the Bevy boot in pre/post Hyprland windowrule
+    /// installation. The resize-test is the canonical Resize-kind gate.
+    ResizeTest,
+    /// `--entities` boot — flips `entities_enabled` + `spawn_test_entity` on
+    /// the standard gate.
+    EntitiesBoot,
+    /// Standard gate (no flags) — `bevy_naadf::run_e2e_render()`.
+    Standard,
+}
+
+/// Post-app validation tails that compose orthogonally with a [`BootCommand`].
+/// Collected pre-boot; run after the Bevy app exits.
+#[derive(Default, Clone, Copy)]
+struct PostAppValidations {
+    validate_gpu_construction: bool,
+    entities: bool,
+    edit_mode: bool,
+    runtime_edit_mode: bool,
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // Parse the CLI flags — `--validate-gpu-construction` (W1) +
-    // `--entities` (W4) + `--edit-mode` (W2) + `--resize-test`
-    // (resize-blackness reproduction — see
-    // `docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
-    // `## GI-bounce-on-resize fix (2026-05-16)`) + `--vox-e2e`
-    // (synthesised-.vox regression gate — see
-    // `docs/orchestrate/feature-completeness/03a-impl-vox-loading.md` —
-    // `## E2E gate addendum`), default off.
-    let validate_gpu_construction = args.iter().any(|a| a == "--validate-gpu-construction");
-    let validate_gpu_construction_scaled =
-        args.iter().any(|a| a == "--validate-gpu-construction-scaled");
-    // vox-gpu-rewrite Stage 9 — production-scale voxels[] readback diagnostic.
-    // Loads the real Oasis VOX fixture, runs the FULL W5 producer chain at
-    // production scale (256×32×256 chunk fixed world, 512 segments, full
-    // bounds chain), reads back voxels[] at TWO checkpoints (post-producer,
-    // post-bounds), and diffs against the CPU oracle at ~25 sampled
-    // Oasis-populated voxel positions. Discriminating test for whether the
-    // visible "voxel types in thousands" bug is in the producer/bounds path
-    // (corrupted voxels[]) or in the renderer's decode path
-    // (voxels[] byte-correct but read wrongly). See
-    // `docs/orchestrate/vox-gpu-rewrite/15-diagnostic-production-scale-readback.md`.
-    let validate_gpu_construction_production =
-        args.iter().any(|a| a == "--validate-gpu-construction-production");
-    let entities_mode = args.iter().any(|a| a == "--entities");
-    let edit_mode = args.iter().any(|a| a == "--edit-mode");
-    let runtime_edit_mode = args.iter().any(|a| a == "--runtime-edit-mode");
-    let resize_test = args.iter().any(|a| a == "--resize-test");
-    let vox_e2e_mode = args.iter().any(|a| a == "--vox-e2e");
-    let oasis_edit_visual_mode = args.iter().any(|a| a == "--oasis-edit-visual");
-    let small_edit_visual_mode = args.iter().any(|a| a == "--small-edit-visual");
-    let small_edit_repro_mode = args.iter().any(|a| a == "--small-edit-repro");
-    let vox_gpu_construction_mode =
-        args.iter().any(|a| a == "--vox-gpu-construction");
-    // vox-gpu-rewrite W5.3-fix Stage 4 — three-flag oracle gate:
-    //   --vox-gpu-oracle           = the top-level mode: spawn the CPU + GPU
-    //                                phases as subprocesses, then compare the
-    //                                two PNGs per-pixel.
-    //   --vox-gpu-oracle-cpu       = single-phase CPU oracle render (called
-    //                                by the top-level mode via subprocess).
-    //   --vox-gpu-oracle-gpu       = single-phase GPU producer render.
-    // See `bevy_naadf::e2e::vox_gpu_oracle` for the gate design + camera pose.
-    let vox_gpu_oracle_mode = args.iter().any(|a| a == "--vox-gpu-oracle");
-    let vox_gpu_oracle_cpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-cpu");
-    let vox_gpu_oracle_gpu_mode = args.iter().any(|a| a == "--vox-gpu-oracle-gpu");
-    // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — three-flag
-    // parity gate. Mirrors the `--vox-gpu-oracle` three-flag pattern:
-    //   --vox-web-parity           = top-level: spawn both sub-modes as
-    //                                subprocesses, SSIM-compare the PNGs.
-    //   --vox-web-parity-skybox    = boot with `GridPreset::Empty`, capture
-    //                                `vox_web_parity_skybox.png`.
-    //   --vox-web-parity-loaded    = boot with `GridPreset::Vox`, capture
-    //                                `vox_web_parity_loaded.png` after
-    //                                W5 + Q3 readback complete.
-    let vox_web_parity_mode = args.iter().any(|a| a == "--vox-web-parity");
-    let vox_web_parity_skybox_mode =
-        args.iter().any(|a| a == "--vox-web-parity-skybox");
-    let vox_web_parity_loaded_mode =
-        args.iter().any(|a| a == "--vox-web-parity-loaded");
-    // 2026-05-19 — horizon-parity gate (cross-target native ↔ WASM SSIM at
-    // the C# default pose). Native-side single capture; the Playwright spec
-    // shells out to this binary's `--ssim-compare … --ssim-min …` to assert
-    // similarity against its own WASM canvas screenshot. See
-    // `crate::e2e::vox_horizon_parity`.
-    let vox_horizon_native_mode = args.iter().any(|a| a == "--vox-horizon-native");
-    // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — `--ssim-compare`
-    // short-circuit. Exits without booting a Bevy app. Used by both the
-    // top-level `--vox-web-parity` mode (out-of-process SSIM compare) AND
-    // the Playwright spec (shells out to this binary for the SSIM compare).
-    let ssim_compare_mode = args.iter().any(|a| a == "--ssim-compare");
 
-    // Phase-C wave-3 — when `--entities` is set, override `AppArgs` to enable
-    // the W4 entity track (`entities_enabled = true`) AND spawn the fixture
-    // entity (`spawn_test_entity = true`). The Startup
-    // `spawn_phase_c_test_entity` system populates `MainWorldEntities`; the
-    // render pipeline then dispatches `entity_update.wgsl` per-frame and
-    // `ray_tracing.wgsl::shoot_ray`'s entity sub-traversal renders the
-    // fixture into the framebuffer.
-    //
-    // `--resize-test` — sets `AppArgs.resize_test = true`. The e2e driver
-    // then runs the resize-blackness reproduction phases instead of the
-    // standard Warmup→Motion→Settle→Shoot flow: boot at 800×600, settle,
-    // screenshot, hyprctl-resize to 1920×1080, settle, screenshot,
-    // hyprctl-resize to 2000×1000, settle, screenshot, then compare
-    // full-frame luma ratios against an `E2E_RESIZE_MIN_LUMA_RATIO = 0.7`
-    // threshold. Reproduces the GI-bounce-on-resize bug (wgpu indirect
-    // dispatch limit overflow at viewport sizes ≥ 1920×1080); fixed by
-    // capping `padded_*_group_count` at 32 768 in `sample_refine.wgsl`.
-    // See `docs/orchestrate/naadf-bevy-port/18-taa-fidelity.md`
-    // `## GI-bounce-on-resize fix (2026-05-16)`.
-    // vox-gpu-rewrite W5.3-fix Stage 4 — top-level oracle gate. Returns its
-    // own exit code WITHOUT booting a bevy app (the compare phase spawns the
-    // two render phases as subprocesses of THIS binary). Handled at the very
-    // top of the dispatch so the standard `e2e_render` flow doesn't fight
-    // over `app_exit`.
-    if vox_gpu_oracle_mode {
-        let code = bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_compare();
-        return ExitCode::from(code);
+    // Layer 1: no-boot short-circuits — return early without touching Bevy.
+    if let Some(cmd) = parse_top_level_short_circuit(&args) {
+        return run_top_level_short_circuit(cmd, &args);
     }
 
-    // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — top-level
-    // parity gate. Returns its own exit code WITHOUT booting a bevy app
-    // (the compare phase spawns the two sub-phases as subprocesses of THIS
-    // binary). Handled at the top of dispatch so the standard `e2e_render`
-    // flow doesn't fight over `app_exit`.
-    if vox_web_parity_mode {
-        let code = bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_compare();
-        return ExitCode::from(code);
-    }
+    // Layer 3: collect the orthogonal post-app validation flags pre-boot.
+    let post_app = parse_post_app_validations(&args);
 
-    // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — `--ssim-compare`
-    // short-circuit. Loads two PNGs from disk, computes SSIM, exits per the
-    // `[min, max)` band assertion. Used by `--vox-web-parity` and by the
-    // Playwright spec. Does NOT boot a bevy app.
-    if ssim_compare_mode {
-        let parsed = match bevy_naadf::e2e::ssim::parse_ssim_compare_args(&args) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "e2e_render --ssim-compare: argument parse error: {e}\n\
-                     Usage: e2e_render --ssim-compare <a.png> <b.png> \
-                     [--ssim-max <f64>] [--ssim-min <f64>]"
-                );
-                return ExitCode::from(2);
+    // Layer 2: pick the boot command.
+    let boot = parse_gate_command(&args);
+
+    // Run the boot command — installs the resize-test windowrule if needed,
+    // boots the app, returns its `AppExit`.
+    let app_exit = run_boot_command(boot);
+    let e2e_code = app_exit_to_code(app_exit);
+
+    // Post-app validation tails — `--validate-gpu-construction`, `--entities`,
+    // `--edit-mode`, `--runtime-edit-mode`. Each runs after the app exits and
+    // can flip the exit code to 1 independently.
+    run_post_app_validations(post_app, e2e_code)
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 — top-level short-circuit dispatch (no Bevy boot)
+// ---------------------------------------------------------------------------
+
+/// Return the no-Bevy-boot command implied by `args`, or `None` if no
+/// short-circuit flag is set. The flag-priority order matches the original
+/// if-ladder shape — `--vox-gpu-oracle` first, then `--vox-web-parity`,
+/// `--ssim-compare`, then the two `--validate-gpu-construction-*`
+/// diagnostics.
+fn parse_top_level_short_circuit(args: &[String]) -> Option<TopLevelShortCircuit> {
+    if args.iter().any(|a| a == "--vox-gpu-oracle") {
+        return Some(TopLevelShortCircuit::VoxGpuOracleCompare);
+    }
+    if args.iter().any(|a| a == "--vox-web-parity") {
+        return Some(TopLevelShortCircuit::VoxWebParityCompare);
+    }
+    if args.iter().any(|a| a == "--ssim-compare") {
+        return Some(TopLevelShortCircuit::SsimCompare);
+    }
+    if args.iter().any(|a| a == "--validate-gpu-construction-scaled") {
+        return Some(TopLevelShortCircuit::ValidateGpuConstructionScaled);
+    }
+    if args.iter().any(|a| a == "--validate-gpu-construction-production") {
+        return Some(TopLevelShortCircuit::ValidateGpuConstructionProduction);
+    }
+    None
+}
+
+/// Execute a top-level short-circuit and return the process exit code.
+fn run_top_level_short_circuit(cmd: TopLevelShortCircuit, args: &[String]) -> ExitCode {
+    match cmd {
+        TopLevelShortCircuit::VoxGpuOracleCompare => {
+            // vox-gpu-rewrite W5.3-fix Stage 4 — top-level oracle gate. Returns
+            // its own exit code WITHOUT booting a bevy app (the compare phase
+            // spawns the two render phases as subprocesses of THIS binary).
+            ExitCode::from(bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_compare())
+        }
+        TopLevelShortCircuit::VoxWebParityCompare => {
+            // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 — top-level
+            // parity gate. Returns its own exit code WITHOUT booting a bevy app
+            // (the compare phase spawns the two sub-phases as subprocesses of
+            // THIS binary).
+            ExitCode::from(bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_compare())
+        }
+        TopLevelShortCircuit::SsimCompare => {
+            // web-vox-async-loading 2026-05-18 follow-up Step 9 / Q6 — pure PNG
+            // diff. Loads two PNGs from disk, computes SSIM, exits per the
+            // `[min, max)` band assertion. Used by `--vox-web-parity` and by the
+            // Playwright spec. Does NOT boot a bevy app.
+            let parsed = match bevy_naadf::e2e::ssim::parse_ssim_compare_args(args) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "e2e_render --ssim-compare: argument parse error: {e}\n\
+                         Usage: e2e_render --ssim-compare <a.png> <b.png> \
+                         [--ssim-max <f64>] [--ssim-min <f64>]"
+                    );
+                    return ExitCode::from(2);
+                }
+            };
+            ExitCode::from(bevy_naadf::e2e::ssim::ssim_compare_command(&parsed))
+        }
+        TopLevelShortCircuit::ValidateGpuConstructionScaled => {
+            // vox-gpu-rewrite Stage 6 — concrete byte-diff diagnostic.
+            // Short-circuits before booting the e2e binary; runs a fixture
+            // sweep through the W5 chunk_calc chain and prints
+            // first-divergent-index per buffer (raw + semantic).
+            match bevy_naadf::render::construction::validate_gpu_construction_scaled() {
+                Ok(_report) => ExitCode::from(0),
+                Err(msg) => {
+                    eprintln!("scaled byte-diff diagnostic FAILED: {msg}");
+                    ExitCode::from(1)
+                }
             }
+        }
+        TopLevelShortCircuit::ValidateGpuConstructionProduction => {
+            // vox-gpu-rewrite Stage 9 — production-scale voxels[] readback
+            // diagnostic. Short-circuits before booting the e2e binary.
+            match bevy_naadf::render::construction::validate_gpu_construction_production_scale() {
+                Ok(_report) => ExitCode::from(0),
+                Err(msg) => {
+                    eprintln!("production-scale readback diagnostic FAILED: {msg}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 — boot-command dispatch (Bevy app boot)
+// ---------------------------------------------------------------------------
+
+/// Pick the boot command from `args`. The boot-command table is ordered to
+/// match the original if-ladder priority — `--resize-test` first, then the
+/// per-gate flags in declaration order, then `--entities` (no special gate),
+/// then the standard fallback.
+fn parse_gate_command(args: &[String]) -> BootCommand {
+    if args.iter().any(|a| a == "--resize-test") {
+        return BootCommand::ResizeTest;
+    }
+    if args.iter().any(|a| a == "--oasis-edit-visual") {
+        return BootCommand::NamedGate {
+            gate: GateKind::OasisEdit,
+            run: bevy_naadf::e2e::oasis_edit_visual::run_oasis_edit_visual,
         };
-        let code = bevy_naadf::e2e::ssim::ssim_compare_command(&parsed);
-        return ExitCode::from(code);
     }
-
-    // vox-gpu-rewrite Stage 6 — concrete byte-diff diagnostic. Short-circuits
-    // before booting the e2e binary; runs a fixture sweep through the W5
-    // chunk_calc chain and prints first-divergent-index per buffer (raw +
-    // semantic). See `docs/orchestrate/vox-gpu-rewrite/12-diagnostic-byte-diff-concrete.md`.
-    if validate_gpu_construction_scaled {
-        match bevy_naadf::render::construction::validate_gpu_construction_scaled() {
-            Ok(_report) => {
-                return ExitCode::from(0);
-            }
-            Err(msg) => {
-                eprintln!("scaled byte-diff diagnostic FAILED: {msg}");
-                return ExitCode::from(1);
-            }
-        }
+    if args.iter().any(|a| a == "--small-edit-visual") {
+        return BootCommand::NamedGate {
+            gate: GateKind::SmallEditVisual,
+            run: bevy_naadf::e2e::small_edit_visual::run_small_edit_visual,
+        };
     }
-
-    // vox-gpu-rewrite Stage 9 — production-scale voxels[] readback diagnostic.
-    // Short-circuits before booting the e2e binary. See module-level docs at
-    // `crate::render::construction::validate_gpu_construction_production_scale`
-    // and `docs/orchestrate/vox-gpu-rewrite/15-diagnostic-production-scale-readback.md`.
-    if validate_gpu_construction_production {
-        match bevy_naadf::render::construction::validate_gpu_construction_production_scale() {
-            Ok(_report) => {
-                return ExitCode::from(0);
-            }
-            Err(msg) => {
-                eprintln!("production-scale readback diagnostic FAILED: {msg}");
-                return ExitCode::from(1);
-            }
-        }
+    if args.iter().any(|a| a == "--small-edit-repro") {
+        return BootCommand::NamedGate {
+            gate: GateKind::SmallEditRepro,
+            run: bevy_naadf::e2e::small_edit_repro::run_small_edit_repro,
+        };
     }
+    if args.iter().any(|a| a == "--vox-gpu-oracle-cpu") {
+        return BootCommand::NamedGate {
+            gate: GateKind::VoxGpuOracle,
+            run: bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_cpu_phase,
+        };
+    }
+    if args.iter().any(|a| a == "--vox-gpu-oracle-gpu") {
+        return BootCommand::NamedGate {
+            gate: GateKind::VoxGpuOracle,
+            run: bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_gpu_phase,
+        };
+    }
+    if args.iter().any(|a| a == "--vox-web-parity-skybox") {
+        return BootCommand::NamedGate {
+            gate: GateKind::VoxWebParity,
+            run: bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_skybox_phase,
+        };
+    }
+    if args.iter().any(|a| a == "--vox-web-parity-loaded") {
+        return BootCommand::NamedGate {
+            gate: GateKind::VoxWebParity,
+            run: bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_loaded_phase,
+        };
+    }
+    if args.iter().any(|a| a == "--vox-horizon-native") {
+        return BootCommand::NamedGate {
+            gate: GateKind::VoxWebParity,
+            run: bevy_naadf::e2e::vox_horizon_parity::run_vox_horizon_native_phase,
+        };
+    }
+    if args.iter().any(|a| a == "--vox-gpu-construction") {
+        return BootCommand::NamedGate {
+            gate: GateKind::VoxGpuConstruction,
+            run: bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction,
+        };
+    }
+    if args.iter().any(|a| a == "--vox-e2e") {
+        return BootCommand::NamedGate {
+            gate: GateKind::Standard,
+            run: bevy_naadf::e2e::vox_e2e::run_vox_e2e,
+        };
+    }
+    if args.iter().any(|a| a == "--entities") {
+        return BootCommand::EntitiesBoot;
+    }
+    BootCommand::Standard
+}
 
-    let app_exit = if resize_test {
-        // resize-blackness: pre-launch — install a Hyprland windowrule so
-        // the e2e_render window starts ALREADY-FLOATING (no togglefloating
-        // dance after the fact). Pixel-precise resize via
-        // `hyprctl dispatch resizewindowpixel` only takes effect on floating
-        // windows; the prior togglefloating-after-launch approach was unreliable
-        // because Hyprland's default behaviour or user windowrules could leave
-        // the window tiled (or re-tile it after toggling). A pre-launch
-        // windowrule sidesteps the race entirely.
-        //
-        // Hyprland 0.54+ syntax: `match:class <regex>, float on` (the older
-        // `windowrulev2 float,class:^(...)$` is deprecated). Verified against
-        // the live `hyprctl --help` + `hyprctl keyword windowrule "..."` on
-        // 2026-05-15.
-        //
-        // Cleanup uses `hyprctl reload` (after the run) to re-read the config
-        // from disk, which discards every runtime keyword set since boot. If
-        // the test panics the rule leaks until the next manual `hyprctl reload`
-        // / Hyprland restart — explicitly acceptable per the dispatch brief.
-        //
-        // Both invocations are gated behind `--resize-test` so the standard
-        // e2e path never shells out to hyprctl.
-        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-            let status = std::process::Command::new("hyprctl")
-                .args([
-                    "keyword",
-                    "windowrule",
-                    "match:class ^(e2e_render)$, float on",
-                ])
-                .status();
-            match status {
-                Ok(s) => eprintln!(
-                    "e2e_render: pre-launch hyprctl keyword windowrule \
-                     'match:class ^(e2e_render)$, float on' -> {s:?}"
-                ),
-                Err(e) => eprintln!(
-                    "e2e_render: pre-launch hyprctl keyword windowrule \
-                     FAILED to spawn: {e} — test will likely fall back to \
-                     tiled behaviour and assert via luma comparison"
-                ),
-            }
-        } else {
-            eprintln!(
-                "e2e_render: pre-launch — HYPRLAND_INSTANCE_SIGNATURE not set; \
-                 skipping windowrule install (driver will abort the run)"
-            );
+/// Execute a boot command and return its `AppExit`. Handles the resize-test
+/// windowrule install/cleanup wrap.
+fn run_boot_command(boot: BootCommand) -> AppExit {
+    match boot {
+        BootCommand::NamedGate { gate, run } => {
+            // `gate` is carried through for potential diagnostic use + as the
+            // anchor for the D6 step 3/4 driver decomposition (where it
+            // becomes the `ActiveGate` resource value). Currently the gate's
+            // own `run_*` function sets the matching `AppArgs.<flag>` boolean
+            // that the wiring reads.
+            let _ = gate;
+            run()
         }
-
-        let mut app_args = bevy_naadf::AppArgs::default();
-        app_args.resize_test = true;
-        let exit = bevy_naadf::run_e2e_render_with_args(app_args);
-
-        // Cleanup: discard the runtime windowrule by reloading the config
-        // from disk. Best-effort — failure here doesn't change the test's
-        // pass/fail verdict, it just leaves a runtime rule until the user
-        // reloads Hyprland.
-        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-            let status = std::process::Command::new("hyprctl")
-                .args(["reload"])
-                .status();
-            match status {
-                Ok(s) => eprintln!("e2e_render: post-run hyprctl reload -> {s:?}"),
-                Err(e) => eprintln!(
-                    "e2e_render: post-run hyprctl reload FAILED to spawn: {e} \
-                     — runtime windowrule may persist until next reload"
-                ),
-            }
+        BootCommand::ResizeTest => run_resize_test(),
+        BootCommand::EntitiesBoot => {
+            let mut app_args = bevy_naadf::AppArgs::default();
+            app_args.construction_config.entities_enabled = true;
+            app_args.spawn_test_entity = true;
+            bevy_naadf::run_e2e_render_with_args(app_args)
         }
+        BootCommand::Standard => bevy_naadf::run_e2e_render(),
+    }
+}
 
-        exit
-    } else if oasis_edit_visual_mode {
-        // `02f-followup` — visual-diff edit-pipeline gate. Loads the
-        // Oasis VOX fixture from
-        // `crates/bevy_naadf/assets/test/oasis_hard_cover.vox` (Git LFS
-        // tracked), pins a birdseye camera over the world centre,
-        // captures frame A, programmatically erases a sphere via the
-        // production `sphere_brush` (runtime path), waits ~5 s for the
-        // W2 GPU dispatch + GI / TAA to converge, captures frame B, and
-        // asserts the bounding-box mean per-pixel delta exceeds
-        // [`OASIS_EDIT_DIFF_FLOOR`]. See [`bevy_naadf::e2e::oasis_edit_visual`].
-        bevy_naadf::e2e::oasis_edit_visual::run_oasis_edit_visual()
-    } else if small_edit_visual_mode {
-        // `03g` — single-voxel-edit gate. Boots the default test grid,
-        // pins a birdseye camera, captures frame A, snapshots non-empty
-        // voxel count, applies a `cube_brush(radius=1.0)` at a known
-        // empty voxel via the runtime path, asserts the voxel count rose
-        // by exactly 1 (CPU pre-condition / Mode 2 catch), waits ~5 s,
-        // captures frame B, asserts the click rect changed and adjacent
-        // rects did not (framebuffer post-condition / Mode 1 catch).
-        // See [`bevy_naadf::e2e::small_edit_visual`].
-        bevy_naadf::e2e::small_edit_visual::run_small_edit_visual()
-    } else if small_edit_repro_mode {
-        // `2026-05-17` — user-captured single-voxel-edit reproduction.
-        // Loads the Oasis VOX fixture, pins the camera to the user's
-        // EDIT_REPRO-logged pose, runs the exact `cube_brush(radius=1)`
-        // call the user made, then asserts no pitch-black pixels in the
-        // 1920×1080 post-edit framebuffer. Catches the regression the
-        // standard `--small-edit-visual` gate misses. See
-        // [`bevy_naadf::e2e::small_edit_repro`].
-        bevy_naadf::e2e::small_edit_repro::run_small_edit_repro()
-    } else if vox_gpu_oracle_cpu_mode {
-        // vox-gpu-rewrite W5.3-fix Stage 4 — CPU oracle phase. Loads Oasis
-        // via the legacy `install_vox_sized_to_model` path, pins the shared
-        // oracle camera pose, captures `target/e2e-screenshots/oracle_cpu.png`,
-        // and exits. The top-level `--vox-gpu-oracle` mode spawns this as a
-        // subprocess and pairs the output with the GPU phase.
-        bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_cpu_phase()
-    } else if vox_gpu_oracle_gpu_mode {
-        // vox-gpu-rewrite W5.3-fix Stage 4 — GPU phase. Loads Oasis via
-        // `install_vox_in_fixed_world` (W5 GPU producer chain), pins the
-        // shared oracle camera pose, captures `oracle_gpu.png`, exits.
-        bevy_naadf::e2e::vox_gpu_oracle::run_vox_gpu_oracle_gpu_phase()
-    } else if vox_web_parity_skybox_mode {
-        // web-vox-async-loading Step 8 / Q5 — skybox-baseline sub-mode.
-        // Boots with `GridPreset::Empty`, captures
-        // `vox_web_parity_skybox.png`.
-        bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_skybox_phase()
-    } else if vox_web_parity_loaded_mode {
-        // web-vox-async-loading Step 8 / Q5 — loaded sub-mode. Boots with
-        // the Oasis fixture via the W5 GPU producer chain, captures
-        // `vox_web_parity_loaded.png`. Asserts zero `tracing::error!`
-        // events fired during the run.
-        bevy_naadf::e2e::vox_web_parity::run_vox_web_parity_loaded_phase()
-    } else if vox_horizon_native_mode {
-        // 2026-05-19 — horizon-parity native capture. Loads oasis.cvox via
-        // the W5 GPU producer chain, pins the C#-faithful horizon pose,
-        // captures `vox_horizon_native.png` at 1280×720. The Playwright
-        // spec shells out to `--ssim-compare` to assert structural
-        // similarity against its WASM canvas screenshot.
-        bevy_naadf::e2e::vox_horizon_parity::run_vox_horizon_native_phase()
-    } else if vox_gpu_construction_mode {
-        // `--vox-gpu-construction` — load the Oasis fixture through the
-        // production W5 GPU producer chain (vox-gpu-rewrite W5.5). Loads
-        // `crates/bevy_naadf/assets/test/oasis_hard_cover.vox` as
-        // `ModelData`, runs `16 × 2 × 16 = 512` per-segment generator +
-        // chunk_calc dispatches against the production WorldGpu buffers,
-        // and asserts the framebuffer is not pure-black. See
-        // `bevy_naadf::e2e::vox_gpu_construction` (+ the orchestration
-        // bundle at `docs/orchestrate/vox-gpu-rewrite/`).
-        bevy_naadf::e2e::vox_gpu_construction::run_vox_gpu_construction()
-    } else if vox_e2e_mode {
-        // `--vox-e2e` — synthesise a 2-model `.vox` fixture in memory,
-        // write it to `target/e2e-screenshots/vox_e2e_fixture.vox`, then
-        // boot the e2e harness with `GridPreset::Vox { path: ... }` so
-        // the production `--vox <path>` load path drives the test. The
-        // driver swaps the default-scene region gate for the
-        // `assert_vox_geometry_visible` non-skybox gate (the synthesised
-        // fixture replaces the default voxel grid; the default-scene
-        // gate rects don't apply). See
-        // `docs/orchestrate/feature-completeness/03a-impl-vox-loading.md`
-        // `## E2E gate addendum`.
-        bevy_naadf::e2e::vox_e2e::run_vox_e2e()
-    } else if entities_mode {
-        let mut app_args = bevy_naadf::AppArgs::default();
-        app_args.construction_config.entities_enabled = true;
-        app_args.spawn_test_entity = true;
-        bevy_naadf::run_e2e_render_with_args(app_args)
+/// Run the `--resize-test` boot wrapped in the Hyprland windowrule
+/// install/cleanup. Behaviour identical to the inline block the if-ladder
+/// previously held.
+fn run_resize_test() -> AppExit {
+    // resize-blackness: pre-launch — install a Hyprland windowrule so
+    // the e2e_render window starts ALREADY-FLOATING (no togglefloating
+    // dance after the fact). Pixel-precise resize via
+    // `hyprctl dispatch resizewindowpixel` only takes effect on floating
+    // windows; the prior togglefloating-after-launch approach was unreliable
+    // because Hyprland's default behaviour or user windowrules could leave
+    // the window tiled (or re-tile it after toggling). A pre-launch
+    // windowrule sidesteps the race entirely.
+    //
+    // Hyprland 0.54+ syntax: `match:class <regex>, float on` (the older
+    // `windowrulev2 float,class:^(...)$` is deprecated). Verified against
+    // the live `hyprctl --help` + `hyprctl keyword windowrule "..."` on
+    // 2026-05-15.
+    //
+    // Cleanup uses `hyprctl reload` (after the run) to re-read the config
+    // from disk, which discards every runtime keyword set since boot. If
+    // the test panics the rule leaks until the next manual `hyprctl reload`
+    // / Hyprland restart — explicitly acceptable per the dispatch brief.
+    //
+    // Both invocations are gated behind `--resize-test` so the standard
+    // e2e path never shells out to hyprctl.
+    install_resize_test_windowrule();
+
+    let mut app_args = bevy_naadf::AppArgs::default();
+    app_args.resize_test = true;
+    let exit = bevy_naadf::run_e2e_render_with_args(app_args);
+
+    cleanup_resize_test_windowrule();
+
+    exit
+}
+
+/// Pre-launch — install the Hyprland windowrule that pre-floats the
+/// e2e_render window so `hyprctl dispatch resizewindowpixel` takes effect.
+fn install_resize_test_windowrule() {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+        let status = std::process::Command::new("hyprctl")
+            .args([
+                "keyword",
+                "windowrule",
+                "match:class ^(e2e_render)$, float on",
+            ])
+            .status();
+        match status {
+            Ok(s) => eprintln!(
+                "e2e_render: pre-launch hyprctl keyword windowrule \
+                 'match:class ^(e2e_render)$, float on' -> {s:?}"
+            ),
+            Err(e) => eprintln!(
+                "e2e_render: pre-launch hyprctl keyword windowrule \
+                 FAILED to spawn: {e} — test will likely fall back to \
+                 tiled behaviour and assert via luma comparison"
+            ),
+        }
     } else {
-        bevy_naadf::run_e2e_render()
-    };
+        eprintln!(
+            "e2e_render: pre-launch — HYPRLAND_INSTANCE_SIGNATURE not set; \
+             skipping windowrule install (driver will abort the run)"
+        );
+    }
+}
 
-    let e2e_code = match app_exit {
+/// Post-run — discard the runtime windowrule by reloading the config from
+/// disk. Best-effort; failure here doesn't change the test verdict.
+fn cleanup_resize_test_windowrule() {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+        let status = std::process::Command::new("hyprctl")
+            .args(["reload"])
+            .status();
+        match status {
+            Ok(s) => eprintln!("e2e_render: post-run hyprctl reload -> {s:?}"),
+            Err(e) => eprintln!(
+                "e2e_render: post-run hyprctl reload FAILED to spawn: {e} \
+                 — runtime windowrule may persist until next reload"
+            ),
+        }
+    }
+}
+
+/// Translate Bevy's `AppExit` into a process exit-code byte.
+fn app_exit_to_code(app_exit: AppExit) -> u8 {
+    match app_exit {
         AppExit::Success => 0u8,
         AppExit::Error(code) => code.get(),
-    };
+    }
+}
 
-    if validate_gpu_construction {
+// ---------------------------------------------------------------------------
+// Layer 3 — post-app validation tails
+// ---------------------------------------------------------------------------
+
+/// Collect the orthogonal post-app validation flags. Run after the Bevy app
+/// exits; each can flip the final exit code to 1 independently.
+fn parse_post_app_validations(args: &[String]) -> PostAppValidations {
+    PostAppValidations {
+        validate_gpu_construction: args.iter().any(|a| a == "--validate-gpu-construction"),
+        entities: args.iter().any(|a| a == "--entities"),
+        edit_mode: args.iter().any(|a| a == "--edit-mode"),
+        runtime_edit_mode: args.iter().any(|a| a == "--runtime-edit-mode"),
+    }
+}
+
+/// Run the post-app validation tails, folding any failure into the final
+/// exit code. `e2e_code` is the boot command's exit code; on validation
+/// failure the function returns `ExitCode::from(1)` even if `e2e_code` was
+/// 0. On all-pass the function returns `ExitCode::from(e2e_code)`.
+fn run_post_app_validations(post_app: PostAppValidations, e2e_code: u8) -> ExitCode {
+    if post_app.validate_gpu_construction {
         match bevy_naadf::render::construction::validate_gpu_construction() {
             Ok(bytes_compared) => {
                 eprintln!(
@@ -417,7 +478,7 @@ fn main() -> ExitCode {
         }
     }
 
-    if entities_mode {
+    if post_app.entities {
         match bevy_naadf::render::construction::validate_entity_handler() {
             Ok(report) => {
                 eprintln!("entity handler validation PASS: {report}");
@@ -429,7 +490,7 @@ fn main() -> ExitCode {
         }
     }
 
-    if edit_mode {
+    if post_app.edit_mode {
         match bevy_naadf::render::construction::validate_edit_mode() {
             Ok(report) => {
                 eprintln!("edit-mode validation PASS: {report}");
@@ -446,7 +507,7 @@ fn main() -> ExitCode {
     // regression hole the pre-`02f` CPU-oracle-only `--edit-mode` left open
     // (edit-doesn't-reach-W2-batch). See `validate_runtime_edit_mode`'s
     // module-level doc for what is + isn't asserted by this gate.
-    if runtime_edit_mode {
+    if post_app.runtime_edit_mode {
         match bevy_naadf::render::construction::validate_runtime_edit_mode() {
             Ok(report) => {
                 eprintln!("runtime-edit gate PASS: {report}");
