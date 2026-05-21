@@ -137,8 +137,11 @@ pub fn build_app(cfg: AppConfig) -> App {
 /// Build the bevy-naadf `App` with **GPU budget preselection** applied.
 ///
 /// Runs the mobile GPU budget probe ([`crate::render::budget::probe_and_select`])
-/// BEFORE building the App, mutates `args.taa_ring_depth` to the chosen rung,
-/// then inserts the budget-selected [`render::budget::EffectiveWorldSize`] +
+/// BEFORE building the App, writes the chosen rung into a
+/// [`crate::bootstrap::BootstrapInputs`] (Step 2 of the config-as-resource
+/// refactor — the migrated field is `taa_ring_depth: TaaRingConfig`; legacy
+/// fields still on `AppArgs` ride along through `inputs.args`), then inserts
+/// the budget-selected [`render::budget::EffectiveWorldSize`] +
 /// [`render::budget::InvalidSampleStorageCount`] resources, overriding the
 /// defensive canonical seeds inside [`build_app_with_args`]. On desktop with a
 /// generous storage-buffer cap (≥ 1.35 GiB) the budget picks canonical
@@ -154,10 +157,15 @@ pub fn build_app(cfg: AppConfig) -> App {
 /// The e2e_render binary intentionally skips this and uses
 /// [`build_app_with_args`] directly — e2e gates need canonical world / TAA
 /// for deterministic SSIM comparisons across runs and across machines.
-pub fn build_app_with_budget(cfg: AppConfig, mut args: AppArgs) -> App {
+pub fn build_app_with_budget(cfg: AppConfig, args: AppArgs) -> App {
     let caps = crate::render::budget::probe_and_select();
-    args.taa_ring_depth = caps.taa_ring_depth;
-    let mut app = build_app_with_args(cfg, args);
+    let inputs = crate::bootstrap::BootstrapInputs {
+        args,
+        taa_ring_depth: crate::render::taa::TaaRingConfig {
+            depth: caps.taa_ring_depth,
+        },
+    };
+    let mut app = crate::bootstrap::build_app_with_bootstrap_inputs(cfg, inputs);
     app.insert_resource(crate::render::budget::EffectiveWorldSize::from_segments(
         caps.world_size_in_segments,
     ));

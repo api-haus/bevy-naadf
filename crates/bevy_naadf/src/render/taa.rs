@@ -29,12 +29,44 @@ use crate::render::pipelines::NaadfPipelines;
 /// camera-matrix ring is tiny in VRAM, so it stays at NAADF's depth.
 pub const CAMERA_HISTORY_DEPTH: usize = 128;
 
-/// Render-world resource carrying the configured TAA sample-ring depth
-/// (`18-taa-fidelity.md` fix #3 — supersedes the former hard-coded
-/// `TAA_SAMPLE_RING_DEPTH = 16` const). Inserted into the render sub-app by
-/// `NaadfRenderPlugin::build` from the main-world `AppArgs.taa_ring_depth`
-/// (default [`crate::DEFAULT_TAA_RING_DEPTH`] = 32; 16 / 24 are the VRAM-lever
-/// alternatives).
+/// Main-world canonical resource carrying the configured TAA sample-ring
+/// depth (`18-taa-fidelity.md` fix #3 — supersedes the former hard-coded
+/// `TAA_SAMPLE_RING_DEPTH = 16` const).
+///
+/// **Inserted at bootstrap** by [`crate::bootstrap::build_app_with_bootstrap_inputs`]
+/// from a [`crate::bootstrap::BootstrapInputs`] field (default
+/// [`crate::DEFAULT_TAA_RING_DEPTH`] = 32). The mobile-budget overrides at
+/// [`crate::build_app_with_budget`] / `main.rs` wasm32 path mutate
+/// `inputs.taa_ring_depth` BEFORE bootstrap fans it out, so the inserted
+/// value is the budget-selected rung (8 on Mali-G52). 16 / 24 are the
+/// VRAM-lever alternatives between desktop canonical 32 and minimum 0.
+///
+/// Mirrored into the render sub-app each frame by
+/// [`crate::render::extract::extract_taa_ring_depth`] into the render-world
+/// [`RenderTaaRingConfig`]. Same shape as the
+/// [`crate::render::budget::EffectiveWorldSize`] /
+/// [`crate::render::budget::RenderEffectiveWorldSize`] precedent.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaaRingConfig {
+    /// The sample-ring depth (default [`crate::DEFAULT_TAA_RING_DEPTH`] = 32).
+    pub depth: u32,
+}
+
+impl Default for TaaRingConfig {
+    fn default() -> Self {
+        Self { depth: crate::DEFAULT_TAA_RING_DEPTH }
+    }
+}
+
+/// Render-sub-app mirror of [`TaaRingConfig`].
+///
+/// **Plumbing — extract-driven, NOT plugin-build-snapshot.** Same rationale as
+/// [`crate::render::budget::RenderEffectiveWorldSize`]: the mobile-budget /
+/// wasm32 entry points insert the main-world [`TaaRingConfig`] (possibly with
+/// a non-canonical depth) BEFORE the plugin pyramid builds, but other callers
+/// (e2e gates) leave it at canonical default. A plugin-build snapshot would
+/// risk drift; extract-driven copy makes the render-world value always
+/// reflect the latest main-world value at frame N+1.
 ///
 /// This is the **single config source of truth** on the render side: it feeds
 /// BOTH the Rust buffer sizing in [`prepare_taa`] (`taa_samples` is
@@ -43,10 +75,22 @@ pub const CAMERA_HISTORY_DEPTH: usize = 128;
 /// `#{TAA_SAMPLE_RING_DEPTH}` shader-def injected at pipeline specialisation.
 /// The two sides MUST agree exactly: a buffer sized for N with a shader
 /// looping/modulo'ing over M is silent ring corruption.
+///
+/// `Default` = canonical [`crate::DEFAULT_TAA_RING_DEPTH`] = 32 so the
+/// resource is always present (used as the `init_resource` seed before the
+/// first extract; `NaadfPipelines::from_world` runs in `RenderStartup` after
+/// the first `ExtractSchedule`, so the mirror is post-extract by the time
+/// the shader-def is read).
 #[derive(Resource, Clone, Copy, Debug)]
-pub struct TaaRingConfig {
-    /// The sample-ring depth — `AppArgs.taa_ring_depth`.
+pub struct RenderTaaRingConfig {
+    /// The sample-ring depth.
     pub depth: u32,
+}
+
+impl Default for RenderTaaRingConfig {
+    fn default() -> Self {
+        Self { depth: crate::DEFAULT_TAA_RING_DEPTH }
+    }
 }
 
 /// The 128-deep camera-history ring + the monotonic frame counter
@@ -287,7 +331,7 @@ pub fn prepare_taa(
     mut commands: Commands,
     extracted_camera: Res<ExtractedCameraData>,
     extracted_history: Res<ExtractedCameraHistory>,
-    ring_config: Res<TaaRingConfig>,
+    ring_config: Res<RenderTaaRingConfig>,
     existing: Option<Res<TaaGpu>>,
     pipelines: Res<NaadfPipelines>,
     pipeline_cache: Res<PipelineCache>,
@@ -503,4 +547,55 @@ fn create_screen_buffers(
         mapped_at_creation: false,
     });
     (taa_samples, taa_sample_accum, taa_dist_min_max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TaaRingConfig::default().depth` MUST be the documented default
+    /// (`18-taa-fidelity.md` fix #3): a mismatch between the const + the
+    /// default would mean the WGSL shader-def and the Rust buffer sizing
+    /// disagree by default, which is silent TAA ring corruption.
+    ///
+    /// Relocated from `app_args.rs::tests` in Step 2 of the
+    /// configuration-as-resource refactor — the canonical default now lives
+    /// on the per-domain [`TaaRingConfig`] resource rather than the
+    /// god-resource `AppArgs.taa_ring_depth` field.
+    #[test]
+    fn default_taa_ring_depth_is_32() {
+        assert_eq!(crate::DEFAULT_TAA_RING_DEPTH, 32);
+        assert_eq!(
+            TaaRingConfig::default().depth,
+            crate::DEFAULT_TAA_RING_DEPTH
+        );
+    }
+
+    /// The ring depth must stay in the supported VRAM-lever range — 16 / 24 /
+    /// 32 are the three values the design records (`01-context.md` §2c /
+    /// `design-exploration-qa.md` §6 + the `18-taa-fidelity.md` fix #3
+    /// supersession). Pin the default at 32 so future edits do not silently
+    /// roll back to the old 16-deep value.
+    ///
+    /// Relocated from `app_args.rs::tests` in Step 2.
+    #[test]
+    fn default_taa_ring_depth_is_a_supported_lever_value() {
+        let depth = TaaRingConfig::default().depth;
+        assert!(
+            matches!(depth, 16 | 24 | 32),
+            "taa_ring_depth = {depth} is not one of the supported 16/24/32 lever values"
+        );
+    }
+
+    /// The render-world mirror also defaults to the canonical depth, so the
+    /// pre-extract first-frame seed in [`RenderTaaRingConfig::Default`] is
+    /// safe (`from_world` reading the resource before the first extract sees
+    /// the canonical value, identical to today's behaviour).
+    #[test]
+    fn render_mirror_default_is_canonical() {
+        assert_eq!(
+            RenderTaaRingConfig::default().depth,
+            crate::DEFAULT_TAA_RING_DEPTH
+        );
+    }
 }

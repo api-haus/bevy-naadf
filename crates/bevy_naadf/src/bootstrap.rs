@@ -24,6 +24,7 @@
 
 use bevy::prelude::{App, AppExit};
 
+use crate::render::taa::TaaRingConfig;
 use crate::{AppArgs, AppConfig};
 
 /// Transient bootstrap-time configuration carrier.
@@ -54,25 +55,54 @@ pub struct BootstrapInputs {
     /// Adding `Debug` here would force a derive on `AppArgs` and its inner
     /// types, which is out of scope for Step 1.)
     pub args: AppArgs,
+    /// TAA sample-ring depth (`18-taa-fidelity.md` fix #3). Migrated out of
+    /// `AppArgs.taa_ring_depth` in Step 2 of the config-as-resource refactor.
+    /// `TaaRingConfig::default()` = [`crate::DEFAULT_TAA_RING_DEPTH`] = 32;
+    /// the mobile-budget / wasm32 entry points overwrite this with the
+    /// budget-selected rung before the fan-out runs.
+    pub taa_ring_depth: TaaRingConfig,
 }
 
 /// Build the bevy-naadf `App` from an [`AppConfig`] and a [`BootstrapInputs`].
 ///
-/// Step-1 shape — forwards to [`crate::build_app_with_args`]. Subsequent
-/// steps replace the forward with a direct fan-out that inserts per-domain
-/// resources from the typed fields on `inputs`.
+/// Step-2 shape — forwards to [`crate::build_app_with_args`] for the
+/// not-yet-migrated `AppArgs` fields, then inserts the per-domain resources
+/// already migrated off `AppArgs`. As more fields migrate, this becomes a
+/// pure resource fan-out (no `AppArgs` forwarding).
 pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) -> App {
-    crate::build_app_with_args(cfg, inputs.args)
+    let mut app = crate::build_app_with_args(cfg, inputs.args);
+    // Migrated in Step 2 — main-world `TaaRingConfig` resource. Bevy's
+    // second-call `insert_resource` semantic is overwrite-in-place, so
+    // mobile-budget callers that wrote a non-canonical depth into
+    // `inputs.taa_ring_depth` end up with their value on the resource.
+    // Inserted AFTER `build_app_with_args` (which adds the
+    // `NaadfRenderPlugin`); the render-world consumer
+    // `extract_taa_ring_depth` runs in `ExtractSchedule` on every frame, so
+    // the first real frame sees this value before `RenderStartup`'s
+    // `NaadfPipelines::from_world` reads the render-world mirror for the
+    // `#{TAA_SAMPLE_RING_DEPTH}` shader-def.
+    app.insert_resource(inputs.taa_ring_depth);
+    app
 }
 
 /// Boot the bounded windowed e2e render test from a [`BootstrapInputs`] and
 /// return its [`AppExit`].
 ///
-/// Step-1 shape — forwards to [`crate::run_e2e_render_with_args`].
-/// Subsequent steps replace the forward with the per-domain resource fan-out
-/// shape described in `02-design.md` §3.3.
+/// Step-2 shape — mirrors [`build_app_with_bootstrap_inputs`]: forward to
+/// [`crate::run_e2e_render_with_args`] for the not-yet-migrated `AppArgs`
+/// fields, then perform a post-build resource insert for fields already
+/// migrated. As more fields migrate, this becomes a pure resource fan-out.
+///
+/// `run_e2e_render_with_args` calls `e2e::run_with_app` which drives the
+/// `AppExit` to completion. To preserve byte-identical determinism after
+/// the resource insert, this wrapper takes the inverted path: build the App
+/// via [`build_app_with_bootstrap_inputs`] (the migrated-resource fan-out)
+/// + the e2e window config + the e2e runner.
 pub fn run_e2e_render_with_bootstrap_inputs(inputs: BootstrapInputs) -> AppExit {
-    crate::run_e2e_render_with_args(inputs.args)
+    let mut cfg = AppConfig::e2e();
+    cfg.window = crate::window_config::window_for_e2e_args(&inputs.args);
+    let app = build_app_with_bootstrap_inputs(cfg, inputs);
+    crate::e2e::run_with_app(app)
 }
 
 #[cfg(test)]
@@ -80,18 +110,22 @@ mod tests {
     use super::*;
     use crate::{GridPreset, DEFAULT_TAA_RING_DEPTH};
 
-    /// `BootstrapInputs::default()` must wrap the canonical `AppArgs::default()`
-    /// — this is the e2e-determinism contract from the design doc's
-    /// "E2e-path byte-identical defaults" section. `AppArgs` is neither
-    /// `Debug` nor `PartialEq`, so this test spot-checks the load-bearing
-    /// fields field-by-field rather than via a single equality assertion.
-    /// If any of these spot-checks ever fails, the migration has introduced
-    /// a default divergence and the e2e-determinism requirement is violated.
+    /// `BootstrapInputs::default()` must produce the same canonical defaults
+    /// as today's `AppArgs::default()` (for fields still on `AppArgs`) plus
+    /// the migrated typed fields at their canonical-default values — this
+    /// is the e2e-determinism contract from the design doc's "E2e-path
+    /// byte-identical defaults" section.
+    ///
+    /// Step 2 of the config-as-resource refactor migrated `taa_ring_depth`
+    /// off `AppArgs` onto the `taa_ring_depth: TaaRingConfig` field on this
+    /// struct; the pin moved to the typed field.
     #[test]
     fn default_wraps_canonical_app_args_defaults() {
         let inputs = BootstrapInputs::default();
         // The user's named smell — must stay at the documented constant.
-        assert_eq!(inputs.args.taa_ring_depth, DEFAULT_TAA_RING_DEPTH);
+        // Migrated to the typed `taa_ring_depth: TaaRingConfig` field in
+        // Step 2.
+        assert_eq!(inputs.taa_ring_depth.depth, DEFAULT_TAA_RING_DEPTH);
         // TAA on by default (Phase A-2; both production and e2e boot TAA on).
         assert!(inputs.args.taa);
         // The default world content is the hard-coded test grid.

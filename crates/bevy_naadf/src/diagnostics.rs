@@ -16,6 +16,7 @@ use crate::AppArgs;
 use crate::AppConfig;
 use crate::camera::position_split::PositionSplit;
 use crate::editor::ray::screen_to_ray;
+use crate::render::taa::TaaRingConfig;
 use crate::world::data::{VoxelTypes, WorldData};
 
 /// `Update` system: on `KeyP` just_pressed, log a single multi-line
@@ -23,6 +24,7 @@ use crate::world::data::{VoxelTypes, WorldData};
 pub fn dump_diagnostics_on_p(
     keys: Res<ButtonInput<KeyCode>>,
     args: Option<Res<AppArgs>>,
+    taa_ring: Option<Res<TaaRingConfig>>,
     world_data: Option<Res<WorldData>>,
     voxel_types: Option<Res<VoxelTypes>>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -102,17 +104,25 @@ pub fn dump_diagnostics_on_p(
     }
 
     if let Some(a) = args.as_ref() {
+        // Step 2 of the config-as-resource refactor: `taa_ring_depth` migrated
+        // off `AppArgs` onto the standalone `TaaRingConfig` main-world
+        // resource. The diagnostics dump fans out — per Q4 of
+        // `docs/orchestrate/config-as-resource-refactor/01-context.md`.
+        let taa_ring_depth_str = taa_ring
+            .as_ref()
+            .map(|r| r.depth.to_string())
+            .unwrap_or_else(|| "<TaaRingConfig resource missing>".to_string());
         let _ = writeln!(
             buf,
             "args.grid_preset         = {:?}\n\
              args.taa                 = {}\n\
-             args.taa_ring_depth      = {}\n\
+             taa_ring_depth           = {}\n\
              args.spawn_test_entity   = {}\n\
              args.gi                  = {:#?}\n\
              args.construction_config = {:#?}",
             a.grid_preset,
             a.taa,
-            a.taa_ring_depth,
+            taa_ring_depth_str,
             a.spawn_test_entity,
             a.gi,
             a.construction_config

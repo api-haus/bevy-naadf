@@ -1,17 +1,21 @@
 //! Command-line options, parsed once and stored as a Bevy `Resource`
 //! (`03-design.md` §4.1).
 //!
-//! Carries the production-meaningful knobs (`grid_preset`, `taa`,
-//! `taa_ring_depth`, `gi`, `construction_config`, `spawn_test_entity`) and a
-//! flat set of mode/phase booleans that drive the e2e harness dispatch from
-//! `bin/e2e_render.rs`. At most one e2e flag is true at a time — the enum
-//! collapse is deferred to a future Step 8 (D6+D7 paired) since it crosses
-//! 11 mode files.
+//! Carries the production-meaningful knobs (`grid_preset`, `taa`, `gi`,
+//! `construction_config`, `spawn_test_entity`) and a flat set of mode/phase
+//! booleans that drive the e2e harness dispatch from `bin/e2e_render.rs`.
+//! At most one e2e flag is true at a time — the enum collapse is deferred to
+//! a future Step 8 (D6+D7 paired) since it crosses 11 mode files.
+//!
+//! **Step 2 of the config-as-resource refactor** migrated the user's named
+//! smell `taa_ring_depth` out of this struct onto the
+//! [`crate::render::taa::TaaRingConfig`] per-domain main-world resource. The
+//! pin tests moved with it to `crates/bevy_naadf/src/render/taa.rs::tests`.
 
 use bevy::prelude::*;
 
 use crate::render;
-use crate::{GiSettings, GridPreset, DEFAULT_TAA_RING_DEPTH};
+use crate::{GiSettings, GridPreset};
 
 /// Command-line options, parsed once and stored as a resource
 /// (`03-design.md` §4.1).
@@ -30,16 +34,6 @@ pub struct AppArgs {
     /// now — both the production binary and the e2e harness boot with TAA
     /// active).
     pub taa: bool,
-    /// The TAA sample-ring depth — the long-term-memory TAA history depth
-    /// (`18-taa-fidelity.md` fix #3). The single config source of truth: it
-    /// feeds BOTH the Rust buffer sizing (`render/taa.rs` — `taa_samples` is
-    /// `pixel_count * taa_ring_depth`) AND the WGSL `#{TAA_SAMPLE_RING_DEPTH}`
-    /// shader-def injected at pipeline specialisation (`render/pipelines.rs`),
-    /// so the loop bounds / `% N` indexing in `taa.wgsl` agree byte-for-byte
-    /// with the buffer size. Default [`DEFAULT_TAA_RING_DEPTH`] (32); 16 / 24
-    /// are the VRAM-lever alternatives. Read on the render side via the
-    /// `TaaRingConfig` render-world resource (`render::taa`).
-    pub taa_ring_depth: u32,
     /// The Phase-B GI pipeline settings (`09-design-b.md` §3.8).
     pub gi: GiSettings,
     /// The Phase-C GPU-construction configuration (`15-design-c.md` §1.8,
@@ -187,7 +181,6 @@ impl Default for AppArgs {
         Self {
             grid_preset: GridPreset::default(),
             taa: true,
-            taa_ring_depth: DEFAULT_TAA_RING_DEPTH,
             gi: GiSettings::default(),
             construction_config: render::construction::ConstructionConfig::default(),
             spawn_test_entity: false,
@@ -206,31 +199,8 @@ impl Default for AppArgs {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `AppArgs::default().taa_ring_depth` MUST be the documented default
-    /// (`18-taa-fidelity.md` fix #3): a mismatch between the const + the
-    /// default would mean the WGSL shader-def and the Rust buffer sizing
-    /// disagree by default, which is silent TAA ring corruption.
-    #[test]
-    fn default_taa_ring_depth_is_32() {
-        assert_eq!(DEFAULT_TAA_RING_DEPTH, 32);
-        assert_eq!(AppArgs::default().taa_ring_depth, DEFAULT_TAA_RING_DEPTH);
-    }
-
-    /// The ring depth must stay in the supported VRAM-lever range — 16 / 24 /
-    /// 32 are the three values the design records (`01-context.md` §2c /
-    /// `design-exploration-qa.md` §6 + the `18-taa-fidelity.md` fix #3
-    /// supersession). Pin the default at 32 so future edits do not silently
-    /// roll back to the old 16-deep value.
-    #[test]
-    fn default_taa_ring_depth_is_a_supported_lever_value() {
-        let depth = AppArgs::default().taa_ring_depth;
-        assert!(
-            matches!(depth, 16 | 24 | 32),
-            "taa_ring_depth = {depth} is not one of the supported 16/24/32 lever values"
-        );
-    }
-}
+// Step 2 of the config-as-resource refactor (`02-design.md` §4 Step 2): the
+// `taa_ring_depth` pin tests moved to `render/taa.rs::tests` along with the
+// migrated field. No remaining `AppArgs`-rooted tests live in this file;
+// subsequent migration steps may add per-bucket tests on their target
+// resources, not here.

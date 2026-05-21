@@ -37,7 +37,7 @@ use crate::render::gi::{
     BUCKET_STORAGE_COUNT, INVALID_SAMPLE_STORAGE_COUNT, REFINED_BUCKET_STORAGE_COUNT,
     VALID_SAMPLE_STORAGE_COUNT,
 };
-use crate::render::taa::CAMERA_HISTORY_DEPTH;
+use crate::render::taa::{TaaRingConfig, CAMERA_HISTORY_DEPTH};
 use crate::{AppArgs, DevFont};
 
 /// Drag-detection threshold in physical pixels.
@@ -138,6 +138,16 @@ enum KnobKind {
     Readonly {
         value: fn(&AppArgs) -> String,
     },
+    /// Step 2 of the config-as-resource refactor (Decision §7 partial split):
+    /// readonly row whose source is the per-domain
+    /// [`crate::render::taa::TaaRingConfig`] resource rather than `AppArgs`.
+    /// As subsequent steps migrate fields off `AppArgs`, this variant family
+    /// grows (`ReadonlyFromGi`, …). Step 9 deletes the legacy
+    /// `KnobKind::Readonly { fn(&AppArgs) -> String }` arm once `AppArgs` is
+    /// gone.
+    ReadonlyFromTaa {
+        value: fn(&TaaRingConfig) -> String,
+    },
     Action {
         apply: fn(&mut AppArgs),
     },
@@ -225,6 +235,15 @@ macro_rules! knob_readonly {
     };
 }
 
+/// Read-only diagnostic row reading the per-domain
+/// [`crate::render::taa::TaaRingConfig`] main-world resource. Step 2 of the
+/// config-as-resource refactor (Decision §7 partial split).
+macro_rules! knob_readonly_taa {
+    ($label:literal, $expr:expr) => {
+        Knob { label: $label, kind: KnobKind::ReadonlyFromTaa { value: $expr } }
+    };
+}
+
 /// Action row — the closure is invoked on click / `R` reset.
 macro_rules! knob_action {
     ($label:literal, $fn:expr) => {
@@ -259,7 +278,7 @@ const KNOBS: &[Knob] = &[
     knob_bool!("  skip_samples",       skip_samples),
 
     knob_section!("DIAGNOSTICS (read-only)"),
-    knob_readonly!("  taa_ring_depth",         |a| format!("{} [restart-required]", a.taa_ring_depth)),
+    knob_readonly_taa!("  taa_ring_depth",     |t| format!("{} [restart-required]", t.depth)),
     knob_readonly!("  camera_history_depth",   |_| format!("{} [const]", CAMERA_HISTORY_DEPTH)),
     knob_readonly!("  valid_sample_storage",   |_| format!("{} [storage-tied]", VALID_SAMPLE_STORAGE_COUNT)),
     knob_readonly!("  invalid_sample_storage", |_| format!("{} [storage-tied]", INVALID_SAMPLE_STORAGE_COUNT)),
@@ -641,6 +660,7 @@ fn handle_click_release(args: &mut AppArgs, knob_index: usize) {
 pub fn update_settings_text(
     state: Res<SettingsState>,
     args: Res<AppArgs>,
+    taa_ring: Res<TaaRingConfig>,
     mut row_texts: Query<(&SettingsRowText, &mut Text, &mut TextColor)>,
     mut row_bgs: Query<(&SettingsRow, &Interaction, &mut BackgroundColor)>,
     mut legend: Query<&mut Text, (With<SettingsLegendText>, Without<SettingsRowText>)>,
@@ -671,6 +691,10 @@ pub fn update_settings_text(
             }
             KnobKind::Readonly { value } => {
                 let _ = write!(s, "{}{:<24} {}", marker, row.label, value(&args));
+                *text_color = TextColor(FG_READONLY);
+            }
+            KnobKind::ReadonlyFromTaa { value } => {
+                let _ = write!(s, "{}{:<24} {}", marker, row.label, value(&taa_ring));
                 *text_color = TextColor(FG_READONLY);
             }
             KnobKind::Action { .. } => {

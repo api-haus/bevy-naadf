@@ -495,6 +495,29 @@ pub fn extract_effective_world_size(
     }
 }
 
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::render::taa::TaaRingConfig`] into the render-world
+/// [`crate::render::taa::RenderTaaRingConfig`].
+///
+/// Step 2 of the config-as-resource refactor (
+/// `docs/orchestrate/config-as-resource-refactor/02-design.md` §3.4): replaces
+/// the former plugin-build-time snapshot of `AppArgs.taa_ring_depth` at
+/// `render/mod.rs:113-126` with an extract-driven copy, mirroring the
+/// [`extract_effective_world_size`] precedent. The render-world mirror is
+/// `init_resource`d to canonical [`crate::DEFAULT_TAA_RING_DEPTH`]; this
+/// extract overwrites it from the main-world value every frame (the first
+/// `ExtractSchedule` runs before `RenderStartup`, so
+/// `NaadfPipelines::from_world` sees the post-extract value when it injects
+/// the `#{TAA_SAMPLE_RING_DEPTH}` shader-def).
+pub fn extract_taa_ring_depth(
+    mut mirror: ResMut<crate::render::taa::RenderTaaRingConfig>,
+    src: Extract<Option<Res<crate::render::taa::TaaRingConfig>>>,
+) {
+    if let Some(src) = &*src {
+        mirror.depth = src.depth;
+    }
+}
+
 /// Render-world mirror of `AppArgs.gi` — the Phase-B GI pipeline settings
 /// (`09-design-b.md` §3.8 / §10.2). `AppArgs` is a main-world resource; the
 /// render-world `prepare_gi` system needs these to build `GpuGiParams`, and

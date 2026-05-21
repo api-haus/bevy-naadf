@@ -73,9 +73,21 @@ fn main() -> AppExit {
     {
         wasm_bindgen_futures::spawn_local(async move {
             let caps = bevy_naadf::render::budget::probe_and_select_async().await;
-            let mut args = args;
-            args.taa_ring_depth = caps.taa_ring_depth;
-            let mut app = bevy_naadf::build_app_with_args(AppConfig::windowed(), args);
+            // Step 2 of the config-as-resource refactor — the TAA sample-ring
+            // depth lives on `BootstrapInputs.taa_ring_depth: TaaRingConfig`
+            // now, fanned out into a main-world resource by
+            // `build_app_with_bootstrap_inputs`. Legacy `AppArgs` fields ride
+            // along via `inputs.args` until subsequent steps migrate them.
+            let inputs = bevy_naadf::bootstrap::BootstrapInputs {
+                args,
+                taa_ring_depth: bevy_naadf::render::taa::TaaRingConfig {
+                    depth: caps.taa_ring_depth,
+                },
+            };
+            let mut app = bevy_naadf::bootstrap::build_app_with_bootstrap_inputs(
+                AppConfig::windowed(),
+                inputs,
+            );
             app.insert_resource(
                 bevy_naadf::render::budget::EffectiveWorldSize::from_segments(
                     caps.world_size_in_segments,
