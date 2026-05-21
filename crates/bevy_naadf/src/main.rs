@@ -29,7 +29,7 @@
 //!   `std::env::args` parsing — no `clap`.
 
 use bevy::prelude::AppExit;
-use bevy_naadf::{build_app_with_args, AppArgs, AppConfig, GridPreset};
+use bevy_naadf::{AppArgs, AppConfig, GridPreset};
 
 fn main() -> AppExit {
     // vox-gpu-rewrite Stage 2 consolidation (2026-05-18): the production
@@ -50,5 +50,42 @@ fn main() -> AppExit {
             return AppExit::error();
         }
     }
-    build_app_with_args(AppConfig::windowed(), args).run()
+
+    // Native: sync probe path (`probe_and_select` → spin up a throwaway Bevy
+    // render App, read `device.limits()`, drop it). Picks canonical defaults
+    // on desktop with a ≥ 1.35 GiB storage-buffer-binding cap; picks mobile
+    // rungs on Android Mali (256 MiB).
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        bevy_naadf::build_app_with_budget(AppConfig::windowed(), args).run()
+    }
+
+    // wasm32 (web / iOS Safari / Android Chrome): async probe path. The
+    // Bevy plugin-pyramid sync probe deadlocks the browser main thread on
+    // `Atomics.wait` (RenderPlugin device creation is async). Instead, call
+    // `wgpu::Instance::request_adapter` directly via `wasm_bindgen_futures::
+    // spawn_local`, read the REAL `adapter.limits()`, then build + run the
+    // App. Desktop Chrome on a workstation reports 2-4 GiB cap → canonical
+    // defaults selected; iOS Safari + Android Chrome report 256 MiB → mobile
+    // rungs. `main` returns AppExit::Success immediately; the spawned future
+    // does the actual App boot via the wasm event loop.
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(async move {
+            let caps = bevy_naadf::render::budget::probe_and_select_async().await;
+            let mut args = args;
+            args.taa_ring_depth = caps.taa_ring_depth;
+            let mut app = bevy_naadf::build_app_with_args(AppConfig::windowed(), args);
+            app.insert_resource(
+                bevy_naadf::render::budget::EffectiveWorldSize::from_segments(
+                    caps.world_size_in_segments,
+                ),
+            );
+            app.insert_resource(bevy_naadf::render::budget::InvalidSampleStorageCount(
+                caps.invalid_sample_storage_count,
+            ));
+            app.run();
+        });
+        AppExit::Success
+    }
 }

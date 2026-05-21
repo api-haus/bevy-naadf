@@ -413,6 +413,38 @@ pub fn select_budget(limits: &wgpu::Limits) -> BudgetCaps {
 /// `AdapterInfo` line — see `docs/orchestrate/mobile-budget/05-consolidated-fix.md`
 /// Investigation §"Symptom 2" for the root-cause trace).
 pub fn probe_and_select() -> BudgetCaps {
+    // wasm32: skip the SYNC live probe. Bevy's `RenderPlugin`-driven device
+    // creation is async, and `app.finish()` on the wasm32 main thread would
+    // end up calling `Atomics.wait` on a futex (forbidden by every browser —
+    // page locks up with `RuntimeError: Atomics.wait cannot be called in
+    // this context`). For wasm32 callers who can `.await`, prefer
+    // [`probe_and_select_async`] (uses `wgpu::Instance::request_adapter`
+    // directly via `wasm_bindgen_futures::spawn_local` from `fn main`) — it
+    // reads the device's real `max_storage_buffer_binding_size` (1-4 GiB on
+    // desktop Chrome, 256 MiB on iOS Safari / Android Chrome).
+    //
+    // This sync path stays as a backstop: synthesizes the WebGPU spec floor
+    // (256 MiB) as the assumed cap. Trades headroom on beefy desktop
+    // browsers for unconditional correctness anywhere without await.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let synthetic_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: MIN_STORAGE_BINDING_CAP_BYTES,
+            ..wgpu::Limits::default()
+        };
+        eprintln!(
+            "[budget] wasm32 sync path: live probe skipped (browser forbids \
+             Atomics.wait on main thread). Selecting against synthetic \
+             {} MiB cap (WebGPU spec mandatory minimum). \
+             For real-cap selection, callers should use probe_and_select_async.",
+            MIN_STORAGE_BINDING_CAP_BYTES / (1024 * 1024)
+        );
+        let caps = select_budget(&synthetic_limits);
+        log_budget_decision(&caps, &synthetic_limits);
+        return caps;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     match probe_limits() {
         Some(limits) => {
             let caps = select_budget(&limits);
@@ -436,6 +468,66 @@ pub fn probe_and_select() -> BudgetCaps {
                 taa_samples_bytes: 0,
                 invalid_samples_bytes: 0,
             }
+        }
+    }
+}
+
+/// Async wasm32 probe — calls `wgpu::Instance::request_adapter` directly
+/// (no Bevy plugin pyramid, no `app.finish()` blocking on `Atomics.wait`)
+/// and reads `adapter.limits()`. Returns `None` if no WebGPU adapter is
+/// available (browser without WebGPU support, or a Safari setting that
+/// hides it). Called from `wasm_bindgen_futures::spawn_local` inside
+/// `crates/bevy_naadf/src/main.rs::main()`'s wasm32 cfg branch.
+///
+/// This is the real-cap path for wasm32 — desktop Chrome with WebGPU
+/// enabled reports 2–4 GiB `max_storage_buffer_binding_size`, iOS Safari
+/// + Android Chrome report 256 MiB exactly. The async path runs against
+/// the actual device's reported value rather than the synthetic spec-floor
+/// used by the sync [`probe_and_select`] fallback.
+#[cfg(target_arch = "wasm32")]
+pub async fn probe_limits_wasm() -> Option<wgpu::Limits> {
+    // `new_without_display_handle()` returns an `InstanceDescriptor` with
+    // every field at its default value (no display handle — fine for a
+    // probe that doesn't need to present to a surface). On wasm32 the only
+    // backend available is BROWSER_WEBGPU regardless.
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })
+        .await
+        .ok()?;
+    Some(adapter.limits())
+}
+
+/// Async wasm32 entry — `probe_limits_wasm` + `select_budget` + log. On a
+/// `RequestAdapter` failure (no WebGPU available, or rejected by the
+/// browser) falls back to the synthetic 256 MiB cap so the budget routine
+/// still picks safe-everywhere defaults.
+#[cfg(target_arch = "wasm32")]
+pub async fn probe_and_select_async() -> BudgetCaps {
+    match probe_limits_wasm().await {
+        Some(limits) => {
+            let caps = select_budget(&limits);
+            log_budget_decision(&caps, &limits);
+            caps
+        }
+        None => {
+            let synthetic_limits = wgpu::Limits {
+                max_storage_buffer_binding_size: MIN_STORAGE_BINDING_CAP_BYTES,
+                ..wgpu::Limits::default()
+            };
+            eprintln!(
+                "[budget] wasm32 async probe: `requestAdapter` returned None \
+                 — falling back to synthetic {} MiB cap (WebGPU spec floor).",
+                MIN_STORAGE_BINDING_CAP_BYTES / (1024 * 1024)
+            );
+            let caps = select_budget(&synthetic_limits);
+            log_budget_decision(&caps, &synthetic_limits);
+            caps
         }
     }
 }

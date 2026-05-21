@@ -133,6 +133,39 @@ pub fn build_app(cfg: AppConfig) -> App {
     build_app_with_args(cfg, AppArgs::default())
 }
 
+/// Build the bevy-naadf `App` with **GPU budget preselection** applied.
+///
+/// Runs the mobile GPU budget probe ([`crate::render::budget::probe_and_select`])
+/// BEFORE building the App, mutates `args.taa_ring_depth` to the chosen rung,
+/// then inserts the budget-selected [`render::budget::EffectiveWorldSize`] +
+/// [`render::budget::InvalidSampleStorageCount`] resources, overriding the
+/// defensive canonical seeds inside [`build_app_with_args`]. On desktop with a
+/// generous storage-buffer cap (≥ 1.35 GiB) the budget picks canonical
+/// defaults — output is byte-identical to [`build_app_with_args`]. On mobile
+/// targets (256 MiB cap — Android Mali / iOS Safari WebGPU) the routine picks
+/// the deepest world + TAA + invalid-samples rungs that fit `cap × 75%`.
+///
+/// Production callers:
+///   * Desktop + WebGPU/wasm32 — `src/main.rs::fn main()` → this →`.run()`.
+///   * Android JNI entry — `src/android_main.rs::android_main()` → this →
+///     [`bevy::winit::WinitSettings::mobile`] → `.run()`.
+///
+/// The e2e_render binary intentionally skips this and uses
+/// [`build_app_with_args`] directly — e2e gates need canonical world / TAA
+/// for deterministic SSIM comparisons across runs and across machines.
+pub fn build_app_with_budget(cfg: AppConfig, mut args: AppArgs) -> App {
+    let caps = crate::render::budget::probe_and_select();
+    args.taa_ring_depth = caps.taa_ring_depth;
+    let mut app = build_app_with_args(cfg, args);
+    app.insert_resource(crate::render::budget::EffectiveWorldSize::from_segments(
+        caps.world_size_in_segments,
+    ));
+    app.insert_resource(crate::render::budget::InvalidSampleStorageCount(
+        caps.invalid_sample_storage_count,
+    ));
+    app
+}
+
 /// Build the bevy-naadf `App` with a caller-supplied [`AppArgs`].
 ///
 /// Phase-C wave-3 — added to let the e2e binary toggle `--entities`-driven

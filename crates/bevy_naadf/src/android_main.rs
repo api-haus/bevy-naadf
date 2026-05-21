@@ -48,51 +48,23 @@ use bevy::prelude::*;
 use bevy::window::WindowMode;
 use bevy::winit::WinitSettings;
 
-use crate::render::budget::{probe_and_select, EffectiveWorldSize, InvalidSampleStorageCount};
-use crate::{build_app_with_args, AppArgs, AppConfig};
+use crate::{build_app_with_budget, AppArgs, AppConfig};
 
 #[bevy_main]
 fn main() {
-    // 1. Probe-app (throwaway): boots `MinimalPlugins + AssetPlugin +
-    //    ImagePlugin + RenderPlugin`, reads the device cap, selects safe
-    //    `(taa_ring_depth, world_size_in_segments)`, drops the probe app.
-    //    Emits the `[budget]` log line to logcat — the device-step
-    //    success signal (`docs/orchestrate/mobile-budget/02-design.md` §8).
+    // GPU budget preselection (probe → select → apply) lives in the shared
+    // `build_app_with_budget` helper alongside the desktop / web entry. Same
+    // probe-app, same `BudgetCaps`, same overrides — only the JNI cdylib entry
+    // is Android-specific. See `crates/bevy_naadf/src/lib.rs::build_app_with_budget`.
     //
-    //    On Galaxy Tab A8 / Mali-G52: ~150 ms cold-boot, ~250 MiB PSS peak
-    //    (matches the empty-probe baseline at `docs/todo/android-build.md:28`).
-    let caps = probe_and_select();
+    // On Galaxy Tab A8 / Mali-G52 this picks `taa_ring_depth=8,
+    // world_size_in_segments=(6,2,6), invalid_sample_storage_count=4` and emits
+    // the `[budget] …` line to logcat (visible via `adb logcat | grep budget`).
+    let mut app = build_app_with_budget(AppConfig::windowed(), AppArgs::default());
 
-    // 2. Apply the budget to AppArgs (TAA ring depth is plumbed end-to-end
-    //    through `AppArgs.taa_ring_depth` already — see
-    //    `crates/bevy_naadf/src/render/mod.rs:105-118`).
-    let mut args = AppArgs::default();
-    args.taa_ring_depth = caps.taa_ring_depth;
-
-    // 3. Build the real App. `build_app_with_args` defensively seeds
-    //    `EffectiveWorldSize::canonical()` if no caller inserted one yet —
-    //    we override it post-build with the budget-chosen rung. Bevy's
-    //    `insert_resource` overwrites on second call, so this is safe and
-    //    cheap (~16 ms on Mali during the W5 GPU producer's 6³ segment
-    //    loop = 216 dispatches × 2 ≈ 432 submits, down from 512 segments
-    //    × 2 = 1024 on desktop).
-    let cfg = AppConfig::windowed();
-    let mut app = build_app_with_args(cfg, args);
-    app.insert_resource(EffectiveWorldSize::from_segments(
-        caps.world_size_in_segments,
-    ));
-    // 2026-05-21 post-deploy lever — overrides the C# canonical
-    // `INVALID_SAMPLE_STORAGE_COUNT = 8` with the budget-selected mobile
-    // value (typically 4 at Mali-G52 + 1920×1200). The render-sub-app
-    // mirror (`RenderInvalidSampleStorageCount`) is created in
-    // `NaadfRenderPlugin::build` and reads this main-world resource.
-    app.insert_resource(InvalidSampleStorageCount(
-        caps.invalid_sample_storage_count,
-    ));
-
-    // 4. Mobile-specific window config — full-screen borderless on Android.
-    //    Preserved from the pre-budget minimal-probe entry; the Gradle
-    //    project's `MainActivity` is built around this shape.
+    // Android-specific window config — full-screen borderless. Preserved from
+    // the pre-budget minimal-probe entry; the Gradle project's `MainActivity`
+    // is built around this shape.
     {
         let mut window_q = app.world_mut().query::<&mut Window>();
         if let Ok(mut window) = window_q.single_mut(app.world_mut()) {
