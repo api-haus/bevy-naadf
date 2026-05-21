@@ -109,10 +109,14 @@ web-static: web-build-release
         exit 1
     fi
     url="http://{{web_host}}:{{web_port}}"
+    lan_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
     echo "miniserve dist → $url   (static, no watch, COOP/COEP enabled)"
+    if [[ -n "$lan_ip" ]]; then
+        echo "                LAN: http://$lan_ip:{{web_port}}   (phone / tablet on same network)"
+    fi
     miniserve dist \
         --index index.html \
-        --interfaces {{web_host}} \
+        --interfaces 0.0.0.0 \
         --port {{web_port}} \
         --header "Cross-Origin-Opener-Policy: same-origin" \
         --header "Cross-Origin-Embedder-Policy: require-corp" &

@@ -47,8 +47,15 @@ Design and ship a **startup-time GPU budget preselection routine** that reads `d
 - [x] Step 7a — synthesize architect result; user approved Mali pick `(taa=8, world=(6,2,6))`, design as-is. Context-doc fix: `taa_sample_accum` corrected (3 big bindings, not 4).
 - [x] Step 6c — checkpoint commit before impl (`ff5e89d`)
 - [x] Step 6d — impl dispatch (general-purpose Opus — Phases A-E landed; Phase F deferred — no tethered device; 187/187 lib tests green; APK built at `android/app/build/outputs/apk/debug/app-debug.apk`)
-- [ ] Step 7b — user on-device check (HARD GATE — install APK on Mali-G52 tablet, verify `[budget]` log line appears + device does not OOM-reboot)
-- [ ] Step 8 — exit when on-device check passes
+- [x] Step 7b — on-device check (deploy agent — installed APK + captured logcat — see `04-device-deploy.md`). **Partial:** device did NOT reboot (improvement); world budget half landed `(6,2,6)` correctly; TAA half landed at depth=16 instead of expected 8 → buffer 281 MiB > 256 MiB cap → Validation RenderError → clean app exit. `[budget]` log line never emitted (subscriber init order). 15 missing WGSL shader assets are a second independent failure.
+- [x] Step 7c — consolidated Research → Architect → Implement remediation (`delegate-consolidated` — see `05-consolidated-fix.md` + `06-logcat-post-fix.log`). All three brief items fixed: `[budget]` log line visible, bind-group validation cleared, 15 missing WGSL shaders packaged. Deploy agent's TAA-depth hypothesis was wrong — real culprit was `gi_gpu.invalid_samples` (pixel_count × 128 B), a binding the architect's design didn't enumerate.
+- [x] Step 8 — user-visible goal met: **Naadf world boots on Mali-G52 + renders at ~0.001 fps (slideshow)**. Device does not reboot. Verdict from consolidated dispatch: PARTIAL (renders but slow).
+
+## Follow-up scope (NOT part of this orchestration)
+
+- **Swap-chain texture timeouts (52 events / "Timeout" from the wgpu surface).** Bevy's render world can't acquire a surface image in <1 s on the Mali-G52 + GPU producer + 13-pass GI graph. GPU saturation, not budget / cap. Slideshow framerate (~0.001 fps) is the user-visible manifestation. Separate task.
+- **Architectural smell flagged by `delegate-consolidated`:** the architect's "mirror snapshot at plugin-build" pattern doesn't compose cleanly with post-build resource overrides. Works for `EffectiveWorldSize` by coincidence (the snapshot is dropped before the world is used); breaks for `invalid_sample_storage_count`. Future refactor candidate — see `05-consolidated-fix.md` side-notes.
+- **iPhone 16 Safari WebGPU.** The cap fix is shared (same 256 MiB ceiling). User wants to try the web build next. Miniserve now binds 0.0.0.0 so iOS Safari on the same LAN can reach the desktop's `dist/`.
 
 ## Verification surface (project rule — see `CLAUDE.md`)
 

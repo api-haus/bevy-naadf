@@ -458,6 +458,24 @@ pub fn extract_taa_config(
     }
 }
 
+/// `ExtractSchedule` system: mirror the main-world [`crate::render::budget::InvalidSampleStorageCount`]
+/// into the render-world [`crate::render::budget::RenderInvalidSampleStorageCount`].
+///
+/// Per the post-deploy fix (`docs/orchestrate/mobile-budget/05-consolidated-fix.md`
+/// Implementation log), the Android entry inserts `InvalidSampleStorageCount`
+/// AFTER `build_app_with_args` returns — so a plugin-build-time snapshot would
+/// see the defensive canonical seed (8), not the budget-selected mobile value
+/// (typically 4). Extract runs every frame from `ExtractSchedule`, so the first
+/// real frame (= when `prepare_gi` runs) sees the post-override budget value.
+pub fn extract_invalid_sample_storage_count(
+    mut mirror: ResMut<crate::render::budget::RenderInvalidSampleStorageCount>,
+    src: Extract<Option<Res<crate::render::budget::InvalidSampleStorageCount>>>,
+) {
+    if let Some(src) = &*src {
+        mirror.0 = src.0;
+    }
+}
+
 /// Render-world mirror of `AppArgs.gi` — the Phase-B GI pipeline settings
 /// (`09-design-b.md` §3.8 / §10.2). `AppArgs` is a main-world resource; the
 /// render-world `prepare_gi` system needs these to build `GpuGiParams`, and

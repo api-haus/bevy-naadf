@@ -48,7 +48,7 @@ use bevy::prelude::*;
 use bevy::window::WindowMode;
 use bevy::winit::WinitSettings;
 
-use crate::render::budget::{probe_and_select, EffectiveWorldSize};
+use crate::render::budget::{probe_and_select, EffectiveWorldSize, InvalidSampleStorageCount};
 use crate::{build_app_with_args, AppArgs, AppConfig};
 
 #[bevy_main]
@@ -80,6 +80,14 @@ fn main() {
     let mut app = build_app_with_args(cfg, args);
     app.insert_resource(EffectiveWorldSize::from_segments(
         caps.world_size_in_segments,
+    ));
+    // 2026-05-21 post-deploy lever — overrides the C# canonical
+    // `INVALID_SAMPLE_STORAGE_COUNT = 8` with the budget-selected mobile
+    // value (typically 4 at Mali-G52 + 1920×1200). The render-sub-app
+    // mirror (`RenderInvalidSampleStorageCount`) is created in
+    // `NaadfRenderPlugin::build` and reads this main-world resource.
+    app.insert_resource(InvalidSampleStorageCount(
+        caps.invalid_sample_storage_count,
     ));
 
     // 4. Mobile-specific window config — full-screen borderless on Android.

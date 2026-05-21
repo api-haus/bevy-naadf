@@ -89,6 +89,27 @@ pub const WORLD_SIZE_LADDER: &[UVec3] = &[
 /// first.
 pub const SELECTION_PIXEL_COUNT_REFERENCE: u64 = 3_000_000;
 
+/// `INVALID_SAMPLE_STORAGE_COUNT` ladder, descending. Picks the deepest unlit-
+/// sample ring whose `invalid_samples` binding (sized
+/// `pixel_count × storage_count × 16 B`) fits the headroom.
+///
+/// First rung MUST equal [`crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT`]
+/// (the C# canonical value at `WorldRenderBase.cs:161`
+/// `globalIllumInvalidSampleStorageCount`) so desktop pass-through is
+/// byte-identical to pre-budget behaviour.
+///
+/// This lever was added 2026-05-21 in the post-deploy consolidated fix
+/// (`docs/orchestrate/mobile-budget/05-consolidated-fix.md`) — the original
+/// `02-design.md` selection logic missed `invalid_samples` from the
+/// per-binding overrun check; on Mali-G52 + 1920×1200, the storage_count=8
+/// canonical value produces 281 MiB > 256 MiB cap, triggering bind-group
+/// validation errors at `naadf_global_illum_bind_group` binding 4 +
+/// `naadf_sample_refine_bind_group` binding 6.
+///
+/// Mobile selection at 3 MP reference + 192 MiB headroom: 8 → 384 MiB ✗,
+/// 4 → 192 MiB ✓ (exact), 2 → 96 MiB ✓. Lands on 4.
+pub const INVALID_SAMPLE_STORAGE_COUNT_LADDER: &[u32] = &[8, 4, 2];
+
 // ---------------------------------------------------------------------------
 // Resources
 // ---------------------------------------------------------------------------
@@ -158,25 +179,98 @@ impl Default for EffectiveWorldSize {
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct RenderEffectiveWorldSize(pub EffectiveWorldSize);
 
+/// Runtime override of [`crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT`]
+/// (the C# canonical `globalIllumInvalidSampleStorageCount = 8`).
+///
+/// Inserted by the budget routine (mobile path: 4 or 2) or defensively
+/// seeded to the canonical value 8 by [`crate::build_app_with_args`].
+/// `prepare_gi` reads this for the `invalid_samples` buffer size AND for
+/// the `GpuGiParams.invalid_sample_storage_count` uniform field; the WGSL
+/// shaders already read the value from the uniform
+/// (`gi_params.invalid_sample_storage_count` at `naadf_global_illum.wgsl
+/// :528`, `sample_refine.wgsl:267,615,665`) — no shader recompile when this
+/// value changes.
+///
+/// The C# const `INVALID_SAMPLE_STORAGE_COUNT = 8` stays intact at
+/// `gi.rs:54`; mobile divergence lives entirely in this resource. Same
+/// const-vs-resource pattern as [`EffectiveWorldSize`].
+///
+/// See `docs/orchestrate/mobile-budget/05-consolidated-fix.md` Design §1.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidSampleStorageCount(pub u32);
+
+impl InvalidSampleStorageCount {
+    pub const fn canonical() -> Self {
+        Self(crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT)
+    }
+}
+
+impl Default for InvalidSampleStorageCount {
+    fn default() -> Self {
+        Self::canonical()
+    }
+}
+
+/// Render-sub-app mirror of [`InvalidSampleStorageCount`].
+///
+/// **Plumbing — extract-driven, NOT plugin-build-snapshot** (2026-05-21
+/// post-deploy correction): the world-size + TAA mirrors are snapshotted at
+/// [`crate::render::NaadfRenderPlugin::build`] from the main-world resource
+/// AT THAT MOMENT. The Android entry's `build_app_with_args` → override-resource
+/// sequence happens AFTER plugin-build, so a snapshot-at-build mirror would
+/// see the defensive canonical seed (8), not the budget-selected mobile value
+/// (typically 4). The world-size mirror works around this because the install
+/// path reads the resource at runtime (`setup_test_grid` is a Startup system
+/// — runs after the override) and the GPU producer reads through the
+/// render-world `RenderEffectiveWorldSize` which IS snapshotted at build but
+/// the producer ALSO reads `extracted.size_in_chunks` which flows from the
+/// post-override `WorldData`.
+///
+/// For `invalid_samples`, `prepare_gi` reads the mirror directly — there is
+/// no `extract`-driven proxy in between. So this mirror is populated by an
+/// `ExtractSchedule` system ([`crate::render::extract::extract_invalid_sample_storage_count`])
+/// that copies the main-world value into the render world each frame. The
+/// first frame sees the post-override value (= the budget-selected 4 on
+/// mobile, the canonical 8 on desktop).
+///
+/// `Default` = canonical 8 so the resource is always present (used as the
+/// `init_resource` seed before the first extract).
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct RenderInvalidSampleStorageCount(pub u32);
+
+impl Default for RenderInvalidSampleStorageCount {
+    fn default() -> Self {
+        Self(crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Probe + select
 // ---------------------------------------------------------------------------
 
 /// The output of [`select_budget`] — the values the caller writes into
-/// [`crate::AppArgs`] + the [`EffectiveWorldSize`] resource before
-/// [`crate::build_app_with_args`] runs.
+/// [`crate::AppArgs`] + the [`EffectiveWorldSize`] / [`InvalidSampleStorageCount`]
+/// resources before [`crate::build_app_with_args`] runs.
 #[derive(Clone, Copy, Debug)]
 pub struct BudgetCaps {
     pub taa_ring_depth: u32,
     pub world_size_in_segments: UVec3,
+    /// Post-2026-05-21 added lever — the GI unlit-sample ring depth.
+    /// The bind groups `naadf_global_illum_bind_group` (binding 4) and
+    /// `naadf_sample_refine_bind_group` (binding 6) reference the
+    /// `gi_gpu.invalid_samples` buffer sized
+    /// `pixel_count × storage_count × 16 B`. Picked from
+    /// [`INVALID_SAMPLE_STORAGE_COUNT_LADDER`].
+    pub invalid_sample_storage_count: u32,
     /// The cap that drove the decision — for the startup log line.
     pub max_storage_buffer_binding_size: u64,
     /// The headroom factor applied — for the startup log line.
     pub headroom_factor: f32,
-    /// Estimated per-binding bytes for the chosen pair (post-selection sanity log).
+    /// Estimated per-binding bytes for the chosen tuple (post-selection sanity log).
     pub voxels_bytes: u64,
     pub blocks_bytes: u64,
     pub taa_samples_bytes: u64,
+    pub invalid_samples_bytes: u64,
 }
 
 /// Spin up a throwaway render app, read `RenderDevice::limits()`, drop it.
@@ -213,13 +307,19 @@ pub fn probe_limits() -> Option<wgpu::Limits> {
 /// Select a budget that fits inside `limits` with [`MOBILE_HEADROOM_FACTOR`]
 /// headroom. Pure function — no I/O, no Bevy types beyond `UVec3`. Unit-
 /// testable by feeding in synthetic [`wgpu::Limits`].
+///
+/// Loop nesting: **world (outer, descending) → TAA depth (descending) →
+/// invalid-sample-storage-count (descending)**. The first tuple where all
+/// per-binding sizes fit `headroom` wins.
+///
+/// Tiebreaker rationale: prefer bigger world (user can't grow it back), then
+/// deeper TAA (recoverable noise), then deeper unlit ring (recoverable noise
+/// in reservoir-resampled GI).
 pub fn select_budget(limits: &wgpu::Limits) -> BudgetCaps {
     let cap: u64 = limits.max_storage_buffer_binding_size;
     // f64 to avoid f32 precision loss on multi-GiB caps.
     let headroom = (cap as f64 * MOBILE_HEADROOM_FACTOR as f64) as u64;
 
-    // Outer iterates world (descending) — prefer bigger fly-around volume.
-    // Inner iterates TAA depth (descending) — prefer deeper temporal denoise.
     for &world in WORLD_SIZE_LADDER {
         let chunks_per_segment = crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4;
         let chunks = UVec3::new(
@@ -233,47 +333,60 @@ pub fn select_budget(limits: &wgpu::Limits) -> BudgetCaps {
         let blocks_bytes = chunk_count * 64 * 4;
         let chunks_bytes = chunk_count * 8;
 
-        // Voxels is the bottleneck — if it doesn't fit headroom, no TAA depth
-        // can rescue this world.
+        // Voxels is the bottleneck for the world buffers — if it doesn't fit
+        // headroom, no TAA / invalid-sample combo can rescue this world.
         if voxels_bytes > headroom || blocks_bytes > headroom || chunks_bytes > headroom {
             continue;
         }
 
         for &taa in TAA_RING_DEPTH_LADDER {
             let taa_bytes = SELECTION_PIXEL_COUNT_REFERENCE * (taa as u64) * 8;
-            if taa_bytes <= headroom {
-                return BudgetCaps {
-                    taa_ring_depth: taa,
-                    world_size_in_segments: world,
-                    max_storage_buffer_binding_size: cap,
-                    headroom_factor: MOBILE_HEADROOM_FACTOR,
-                    voxels_bytes,
-                    blocks_bytes,
-                    taa_samples_bytes: taa_bytes,
-                };
+            if taa_bytes > headroom {
+                continue;
+            }
+            for &inv in INVALID_SAMPLE_STORAGE_COUNT_LADDER {
+                // gi_gpu.invalid_samples sizing: pixel_count * storage_count * 16.
+                // (`crates/bevy_naadf/src/render/gi.rs:477-481`)
+                let inv_bytes = SELECTION_PIXEL_COUNT_REFERENCE * (inv as u64) * 16;
+                if inv_bytes <= headroom {
+                    return BudgetCaps {
+                        taa_ring_depth: taa,
+                        world_size_in_segments: world,
+                        invalid_sample_storage_count: inv,
+                        max_storage_buffer_binding_size: cap,
+                        headroom_factor: MOBILE_HEADROOM_FACTOR,
+                        voxels_bytes,
+                        blocks_bytes,
+                        taa_samples_bytes: taa_bytes,
+                        invalid_samples_bytes: inv_bytes,
+                    };
+                }
             }
         }
-        // taa=0 always fits (byte cost is 0); the inner loop never falls off
-        // this path in practice. Kept for ladder-extension safety.
     }
 
     // Pathological fallback: even the smallest world failed headroom. Return
-    // smallest + taa=0 so the downstream limits check at
-    // `prepare/world.rs:390-426` fires its existing error log; caller can
+    // smallest + taa=0 + smallest invalid-ring so the downstream limits check
+    // at `prepare/world.rs:390-426` fires its existing error log; caller can
     // observe the failure in logcat.
     let world = *WORLD_SIZE_LADDER.last().expect("WORLD_SIZE_LADDER non-empty");
     let chunks_per_segment = crate::WORLD_GEN_SEGMENT_SIZE_IN_GROUPS * 4;
     let chunk_count = (world.x * chunks_per_segment) as u64
         * (world.y * chunks_per_segment) as u64
         * (world.z * chunks_per_segment) as u64;
+    let smallest_inv = *INVALID_SAMPLE_STORAGE_COUNT_LADDER
+        .last()
+        .expect("INVALID_SAMPLE_STORAGE_COUNT_LADDER non-empty");
     BudgetCaps {
         taa_ring_depth: 0,
         world_size_in_segments: world,
+        invalid_sample_storage_count: smallest_inv,
         max_storage_buffer_binding_size: cap,
         headroom_factor: MOBILE_HEADROOM_FACTOR,
         voxels_bytes: chunk_count * 128 * 4,
         blocks_bytes: chunk_count * 64 * 4,
         taa_samples_bytes: 0,
+        invalid_samples_bytes: SELECTION_PIXEL_COUNT_REFERENCE * smallest_inv as u64 * 16,
     }
 }
 
@@ -282,6 +395,16 @@ pub fn select_budget(limits: &wgpu::Limits) -> BudgetCaps {
 /// (no adapter — e.g. headless CI), returns a canonical-shaped budget and
 /// warns; mobile will then OOM at the actual allocation, but the failure
 /// surface is visible in the log.
+///
+/// **Logging mechanism** — `eprintln!` (NOT `bevy::log::info!`). The probe
+/// app uses `MinimalPlugins`, which does NOT include `LogPlugin`. No
+/// `tracing` subscriber is installed during the probe lifetime, so
+/// `bevy::log::info!` events vanish into the no-op default subscriber and
+/// never reach logcat. `eprintln!` lands on stderr, which the Android
+/// `android-game-activity` harness pipes to logcat under the
+/// `RustStdoutStderr` tag (the same tag wgpu uses for its
+/// `AdapterInfo` line — see `docs/orchestrate/mobile-budget/05-consolidated-fix.md`
+/// Investigation §"Symptom 2" for the root-cause trace).
 pub fn probe_and_select() -> BudgetCaps {
     match probe_limits() {
         Some(limits) => {
@@ -290,18 +413,21 @@ pub fn probe_and_select() -> BudgetCaps {
             caps
         }
         None => {
-            bevy::log::warn!(
+            eprintln!(
                 "[budget] probe_limits returned None (no RenderDevice). \
                  Falling back to canonical desktop budget — mobile may OOM."
             );
             BudgetCaps {
                 taa_ring_depth: crate::DEFAULT_TAA_RING_DEPTH,
                 world_size_in_segments: crate::WORLD_SIZE_IN_SEGMENTS,
+                invalid_sample_storage_count:
+                    crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT,
                 max_storage_buffer_binding_size: 0,
                 headroom_factor: MOBILE_HEADROOM_FACTOR,
                 voxels_bytes: 0,
                 blocks_bytes: 0,
                 taa_samples_bytes: 0,
+                invalid_samples_bytes: 0,
             }
         }
     }
@@ -311,12 +437,14 @@ fn log_budget_decision(caps: &BudgetCaps, limits: &wgpu::Limits) {
     let ceiling_mib = (caps.max_storage_buffer_binding_size as f64
         * caps.headroom_factor as f64) as u64
         / (1024 * 1024);
-    bevy::log::info!(
+    eprintln!(
         "[budget] device cap max_storage_buffer_binding_size = {} MiB; \
-         headroom_factor = {:.2} → ceiling {} MiB. Selected: \
-         taa_ring_depth = {}, world_size_in_segments = ({}, {}, {}). \
-         Estimated binding sizes: voxels = {} MiB, blocks = {} MiB, \
-         taa_samples (@ {} MP reference) = {} MiB.",
+         headroom_factor = {:.2} -> ceiling {} MiB. Selected: \
+         taa_ring_depth = {}, world_size_in_segments = ({}, {}, {}), \
+         invalid_sample_storage_count = {}. \
+         Estimated binding sizes (@ {} MP reference): \
+         voxels = {} MiB, blocks = {} MiB, taa_samples = {} MiB, \
+         invalid_samples = {} MiB.",
         limits.max_storage_buffer_binding_size / (1024 * 1024),
         caps.headroom_factor,
         ceiling_mib,
@@ -324,10 +452,12 @@ fn log_budget_decision(caps: &BudgetCaps, limits: &wgpu::Limits) {
         caps.world_size_in_segments.x,
         caps.world_size_in_segments.y,
         caps.world_size_in_segments.z,
+        caps.invalid_sample_storage_count,
+        SELECTION_PIXEL_COUNT_REFERENCE / 1_000_000,
         caps.voxels_bytes / (1024 * 1024),
         caps.blocks_bytes / (1024 * 1024),
-        SELECTION_PIXEL_COUNT_REFERENCE / 1_000_000,
         caps.taa_samples_bytes / (1024 * 1024),
+        caps.invalid_samples_bytes / (1024 * 1024),
     );
 }
 
@@ -353,24 +483,32 @@ mod tests {
         let caps = select_budget(&l);
         assert_eq!(caps.taa_ring_depth, 32);
         assert_eq!(caps.world_size_in_segments, UVec3::new(16, 2, 16));
+        assert_eq!(
+            caps.invalid_sample_storage_count,
+            crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT
+        );
     }
 
     #[test]
     fn select_budget_mobile_256mib_picks_safe_combination() {
         let l = limits_with_cap(MIN_STORAGE_BINDING_CAP_BYTES);
         let caps = select_budget(&l);
-        // Mali-G52 selection arithmetic, per design §2:
+        // Mali-G52 selection arithmetic — post-2026-05-21 (3-lever):
         // cap=256 MiB → headroom=192 MiB.
-        // (16,2,16) voxels=1024 MiB ✗; (12,2,12)=576 ✗; (8,2,8)=256 ✗;
-        // (6,2,6)=144 ✓; inner: 32→768 ✗, 24→576 ✗, 16→384 ✗, 8→192 ✓ (==)
+        // Worlds (16,2,16) (12,2,12) (8,2,8) fail voxels-headroom.
+        // (6,2,6): voxels=144 MiB ≤ 192 ✓, blocks=72 MiB ✓, chunks=2.25 MiB ✓.
+        //   TAA: 32→768 ✗, 24→576 ✗, 16→384 ✗, 8→192 ✓.
+        //     Inv: 8→384 ✗, 4→192 ✓.
         assert_eq!(caps.world_size_in_segments, UVec3::new(6, 2, 6));
         assert_eq!(caps.taa_ring_depth, 8);
+        assert_eq!(caps.invalid_sample_storage_count, 4);
 
         let headroom = (MIN_STORAGE_BINDING_CAP_BYTES as f64
             * MOBILE_HEADROOM_FACTOR as f64) as u64;
         assert!(caps.voxels_bytes <= headroom);
         assert!(caps.blocks_bytes <= headroom);
         assert!(caps.taa_samples_bytes <= headroom);
+        assert!(caps.invalid_samples_bytes <= headroom);
     }
 
     #[test]
@@ -378,9 +516,13 @@ mod tests {
         // A device that reports 512 MiB (spec-legal, some Adreno reports this).
         // Headroom = 384 MiB. (16,2,16)=1024 ✗; (12,2,12)=576 ✗;
         // (8,2,8) voxels=256 ✓, blocks=128 ✓, chunks=2.25 MiB ✓.
+        //   TAA: 32→768 ✗, 24→576 ✗, 16→384 ✓ (exact).
+        //     Inv: 8→384 ✓ (exact).
         let l = limits_with_cap(512 * 1024 * 1024);
         let caps = select_budget(&l);
         assert_eq!(caps.world_size_in_segments, UVec3::new(8, 2, 8));
+        assert_eq!(caps.taa_ring_depth, 16);
+        assert_eq!(caps.invalid_sample_storage_count, 8);
     }
 
     #[test]
@@ -390,6 +532,28 @@ mod tests {
         let caps = select_budget(&l);
         assert_eq!(caps.world_size_in_segments, *WORLD_SIZE_LADDER.last().unwrap());
         assert_eq!(caps.taa_ring_depth, 0);
+        assert_eq!(
+            caps.invalid_sample_storage_count,
+            *INVALID_SAMPLE_STORAGE_COUNT_LADDER.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_sample_storage_count_ladder_first_rung_matches_canonical() {
+        // Guards against future ladder edits silently breaking desktop /
+        // C# faithful-port semantics.
+        assert_eq!(
+            INVALID_SAMPLE_STORAGE_COUNT_LADDER[0],
+            crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT
+        );
+    }
+
+    #[test]
+    fn invalid_sample_storage_count_default_is_canonical() {
+        assert_eq!(
+            InvalidSampleStorageCount::default(),
+            InvalidSampleStorageCount(crate::render::gi::INVALID_SAMPLE_STORAGE_COUNT)
+        );
     }
 
     #[test]

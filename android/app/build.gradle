@@ -37,55 +37,33 @@ android {
     }
     sourceSets {
         main {
-            // Bevy's `AssetPlugin.file_path = "src/assets"` (lib.rs:215) is
-            // honoured by Bevy's Android `AssetReader` as a sub-folder under
-            // the APK assets root. Mirror the desktop layout: copy the entire
-            // `crates/bevy_naadf/src/assets` tree into the APK's `assets/`
-            // dir so the on-device path becomes `assets/src/assets/...` and
-            // the existing relative paths in code (`shaders/...`,
-            // `fonts/...`) still resolve.
+            // Copy the entire `crates/bevy_naadf/src/assets` tree into the
+            // APK's `assets/` root. The on-device layout becomes:
+            //   assets/shaders/*.wgsl
+            //   assets/fonts/*.ttf
+            //
+            // **Why no `src/assets/` wrapper:** Bevy's Android `AssetReader`
+            // (`bevy_asset-0.19.0-rc.1/src/io/android.rs:18-30`) IGNORES the
+            // `AssetPlugin.file_path` config — it passes the raw asset path
+            // straight to `AssetManager.open(...)`. Only the desktop
+            // `FileAssetReader` prepends `file_path` (= "src/assets") to
+            // build `crates/bevy_naadf/src/assets/<asset>` on disk. So the
+            // APK needs assets at the bare `assets/<asset>` paths the Rust
+            // load calls already use (e.g. `asset_server.load("shaders/foo.wgsl")`
+            // resolves to APK `assets/shaders/foo.wgsl`).
+            //
+            // Pre-2026-05-21 we wrapped everything under `src/assets/` via a
+            // post-merge gradle rename to "honour" `file_path` — that
+            // explanation was wrong: AndroidAssetReader doesn't honour it.
+            // The wrap broke every shader load on-device. See
+            // `docs/orchestrate/mobile-budget/05-consolidated-fix.md`
+            // Investigation §"Symptom 3".
             //
             // Path is relative to this file (`android/app/build.gradle`):
             // `../..` = worktree root.
             assets {
                 srcDir '../../crates/bevy_naadf/src/assets'
-                // The Bevy AssetReader on Android prepends "src/assets" to
-                // every asset path (because `file_path` is "src/assets").
-                // We want the APK's `assets/src/assets/<...>` layout, so
-                // tell Gradle to wrap the source dir under that prefix
-                // using a separate `into('src/assets')` copy — done via
-                // android.applicationVariants below.
             }
-        }
-    }
-}
-
-// Wrap copied assets under the `src/assets/` prefix so Bevy's
-// `AssetPlugin.file_path = "src/assets"` resolves them on-device. Using the
-// merge-assets task lets us avoid splattering a second copy of the asset
-// tree into the worktree.
-android.applicationVariants.configureEach { variant ->
-    variant.mergeAssetsProvider.configure { task ->
-        task.doFirst {
-            def outDir = task.outputDir.get().asFile
-            // The default sourceSet copies `crates/bevy_naadf/src/assets/*`
-            // straight to `outDir/*`. We want them at `outDir/src/assets/*`.
-            // Move them after Gradle's normal merge.
-        }
-        task.doLast {
-            def outDir = task.outputDir.get().asFile
-            def nested = new File(outDir, 'src/assets')
-            if (nested.exists()) return
-            nested.parentFile.mkdirs()
-            def tmp = new File(outDir.parentFile, "merged_assets_tmp_${variant.name}")
-            if (tmp.exists()) { tmp.deleteDir() }
-            outDir.renameTo(tmp)
-            outDir.mkdirs()
-            new File(outDir, 'src/assets').mkdirs()
-            tmp.eachFile { f ->
-                f.renameTo(new File(outDir, "src/assets/${f.name}"))
-            }
-            tmp.deleteDir()
         }
     }
 }

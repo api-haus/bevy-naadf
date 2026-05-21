@@ -47,7 +47,8 @@ use bevy::render::{
 
 use atmosphere::prepare_atmosphere;
 use extract::{
-    extract_camera, extract_camera_history, extract_gi_config, extract_taa_config,
+    extract_camera, extract_camera_history, extract_gi_config,
+    extract_invalid_sample_storage_count, extract_taa_config,
     stage_model_data_buildonce, stage_world_gpu_buildonce, ExtractedCameraData,
     ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
 };
@@ -140,6 +141,17 @@ impl Plugin for NaadfRenderPlugin {
             .insert_resource(crate::render::budget::RenderEffectiveWorldSize(
                 effective_world,
             ))
+            // `RenderInvalidSampleStorageCount` is `init_resource`d — its
+            // `Default` is the C# canonical 8. The real value is copied from
+            // the main-world `InvalidSampleStorageCount` each frame by
+            // `extract_invalid_sample_storage_count` (registered below in
+            // ExtractSchedule). This extract-driven path is what lets the
+            // Android entry's post-`build_app_with_args` override
+            // (`app.insert_resource(InvalidSampleStorageCount(4))`) actually
+            // reach `prepare_gi` — a build-time snapshot would see only the
+            // defensive canonical seed (8). See doc on the mirror struct in
+            // `budget.rs`.
+            .init_resource::<crate::render::budget::RenderInvalidSampleStorageCount>()
             // `02f` rearch: no `ExtractedWorld` resource. The build-once
             // hand-off goes through `WorldGpuStaging` (transient, dropped
             // after `prepare_world_gpu` consumes it) + `WorldDataMeta`
@@ -182,6 +194,11 @@ impl Plugin for NaadfRenderPlugin {
                     extract_camera_history,
                     extract_taa_config,
                     extract_gi_config,
+                    // 2026-05-21 mobile-budget post-deploy fix — copy the
+                    // post-`build_app_with_args`-override main-world value
+                    // into the render-world mirror (see docstring on
+                    // `RenderInvalidSampleStorageCount` in `budget.rs`).
+                    extract_invalid_sample_storage_count,
                 ),
             )
             // Prepare: create + upload GPU resources, build bind groups,

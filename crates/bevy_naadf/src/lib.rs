@@ -203,6 +203,17 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     if !app.world().contains_resource::<crate::render::budget::EffectiveWorldSize>() {
         app.insert_resource(crate::render::budget::EffectiveWorldSize::canonical());
     }
+    // Post-2026-05-21 — the unlit-sample ring is the third per-pixel-scaled
+    // mobile budget lever (`docs/orchestrate/mobile-budget/05-consolidated-fix.md`
+    // Design §1). Defensive seed of the canonical 8 keeps every existing
+    // caller byte-identical; the Android entry overrides post-build with the
+    // budget-selected value (typically 4 on mobile).
+    if !app
+        .world()
+        .contains_resource::<crate::render::budget::InvalidSampleStorageCount>()
+    {
+        app.insert_resource(crate::render::budget::InvalidSampleStorageCount::canonical());
+    }
 
     app
         .add_plugins(
