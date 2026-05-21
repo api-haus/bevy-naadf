@@ -106,7 +106,7 @@ pub enum GridPreset {
 /// `WorldRenderBase` ImGui sliders (`SettingDataRenderBase`) become these
 /// `AppArgs` constants — there is no GI settings GUI in the port (§1). The
 /// values are the C# slider *defaults*.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GiSettings {
     /// Max secondary-ray bounce count (C# `bounceCount`).
     pub bounce_count: u32,
@@ -183,6 +183,35 @@ pub struct GiSettings {
     /// indirect-bounce noise (`19-gi-reservoir-scope.md` §3.3). Uploaded into
     /// `GpuGiParams.spatial_iter_count`.
     pub spatial_iter_count: u32,
+}
+
+impl GiSettings {
+    /// Canonical defaults — single source of truth for the C# slider defaults
+    /// (`WorldRenderBase.cs:14-25`) + the 5 promoted ray-step caps +
+    /// `spatial_iter_count`. Consumed by `Default for GiSettings`, D2's
+    /// `settings::KNOBS` table `default:` fields, and D4's GPU-params
+    /// `From<&AppArgs>` conversion.
+    pub const DEFAULTS: GiSettings = GiSettings {
+        bounce_count: 3,
+        global_illum_max_accum: 128,
+        spatial_resample_size: 500.0,
+        spatial_visibility_count: 80,
+        denoise_thresh: 400.0,
+        radius_lit_factor: 3.0,
+        noise_suppression_factor: 0.4,
+        skip_samples: true,
+        is_denoise: true,
+        is_sample_leveling: true,
+        is_varying_resampling_radius: true,
+        is_atmosphere_interaction: true,
+        sun_shadow_taps: 1,
+        max_ray_steps_primary: 120,
+        max_ray_steps_secondary: 100,
+        max_ray_steps_sun: 120,
+        max_ray_steps_sun_secondary: 80,
+        max_ray_steps_visibility: 60,
+        spatial_iter_count: 12,
+    };
 }
 
 impl Default for GiSettings {
