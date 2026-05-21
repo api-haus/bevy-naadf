@@ -48,7 +48,7 @@ use bevy::prelude::*;
 use bevy::window::WindowMode;
 use bevy::winit::WinitSettings;
 
-use crate::{build_app_with_budget, AppArgs, AppConfig, GridPreset};
+use crate::{build_app_with_budget, AppConfig, GridPreset};
 
 #[bevy_main]
 fn main() {
@@ -60,12 +60,12 @@ fn main() {
     // On Galaxy Tab A8 / Mali-G52 this picks `taa_ring_depth=8,
     // world_size_in_segments=(6,2,6), invalid_sample_storage_count=4` and emits
     // the `[budget] …` line to logcat (visible via `adb logcat | grep budget`).
-    // Step 5 of the config-as-resource refactor — `grid_preset` migrated off
-    // `AppArgs` onto its own per-domain resource. Android has no CLI surface
-    // (no `--vox` flag), so always boots into the default test grid.
+    // Step 5 of the config-as-resource refactor — `grid_preset` is a
+    // per-domain resource. Android has no CLI surface (no `--vox` flag), so
+    // always boots into the default test grid. Step 9 removed the last
+    // `AppArgs` reference — `build_app_with_budget` takes only the grid preset.
     let mut app = build_app_with_budget(
         AppConfig::windowed(),
-        AppArgs::default(),
         GridPreset::default(),
     );
 

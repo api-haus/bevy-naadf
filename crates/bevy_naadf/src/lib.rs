@@ -13,7 +13,6 @@
 pub mod aadf;
 #[cfg(target_os = "android")]
 pub mod android_main;
-pub mod app_args;
 pub mod app_config;
 pub mod app_mode;
 pub mod bootstrap;
@@ -30,7 +29,6 @@ pub mod window_config;
 pub mod world;
 pub mod world_size;
 
-pub use app_args::AppArgs;
 pub use app_config::AppConfig;
 pub use dev_font::{load_dev_font, DevFont};
 pub use settings::canonical::GiSettings;
@@ -56,8 +54,9 @@ use bevy::anti_alias::dlss::DlssProjectId;
 /// Track A (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`)
 /// added the [`GridPreset::Vox`] variant — a MagicaVoxel `.vox` file path read
 /// synchronously at `Startup` via [`voxel::vox_import::load_vox`]. `PathBuf` is
-/// not `Copy`, so this enum is now `Clone` only (the
-/// [`AppArgs`] / [`build_app_with_args`] surfaces propagate the move).
+/// not `Copy`, so this enum is `Clone` only; it is its own per-domain
+/// [`Resource`] inserted at bootstrap by the
+/// [`crate::bootstrap::BootstrapInputs`] fan-out.
 ///
 /// **vox-gpu-rewrite Stage 2 consolidation (2026-05-18):** both variants now
 /// always route through the C#-faithful fixed-world install path
@@ -135,7 +134,7 @@ pub const DEFAULT_TAA_RING_DEPTH: u32 = 32;
 /// window) in *both* configs; `AppConfig` only flips the four deliberate e2e
 /// deltas (`e2e-render-test.md` §2.2). Caller runs `.run()` on the result.
 pub fn build_app(cfg: AppConfig) -> App {
-    build_app_with_args(cfg, AppArgs::default())
+    build_app_core(cfg)
 }
 
 /// Build the bevy-naadf `App` with **GPU budget preselection** applied.
@@ -143,13 +142,12 @@ pub fn build_app(cfg: AppConfig) -> App {
 /// Runs the mobile GPU budget probe ([`crate::render::budget::probe_and_select`])
 /// BEFORE building the App, writes the chosen rung into a
 /// [`crate::bootstrap::BootstrapInputs`] (Step 2 of the config-as-resource
-/// refactor — the migrated field is `taa_ring_depth: TaaRingConfig`; legacy
-/// fields still on `AppArgs` ride along through `inputs.args`), then inserts
-/// the budget-selected [`render::budget::EffectiveWorldSize`] +
+/// refactor — the migrated field is `taa_ring_depth: TaaRingConfig`), then
+/// inserts the budget-selected [`render::budget::EffectiveWorldSize`] +
 /// [`render::budget::InvalidSampleStorageCount`] resources, overriding the
-/// defensive canonical seeds inside [`build_app_with_args`]. On desktop with a
+/// defensive canonical seeds inside [`build_app_core`]. On desktop with a
 /// generous storage-buffer cap (≥ 1.35 GiB) the budget picks canonical
-/// defaults — output is byte-identical to [`build_app_with_args`]. On mobile
+/// defaults — output is byte-identical to [`build_app`]. On mobile
 /// targets (256 MiB cap — Android Mali / iOS Safari WebGPU) the routine picks
 /// the deepest world + TAA + invalid-samples rungs that fit `cap × 75%`.
 ///
@@ -158,13 +156,9 @@ pub fn build_app(cfg: AppConfig) -> App {
 ///   * Android JNI entry — `src/android_main.rs::android_main()` → this →
 ///     [`bevy::winit::WinitSettings::mobile`] → `.run()`.
 ///
-/// The e2e_render binary intentionally skips this and uses
-/// [`build_app_with_args`] directly — e2e gates need canonical world / TAA
-/// for deterministic SSIM comparisons across runs and across machines.
-pub fn build_app_with_budget(cfg: AppConfig, args: AppArgs, grid_preset: GridPreset) -> App {
-    // `AppArgs` is a zero-field shell after Step 7 of the config-as-resource
-    // refactor — kept only so this signature stays stable; Step 9 drops it.
-    let _ = args;
+/// The e2e_render binary intentionally skips this — e2e gates need canonical
+/// world / TAA for deterministic SSIM comparisons across runs and machines.
+pub fn build_app_with_budget(cfg: AppConfig, grid_preset: GridPreset) -> App {
     let caps = crate::render::budget::probe_and_select();
     let inputs = crate::bootstrap::BootstrapInputs {
         grid_preset,
@@ -183,13 +177,18 @@ pub fn build_app_with_budget(cfg: AppConfig, args: AppArgs, grid_preset: GridPre
     app
 }
 
-/// Build the bevy-naadf `App` with a caller-supplied [`AppArgs`].
+/// Core App-wiring path — the shared plugin pyramid + the defensive
+/// per-domain resource seeds.
 ///
-/// Phase-C wave-3 — added to let the e2e binary toggle `--entities`-driven
-/// state (`entities_enabled = true` + `spawn_test_entity = true`) without
-/// having to mutate the global `AppArgs::default()`. Callers that don't need
-/// to override args use [`build_app`] (which forwards to this with the default).
-pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
+/// Step 9 of the config-as-resource refactor renamed this from
+/// `build_app_with_args` and dropped its `AppArgs` parameter — the
+/// `AppArgs` god-resource is fully decomposed into per-domain resources,
+/// so there is no `args` state left to thread through. The bootstrap
+/// fan-out ([`crate::bootstrap::build_app_with_bootstrap_inputs`]) calls
+/// this, then `insert_resource`-overwrites the defensive seeds with the
+/// caller's `BootstrapInputs` values; the direct [`build_app`] path
+/// (`run_e2e_render`) leaves the seeds at their canonical defaults.
+pub fn build_app_core(cfg: AppConfig) -> App {
 
     let mut app = App::new();
 
@@ -227,12 +226,11 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         primary_window.prevent_default_event_handling = true;
     }
 
-    // The `AppArgs` resource is inserted (down to its single residual
-    // `vox_e2e_mode` field after Step 6 — Step 7 drains it, Step 9 deletes
-    // the shell). `AppConfig` is also inserted so plugins can `.run_if` on
-    // its fields (e.g. `DiagnosticsPlugin` self-skips under e2e).
+    // `AppConfig` is inserted so plugins can `.run_if` on its fields
+    // (e.g. `DiagnosticsPlugin` self-skips under e2e). The old `AppArgs`
+    // god-resource is gone — Step 9 of the config-as-resource refactor
+    // decomposed it fully into the per-domain resources seeded below.
     app.insert_resource(cfg)
-        .insert_resource(args.clone())
         // The 128-deep camera-history ring + the monotonic frame counter
         // (`06-design-a2.md` §2.3). Main-world resource, `Default`-seeded,
         // updated each frame by `update_camera_history`.

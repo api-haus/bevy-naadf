@@ -16,10 +16,10 @@
 //! Both keyboard navigation and mouse drag-sliders are live concurrently,
 //! mutating the per-domain [`GiSettings`] resource. **Step 3 of the
 //! config-as-resource refactor** swung this off `ResMut<AppArgs>` (mutating
-//! `args.gi`) onto `ResMut<GiSettings>`. The `KnobKind::Readonly` variant
-//! that read `&AppArgs` is now joined by a `ReadonlyFromGi` typed sibling
-//! (Decision §7 of `02-design.md`) carrying the `global_illum_max_accum`
-//! readonly row off `AppArgs` onto `GiSettings`.
+//! `args.gi`) onto `ResMut<GiSettings>`. **Step 9** deleted `AppArgs`
+//! entirely: the readonly rows split into `KnobKind::Readonly` (a pure
+//! function of compile-time constants), `ReadonlyFromTaa` (reads
+//! `TaaRingConfig`), and `ReadonlyFromGi` (reads `GiSettings`).
 
 pub mod canonical;
 
@@ -43,7 +43,7 @@ use crate::render::gi::{
     VALID_SAMPLE_STORAGE_COUNT,
 };
 use crate::render::taa::{TaaRingConfig, CAMERA_HISTORY_DEPTH};
-use crate::{AppArgs, DevFont};
+use crate::DevFont;
 
 /// Drag-detection threshold in physical pixels.
 const DRAG_THRESHOLD_PX: f32 = 2.0;
@@ -140,15 +140,18 @@ enum KnobKind {
         setter: fn(&mut GiSettings, bool),
         default: bool,
     },
+    /// Read-only diagnostic row whose displayed value is a pure function of
+    /// compile-time constants — the closure takes no argument. Step 9 of the
+    /// config-as-resource refactor dropped the closure's old `&AppArgs`
+    /// parameter when `AppArgs` was deleted: the five rows using this variant
+    /// (`camera_history_depth`, the four `*_storage` counts) always read
+    /// `const`s and ignored the arg. Rows whose value comes from a per-domain
+    /// resource use the `ReadonlyFrom*` siblings below.
     Readonly {
-        value: fn(&AppArgs) -> String,
+        value: fn() -> String,
     },
-    /// Step 2 of the config-as-resource refactor (Decision §7 partial split):
-    /// readonly row whose source is the per-domain
-    /// [`crate::render::taa::TaaRingConfig`] resource rather than `AppArgs`.
-    /// As subsequent steps migrate fields off `AppArgs`, this variant family
-    /// grows; Step 9 deletes the legacy `KnobKind::Readonly` arm once
-    /// `AppArgs` is gone.
+    /// Step 2 of the config-as-resource refactor: readonly row whose source
+    /// is the per-domain [`crate::render::taa::TaaRingConfig`] resource.
     ReadonlyFromTaa {
         value: fn(&TaaRingConfig) -> String,
     },
@@ -239,7 +242,7 @@ macro_rules! knob_bool {
 }
 
 /// Read-only diagnostic row — the closure formats the displayed value from
-/// `&AppArgs`.
+/// compile-time constants (it takes no argument).
 macro_rules! knob_readonly {
     ($label:literal, $expr:expr) => {
         Knob { label: $label, kind: KnobKind::Readonly { value: $expr } }
@@ -299,11 +302,11 @@ const KNOBS: &[Knob] = &[
 
     knob_section!("DIAGNOSTICS (read-only)"),
     knob_readonly_taa!("  taa_ring_depth",     |t| format!("{} [restart-required]", t.depth)),
-    knob_readonly!("  camera_history_depth",   |_| format!("{} [const]", CAMERA_HISTORY_DEPTH)),
-    knob_readonly!("  valid_sample_storage",   |_| format!("{} [storage-tied]", VALID_SAMPLE_STORAGE_COUNT)),
-    knob_readonly!("  invalid_sample_storage", |_| format!("{} [storage-tied]", INVALID_SAMPLE_STORAGE_COUNT)),
-    knob_readonly!("  bucket_storage",         |_| format!("{} [storage-tied]", BUCKET_STORAGE_COUNT)),
-    knob_readonly!("  refined_bucket",         |_| format!("{} [storage-tied]", REFINED_BUCKET_STORAGE_COUNT)),
+    knob_readonly!("  camera_history_depth",   || format!("{} [const]", CAMERA_HISTORY_DEPTH)),
+    knob_readonly!("  valid_sample_storage",   || format!("{} [storage-tied]", VALID_SAMPLE_STORAGE_COUNT)),
+    knob_readonly!("  invalid_sample_storage", || format!("{} [storage-tied]", INVALID_SAMPLE_STORAGE_COUNT)),
+    knob_readonly!("  bucket_storage",         || format!("{} [storage-tied]", BUCKET_STORAGE_COUNT)),
+    knob_readonly!("  refined_bucket",         || format!("{} [storage-tied]", REFINED_BUCKET_STORAGE_COUNT)),
     knob_readonly_gi!("  global_illum_max_accum", |g| format!("{} [const]", g.global_illum_max_accum)),
 
     knob_action!("> RESET ALL TO DEFAULTS <", reset_all_knobs),
@@ -689,13 +692,12 @@ fn handle_click_release(gi: &mut GiSettings, knob_index: usize) {
 /// Gated by `.run_if(in_state(AppMode::Settings))`.
 ///
 /// Step 3 of the config-as-resource refactor: gained `gi: Res<GiSettings>` (the
-/// interactive U32/F32/Bool rows + the new `ReadonlyFromGi` row read it
-/// directly). The legacy `Res<AppArgs>` parameter stays only for the existing
-/// `KnobKind::Readonly { fn(&AppArgs) -> String }` rows that pass `|_| const`
-/// closures — Step 9 deletes both the variant and the parameter.
+/// interactive U32/F32/Bool rows + the `ReadonlyFromGi` row read it directly).
+/// Step 9 dropped the old `Res<AppArgs>` parameter — `AppArgs` is deleted, and
+/// the `KnobKind::Readonly` rows it used to feed now read compile-time
+/// constants through an argument-free closure.
 pub fn update_settings_text(
     state: Res<SettingsState>,
-    args: Res<AppArgs>,
     gi: Res<GiSettings>,
     taa_ring: Res<TaaRingConfig>,
     mut row_texts: Query<(&SettingsRowText, &mut Text, &mut TextColor)>,
@@ -727,7 +729,7 @@ pub fn update_settings_text(
                 *text_color = TextColor(if i == state.cursor { FG_VALUE_SELECTED } else { FG_PRIMARY });
             }
             KnobKind::Readonly { value } => {
-                let _ = write!(s, "{}{:<24} {}", marker, row.label, value(&args));
+                let _ = write!(s, "{}{:<24} {}", marker, row.label, value());
                 *text_color = TextColor(FG_READONLY);
             }
             KnobKind::ReadonlyFromTaa { value } => {

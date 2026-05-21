@@ -1395,3 +1395,190 @@ alongside — `AppArgs` has nothing left to read).
   driver reads it exactly once, in `run_assertions`, with zero
   state-machine involvement. Splitting it off `E2eGateMode` was the
   right call.
+
+## Step 9 — Delete the emptied AppArgs shell (2026-05-21)
+
+### What landed
+
+The migration's final step: `crates/bevy_naadf/src/app_args.rs` deleted,
+`pub mod app_args;` + `pub use app_args::AppArgs;` removed from `lib.rs`,
+and every remaining `AppArgs` type/parameter reference across the
+workspace resolved. `cargo build --workspace` PASSING is the load-bearing
+proof that no `AppArgs` reference survives — and it does.
+
+The Step 9 design spec said "1 file deleted, 1-2 imports removed, ~10
+LOC". Reality was larger: `AppArgs` was still threaded as a (zero-field,
+inert) parameter through `build_app_with_args`, `build_app_with_budget`,
+`main.rs`, `android_main.rs`, and `settings/mod.rs`. None of these
+reads carried state after Step 7, but the type still appeared in five
+signatures + a `KnobKind` closure type. All resolved — see the straggler
+table in the side-notes.
+
+- **`crates/bevy_naadf/src/app_args.rs`** — DELETED (`git rm`).
+- **`crates/bevy_naadf/src/lib.rs`** — removed `pub mod app_args;` and
+  `pub use app_args::AppArgs;`. `build_app_with_args(cfg, args)` renamed
+  to `build_app_core(cfg)` — the `AppArgs` parameter dropped and the
+  `app.insert_resource(args.clone())` line removed (the god-resource is
+  fully decomposed; nothing inserts it any more). `build_app` now calls
+  `build_app_core(cfg)`. `build_app_with_budget` dropped its `args:
+  AppArgs` parameter (now `(cfg, grid_preset)`). Two broken intra-doc
+  links (`[AppArgs]` / `[build_app_with_args]` on the `GridPreset` doc;
+  the stale `build_app_with_args` rustdoc first line) fixed.
+- **`crates/bevy_naadf/src/bootstrap.rs`** — dropped the `use crate::AppArgs`
+  import; `build_app_with_bootstrap_inputs` calls `build_app_core(cfg)`
+  instead of `build_app_with_args(cfg, AppArgs::default())`. Module
+  docstring updated to "migration complete" framing (the stale
+  `[`AppArgs`]` intra-doc link removed).
+- **`crates/bevy_naadf/src/main.rs`** — dropped the `AppArgs` import, the
+  `let args = AppArgs::default()` line, and the `args` argument to
+  `build_app_with_budget` (native) / the `args` field on the wasm32
+  `BootstrapInputs` literal.
+- **`crates/bevy_naadf/src/android_main.rs`** — dropped the `AppArgs`
+  import and the `AppArgs::default()` argument to `build_app_with_budget`.
+- **`crates/bevy_naadf/src/settings/mod.rs`** — `KnobKind::Readonly`'s
+  closure type changed `fn(&AppArgs) -> String` → `fn() -> String`. The
+  five rows using it (`camera_history_depth`, the four `*_storage`
+  counts) already passed `|_| const` closures that ignored the arg —
+  changed to `|| const`. `update_settings_text` dropped its
+  `args: Res<AppArgs>` parameter; the `KnobKind::Readonly` match arm
+  calls `value()` instead of `value(&args)`. `use crate::AppArgs` import
+  dropped (now `use crate::DevFont`). Module + variant docstrings updated.
+
+### Files touched
+
+| File | Change kind |
+|---|---|
+| `crates/bevy_naadf/src/app_args.rs` | DELETED |
+| `crates/bevy_naadf/src/lib.rs` | Drop `mod`/`pub use`; `build_app_with_args` → `build_app_core` (no `AppArgs` param); `build_app_with_budget` drops `args`; doc-link fixups |
+| `crates/bevy_naadf/src/bootstrap.rs` | Drop `AppArgs` import; call `build_app_core`; module-doc "migration complete" |
+| `crates/bevy_naadf/src/main.rs` | Drop `AppArgs` import + `let args` + the `args` argument/field |
+| `crates/bevy_naadf/src/android_main.rs` | Drop `AppArgs` import + the `AppArgs::default()` argument |
+| `crates/bevy_naadf/src/settings/mod.rs` | `KnobKind::Readonly` closure `fn(&AppArgs)` → `fn()`; drop `args` param; import + docstrings |
+
+### Decisions made during impl
+
+1. **`build_app_with_args` renamed to `build_app_core`, kept as a
+   function.** The Step 9 design + the Step 6 side-note suggested
+   "consider folding it into `build_app_with_bootstrap_inputs`". It is
+   *not* folded — it is the shared plugin-pyramid + defensive-seed wiring
+   that BOTH the bootstrap fan-out and the direct `build_app` path
+   (`run_e2e_render`) call. Folding it into the fan-out would force
+   `run_e2e_render`'s direct `build_app(AppConfig::e2e())` path to also
+   route through `BootstrapInputs`, which is a larger entry-point
+   reshape outside Step 9's scope. The rename + parameter drop is the
+   minimal correct change; the function's role (shared core wiring) is
+   unchanged.
+2. **`KnobKind::Readonly` kept (closure made argument-free), not
+   deleted.** The design's `02-design.md` §3.5 / Decision §7 partial
+   split anticipated `KnobKind::Readonly` being deleted once `AppArgs`
+   is gone, with `ReadonlyFromTaa` / `ReadonlyFromGi` covering the
+   resource-backed rows. But five readonly rows read pure compile-time
+   `const`s (`CAMERA_HISTORY_DEPTH`, the four storage counts) — they
+   never read `AppArgs`, they ignored the arg. There is no per-domain
+   resource for those rows to read; they are not config, they are
+   constants. So `KnobKind::Readonly` survives, with its closure changed
+   to take no argument. Deleting it would have required inventing a
+   resource that does not exist. The variant now has a clear, honest
+   meaning: "readonly row whose value is a pure function of build
+   constants".
+3. **Historical narrative comments left intact.** Many `//` comments and
+   `///` docstrings across the crate say "migrated off `AppArgs`" /
+   "was `AppArgs.<field>`" — accurate descriptions of the refactor's
+   history. They are not broken intra-doc links (plain text inside
+   comments) and are correct as historical record. Only the two genuine
+   broken intra-doc links (`[`AppArgs`]` in rustdoc) were fixed.
+
+### Verification
+
+- `cargo build --workspace`: PASS (clean — no errors, no warnings). This
+  is the load-bearing proof: with `app_args.rs` deleted and `pub use
+  app_args::AppArgs` removed, any surviving `AppArgs` reference is a hard
+  compile error. The build is green ⇒ zero references survive.
+- `cargo test --workspace --lib`: PASS (192 passed; 0 failed; 1 ignored).
+- **Full e2e gate sweep — all 15 gates PASS (exit 0):**
+  - `baseline` — batch-6 region gate green; 100% non-black.
+  - `--vox-e2e` — boot dispatch gate mode Standard; batch-6 gate green.
+  - `--oasis-edit-visual` — exit 0.
+  - `--small-edit-visual` — exit 0.
+  - `--small-edit-repro` — exit 0.
+  - `--vox-gpu-construction` — rect per-pixel RGB Δ=87.80 over floor 8.00.
+  - `--vox-gpu-oracle-cpu` — `oracle_cpu.png` written; exit 0.
+  - `--vox-gpu-oracle-gpu` — `oracle_gpu.png` written; exit 0.
+  - `--vox-gpu-oracle` (compare) — SSIM 0.8842 over threshold 0.850.
+  - `--vox-horizon-native` — exit 0.
+  - `--vox-web-parity-skybox` — exit 0.
+  - `--vox-web-parity-loaded` — exit 0.
+  - `--vox-web-parity` (compare) — SSIM 0.0180 under dissimilar threshold.
+  - `--entities` — `spawned fixture entity: 4×4×4 green-emissive` line
+    present; batch-6 PASS; entity-handler validation PASS.
+  - `--resize-test` — RAN (`HYPRLAND_INSTANCE_SIGNATURE` set); both
+    post-resize luma ratios above the 0.7 threshold; PASS.
+
+### Side notes / observations / complaints
+
+- **The Step 9 design spec under-counted the scope.** It said "1 file
+  deleted, 1-2 imports removed, ~10 LOC" and assumed Steps 2-8 had
+  drained every `AppArgs` reference. They had not — `AppArgs` (even
+  zero-field after Step 7) was still a parameter type on five
+  signatures + a `KnobKind` closure type. None carried state, so the
+  removal was mechanical, but it touched six files, not one. This is
+  exactly the kind of straggler the brief anticipated ("the build will
+  surface any straggler"); the build did, and every straggler was
+  trivially removable as the brief predicted (the references were
+  inert — `AppArgs` had no fields and no behaviour).
+
+  Straggler table — every `AppArgs` reference that survived Steps 2-8
+  and how Step 9 removed it:
+
+  | Site | Pre-Step-9 shape | Resolution |
+  |---|---|---|
+  | `lib.rs::build_app_with_args` | `fn(cfg, args: AppArgs)` + `insert_resource(args.clone())` | renamed `build_app_core(cfg)`; param + insert dropped |
+  | `lib.rs::build_app` | `build_app_with_args(cfg, AppArgs::default())` | calls `build_app_core(cfg)` |
+  | `lib.rs::build_app_with_budget` | `fn(cfg, args: AppArgs, grid_preset)` | param dropped — `fn(cfg, grid_preset)` |
+  | `bootstrap.rs` | `build_app_with_args(cfg, AppArgs::default())` | calls `build_app_core(cfg)` |
+  | `main.rs` | `AppArgs::default()` local + arg/field | local + arg/field dropped |
+  | `android_main.rs` | `AppArgs::default()` arg | arg dropped |
+  | `settings/mod.rs::KnobKind::Readonly` | `value: fn(&AppArgs) -> String` | closure → `fn() -> String` |
+  | `settings/mod.rs::update_settings_text` | `args: Res<AppArgs>` param | param dropped |
+
+- **The `E2eDriverConfig` struct no longer holds an `app_args` field**
+  — Step 7 already replaced it with `vox_e2e_assertion`. The Step 6
+  side-note's "Step 9 will drop `app_args` from the struct" was satisfied
+  one step early, in Step 7, because `AppArgs` was empty by then and
+  there was nothing for an `app_args` field to read.
+
+- **Foundation observation: the refactor satisfies the user's principle
+  cleanly.** The user's stated principle was: "args insert resources,
+  app consumes resources … any application code outside of bootstrap
+  domain must not read the configuration conceptualising anything as
+  'args'". Post-Step-9 there is no `args` type anywhere — the concept is
+  gone. Every former `AppArgs` field is its own per-domain `Resource`
+  (`GridPreset`, `TaaConfig`, `TaaRingConfig`, `GiSettings`,
+  `ConstructionConfig`, `SpawnTestEntity`, `E2eGateMode`,
+  `VoxE2eAssertion`), inserted at bootstrap by the `BootstrapInputs`
+  fan-out, and read at runtime via `Res<T>` / `ResMut<T>`. The
+  `BootstrapInputs` carrier is transient — constructed by the per-binary
+  entry point, consumed once by the fan-out, dropped — exactly the
+  "bootstrap-domain-only" shape the principle calls for. The user's
+  named smell (`args.taa_ring_depth` not being a resource) is fully
+  resolved: it is `TaaRingConfig` now.
+
+- **Subjective reaction on the finished state.** Nine incremental steps,
+  every one with green deterministic gates, every one bisectable. The
+  god-resource is gone and nothing about the runtime behaviour changed —
+  every e2e gate (including the SSIM-compare gates that would catch any
+  pose/window/install-path drift) passed byte-identically. This is what
+  an incremental refactor is supposed to look like. The one design-spec
+  miss (Step 9 scope under-count) was caught by the build exactly as the
+  brief said it would be, and cost nothing — the stragglers were inert.
+  The completed shape is genuinely better: a reader looking for "what is
+  TAA's ring depth" now finds `TaaRingConfig`, not a field buried in a
+  16-field god-struct named after a CLI parser.
+
+### Migration complete
+
+All 9 steps of the config-as-resource refactor are landed. `AppArgs` no
+longer exists. `crates/bevy_naadf/src/app_args.rs` is deleted. Every
+configuration value is a per-domain Bevy `Resource` inserted at bootstrap
+via the transient `BootstrapInputs` carrier; no runtime code reads an
+`args`-conceptualised configuration object.

@@ -29,19 +29,18 @@
 //!   `std::env::args` parsing — no `clap`.
 
 use bevy::prelude::AppExit;
-use bevy_naadf::{AppArgs, AppConfig, GridPreset};
+use bevy_naadf::{AppConfig, GridPreset};
 
 fn main() -> AppExit {
     // vox-gpu-rewrite Stage 2 consolidation (2026-05-18): the production
     // binary and every e2e gate route through the SAME C#-faithful fixed-
-    // size world install path. `AppArgs::fixed_world_size` is gone; there's
-    // no per-binary divergence to configure.
+    // size world install path — no per-binary divergence to configure.
     //
-    // Step 5 of the config-as-resource refactor: `grid_preset` migrated off
-    // `AppArgs` onto its own per-domain resource. `--vox <path>` writes
-    // `BootstrapInputs.grid_preset` (native) or main-thread bootstrap reads
-    // `?skybox=1` to write the same field (wasm32) BEFORE the App is built.
-    let args = AppArgs::default();
+    // Step 5 of the config-as-resource refactor: `grid_preset` is a
+    // per-domain resource. `--vox <path>` writes `BootstrapInputs.grid_preset`
+    // (native) or the main-thread bootstrap reads `?skybox=1` to write the
+    // same field (wasm32) BEFORE the App is built. Step 9 removed the last
+    // `AppArgs` reference — every config value is now a per-domain resource.
     let mut grid_preset = GridPreset::default();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -65,7 +64,6 @@ fn main() -> AppExit {
     {
         bevy_naadf::build_app_with_budget(
             AppConfig::windowed(),
-            args,
             grid_preset,
         )
         .run()
@@ -98,12 +96,11 @@ fn main() -> AppExit {
             let caps = bevy_naadf::render::budget::probe_and_select_async().await;
             // Step 2/5 of the config-as-resource refactor — the TAA
             // sample-ring depth and the grid preset both live on
-            // `BootstrapInputs` now, fanned out into per-domain main-world
-            // resources by `build_app_with_bootstrap_inputs`. Legacy
-            // `AppArgs` fields ride along via `inputs.args` until subsequent
-            // steps migrate them.
+            // `BootstrapInputs`, fanned out into per-domain main-world
+            // resources by `build_app_with_bootstrap_inputs`. Step 9 drained
+            // the last `AppArgs` field, so every config value is a typed
+            // per-domain field on `BootstrapInputs` now.
             let inputs = bevy_naadf::bootstrap::BootstrapInputs {
-                args,
                 grid_preset,
                 taa_ring_depth: bevy_naadf::render::taa::TaaRingConfig {
                     depth: caps.taa_ring_depth,

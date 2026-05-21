@@ -9,18 +9,18 @@
 //! `Resource` itself.
 //!
 //! Introduced at **Step 1** of the config-as-resource refactor
-//! (`docs/orchestrate/config-as-resource-refactor/02-design.md`). At Step 1
-//! it is a thin wrapper around [`AppArgs`]; subsequent steps progressively
-//! move fields out of `AppArgs` into typed per-domain resource fields on this
-//! struct (e.g. `taa_ring_depth`, `gi`, `construction_overrides`, …) until
-//! `AppArgs` is fully drained and deleted.
+//! (`docs/orchestrate/config-as-resource-refactor/02-design.md`). It began
+//! as a thin wrapper around the old `AppArgs` god-resource; Steps 2-8
+//! progressively moved each field out into a typed per-domain resource
+//! field on this struct, and **Step 9** deleted the now-empty `AppArgs`
+//! shell entirely. The migration is complete — every config value travels
+//! as its own per-domain resource.
 //!
 //! [`build_app_with_bootstrap_inputs`] fans `BootstrapInputs` into the
 //! per-domain resources; [`run_e2e_render_with_bootstrap_inputs`] is the
 //! e2e-gate entry point — it builds the App via the fan-out, picks the
 //! window config from `inputs.gate_mode`, and drives the run to
-//! completion. As of Step 6 every e2e gate routes through these; the
-//! legacy `run_e2e_render_with_args` entry point was deleted.
+//! completion. As of Step 6 every e2e gate routes through these.
 
 use bevy::prelude::{App, AppExit};
 
@@ -28,7 +28,7 @@ use crate::e2e::gate::E2eGateMode;
 use crate::e2e::VoxE2eAssertion;
 use crate::render::construction::{ConstructionConfig, SpawnTestEntity};
 use crate::render::taa::{TaaConfig, TaaRingConfig};
-use crate::{AppArgs, AppConfig, GiSettings, GridPreset};
+use crate::{AppConfig, GiSettings, GridPreset};
 
 /// Transient bootstrap-time configuration carrier.
 ///
@@ -140,13 +140,13 @@ impl Default for BootstrapInputs {
 
 /// Build the bevy-naadf `App` from an [`AppConfig`] and a [`BootstrapInputs`].
 ///
-/// Forwards to [`crate::build_app_with_args`] for the shared plugin-pyramid
-/// wiring, then fans the per-domain resources off `inputs` into the App.
-/// After Step 7 of the config-as-resource refactor `AppArgs` is a
-/// zero-field shell — `build_app_with_args` no longer carries any state;
-/// Step 9 folds it away entirely.
+/// Calls [`crate::build_app_core`] for the shared plugin-pyramid wiring +
+/// the defensive per-domain resource seeds, then `insert_resource`-overwrites
+/// each seed with the caller's `inputs` value. After Step 9 of the
+/// config-as-resource refactor the `AppArgs` god-resource is fully gone —
+/// every config value travels as its own per-domain resource.
 pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) -> App {
-    let mut app = crate::build_app_with_args(cfg, AppArgs::default());
+    let mut app = crate::build_app_core(cfg);
     // Migrated in Step 2 — main-world `TaaRingConfig` resource. Bevy's
     // second-call `insert_resource` semantic is overwrite-in-place, so
     // mobile-budget callers that wrote a non-canonical depth into

@@ -37,6 +37,8 @@ Decompose `AppArgs` from a runtime-read god-resource into per-domain Bevy resour
 - [x] Step 6 — Collapse 10 e2e-mode booleans → `E2eGateMode` enum (`GateKind` promoted); `e2e_driver` config reads grouped into the `E2eDriverConfig` `#[derive(SystemParam)]` struct
 - [x] Step 7 — Extract `vox_e2e_mode` → `VoxE2eAssertion(bool)`; `AppArgs` drained to a zero-field shell; driver read folded into `E2eDriverConfig`
 - [x] Step 8 — Extract `spawn_test_entity` → `SpawnTestEntity(bool)` — commit `53c37b3`
-- [ ] Step 9 — Delete the now-empty `AppArgs` shell — **NOT STARTED** (blocked on Step 7; after Step 6 `AppArgs` holds only `vox_e2e_mode`)
+- [x] Step 9 — Delete the now-empty `AppArgs` shell; `app_args.rs` deleted, `build_app_with_args` → `build_app_core` (no `AppArgs` param), every workspace `AppArgs` reference resolved
 
-Desktop verification at HEAD `53c37b3`: `cargo build --workspace` clean, `cargo test --workspace --lib` 192 passed / 1 ignored, e2e gates `baseline` / `--vox-e2e` / `--vox-horizon-native` / `--vox-gpu-construction` / `--entities` all PASS. Wasm32 visual checks (Steps 4 + 5) are the user's surface.
+**Migration complete.** All 9 steps landed. `AppArgs` no longer exists; `crates/bevy_naadf/src/app_args.rs` is deleted. Every configuration value is a per-domain Bevy `Resource` inserted at bootstrap via the transient `BootstrapInputs` carrier — no runtime code reads an `args`-conceptualised configuration object.
+
+Desktop verification at the Step 9 commit: `cargo build --workspace` clean (this PASSING proves zero surviving `AppArgs` references), `cargo test --workspace --lib` 192 passed / 1 ignored, full e2e gate sweep (`baseline`, `--vox-e2e`, `--oasis-edit-visual`, `--small-edit-visual`, `--small-edit-repro`, `--vox-gpu-construction`, `--vox-gpu-oracle-cpu/-gpu`, `--vox-gpu-oracle`, `--vox-horizon-native`, `--vox-web-parity-skybox/-loaded`, `--vox-web-parity`, `--entities`, `--resize-test`) — all 15 PASS. Wasm32 visual checks (Steps 4 + 5) are the user's surface.
