@@ -81,6 +81,8 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{Render, RenderApp, RenderSystems};
 
+use crate::render::pipelines::NaadfPipelines;
+
 pub use chunk_calc::build_segment_voxel_buffer_from_dense;
 pub use config::ConstructionConfig;
 pub use extract::{extract_world_changes, MainWorldEntities, RenderWorldEntityState};
@@ -350,15 +352,6 @@ pub struct ConstructionBindGroups {
     pub construction_generator_model: Option<BindGroup>,
 }
 
-/// **Resolution D — W0 seam retired.** The former `ConstructionPipelines`
-/// resource has been folded into [`crate::render::pipelines::NaadfPipelines`]
-/// per the codebase-tightening D5 architect §2.10. This type alias keeps
-/// pre-merge consumer code (`Res<ConstructionPipelines>`) compiling — every
-/// field on the original struct now lives at the same name on
-/// `NaadfPipelines`. New code should prefer `Res<NaadfPipelines>` directly.
-pub type ConstructionPipelines = crate::render::pipelines::NaadfPipelines;
-
-
 /// Phase-C W2 — render-world resource mirroring the per-frame edit state from
 /// the main world's [`crate::world::data::WorldData::pending_edits`]
 /// (`15-design-c.md` §1.2 regime-3, §2.1 W2; `16-impl-c-W2.md`).
@@ -468,7 +461,7 @@ pub fn prepare_construction(
     gpu: Option<ResMut<ConstructionGpu>>,
     bind_groups: Option<ResMut<ConstructionBindGroups>>,
     world_gpu: Option<ResMut<crate::render::prepare::WorldGpu>>,
-    construction_pipelines: Option<Res<ConstructionPipelines>>,
+    pipelines: Option<Res<NaadfPipelines>>,
     construction_config: Res<config::ConstructionConfig>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
@@ -504,7 +497,7 @@ pub fn prepare_construction(
     let mut gpu = gpu.unwrap();
     let mut bind_groups = bind_groups.unwrap();
     let Some(mut world_gpu) = world_gpu else { return; };
-    let Some(construction_pipelines) = construction_pipelines else { return; };
+    let Some(pipelines) = pipelines else { return; };
 
     // === Phase-C followup #1 — runtime GPU producer pre-allocation ==========
     //
@@ -906,7 +899,7 @@ pub fn prepare_construction(
             gpu.chunks_mirror_buffer.as_ref(),
         ) {
             let bgl = pipeline_cache
-                .get_bind_group_layout(&construction_pipelines.construction_bounds_world_layout);
+                .get_bind_group_layout(&pipelines.construction_bounds_world_layout);
             let bg = render_device.create_bind_group(
                 "naadf_construction_bounds_world_bind_group",
                 &bgl,
@@ -928,7 +921,7 @@ pub fn prepare_construction(
             gpu.bound_queue_sizes.as_ref(),
         ) {
             let bgl = pipeline_cache
-                .get_bind_group_layout(&construction_pipelines.construction_bounds_layout);
+                .get_bind_group_layout(&pipelines.construction_bounds_layout);
             // 2026-05-19 web fix — 5 bindings: `bound_queue_starts` (0) /
             // `bound_group_queues` (1) / `bound_group_masks` (2) /
             // `bound_refined_info` (3) / `bound_queue_sizes` (4).
@@ -949,7 +942,7 @@ pub fn prepare_construction(
     if bind_groups.bound_dispatch.is_none() {
         if let Some(indirect) = gpu.bound_dispatch_indirect.as_ref() {
             let bgl = pipeline_cache
-                .get_bind_group_layout(&construction_pipelines.bound_dispatch_indirect_layout);
+                .get_bind_group_layout(&pipelines.bound_dispatch_indirect_layout);
             let bg = render_device.create_bind_group(
                 "naadf_bound_dispatch_bind_group",
                 &bgl,
@@ -970,7 +963,7 @@ pub fn prepare_construction(
     //
     // Gating: requires
     //   - `model_data: Option<Res<ModelDataRender>>` → Some
-    //   - `construction_pipelines.generator_model_layout` (always present per
+    //   - `pipelines.generator_model_layout` (always present per
     //     the `ConstructionPipelines::from_world` impl at `:337-344`)
     //   - `gpu.segment_voxel_buffer` → Some (the existing W1 block at
     //     `:888-1015` gates `want_gpu_producer` on `dense_voxel_types` being
@@ -1090,7 +1083,7 @@ pub fn prepare_construction(
                 gpu.model_data_params_buffer.as_ref(),
             ) {
                 let bgl = pipeline_cache.get_bind_group_layout(
-                    &construction_pipelines.generator_model_layout,
+                    &pipelines.generator_model_layout,
                 );
                 let bg = render_device.create_bind_group(
                     "naadf_construction_generator_model_bind_group",
@@ -1134,7 +1127,7 @@ pub fn prepare_construction(
         && (!want_gpu_producer || gpu.gpu_producer_has_run)
     {
         let Some(initial_pipeline) = pipeline_cache
-            .get_compute_pipeline(construction_pipelines.bounds_calc_pipeline_add_initial)
+            .get_compute_pipeline(pipelines.bounds_calc_pipeline_add_initial)
         else {
             return;
         };
@@ -1340,7 +1333,7 @@ pub fn prepare_construction(
             gpu.changed_voxels_dynamic.as_ref(),
         ) {
             let bgl = pipeline_cache
-                .get_bind_group_layout(&construction_pipelines.construction_change_layout);
+                .get_bind_group_layout(&pipelines.construction_change_layout);
             let bg = render_device.create_bind_group(
                 "naadf_construction_change_bind_group",
                 &bgl,
@@ -1431,7 +1424,7 @@ pub fn prepare_construction(
             // TextureViews is moot because storage buffers do not have
             // view-recorded access types.)
             let bgl = pipeline_cache
-                .get_bind_group_layout(&construction_pipelines.construction_world_layout);
+                .get_bind_group_layout(&pipelines.construction_world_layout);
             let bg = render_device.create_bind_group(
                 "naadf_construction_world_bind_group",
                 &bgl,
@@ -1684,7 +1677,7 @@ pub fn prepare_construction(
                 gpu.entity_instances_history.as_ref(),
             ) {
                 let bgl = pipeline_cache.get_bind_group_layout(
-                    &construction_pipelines.construction_entity_layout,
+                    &pipelines.construction_entity_layout,
                 );
                 let bg = render_device.create_bind_group(
                     "naadf_construction_entity_bind_group",
@@ -1721,7 +1714,7 @@ pub fn prepare_construction(
                 let rebuilt = crate::render::prepare::rebuild_world_bind_group_with_entities(
                     &render_device,
                     &pipeline_cache,
-                    &construction_pipelines,
+                    &pipelines,
                     &world_gpu,
                     eci_rw,
                     evd,

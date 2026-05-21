@@ -309,7 +309,7 @@ pub fn dispatch_copy_entity_history(
 pub fn naadf_entity_update_node(
     mut render_context: bevy::render::renderer::RenderContext,
     pipeline_cache: Res<bevy::render::render_resource::PipelineCache>,
-    construction_pipelines: Option<Res<crate::render::construction::ConstructionPipelines>>,
+    pipelines: Option<Res<crate::render::pipelines::NaadfPipelines>>,
     construction_bind_groups: Option<Res<crate::render::construction::ConstructionBindGroups>>,
     construction_gpu: Option<Res<crate::render::construction::ConstructionGpu>>,
     construction_events: Option<Res<crate::render::construction::ConstructionEvents>>,
@@ -326,7 +326,7 @@ pub fn naadf_entity_update_node(
         // Regime-3 fast-path: no-op on no-entity-update frames.
         return;
     }
-    let Some(construction_pipelines) = construction_pipelines else { return; };
+    let Some(pipelines) = pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
     let Some(construction_gpu) = construction_gpu else { return; };
     let Some(world_gpu) = world_gpu else { return; };
@@ -340,9 +340,9 @@ pub fn naadf_entity_update_node(
 
     // Resolve the 3 pipelines.
     let (Some(p_update), Some(p_copy_ci), Some(p_copy_hist)) = (
-        pipeline_cache.get_compute_pipeline(construction_pipelines.entity_update_pipeline_update_chunks),
-        pipeline_cache.get_compute_pipeline(construction_pipelines.entity_update_pipeline_copy_entity_chunk_instances),
-        pipeline_cache.get_compute_pipeline(construction_pipelines.entity_update_pipeline_copy_entity_history),
+        pipeline_cache.get_compute_pipeline(pipelines.entity_update_pipeline_update_chunks),
+        pipeline_cache.get_compute_pipeline(pipelines.entity_update_pipeline_copy_entity_chunk_instances),
+        pipeline_cache.get_compute_pipeline(pipelines.entity_update_pipeline_copy_entity_history),
     ) else {
         return;
     };
@@ -350,7 +350,7 @@ pub fn naadf_entity_update_node(
     // Build the entity_world bind group inline (cheap; the bind group is
     // not stashed because it depends on the per-frame params buffer).
     let entity_world_bgl = pipeline_cache
-        .get_bind_group_layout(&construction_pipelines.entity_world_layout);
+        .get_bind_group_layout(&pipelines.entity_world_layout);
     let entity_world_bg = render_device.create_bind_group(
         "naadf_entity_update_world_bind_group",
         &entity_world_bgl,

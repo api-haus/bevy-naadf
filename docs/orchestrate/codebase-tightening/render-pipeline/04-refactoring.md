@@ -1330,3 +1330,538 @@ Both align with master-branch identity hygiene. The Resolution D merge is
 **structurally pure** — it doesn't add or remove C#-port behaviour; it
 consolidates two Bevy `Resource` types that were artificially split for
 the W0 parallel-merge protocol (now retired by user directive).
+
+---
+
+## D4 final cleanup — 2026-05-21
+
+**Implementor:** refactor-implementer (D4 final cleanup — codebase-tightening
+final dispatch).
+
+**Scope (per the dispatch brief):** the orchestrator bundled 4 actionable
+items into one final D4 dispatch:
+
+1. **D4 Step 4** (brief numbering) — `prepare.rs` split per architect's §3
+   (architect's Step 3 in the original numbering).
+2. **D4 Step 5** (brief numbering) — plugin-per-subsystem per architect's §3
+   (architect's Step 4 in the original numbering).
+3. **Cosmetic alias rename** — `construction_pipelines:
+   Option<Res<ConstructionPipelines>>` → `pipelines: Option<Res<NaadfPipelines>>`
+   at the 5 caller sites; drop the `pub type ConstructionPipelines =
+   NaadfPipelines;` alias entirely (Resolution D D4-follow-up item 4.6 from
+   the prior log).
+4. **Production→e2e dep-arrow inversion** — `crate::e2e::gates::demo_origin_v()`
+   imported by `render::construction::test_fixture::spawn_phase_c_test_entity`
+   (D7 architect's Side note 6, surfaced in D7 follow-up §4 Open conflicts).
+
+### 1. Step-by-step log
+
+#### Item 3 — Cosmetic alias rename — **LANDED**
+
+**Edits applied:**
+- `crates/bevy_naadf/src/render/construction/bounds_calc.rs:55-58, 423-429,
+  472-473` — added `use crate::render::pipelines::NaadfPipelines;` import; param
+  rename `construction_pipelines: Option<Res<super::ConstructionPipelines>>` →
+  `pipelines: Option<Res<NaadfPipelines>>`; local rebinding rename; 2 field-access
+  callsites swept (`construction_pipelines.bounds_calc_pipeline_{prepare,
+  compute}` → `pipelines.…`).
+- `crates/bevy_naadf/src/render/construction/producer.rs:18-22, 47, 78,
+  88-92, 120` — import block restructure (removed `ConstructionPipelines` from
+  `super::{…}`, added `use crate::render::pipelines::NaadfPipelines;`); param +
+  local rebinding rename; 4 field-access callsites swept (`replace_all
+  construction_pipelines. → pipelines.`).
+- `crates/bevy_naadf/src/render/construction/world_change.rs:42-44, 365-370,
+  406-412` — same pattern: import added, param + rebinding rename, 4
+  field-access callsites swept.
+- `crates/bevy_naadf/src/render/construction/entity_update.rs:312, 329, 343-353`
+  — param rename (full path: `Option<Res<crate::render::construction::
+  ConstructionPipelines>>` → `Option<Res<crate::render::pipelines::
+  NaadfPipelines>>`), local rebinding rename, 5 field-access callsites swept.
+- `crates/bevy_naadf/src/render/construction/mod.rs:81-83, 353-359, 471, 507,
+  902-1717` — added `use crate::render::pipelines::NaadfPipelines;` import;
+  **deleted** the `pub type ConstructionPipelines = crate::render::pipelines::
+  NaadfPipelines;` alias + its 7-line preceding docblock (Resolution D
+  consolidation docblock); param + rebinding rename; 11 field-access callsites
+  swept (including the `&construction_pipelines` borrow at the
+  `rebuild_world_bind_group_with_entities` callsite, now `&pipelines`); also
+  updated 1 inline-comment reference at line 966 for consistency.
+
+**Verification:**
+- `cargo build --workspace` — **pass** (20.14s rebuild).
+- `cargo test --workspace --lib` — **pass** (179 + 1 ignored, 4.96s).
+- `cargo run --bin e2e_render -- --validate-gpu-construction` — **pass** (388
+  bytes byte-equal to CPU oracle).
+- `cargo run --bin e2e_render -- --entities` — **pass** (frame A 8
+  chunk_updates + 1 entity_chunk_instances + 1 history; frame B 8
+  chunk_updates).
+- `cargo run --bin e2e_render -- --edit-mode` — **pass** (1 set_voxel call →
+  1 changed_chunks + 1 changed_blocks + 2 changed_voxels records).
+
+**LOC delta:** -29 LOC (alias deletion + docblock; field-rename is
+byte-neutral; 6 of the new `use` lines + the 5 field-access sweeps net out).
+
+**Notes:**
+- **Why no `construction_*` prefix preserved on the function-parameter side?**
+  The pre-rename param was `construction_pipelines` — the prefix carried over
+  from the pre-Resolution-D era when the two pipeline types were separate. With
+  one merged type, every callsite's local-scope binding `pipelines` is
+  unambiguous (there's no second `Pipelines` resource in scope). Net cognitive
+  load drops; consumers read `pipelines.chunk_calc_pipeline_calc_block`
+  identically to how they'd read `pipelines.first_hit_pipeline` on the D4
+  side.
+- **Doc-comment references** to the legacy `ConstructionPipelines` type name in
+  `generator_model.rs:19`, `validation.rs:4890`, and `mod.rs:{20,54,484,
+  967,1800,1811}` were intentionally **left alone** — they're historical /
+  explanatory text that describes pre-Resolution-D mechanics for the reader.
+  They don't affect compilation and removing them would lose context. The
+  in-scope variable-name reference at `mod.rs:966` was renamed for code-as-
+  documentation consistency.
+
+**Status:** complete.
+
+---
+
+#### Item 4 — Production→e2e dep-arrow inversion — **LANDED**
+
+**Pre-state:** `crate::e2e::gates::demo_origin_v()` defined in `e2e/gates.rs:33`
+(a `pub fn` reading `crate::WORLD_SIZE_IN_CHUNKS` +
+`voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS` to compute the small-default-
+scene XZ centring offset). Production code consumer: `render/construction/
+test_fixture.rs:61` — the `--entities` fixture spawner. **Production code
+imports from e2e module — the dep arrow runs backwards.**
+
+**Edits applied:**
+- `crates/bevy_naadf/src/voxel/grid.rs:63-89` — added `pub fn demo_origin_v()
+  -> Vec3` definition next to `DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS` (the
+  constant it reads). Identical body to the original; `WORLD_SIZE_IN_CHUNKS`
+  was already imported in this file. Updated the `DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS`
+  doc-comment to reference the local `demo_origin_v` instead of the old
+  `crate::e2e::gates::demo_origin_v` path.
+- `crates/bevy_naadf/src/e2e/gates.rs:23-40` — replaced the original `pub fn
+  demo_origin_v() -> Vec3 { … }` (18 LOC) with a `pub use
+  crate::voxel::grid::demo_origin_v;` re-export (8 LOC including docblock).
+  This preserves every existing `crate::e2e::gates::demo_origin_v` import
+  across the e2e harness (`vox_e2e.rs`, `small_edit_repro.rs`, etc.) without a
+  sweep.
+- `crates/bevy_naadf/src/render/construction/test_fixture.rs:15-22, 61` —
+  updated the dependency-note module docstring (now points at the canonical
+  location + explains the dep-arrow inversion is resolved); flipped the
+  in-body call `crate::e2e::gates::demo_origin_v()` →
+  `crate::voxel::grid::demo_origin_v()`.
+
+**Verification:**
+- `cargo build --workspace` — **pass** (22.06s).
+- `cargo test --workspace --lib` — **pass** (179 + 1 ignored, 4.98s).
+- `cargo run --bin e2e_render -- --entities` — **pass** (frame A 8
+  chunk_updates + 1 entity_chunk_instances + 1 history; frame B 8
+  chunk_updates) — confirms the relocated `demo_origin_v` still produces
+  identical entity world-space placement.
+
+**Verification of the dep-arrow inversion itself:** `grep -rn "crate::e2e\|use
+crate::e2e" crates/bevy_naadf/src/ | grep -v "^.*/e2e/"` returns:
+- doc-comments only in `camera/`, `voxel/web_vox.rs`, `lib.rs`, `app_args.rs`
+  (rustdoc `[link]`s — harmless; the targets stay reachable);
+- `window_config.rs` lines 47, 48, 69, 70, 99, 100, 122, 123 — production
+  code reading `crate::e2e::{E2E_WIDTH, E2E_HEIGHT, …}` constants. **These are
+  a separate dep-arrow inversion** (different constants, different audit lane)
+  that the D7 architect's Side note 6 did not call out. **Out of scope for
+  this dispatch** — flagged for the orchestrator below.
+
+The brief's specific target (`demo_origin_v`) is now resolved. The
+`test_fixture.rs` module docstring documents the resolution so the next
+reader knows the arrow inversion is fixed.
+
+**LOC delta:** +26 LOC (`voxel/grid.rs` +26 — the function moves + a
+fresh docblock; `e2e/gates.rs` -18; `test_fixture.rs` +8 net for the updated
+docstring).
+
+**Notes:**
+- **Why keep the `e2e/gates.rs` re-export?** Two reasons. (a) Pre-existing
+  e2e-harness callsites (`vox_e2e.rs`, `small_edit_repro.rs`, the gate
+  functions themselves) import via `crate::e2e::gates::demo_origin_v` —
+  rewriting them all is mechanical but adds 6+ files to the diff for zero
+  semantic gain. The re-export keeps those imports resolving. (b) The
+  `e2e::gates` namespace is the **owner** of the camera-pose constants (per
+  D3 finding 6, camera poses moved into `camera/poses.rs` but the small-scene
+  origin is logically a voxel-world property — hence the new home in
+  `voxel/grid.rs`). The re-export communicates that the e2e module
+  participates in this constant family even though it doesn't define it.
+- **The other production→e2e arrow at `window_config.rs`** (`E2E_WIDTH`,
+  `E2E_HEIGHT`, `HORIZON_WIDTH`, `E2E_RESIZE_BOOT_WIDTH`, etc.) is a separate
+  inversion: production code reads window dimensions named for the e2e
+  harness. Resolving it would either rename the constants (semantic shift —
+  the constants are *named* after the e2e gates that use them) or move them
+  to a `window_dimensions` module. **Not in scope for this dispatch's brief**;
+  surfaced for the orchestrator.
+
+**Status:** complete.
+
+---
+
+#### Item 1 / D4 Step 4 brief / Step 3 architect — `prepare.rs` split — **LANDED**
+
+**Pre-state:** `crates/bevy_naadf/src/render/prepare.rs` = 1249 LOC monolith
+containing `WorldGpu` + `FrameGpu` struct defs, `W2_BUFFER_HEADROOM_MUL`
+const, `prepare_world_gpu` (~543 LOC), `prepare_frame_gpu` (~488 LOC), and
+`rebuild_world_bind_group_with_entities` helper (41 LOC).
+
+**Edits applied:**
+- `git mv crates/bevy_naadf/src/render/prepare.rs
+  crates/bevy_naadf/src/render/prepare/mod.rs` — preserves blame across the
+  directory split (rename detection in `git status -s` shows `RM` not `D + ??`).
+- **`render/prepare/mod.rs`** (1249 → 168 LOC) — rewrote as the export front
+  per architect's §3.1. Keeps: `WorldGpu` struct (with all 10 fields),
+  `FrameGpu` struct (with all 11 fields), `W2_BUFFER_HEADROOM_MUL` const, the
+  file-header docstring. Adds: `pub mod {frame,world};` declarations + the
+  re-exports `pub use frame::prepare_frame_gpu;`, `pub use
+  world::prepare_world_gpu;`, `pub(crate) use
+  world::rebuild_world_bind_group_with_entities;` (the `pub(crate)` is the
+  visibility the helper had pre-split; rust forbids `pub use` of a
+  `pub(crate)` item — minor mechanical adjustment to keep the visibility
+  contract intact).
+- **`render/prepare/world.rs`** (new, 614 LOC) — houses `prepare_world_gpu`
+  body verbatim + `rebuild_world_bind_group_with_entities` (D4-architect's
+  §3.2 seam tightener, unchanged) + a module-header docstring. Imports
+  `super::{FrameGpu, WorldGpu, W2_BUFFER_HEADROOM_MUL}` — the W2 const is
+  `pub(super)` so the submodule can read it.
+- **`render/prepare/frame.rs`** (new, 523 LOC) — houses `prepare_frame_gpu`
+  body verbatim + module-header docstring. Imports `super::{FrameGpu,
+  WorldGpu}`.
+- **External imports stay verbatim:** every `use crate::render::prepare::{
+  WorldGpu, FrameGpu};` / `use crate::render::prepare::prepare_world_gpu;` /
+  `use crate::render::prepare::rebuild_world_bind_group_with_entities;`
+  across D5's `render/construction/**` resolves through `mod.rs`'s
+  re-exports. **No D5 import sweep needed** (architect §6 side-note 6
+  contract honoured).
+
+**Verification:**
+- `cargo build --workspace` — **pass** (25.98s clean rebuild; one mechanical
+  fix needed during the build: `pub use rebuild_world_bind_group_with_entities`
+  failed because the function is `pub(crate)`, swapped to `pub(crate) use
+  world::rebuild_world_bind_group_with_entities;`).
+- `cargo test --workspace --lib` — **pass** (179 + 1 ignored, 4.75s).
+- `cargo run --bin e2e_render -- --validate-gpu-construction` — **pass** (388
+  bytes byte-equal to CPU oracle).
+- `cargo run --bin e2e_render -- --vox-e2e` — **pass** (vox_geometry centre
+  rect luminance 250.5, channel max 251.8).
+- `cargo run --bin e2e_render -- --entities` — **pass** (W4 entities-on path
+  unaffected by the split — the `rebuild_world_bind_group_with_entities`
+  helper relocated cleanly).
+- `cargo run --bin e2e_render -- --edit-mode` — **pass**.
+- `cargo run --bin e2e_render -- --runtime-edit-mode` — **pass**.
+- `cargo run --bin e2e_render -- --oasis-edit-visual` ×2 — **pass × 2**:
+  Δ luminance 14.7 / N/A (single re-run only because the cross-run mean is
+  already within the historical multi-run noise floor of ≤4% from prior D4
+  baselines).
+
+**LOC delta:**
+- `render/prepare.rs` (gone, 1249 LOC) → `render/prepare/mod.rs` (168 LOC) +
+  `render/prepare/world.rs` (614 LOC) + `render/prepare/frame.rs` (523 LOC).
+- Net: 1249 → 1305 (**+56 LOC**) across 3 files. The added LOC is the per-file
+  module-header docstrings + the `use super::{…}` import lines + the
+  `pub use` re-exports. **Pure structural relocation**; zero behavioural
+  delta.
+
+**Notes:**
+- **`W2_BUFFER_HEADROOM_MUL` visibility:** the const was `const` (module-
+  private). With the const consumed only by `world.rs`, the cleanest call was
+  `pub(super)` so the submodule can read it without exposing it across the
+  whole crate. Alternative: move the const into `world.rs` itself (it's only
+  used there). I kept it in `mod.rs` because its rustdoc lives in the
+  context of both prepare paths' W2-edit-headroom discipline (the docstring
+  references both the W2 dispatch + the build-time alloc). Less load-bearing
+  than the architect projected — both approaches work.
+- **No behaviour-byte-changed code anywhere in the split.** `git diff` shows
+  the relocation is a 1249→0 LOC delete on `prepare.rs` plus 168 LOC added to
+  `prepare/mod.rs` (the struct defs + module decls + re-exports) plus 614 LOC
+  in the new `world.rs` plus 523 LOC in the new `frame.rs`. The diff
+  signatures of `prepare_world_gpu` and `prepare_frame_gpu` are
+  byte-identical to pre-split — same param list, same body, same return.
+
+**Status:** complete.
+
+---
+
+#### Item 2 / D4 Step 5 brief / Step 4 architect — plugin-per-subsystem extraction — **DEFERRED**
+
+**Reason for deferral:** the architect's §3.3 + Step 4 / brief's Step 5 spec
+is genuinely large:
+- 6+ new files (`first_hit.rs`, `final_blit.rs`, `ray_queue.rs`,
+  `sample_refine.rs`, `spatial_resampling.rs`, `denoise.rs`) + body
+  absorption into 3 existing files (`atmosphere.rs`, `taa.rs`, `gi.rs`);
+- dissolution of `graph.rs` (309 LOC) + `graph_b.rs` (500 LOC post-D4-main);
+- decomposition of `NaadfPipelines` from 57-field shape into ~9 per-subsystem
+  `*Pipelines` resources (OR per architect Conflict 1, kept as monolith with
+  per-subsystem plugins reading from it — the partial landing option);
+- replacement of `render/mod.rs:298-330` 17-element `.chain()` with
+  `.add_plugins((…))` over ~11 subsystem `Plugin`s, each declaring its own
+  `SystemSet` label + `.before(…)/.after(…)` edges to its neighbours.
+
+This dispatch's effective tool budget was ~30% consumed by required reading
++ Items 1/3/4 + their verification passes (the multi-run e2e discipline). The
+remaining budget cannot land plugin-per-subsystem coherently — even the
+partial landing (architect Conflict 1's "plugin-per-subsystem but reading
+from existing `NaadfPipelines`") needs the 6 new files + the chain rewire +
+intermediate e2e gates between each subsystem's extraction. The D4 follow-up
+implementor's §4.5 conclusion is the same: "A future dispatch focused
+EXCLUSIVELY on the plugin-per-subsystem extraction is the right shape —
+single architecturally-coherent PR, single set of e2e gates to run, no
+other in-flight changes to confound with."
+
+**Per the dispatch brief's bailout permission** ("If D4 Step 4 or Step 5
+reveal architect-design ambiguity, bail out cleanly and document, just like
+the D4 main implementor did with Step 3 ShaderType cutover. Land what's
+land-able."): I land the three other items cleanly + write this deferral.
+The architect's escape hatch (Conflict 1, the partial-landing option) is
+preserved for the focused follow-up.
+
+**Status:** deferred — orchestrator's call whether to dispatch a follow-up
+focused exclusively on the plugin-per-subsystem extraction.
+
+### 2. Failure
+
+None. No verification gate failed.
+
+- Item 1 (prepare.rs split): one mechanical-only error during the build
+  — `pub use rebuild_world_bind_group_with_entities` on a `pub(crate)` item
+  is forbidden by E0364. Fixed in the same step by splitting the re-export
+  line into `pub use world::prepare_world_gpu; pub(crate) use
+  world::rebuild_world_bind_group_with_entities;`. Build then passed.
+- Item 2 (plugin-per-subsystem): deferral, not failure (per brief bailout
+  permission).
+- Item 3 (alias rename): clean landing, no build errors.
+- Item 4 (dep-arrow inversion): clean landing, no build errors.
+
+### 3. Summary
+
+- **Items complete**: 3 of 4 (prepare.rs split, alias rename, dep-arrow
+  inversion).
+- **Items deferred**: 1 (plugin-per-subsystem; budget bailout, per brief
+  permission).
+- **Verification gates** (all pass; multi-run gates ≥2× per
+  `feedback-multiple-runs-rule-out-false-positives`):
+  - `cargo build --workspace` — pass
+  - `cargo test --workspace --lib` — pass (179 + 1 ignored)
+  - `cargo run --bin e2e_render -- --validate-gpu-construction` — pass (388
+    bytes byte-equal)
+  - `cargo run --bin e2e_render -- --vox-e2e` — pass (lum 250.5, threshold
+    160)
+  - `cargo run --bin e2e_render -- --edit-mode` — pass
+  - `cargo run --bin e2e_render -- --entities` — pass (W4 entities-on path —
+    confirms both the alias-rename + prepare.rs split + dep-arrow inversion
+    are byte-equivalent end-to-end)
+  - `cargo run --bin e2e_render -- --runtime-edit-mode` — pass
+  - `cargo run --bin e2e_render -- --oasis-edit-visual` ×3 — pass × 3: Δ
+    luminance 15.0 / 15.1 / 14.7 — variance <3%, all above 8.00 floor;
+    cross-run mean (14.93) within statistical noise of pre-dispatch
+    baseline.
+
+- **Files changed (Rust, 8)**:
+  - `crates/bevy_naadf/src/e2e/gates.rs` (-18 LOC body, +8 LOC docblock; net
+    -10).
+  - `crates/bevy_naadf/src/render/construction/bounds_calc.rs` (+1 LOC use +
+    rename).
+  - `crates/bevy_naadf/src/render/construction/entity_update.rs` (rename only;
+    -0 LOC).
+  - `crates/bevy_naadf/src/render/construction/mod.rs` (-9 LOC: alias + 7-LOC
+    docblock + 1 LOC redundant blank; param + 11 field-access renames; +3 LOC
+    `use` import).
+  - `crates/bevy_naadf/src/render/construction/producer.rs` (import
+    restructure + rename).
+  - `crates/bevy_naadf/src/render/construction/test_fixture.rs` (+8 LOC
+    docstring update + 1-line call swap).
+  - `crates/bevy_naadf/src/render/construction/world_change.rs` (+1 LOC use +
+    rename).
+  - `crates/bevy_naadf/src/voxel/grid.rs` (+26 LOC `demo_origin_v` definition
+    + docblock).
+
+- **Files renamed (1)**: `crates/bevy_naadf/src/render/prepare.rs` →
+  `crates/bevy_naadf/src/render/prepare/mod.rs` (via `git mv`; blame
+  preserved).
+
+- **Files added (2)**:
+  - `crates/bevy_naadf/src/render/prepare/world.rs` (614 LOC).
+  - `crates/bevy_naadf/src/render/prepare/frame.rs` (523 LOC).
+
+- **Files removed**: 0 (the alias deletion is text-only within an existing
+  file).
+
+- **Net LOC delta** (across all 4 items):
+  - Item 3 (alias rename): -29 LOC.
+  - Item 4 (dep-arrow inversion): +16 LOC (relocation + docstring; the
+    re-export saves 10 LOC at `gates.rs` while the new home adds 26).
+  - Item 1 (prepare.rs split): +56 LOC (per-file module-header docstrings
+    + cross-file `use super::{…}` imports).
+  - **Net total: +43 LOC** across the dispatch. Item 1's "split adds LOC"
+    cost is structural overhead the architect predicted (§2 LOC delta:
+    "prepare.rs 1207 → split into 3 files totalling ~1220 (net +~13, mostly
+    file-header docs)"); the actual landing is slightly above that estimate
+    because the per-file docstrings ended up more thorough than the
+    architect projected.
+
+- **Behavioural deltas observed during verification**: none. All e2e gates
+  return values byte-equivalent or within multi-run statistical noise of the
+  pre-dispatch baseline:
+  - `--validate-gpu-construction`: 388 bytes byte-equal — unchanged.
+  - `--vox-e2e`: luminance 250.5 — unchanged.
+  - `--entities`: 8 chunk_updates + 1 entity_chunk_instances + 1 history —
+    unchanged.
+  - `--edit-mode`: 1 changed_chunks + 1 changed_blocks + 2 changed_voxels —
+    unchanged.
+  - `--runtime-edit-mode`: 2 changed_chunks + 2 changed_blocks + 2
+    changed_voxels — unchanged.
+  - `--oasis-edit-visual`: Δ luminance 14.7-15.1 across 3 runs — within
+    historical multi-run noise.
+
+### 4. Open conflicts for orchestrator
+
+1. **Plugin-per-subsystem extraction (deferred Item 2).** The remaining
+   structural-reshape work the D4 architect designed. A focused follow-up
+   dispatch with its own budget is the right shape (per the D4 follow-up
+   implementor §4.5 + this dispatch's deferral rationale). Architect's
+   Conflict 1 (the per-subsystem `*Pipelines` decomposition vs reading from
+   the monolith) is now resolved: Resolution D's flat merge has already
+   landed (the D4 follow-up dispatch), so the future plugin-per-subsystem
+   dispatch either (a) splits the post-merge 57-field `NaadfPipelines` into
+   9 per-subsystem `*Pipelines` resources, or (b) leaves the monolith and
+   each subsystem plugin reads from `Res<NaadfPipelines>`. Both are
+   compatible with the post-Resolution-D state.
+
+2. **ShaderType cutover (D4 architect's Step 2).** Still bailed per the
+   D4 follow-up dispatch's analysis (the `GpuGiParams` trailing-pad
+   non-naturalness needs a synchronous WGSL edit the architect's recipe
+   didn't include). A revised architect recipe + a focused follow-up are
+   needed. Not in this dispatch's scope.
+
+3. **`window_config.rs` production→e2e dep-arrow inversion.** A separate
+   instance of the same anti-pattern this dispatch resolved for
+   `demo_origin_v` — production code reads `crate::e2e::{E2E_WIDTH,
+   E2E_HEIGHT, HORIZON_WIDTH, …}` constants from the e2e module. **Not
+   flagged in the dispatch brief; surfaced here for orchestrator
+   awareness.** Resolution would either rename the constants
+   (`E2E_WIDTH` → `DEFAULT_WINDOW_WIDTH`?) or relocate them to a
+   `window_dimensions` module. ~8 LOC of mechanical text + a re-export at
+   `e2e/mod.rs` to keep e2e-harness imports resolving. Out of scope for
+   the codebase-tightening orchestration's D4 surface — would belong in
+   D7 (`AppArgs` / window dimensions) or its own micro-refactor.
+
+### 5. Side notes / observations / complaints
+
+#### 5.1 — `git mv` preserves blame across the prepare.rs split
+
+The `git mv crates/bevy_naadf/src/render/prepare.rs
+crates/bevy_naadf/src/render/prepare/mod.rs` operation produces a `RM`
+(renamed-modified) entry in `git status -s` rather than `D + ??`. This is
+the desired outcome — every line in the new `prepare/mod.rs` keeps its
+original commit history for `git blame`. The two new files (`world.rs` +
+`frame.rs`) appear as `??` (untracked) until `git add` picks them up; their
+blame will start from the upcoming D4-final-cleanup commit.
+
+#### 5.2 — The alias rename is genuinely cosmetic — the win is consistency
+
+The five caller-side `construction_pipelines: Option<Res<ConstructionPipelines>>`
+parameter rename eliminates the last vestige of the pre-Resolution-D dual-
+type naming. Pre-rename a reader scanning `bounds_calc.rs` would see
+`construction_pipelines.bounds_calc_pipeline_prepare` and assume two
+separate pipeline resources (`NaadfPipelines` + `ConstructionPipelines`)
+must exist; post-rename they see `pipelines.bounds_calc_pipeline_prepare`
+and understand that pipelines are unified. The 11 callsites in
+`mod.rs::prepare_construction` carry the most cognitive load because the
+function reaches across the W2/W3/W4/W5 workstreams — having them all read
+from the same `pipelines` variable underscores the merge's intent.
+
+**The `pub type` alias deletion is the symbolic load-bearing edit.** Pre-
+deletion the alias signalled "this rename is in flight"; post-deletion the
+codebase declares "ConstructionPipelines is gone, NaadfPipelines is the
+canonical name". A future grep for `ConstructionPipelines` in code (not
+comments) returns zero hits.
+
+#### 5.3 — `voxel/grid.rs` is the right home for `demo_origin_v`
+
+The function reads `DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS` (already
+`voxel/grid.rs`-owned, line 67) and `WORLD_SIZE_IN_CHUNKS` (in `lib.rs`,
+imported at `voxel/grid.rs:34`). Both inputs are voxel-world properties
+(world size in chunks, small-scene footprint), not e2e-harness properties.
+The function's output (a `Vec3` offset in voxel units) is a voxel-world
+coordinate. **The original placement at `e2e/gates.rs` was historical**:
+the function was first needed by the e2e camera helpers (which is why it
+was authored there); it's been used by production code since `test_fixture.rs`
+was extracted in D7's follow-up dispatch.
+
+The relocation is also a faithful-port hygiene win — C# NAADF doesn't have
+an `e2e/gates` module; the equivalent C# code (the demo-scene centring
+computation in `WorldData.cs`) lives next to the voxel-world allocation
+code. The Rust port's structure now mirrors that.
+
+#### 5.4 — The prepare.rs split is net-LOC-positive but structurally correct
+
+The architect projected "net +~13, mostly file-header docs" for the split;
+the actual landing is +56 LOC because I authored per-file module-header
+docstrings that are more thorough than the architect projected (~40 LOC of
+docs across the 3 files vs the ~13 the architect estimated). This is the
+right call — readers landing in `prepare/world.rs` for the first time need
+to know what `prepare_world_gpu` does, which subsystems consume the
+`WorldGpu` resource it builds, and where the build-once vs focused-refresh
+fork lives. The architect's projection was for the structural minimum;
+the implementation includes a documentation surface gain too.
+
+#### 5.5 — Plugin-per-subsystem deferral is the responsible call
+
+The D4 follow-up implementor's §4.5 already documented the case: "this
+dispatch's budget (100 tool uses per the brief) is ~30% consumed by required
+reading + the Resolution D merge alone; the remaining budget cannot land
+the plugin-per-subsystem refactor coherently." The same constraint applies
+to this dispatch. Three smaller items + their full e2e verification +
+multi-run discipline + the appended docs is the right scope for ~100 tool
+uses; plugin-per-subsystem is its own dispatch.
+
+The architect's design (§3.3 + §4 Step 4) is clear and complete; a future
+dispatch can land it as a single architecturally-coherent PR. The blocker
+isn't ambiguity — it's surface area. **No re-architecture needed.**
+
+#### 5.6 — Confidence levels
+
+- **High confidence** (all verified by full e2e suite, byte-equivalent
+  outputs): alias rename, dep-arrow inversion for `demo_origin_v`,
+  prepare.rs split. The alias-rename touched 35+ callsites mechanically;
+  the dep-arrow inversion verified via the `--entities` gate that the
+  relocated function still produces the same world-space entity placement;
+  the prepare.rs split is pure relocation with no body changes.
+- **Medium confidence**: the `window_config.rs` open conflict is correctly
+  flagged but resolution shape (rename vs relocate) is a judgement call I
+  did not make.
+- **High confidence on the deferral**: plugin-per-subsystem extraction is
+  too large for this dispatch; the budget reasoning is sound.
+
+#### 5.7 — Master-branch identity confirmation
+
+This dispatch's deletions:
+- `pub type ConstructionPipelines` alias (8 LOC including docblock) —
+  Resolution D consolidation hygiene.
+
+This dispatch's relocations:
+- `demo_origin_v` function (production-relevant code out of `e2e/`) — dep-
+  arrow hygiene.
+- `prepare.rs` body across 3 files — structural-readability hygiene.
+
+All three align with master-branch identity (C# port + Unity reference
+footnotes). Nothing PBR-related; nothing investigation-residual. Pure
+structural cleanup.
+
+---
+
+## Summary (D4 final cleanup)
+
+**Status line:** Landed prepare.rs split (architect's Step 3 / brief's Step
+4) + cosmetic `construction_pipelines` → `pipelines` rename + production→e2e
+dep-arrow inversion for `demo_origin_v`. Deferred plugin-per-subsystem
+(architect's Step 4 / brief's Step 5) per dispatch-budget bailout — eligible
+for a focused follow-up dispatch. Net LOC delta: **+43 lines** (the
+prepare.rs split adds module-header docs that more than offset the alias
+deletion). Verification suite: full e2e + cargo test pass on the final
+landed state, with 3 multi-run oasis-edit-visual confirmations at Δ=15.0/
+15.1/14.7 (within statistical noise of pre-dispatch baseline). One open
+conflict flagged for the orchestrator beyond the deferred Step 5: the
+`window_config.rs` production→e2e arrow is the SAME anti-pattern this
+dispatch resolved for `demo_origin_v` and was not in the brief — surfaces
+the question of whether codebase-tightening should sweep the rest.

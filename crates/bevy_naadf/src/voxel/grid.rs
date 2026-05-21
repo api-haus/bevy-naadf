@@ -62,9 +62,31 @@ const TY_EMISSIVE_MAGENTA: VoxelTypeId = VoxelTypeId(12);
 const GRID_SIZE_IN_CHUNKS: [u32; 3] = [4, 2, 4];
 
 /// Public alias for [`GRID_SIZE_IN_CHUNKS`] — the small Default test-scene
-/// footprint, used by [`crate::e2e::gates::demo_origin_v`] to compute the
-/// XZ centring offset for the demo inside the fixed world.
+/// footprint, used by [`demo_origin_v`] to compute the XZ centring offset for
+/// the demo inside the fixed world.
 pub const DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS: [u32; 3] = GRID_SIZE_IN_CHUNKS;
+
+/// vox-gpu-rewrite Stage 2 (2026-05-18) — the small Default test-scene used
+/// to live at world origin `(0..64, 0..32, 0..64)`. After consolidation,
+/// `setup_test_grid` always uses the fixed `(4096, 512, 4096)`-voxel world
+/// and embeds the small primitive scene at the world centre — the demo
+/// origin shifts from `(0, 0, 0)` to this voxel offset
+/// (`((4096-64)/2, 0, (4096-64)/2) = (2016, 0, 2016)`).
+///
+/// Production code (the `--entities` fixture spawner at
+/// `render::construction::test_fixture::spawn_phase_c_test_entity`) and every
+/// e2e camera-pose helper translate small-world-relative voxel coords through
+/// this function so framing stays pixel-identical regardless of where the
+/// world container places the demo. Previously lived in `e2e/gates.rs`; moved
+/// out of `e2e/` per the codebase-tightening D7 architect's Side note 6
+/// (production code must not depend on the `e2e` module).
+pub fn demo_origin_v() -> Vec3 {
+    let small_in_voxels_x = DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[0] * 16;
+    let small_in_voxels_z = DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[2] * 16;
+    let off_x = (WORLD_SIZE_IN_CHUNKS.x * 16 - small_in_voxels_x) / 2;
+    let off_z = (WORLD_SIZE_IN_CHUNKS.z * 16 - small_in_voxels_z) / 2;
+    Vec3::new(off_x as f32, 0.0, off_z as f32)
+}
 
 /// Startup system: build the hard-coded Phase-A voxel test grid (D2).
 ///

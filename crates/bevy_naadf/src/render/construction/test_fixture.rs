@@ -12,11 +12,15 @@
 //! in [`super::ConstructionPlugin::build`]. The flag is set by `--entities`
 //! in `bin/e2e_render.rs`.
 //!
-//! **Dependency note**: this fn reads `crate::e2e::gates::demo_origin_v()` to
-//! translate the small-default-scene-relative entity position to the
-//! fixed-world coordinate space. The production→e2e import arrow was flagged
-//! in D7 architect's Side note 6; resolving it (move `demo_origin_v` to a
-//! non-e2e module) is a separate cleanup. Functionally correct as-is.
+//! **Dependency note**: this fn reads
+//! [`crate::voxel::grid::demo_origin_v`] to translate the
+//! small-default-scene-relative entity position to the fixed-world coordinate
+//! space. The function lives next to
+//! [`crate::voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS`] (the
+//! small-world footprint it reads) so production code does not depend on
+//! the `e2e` module — the D7 architect's Side note 6 dep-arrow inversion.
+//! The `crate::e2e::gates::demo_origin_v` re-export still exists for the
+//! e2e harness's pre-existing imports.
 
 use bevy::math::Vec3;
 use bevy::prelude::*;
@@ -58,7 +62,7 @@ pub fn spawn_phase_c_test_entity(mut entities: ResMut<MainWorldEntities>) {
     // centered in the fixed `(4096, 512, 4096)`-voxel world, so the entity
     // position must translate through `demo_origin_v` to land in the same
     // relative spot the e2e camera frames.
-    let demo_off = crate::e2e::gates::demo_origin_v();
+    let demo_off = crate::voxel::grid::demo_origin_v();
     let entity_pos = demo_off + Vec3::new(30.0, 24.0, 30.0);
     entities.instances = vec![EntityInstance {
         position: entity_pos,

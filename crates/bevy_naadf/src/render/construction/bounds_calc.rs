@@ -55,6 +55,7 @@ use bevy::shader::Shader;
 use crate::render::construction::config::ConstructionConfig;
 use crate::render::construction::{ConstructionBindGroups, ConstructionGpu};
 use crate::render::gpu_types::GpuConstructionParams;
+use crate::render::pipelines::NaadfPipelines;
 
 /// Asset path of the W3 `bounds_calc.wgsl` shader.
 pub const BOUNDS_CALC_SHADER: &str = "shaders/bounds_calc.wgsl";
@@ -420,13 +421,13 @@ fn refresh_chunks_mirror(
 pub fn naadf_bounds_compute_node(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,
-    construction_pipelines: Option<Res<super::ConstructionPipelines>>,
+    pipelines: Option<Res<NaadfPipelines>>,
     construction_bind_groups: Option<Res<ConstructionBindGroups>>,
     construction_gpu: Option<Res<ConstructionGpu>>,
     construction_config: Option<Res<ConstructionConfig>>,
     world_gpu: Option<Res<crate::render::prepare::WorldGpu>>,
 ) {
-    let Some(construction_pipelines) = construction_pipelines else { return; };
+    let Some(pipelines) = pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
     let Some(construction_gpu) = construction_gpu else { return; };
     let Some(construction_config) = construction_config else { return; };
@@ -469,8 +470,8 @@ pub fn naadf_bounds_compute_node(
 
     // Resolve the two pipelines.
     let (Some(prepare_pipeline), Some(compute_pipeline)) = (
-        pipeline_cache.get_compute_pipeline(construction_pipelines.bounds_calc_pipeline_prepare),
-        pipeline_cache.get_compute_pipeline(construction_pipelines.bounds_calc_pipeline_compute),
+        pipeline_cache.get_compute_pipeline(pipelines.bounds_calc_pipeline_prepare),
+        pipeline_cache.get_compute_pipeline(pipelines.bounds_calc_pipeline_compute),
     ) else {
         return;
     };

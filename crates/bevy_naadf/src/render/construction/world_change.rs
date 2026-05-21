@@ -41,6 +41,7 @@ use bevy::shader::Shader;
 
 use crate::render::construction::config::ConstructionConfig;
 use crate::render::construction::{ConstructionBindGroups, ConstructionEvents};
+use crate::render::pipelines::NaadfPipelines;
 
 /// Asset path of the W2 `world_change.wgsl` shader.
 pub const WORLD_CHANGE_SHADER: &str = "shaders/world_change.wgsl";
@@ -362,12 +363,12 @@ pub fn dispatch_apply_group_change(
 pub fn naadf_world_change_node(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,
-    construction_pipelines: Option<Res<super::ConstructionPipelines>>,
+    pipelines: Option<Res<NaadfPipelines>>,
     construction_bind_groups: Option<Res<ConstructionBindGroups>>,
     construction_events: Option<Res<ConstructionEvents>>,
     construction_config: Option<Res<ConstructionConfig>>,
 ) {
-    let Some(construction_pipelines) = construction_pipelines else { return; };
+    let Some(pipelines) = pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
     let Some(construction_events) = construction_events else { return; };
     let Some(construction_config) = construction_config else { return; };
@@ -403,13 +404,13 @@ pub fn naadf_world_change_node(
     // Resolve the 4 pipelines.
     let (Some(p_chunk), Some(p_block), Some(p_voxel), Some(p_group)) = (
         pipeline_cache
-            .get_compute_pipeline(construction_pipelines.world_change_pipeline_apply_chunk_change),
+            .get_compute_pipeline(pipelines.world_change_pipeline_apply_chunk_change),
         pipeline_cache
-            .get_compute_pipeline(construction_pipelines.world_change_pipeline_apply_block_change),
+            .get_compute_pipeline(pipelines.world_change_pipeline_apply_block_change),
         pipeline_cache
-            .get_compute_pipeline(construction_pipelines.world_change_pipeline_apply_voxel_change),
+            .get_compute_pipeline(pipelines.world_change_pipeline_apply_voxel_change),
         pipeline_cache
-            .get_compute_pipeline(construction_pipelines.world_change_pipeline_apply_group_change),
+            .get_compute_pipeline(pipelines.world_change_pipeline_apply_group_change),
     ) else {
         return;
     };

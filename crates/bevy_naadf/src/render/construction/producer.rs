@@ -17,8 +17,8 @@ use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
 
 use super::{
     bounds_calc, chunk_calc, config, generator_model, ConstructionBindGroups, ConstructionGpu,
-    ConstructionPipelines,
 };
+use crate::render::pipelines::NaadfPipelines;
 
 /// Phase-C followup #1 — runtime GPU producer dispatch (render-graph node).
 ///
@@ -44,7 +44,7 @@ use super::{
 pub fn naadf_gpu_producer_node(
     mut render_context: RenderContext,
     pipeline_cache: Res<PipelineCache>,
-    construction_pipelines: Option<Res<ConstructionPipelines>>,
+    pipelines: Option<Res<NaadfPipelines>>,
     construction_bind_groups: Option<Res<ConstructionBindGroups>>,
     construction_gpu: Option<ResMut<ConstructionGpu>>,
     construction_config: Option<Res<config::ConstructionConfig>>,
@@ -75,7 +75,7 @@ pub fn naadf_gpu_producer_node(
     if gpu.gpu_producer_has_run {
         return;
     }
-    let Some(construction_pipelines) = construction_pipelines else { return; };
+    let Some(pipelines) = pipelines else { return; };
     let Some(construction_bind_groups) = construction_bind_groups else { return; };
 
     // Common-prerequisite pipelines (Algorithm 1 + bounds chain). Both branches
@@ -85,11 +85,11 @@ pub fn naadf_gpu_producer_node(
     };
     let (Some(p_calc), Some(p_voxel), Some(p_block)) = (
         pipeline_cache
-            .get_compute_pipeline(construction_pipelines.chunk_calc_pipeline_calc_block),
+            .get_compute_pipeline(pipelines.chunk_calc_pipeline_calc_block),
         pipeline_cache
-            .get_compute_pipeline(construction_pipelines.chunk_calc_pipeline_voxel_bounds),
+            .get_compute_pipeline(pipelines.chunk_calc_pipeline_voxel_bounds),
         pipeline_cache
-            .get_compute_pipeline(construction_pipelines.chunk_calc_pipeline_block_bounds),
+            .get_compute_pipeline(pipelines.chunk_calc_pipeline_block_bounds),
     ) else {
         return;
     };
@@ -117,7 +117,7 @@ pub fn naadf_gpu_producer_node(
         // Then ONCE after the loop:
         //   ComputeVoxelBounds; ComputeBlockBounds.
         let Some(p_gen) = pipeline_cache
-            .get_compute_pipeline(construction_pipelines.generator_model_pipeline)
+            .get_compute_pipeline(pipelines.generator_model_pipeline)
         else {
             return;
         };

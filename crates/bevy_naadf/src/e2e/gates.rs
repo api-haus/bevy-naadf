@@ -20,24 +20,14 @@ use bevy::prelude::*;
 
 use super::framebuffer::{Framebuffer, Rect};
 
-/// vox-gpu-rewrite Stage 2 (2026-05-18) — the small Default test-scene used
-/// to live at world origin `(0..64, 0..32, 0..64)`. After consolidation,
-/// `setup_test_grid` always uses the fixed `(4096, 512, 4096)`-voxel world
-/// and embeds the small primitive scene at the world centre — the demo
-/// origin shifts from `(0, 0, 0)` to this voxel offset
-/// (`((4096-64)/2, 0, (4096-64)/2) = (2016, 0, 2016)`). Every e2e camera
-/// pose / look target / entity position const in this module is expressed
-/// in small-world-relative voxels and translated through [`demo_origin_v`]
-/// at point-of-use so the framing of the small primitive scene stays
-/// pixel-identical regardless of where the world container places it.
-pub fn demo_origin_v() -> Vec3 {
-    use crate::{WORLD_SIZE_IN_CHUNKS, voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS};
-    let small_in_voxels_x = DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[0] * 16;
-    let small_in_voxels_z = DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[2] * 16;
-    let off_x = (WORLD_SIZE_IN_CHUNKS.x * 16 - small_in_voxels_x) / 2;
-    let off_z = (WORLD_SIZE_IN_CHUNKS.z * 16 - small_in_voxels_z) / 2;
-    Vec3::new(off_x as f32, 0.0, off_z as f32)
-}
+/// Re-export of the canonical [`crate::voxel::grid::demo_origin_v`] — kept
+/// here so existing `crate::e2e::gates::demo_origin_v` imports across the
+/// e2e harness keep resolving without sweeping every callsite. The body
+/// lives next to [`crate::voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS`]
+/// (the small-world footprint it reads) so production code (the
+/// `--entities` fixture spawner) no longer imports from `e2e/`. Moved per
+/// the codebase-tightening D7 architect's Side note 6.
+pub use crate::voxel::grid::demo_origin_v;
 
 /// The fixed E2E camera pose (`e2e-render-test.md` §4.2, R5).
 ///
