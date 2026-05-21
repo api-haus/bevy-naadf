@@ -16,6 +16,7 @@ pub mod android_main;
 pub mod app_args;
 pub mod app_config;
 pub mod app_mode;
+pub mod bootstrap;
 pub mod camera;
 pub mod dev_font;
 pub mod diagnostics;
