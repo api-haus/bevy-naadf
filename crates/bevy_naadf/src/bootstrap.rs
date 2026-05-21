@@ -26,7 +26,7 @@ use bevy::prelude::{App, AppExit};
 
 use crate::render::construction::ConstructionConfig;
 use crate::render::taa::{TaaConfig, TaaRingConfig};
-use crate::{AppArgs, AppConfig, GiSettings};
+use crate::{AppArgs, AppConfig, GiSettings, GridPreset};
 
 /// Transient bootstrap-time configuration carrier.
 ///

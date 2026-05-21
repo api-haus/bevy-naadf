@@ -382,12 +382,16 @@ fn install_dnd_listeners() -> Result<(), JsValue> {
 /// [`apply_pending_vox`] on the next `Update`.
 ///
 /// **`?skybox=1` short-circuit** (Q6): if the URL contains `skybox=1`, the
-/// HTTP fetch is skipped and `AppArgs.grid_preset` is mutated to
-/// [`crate::GridPreset::WebSkybox`]. The `setup_test_grid` system (which
-/// runs in the same `Startup` schedule via the explicit `.before(...)`
-/// ordering at `lib.rs:838-842`) reads the updated preset and installs the
-/// empty skybox-only world. Used by the Playwright SSIM-baseline capture.
-pub fn startup_fetch_default_vox(mut commands: Commands, mut args: ResMut<crate::AppArgs>) {
+/// HTTP fetch is skipped. The grid-preset routing already lives upstream
+/// — **Step 5 of the config-as-resource refactor** relocated the
+/// `?skybox=1 → GridPreset::WebSkybox` resolution into `main.rs`'s wasm32
+/// bootstrap (via [`resolve_skybox_only_param`] called BEFORE
+/// `build_app_with_bootstrap_inputs`). By the time this `Startup` system
+/// fires, `Res<GridPreset>` already carries `WebSkybox` and
+/// `setup_test_grid` has installed the empty skybox-only world. All this
+/// function does for the skybox path now is skip the HTTP fetch and hide
+/// the loading overlay.
+pub fn startup_fetch_default_vox(mut commands: Commands) {
     install_panic_hook();
     if let Err(e) = install_dnd_listeners() {
         error!("web_vox: failed to attach drag-drop listeners: {:?}", e);
@@ -395,11 +399,10 @@ pub fn startup_fetch_default_vox(mut commands: Commands, mut args: ResMut<crate:
 
     if resolve_skybox_only_param() {
         info!(
-            "web_vox: ?skybox=1 detected — skipping HTTP fetch + switching \
-             grid_preset to WebSkybox; setup_test_grid will install the \
-             empty skybox-only world"
+            "web_vox: ?skybox=1 detected — skipping HTTP fetch \
+             (GridPreset::WebSkybox already inserted at bootstrap; \
+             setup_test_grid installed the empty skybox-only world)"
         );
-        args.grid_preset = crate::GridPreset::WebSkybox;
         hide_loading_overlay();
         return;
     }

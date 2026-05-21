@@ -1,11 +1,11 @@
 //! Command-line options, parsed once and stored as a Bevy `Resource`
 //! (`03-design.md` §4.1).
 //!
-//! Carries the remaining production-meaningful knobs (`grid_preset`,
-//! `construction_config`, `spawn_test_entity`) and a flat set of mode/phase
-//! booleans that drive the e2e harness dispatch from `bin/e2e_render.rs`.
-//! At most one e2e flag is true at a time — the enum collapse is deferred to
-//! a future Step 6 (D6+D7 paired) since it crosses 11 mode files.
+//! Carries the remaining production-meaningful knob (`spawn_test_entity`,
+//! migrating in Step 8) and a flat set of mode/phase booleans that drive the
+//! e2e harness dispatch from `bin/e2e_render.rs`. At most one e2e flag is
+//! true at a time — the enum collapse is deferred to a future Step 6
+//! (D6+D7 paired) since it crosses 11 mode files.
 //!
 //! **Step 2 of the config-as-resource refactor** migrated the user's named
 //! smell `taa_ring_depth` out of this struct onto the
@@ -26,23 +26,24 @@
 //! mirror is extract-driven; the wasm32 divergence (previously inside the
 //! deleted `From<&AppArgs>` impl) now lives on
 //! `ConstructionConfig::for_target_arch()` (Decision §5).
+//!
+//! **Step 5 of the config-as-resource refactor** migrated
+//! `grid_preset: GridPreset` onto a per-domain main-world resource. The
+//! native `--vox <path>` flag and the wasm32 `?skybox=1` URL param now
+//! resolve into `BootstrapInputs.grid_preset` BEFORE the App is built;
+//! `setup_test_grid` reads `Res<GridPreset>` instead of `Res<AppArgs>`.
 
 use bevy::prelude::*;
-
-use crate::GridPreset;
 
 /// Command-line options, parsed once and stored as a resource
 /// (`03-design.md` §4.1).
 ///
-/// Track A (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`
-/// — Assumption #5) dropped `Copy` because [`GridPreset::Vox`] carries a
-/// `PathBuf`. Every internal use is by-ref (`Res<AppArgs>` / `&AppArgs`); the
-/// only by-value site is [`crate::build_app_with_args`], where a single move
-/// suffices.
+/// After Steps 2-5 of the config-as-resource refactor only the
+/// `spawn_test_entity` parameter (Bucket A, migrates in Step 8) and the
+/// 11 e2e mode booleans + `vox_e2e_mode` (Bucket B, migrate in Step 6 /
+/// Step 7) remain here. Steps 6-9 drain the shell.
 #[derive(Resource, Clone)]
 pub struct AppArgs {
-    /// Which hard-coded test grid to build (D2).
-    pub grid_preset: GridPreset,
     /// Phase-C wave-3 — when `true`, [`crate::build_app`] adds a `Startup`
     /// system that spawns one fixture entity into
     /// [`render::construction::MainWorldEntities`] (a 4×4×4 emissive-voxel
@@ -175,7 +176,6 @@ pub struct AppArgs {
 impl Default for AppArgs {
     fn default() -> Self {
         Self {
-            grid_preset: GridPreset::default(),
             spawn_test_entity: false,
             resize_test: false,
             vox_e2e_mode: false,

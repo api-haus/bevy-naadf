@@ -67,7 +67,7 @@ use bevy::anti_alias::dlss::DlssProjectId;
 /// `voxelPos % modelSize` tiling on the device. The legacy sized-to-model
 /// install function is preserved only as a test-only oracle reachable from
 /// the `--vox-gpu-oracle` CPU-phase branch.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Resource, Clone, Default, PartialEq, Eq, Debug)]
 pub enum GridPreset {
     /// The default scene: ground slab + axis-aligned boxes + a sphere + one
     /// emissive box.
@@ -157,10 +157,11 @@ pub fn build_app(cfg: AppConfig) -> App {
 /// The e2e_render binary intentionally skips this and uses
 /// [`build_app_with_args`] directly — e2e gates need canonical world / TAA
 /// for deterministic SSIM comparisons across runs and across machines.
-pub fn build_app_with_budget(cfg: AppConfig, args: AppArgs) -> App {
+pub fn build_app_with_budget(cfg: AppConfig, args: AppArgs, grid_preset: GridPreset) -> App {
     let caps = crate::render::budget::probe_and_select();
     let inputs = crate::bootstrap::BootstrapInputs {
         args,
+        grid_preset,
         taa_ring_depth: crate::render::taa::TaaRingConfig {
             depth: caps.taa_ring_depth,
         },

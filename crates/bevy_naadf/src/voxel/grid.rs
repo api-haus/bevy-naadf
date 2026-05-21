@@ -120,11 +120,17 @@ pub fn demo_origin_v(world_size_in_chunks: UVec3) -> Vec3 {
 /// `--vox-gpu-oracle` gate. Production callers never set this flag.
 pub fn setup_test_grid(
     mut commands: Commands,
+    grid_preset: Res<GridPreset>,
     args: Res<AppArgs>,
     effective_world: Res<EffectiveWorldSize>,
 ) {
     let effective = *effective_world;
-    match &args.grid_preset {
+    // Step 5 of the config-as-resource refactor — `grid_preset` migrated
+    // off `AppArgs` onto its own per-domain resource. The legacy
+    // `args.vox_gpu_oracle_cpu_phase` read for the test-only CPU-oracle
+    // branch stays on `AppArgs` until Step 6 collapses the 11 e2e booleans
+    // into `E2eGateMode`.
+    match &*grid_preset {
         GridPreset::Default => {
             install_default_embedded_in_fixed_world(&mut commands, &effective);
         }
@@ -145,10 +151,14 @@ pub fn setup_test_grid(
             install_empty_world(&mut commands, "cli-empty", &effective);
         }
         GridPreset::WebSkybox => {
-            // Web `?skybox=1` URL-param — `web_vox::startup_fetch_default_vox`
-            // mutates `AppArgs.grid_preset` to this arm before
-            // `setup_test_grid` reads it (enforced by the `.before(...)`
-            // ordering at `lib.rs:838-842`).
+            // Web `?skybox=1` URL-param — Step 5 of the config-as-resource
+            // refactor relocated the URL resolution from
+            // `web_vox::startup_fetch_default_vox` (which mutated
+            // `AppArgs.grid_preset` to this arm at `Startup` time) into
+            // `main.rs`'s wasm32 bootstrap, which writes
+            // `BootstrapInputs.grid_preset = GridPreset::WebSkybox` BEFORE
+            // bootstrap fans it out. By the time `setup_test_grid` reads
+            // `Res<GridPreset>` the value is already the correct arm.
             install_empty_world(&mut commands, "skybox-only", &effective);
         }
     }

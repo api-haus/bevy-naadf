@@ -36,13 +36,19 @@ fn main() -> AppExit {
     // binary and every e2e gate route through the SAME C#-faithful fixed-
     // size world install path. `AppArgs::fixed_world_size` is gone; there's
     // no per-binary divergence to configure.
-    let mut args = AppArgs::default();
+    //
+    // Step 5 of the config-as-resource refactor: `grid_preset` migrated off
+    // `AppArgs` onto its own per-domain resource. `--vox <path>` writes
+    // `BootstrapInputs.grid_preset` (native) or main-thread bootstrap reads
+    // `?skybox=1` to write the same field (wasm32) BEFORE the App is built.
+    let args = AppArgs::default();
+    let mut grid_preset = GridPreset::default();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
     if let Some(idx) = argv.iter().position(|a| a == "--vox") {
         if let Some(path) = argv.get(idx + 1) {
-            args.grid_preset = GridPreset::Vox {
+            grid_preset = GridPreset::Vox {
                 path: std::path::PathBuf::from(path),
             };
         } else {
@@ -57,7 +63,12 @@ fn main() -> AppExit {
     // rungs on Android Mali (256 MiB).
     #[cfg(not(target_arch = "wasm32"))]
     {
-        bevy_naadf::build_app_with_budget(AppConfig::windowed(), args).run()
+        bevy_naadf::build_app_with_budget(
+            AppConfig::windowed(),
+            args,
+            grid_preset,
+        )
+        .run()
     }
 
     // wasm32 (web / iOS Safari / Android Chrome): async probe path. The
@@ -71,15 +82,29 @@ fn main() -> AppExit {
     // does the actual App boot via the wasm event loop.
     #[cfg(target_arch = "wasm32")]
     {
+        // Step 5 of the config-as-resource refactor — relocate the
+        // `?skybox=1` URL-param resolution OUT of
+        // `voxel::web_vox::startup_fetch_default_vox` (which used to mutate
+        // `args.grid_preset` at `Startup` time) INTO the wasm32 bootstrap.
+        // Read the URL param on the main thread before the App is built;
+        // write `GridPreset::WebSkybox` directly into `BootstrapInputs`.
+        // The `?pose=horizon` / `?ui=hide` resolvers stay where they are
+        // — they insert separate marker resources at `Startup` time.
+        let mut grid_preset = grid_preset;
+        if bevy_naadf::voxel::web_vox::resolve_skybox_only_param() {
+            grid_preset = GridPreset::WebSkybox;
+        }
         wasm_bindgen_futures::spawn_local(async move {
             let caps = bevy_naadf::render::budget::probe_and_select_async().await;
-            // Step 2 of the config-as-resource refactor — the TAA sample-ring
-            // depth lives on `BootstrapInputs.taa_ring_depth: TaaRingConfig`
-            // now, fanned out into a main-world resource by
-            // `build_app_with_bootstrap_inputs`. Legacy `AppArgs` fields ride
-            // along via `inputs.args` until subsequent steps migrate them.
+            // Step 2/5 of the config-as-resource refactor — the TAA
+            // sample-ring depth and the grid preset both live on
+            // `BootstrapInputs` now, fanned out into per-domain main-world
+            // resources by `build_app_with_bootstrap_inputs`. Legacy
+            // `AppArgs` fields ride along via `inputs.args` until subsequent
+            // steps migrate them.
             let inputs = bevy_naadf::bootstrap::BootstrapInputs {
                 args,
+                grid_preset,
                 taa_ring_depth: bevy_naadf::render::taa::TaaRingConfig {
                     depth: caps.taa_ring_depth,
                 },
