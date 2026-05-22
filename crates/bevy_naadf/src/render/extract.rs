@@ -435,34 +435,126 @@ pub fn extract_camera_history(
     extracted.valid = true;
 }
 
-/// Render-world mirror of the `AppArgs.taa` runtime toggle
-/// (`06-design-a2.md` §6.1, §8.2). `AppArgs` is a main-world resource; the
-/// render-world prepare / graph systems need the flag to (a) set `FLAG_IS_TAA`
-/// in `GpuRenderParams` so the first-hit pass writes the `taa_samples` ring,
-/// and (b) gate the TAA reproject node's dispatch — when TAA is off the node
-/// early-returns, leaving `taa_sample_accum` bit-identical to Phase A.
+/// Render-world mirror of the [`crate::render::taa::TaaConfig`] runtime toggle
+/// (`06-design-a2.md` §6.1, §8.2). The main-world `TaaConfig` lives on a
+/// per-domain resource (Step 3 of the config-as-resource refactor — was
+/// formerly `AppArgs.taa`); the render-world prepare / graph systems need the
+/// flag to (a) set `FLAG_IS_TAA` in `GpuRenderParams` so the first-hit pass
+/// writes the `taa_samples` ring, and (b) gate the TAA reproject node's
+/// dispatch — when TAA is off the node early-returns, leaving
+/// `taa_sample_accum` bit-identical to Phase A.
 #[derive(Resource, Default, Clone, Copy)]
 pub struct ExtractedTaaConfig {
-    /// Whether long-term TAA is enabled (mirrors `AppArgs.taa`).
+    /// Whether long-term TAA is enabled (mirrors `TaaConfig.enabled`).
     pub enabled: bool,
 }
 
-/// `ExtractSchedule` system: mirror `AppArgs.taa` into the render-world
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::render::taa::TaaConfig`] into the render-world
 /// [`ExtractedTaaConfig`] (`06-design-a2.md` §8.2).
+///
+/// Step 3 of the config-as-resource refactor swapped the source from
+/// `Res<AppArgs>` (reading `args.taa`) to `Res<TaaConfig>` (reading
+/// `taa.enabled`) — the mirror shape is unchanged.
 pub fn extract_taa_config(
     mut extracted: ResMut<ExtractedTaaConfig>,
-    args: Extract<Option<Res<crate::AppArgs>>>,
+    taa: Extract<Option<Res<crate::render::taa::TaaConfig>>>,
 ) {
-    if let Some(args) = &*args {
-        extracted.enabled = args.taa;
+    if let Some(taa) = &*taa {
+        extracted.enabled = taa.enabled;
     }
 }
 
-/// Render-world mirror of `AppArgs.gi` — the Phase-B GI pipeline settings
-/// (`09-design-b.md` §3.8 / §10.2). `AppArgs` is a main-world resource; the
-/// render-world `prepare_gi` system needs these to build `GpuGiParams`, and
+/// `ExtractSchedule` system: mirror the main-world [`crate::render::budget::InvalidSampleStorageCount`]
+/// into the render-world [`crate::render::budget::RenderInvalidSampleStorageCount`].
+///
+/// Per the post-deploy fix (`docs/orchestrate/mobile-budget/05-consolidated-fix.md`
+/// Implementation log), the Android entry inserts `InvalidSampleStorageCount`
+/// AFTER `build_app_with_args` returns — so a plugin-build-time snapshot would
+/// see the defensive canonical seed (8), not the budget-selected mobile value
+/// (typically 4). Extract runs every frame from `ExtractSchedule`, so the first
+/// real frame (= when `prepare_gi` runs) sees the post-override budget value.
+pub fn extract_invalid_sample_storage_count(
+    mut mirror: ResMut<crate::render::budget::RenderInvalidSampleStorageCount>,
+    src: Extract<Option<Res<crate::render::budget::InvalidSampleStorageCount>>>,
+) {
+    if let Some(src) = &*src {
+        mirror.0 = src.0;
+    }
+}
+
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::render::budget::EffectiveWorldSize`] into the render-world
+/// [`crate::render::budget::RenderEffectiveWorldSize`].
+///
+/// Same rationale as [`extract_invalid_sample_storage_count`]: the Android
+/// entry's `app.insert_resource(EffectiveWorldSize::from_segments(...))` runs
+/// AFTER `build_app_with_args` returns — so a `NaadfRenderPlugin::build`-time
+/// snapshot would capture only the defensive canonical seed `(16, 2, 16)`,
+/// not the budget-selected mobile rung (e.g. `(6, 2, 6)` on Mali-G52). Extract
+/// runs every frame, so the first real frame sees the post-override value.
+pub fn extract_effective_world_size(
+    mut mirror: ResMut<crate::render::budget::RenderEffectiveWorldSize>,
+    src: Extract<Option<Res<crate::render::budget::EffectiveWorldSize>>>,
+) {
+    if let Some(src) = &*src {
+        mirror.0 = **src;
+    }
+}
+
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::render::construction::ConstructionConfig`] into the render-world
+/// `ConstructionConfig`.
+///
+/// Step 4 of the config-as-resource refactor (`docs/orchestrate/config-as-
+/// resource-refactor/02-design.md` §3.4): replaces the
+/// `From<&AppArgs>`-driven plugin-build snapshot at
+/// `render/construction/mod.rs:1832-1836` with an extract-driven copy,
+/// mirroring the [`extract_effective_world_size`] precedent. The render-world
+/// resource is `init_resource`d to the canonical desktop `Default`; this
+/// extract overwrites it from the main-world value every frame. `Copy`,
+/// fixed-size — cheap.
+pub fn extract_construction_config(
+    mut mirror: ResMut<crate::render::construction::ConstructionConfig>,
+    src: Extract<Option<Res<crate::render::construction::ConstructionConfig>>>,
+) {
+    if let Some(src) = &*src {
+        *mirror = **src;
+    }
+}
+
+/// `ExtractSchedule` system: mirror the main-world
+/// [`crate::render::taa::TaaRingConfig`] into the render-world
+/// [`crate::render::taa::RenderTaaRingConfig`].
+///
+/// Step 2 of the config-as-resource refactor (
+/// `docs/orchestrate/config-as-resource-refactor/02-design.md` §3.4): replaces
+/// the former plugin-build-time snapshot of `AppArgs.taa_ring_depth` at
+/// `render/mod.rs:113-126` with an extract-driven copy, mirroring the
+/// [`extract_effective_world_size`] precedent. The render-world mirror is
+/// `init_resource`d to canonical [`crate::DEFAULT_TAA_RING_DEPTH`]; this
+/// extract overwrites it from the main-world value every frame (the first
+/// `ExtractSchedule` runs before `RenderStartup`, so
+/// `NaadfPipelines::from_world` sees the post-extract value when it injects
+/// the `#{TAA_SAMPLE_RING_DEPTH}` shader-def).
+pub fn extract_taa_ring_depth(
+    mut mirror: ResMut<crate::render::taa::RenderTaaRingConfig>,
+    src: Extract<Option<Res<crate::render::taa::TaaRingConfig>>>,
+) {
+    if let Some(src) = &*src {
+        mirror.depth = src.depth;
+    }
+}
+
+/// Render-world mirror of the main-world [`crate::GiSettings`] — the Phase-B
+/// GI pipeline settings (`09-design-b.md` §3.8 / §10.2). The render-world
+/// `prepare_gi` system needs these to build `GpuGiParams`, and
 /// `naadf_denoise_node` (Batch 5) gates on `is_denoise`. Like A-2's
 /// `ExtractedTaaConfig` — a flat `Copy` mirror, re-copied each frame.
+///
+/// Step 3 of the config-as-resource refactor lifted `GiSettings` out of
+/// `AppArgs.gi` onto its own per-domain main-world resource; only the extract
+/// SOURCE changed (was `Res<AppArgs>`, now `Res<GiSettings>`).
 #[derive(Resource, Clone, Copy)]
 #[derive(Default)]
 pub struct ExtractedGiConfig {
@@ -471,13 +563,17 @@ pub struct ExtractedGiConfig {
 }
 
 
-/// `ExtractSchedule` system: mirror `AppArgs.gi` into the render-world
-/// [`ExtractedGiConfig`] (`09-design-b.md` §10.2).
+/// `ExtractSchedule` system: mirror the main-world [`crate::GiSettings`] into
+/// the render-world [`ExtractedGiConfig`] (`09-design-b.md` §10.2).
+///
+/// Step 3 of the config-as-resource refactor swapped the source from
+/// `Res<AppArgs>` (reading `args.gi`) to `Res<GiSettings>` (reading the
+/// resource directly).
 pub fn extract_gi_config(
     mut extracted: ResMut<ExtractedGiConfig>,
-    args: Extract<Option<Res<crate::AppArgs>>>,
+    gi: Extract<Option<Res<crate::GiSettings>>>,
 ) {
-    if let Some(args) = &*args {
-        extracted.settings = args.gi;
+    if let Some(gi) = &*gi {
+        extracted.settings = **gi;
     }
 }

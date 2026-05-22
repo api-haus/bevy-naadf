@@ -8,9 +8,11 @@
 //! (`naadf_entity_update_node` + the `ray_tracing.wgsl::shoot_ray` entity
 //! sub-traversal) folds it into the framebuffer.
 //!
-//! Gated on `AppArgs::spawn_test_entity = true` via a `.run_if` registered
-//! in [`super::ConstructionPlugin::build`]. The flag is set by `--entities`
-//! in `bin/e2e_render.rs`.
+//! Gated on the [`super::SpawnTestEntity`] resource (`SpawnTestEntity(true)`)
+//! via a `.run_if` registered in [`super::ConstructionPlugin::build`]. The
+//! resource is set by the `--entities` boot in `bin/e2e_render.rs`. Step 8 of
+//! the config-as-resource refactor migrated the gate off the former
+//! `AppArgs::spawn_test_entity` boolean onto this per-domain resource.
 //!
 //! **Dependency note**: this fn reads
 //! [`crate::voxel::grid::demo_origin_v`] to translate the
@@ -62,7 +64,9 @@ pub fn spawn_phase_c_test_entity(mut entities: ResMut<MainWorldEntities>) {
     // centered in the fixed `(4096, 512, 4096)`-voxel world, so the entity
     // position must translate through `demo_origin_v` to land in the same
     // relative spot the e2e camera frames.
-    let demo_off = crate::voxel::grid::demo_origin_v();
+    // e2e fixture entity assumes the canonical desktop world size (the fixture
+    // is desktop-test-only — mobile budgets never reach this entity spawner).
+    let demo_off = crate::voxel::grid::demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     let entity_pos = demo_off + Vec3::new(30.0, 24.0, 30.0);
     entities.instances = vec![EntityInstance {
         position: entity_pos,

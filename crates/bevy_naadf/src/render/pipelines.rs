@@ -57,7 +57,7 @@ use crate::render::gpu_types::{
     GpuAtmosphereParams, GpuCamera, GpuGiParams, GpuRenderParams, GpuTaaParams,
     GpuWorldMeta,
 };
-use crate::render::taa::TaaRingConfig;
+use crate::render::taa::RenderTaaRingConfig;
 use crate::voxel::{CELL_CHILDREN, CELL_DIM};
 
 /// SSoT-3 — shader-def injection for the paper's `CELL_DIM` / `CELL_CHILDREN`
@@ -356,11 +356,17 @@ impl FromWorld for NaadfPipelines {
         // injected as the naga-oil `#{TAA_SAMPLE_RING_DEPTH}` shader-def into
         // the two pipelines whose shader (`taa.wgsl` + its `taa_common.wgsl`
         // import) declares `const TAA_SAMPLE_RING_DEPTH = #{...}u`. This is the
-        // SAME `TaaRingConfig` value `prepare_taa` sizes `taa_samples` from, so
-        // the buffer length and the shader's loop bounds / `% N` indexing
-        // agree exactly. `TaaRingConfig` is inserted into the render sub-app by
-        // `NaadfRenderPlugin::build` before this `RenderStartup` `FromWorld`.
-        let taa_ring_depth = world.resource::<TaaRingConfig>().depth;
+        // SAME `RenderTaaRingConfig` value `prepare_taa` sizes `taa_samples`
+        // from, so the buffer length and the shader's loop bounds / `% N`
+        // indexing agree exactly. `RenderTaaRingConfig` is `init_resource`d
+        // in the render sub-app by `NaadfRenderPlugin::build` to the canonical
+        // default, then overwritten each frame from the main-world
+        // [`crate::render::taa::TaaRingConfig`] by `extract_taa_ring_depth`.
+        // `RenderStartup` runs after the first `ExtractSchedule`, so this
+        // `FromWorld` reads the post-extract value — including any
+        // mobile-budget override that wrote a non-canonical depth into the
+        // main-world resource at bootstrap.
+        let taa_ring_depth = world.resource::<RenderTaaRingConfig>().depth;
         let taa_shader_defs =
             vec![ShaderDefVal::UInt("TAA_SAMPLE_RING_DEPTH".into(), taa_ring_depth)];
         let pipeline_cache = world.resource::<PipelineCache>();

@@ -57,11 +57,6 @@
 
 use std::path::{Path, PathBuf};
 
-use bevy::prelude::*;
-use bevy::winit::WinitSettings;
-
-use crate::camera::poses::{HORIZON_CAMERA_POS, HORIZON_CAMERA_ROT};
-use crate::camera::position_split::PositionSplit;
 use crate::e2e::framebuffer::Framebuffer;
 
 // ---------------------------------------------------------------------------
@@ -119,74 +114,6 @@ pub const HORIZON_DRAIN_FRAMES: u32 = super::vox_web_parity::PARITY_DRAIN_FRAMES
 /// headroom above the current measured SSIM and well above the 0.789
 /// pre-fix regression.
 pub const HORIZON_SSIM_SIMILARITY_MIN: f64 = 0.91;
-
-// ---------------------------------------------------------------------------
-// Sub-phase entry point
-// ---------------------------------------------------------------------------
-
-/// Boot the e2e harness configured for the native horizon-capture phase.
-/// Loads the Oasis `.cvox` fixture via the production W5 GPU producer chain
-/// (same install path as the live web build), pins the horizon camera, and
-/// saves `target/e2e-screenshots/vox_horizon_native.png`.
-pub fn run_vox_horizon_native_phase() -> AppExit {
-    let path = oasis_cvox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --vox-horizon-native: FIXTURE MISSING at {} \
-             (cwd = {:?}). The fixture is Git LFS-tracked at \
-             {OASIS_CVOX_FIXTURE_PATH}. Run `git lfs pull`, OR run from the \
-             workspace root.",
-            path.display(),
-            std::env::current_dir().ok()
-        );
-        return AppExit::error();
-    }
-    println!(
-        "e2e_render --vox-horizon-native: loading Oasis CVOX from {} via \
-         the W5 GPU producer chain. Camera pinned to translation={:?} \
-         rotation={:?}. Window {}×{}. Saving to {}.",
-        path.display(),
-        HORIZON_CAMERA_POS,
-        HORIZON_CAMERA_ROT,
-        HORIZON_WIDTH,
-        HORIZON_HEIGHT,
-        HORIZON_NATIVE_PNG,
-    );
-
-    let mut app_args = crate::AppArgs::default();
-    app_args.grid_preset = crate::GridPreset::Vox { path };
-    app_args.construction_config.gpu_construction_enabled = true;
-    app_args.vox_horizon_native_phase = true;
-    crate::run_e2e_render_with_args(app_args)
-}
-
-// ---------------------------------------------------------------------------
-// Camera-pin system — overrides the e2e driver's pose write every tick
-// ---------------------------------------------------------------------------
-
-/// `Update` system: pin the camera at the horizon pose every tick when
-/// `vox_horizon_native_phase` is set. Registered with
-/// `.after(driver::e2e_driver)` so this pose write lands AFTER the driver's
-/// motion-phase write but BEFORE `sync_position_split` consumes the
-/// `Transform`.
-pub fn pin_vox_horizon_camera(
-    args: Option<Res<crate::AppArgs>>,
-    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
-) {
-    let Some(args) = args else { return; };
-    if !args.vox_horizon_native_phase {
-        return;
-    }
-    let pose = Transform {
-        translation: HORIZON_CAMERA_POS,
-        rotation: HORIZON_CAMERA_ROT,
-        scale: Vec3::ONE,
-    };
-    let (transform, position_split) = &mut *camera;
-    **transform = pose;
-    **position_split = PositionSplit::from_world(pose.translation);
-    let _ = WinitSettings::game;
-}
 
 // ---------------------------------------------------------------------------
 // Oasis CVOX fixture path

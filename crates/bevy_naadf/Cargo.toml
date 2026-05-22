@@ -7,6 +7,10 @@ license = "MIT"
 # The crate ships three binaries (`bevy-naadf`, `e2e_render`, `bake`); `cargo run`
 # / `just run` resolve to the production app unless another `--bin` is given.
 default-run = "bevy-naadf"
+# Android-only build script. On non-Android targets it returns immediately;
+# the cost is one extra process invocation per `cargo build`. See `build.rs`
+# for why it exists (NDK outline-atomics builtins linking).
+build = "build.rs"
 
 # The crate is a library (`src/lib.rs` — the shared `build_app` app-wiring path)
 # plus three thin binaries over it: `bevy-naadf` (the production app,
@@ -18,6 +22,11 @@ default-run = "bevy-naadf"
 [lib]
 name = "bevy_naadf"
 path = "src/lib.rs"
+# `cdylib` produces the `libbevy_naadf.so` that `cargo-ndk` drops into the
+# Android Gradle project's `jniLibs/arm64-v8a/`. `rlib` keeps the binaries
+# (`bevy-naadf`, `e2e_render`, `bake`) linkable against the same library
+# crate. Mirrors Bevy's own `examples/mobile/Cargo.toml`.
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "bevy-naadf"
@@ -39,6 +48,13 @@ path = "src/bin/bake.rs"
 bevy = { version = "=0.19.0-rc.1", features = [
     "free_camera",
 ] }
+# base64 = the wire encoding for the `naadf/await_capture` BRP verb's PNG
+# payload (`src/e2e_brp/verbs.rs`) — a captured framebuffer travels as a
+# base64-encoded PNG inside the JSON-RPC reply. Pinned to the EXACT version
+# Bevy 0.19-rc.1 already pulls in transitively (`Cargo.lock` → base64 0.22.1)
+# so there is no second copy of the crate. Used unconditionally (the verb code
+# is feature-gated, but a small always-compiled dep avoids a feature-scramble).
+base64 = "=0.22.1"
 # bytemuck = #[repr(C)] <-> &[u8] for the GPU-mirror structs (render/gpu_types.rs).
 # Pinned to the version Bevy 0.19-rc.1 re-exports so the `Pod`/`Zeroable` traits
 # match across the crate boundary.
@@ -113,6 +129,17 @@ wgpu = "=29.0.3"
 # Pure-rust, no native deps; wasm-compatible.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# dev-dependencies — the BRP-driven e2e gate test files in `tests/` use the
+# external runner library. `naadf_e2e` depends back on this crate (for the
+# `e2e_brp::schema` structs + the pure `e2e::framebuffer` assertion code);
+# that is not a cycle — a `[dev-dependencies]` arrow is allowed to point at a
+# crate that depends on this one's *library* target. The gate test files are
+# same-package as the `bevy-naadf` binary, so Cargo sets `CARGO_BIN_EXE_bevy-naadf`
+# for them — `Sut::spawn` locates the SUT binary with no `cargo build`
+# shell-out (the Phase 2 hybrid-layout decision; design §7).
+[dev-dependencies]
+naadf_e2e = { path = "../naadf_e2e" }
+
 # Native-only — the `bake` binary (`src/bin/bake.rs`) needs Bevy's
 # `AssetProcessor` to opt into `AssetMode::Processed`. Without
 # `bevy/asset_processor` Bevy only *reads* a pre-built `imported_assets/`;
@@ -122,6 +149,14 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # user memory).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy = { version = "=0.19.0-rc.1", features = ["asset_processor"] }
+
+# Android — `android-game-activity` selects the modern GameActivity (AGDK) JNI
+# bridge (API 31+), matching Bevy's `examples/mobile/android_example/`. Cargo
+# merges this features list with the base `[dependencies]` and the
+# `cfg(not(wasm32))` entry above, so the final Android build of Bevy carries
+# `["free_camera", "asset_processor", "android-game-activity"]`.
+[target.'cfg(target_os = "android")'.dependencies]
+bevy = { version = "=0.19.0-rc.1", features = ["android-game-activity"] }
 
 # wasm32-only: getrandom ≥0.3 refuses to compile for `wasm32-unknown-unknown`
 # without an explicit backend. `dot_vox`→`ahash` pulls getrandom 0.3.4
@@ -194,6 +229,17 @@ web-sys = { version = "0.3", features = [
 
 [features]
 default = []
+# e2e-brp = the native-only Bevy Remote Protocol control surface for the
+# external e2e test runner. Forwards to Bevy's `bevy_remote` umbrella feature,
+# which pulls `bevy_remote` (with `bevy_asset` + `bevy_render`, so the
+# render-world custom-method hook is available) and its `http` default feature
+# (so `RemoteHttpPlugin` exists). The shipped production binary must NOT carry
+# a remote-control socket, so this is opt-in: `cargo build --workspace` (the
+# project verification gate) compiles the default set; the e2e runner builds
+# the SUT with `--features e2e-brp`. All BRP code is behind
+# `#[cfg(feature = "e2e-brp")]`. Phase 0 transport spike — see
+# `docs/orchestrate/e2e-ipc-rpc-restructure/02-design.md` §2.
+e2e-brp = ["bevy/bevy_remote"]
 # DLSS Ray Reconstruction. Forwards to Bevy's `dlss` feature, whose transitive
 # `dlss_wgpu` build step needs the NVIDIA DLSS SDK + Vulkan + clang. Opt-in —
 # the integration is not wired up yet, so leave off for normal builds.

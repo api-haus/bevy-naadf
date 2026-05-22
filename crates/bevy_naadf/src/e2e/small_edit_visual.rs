@@ -55,9 +55,8 @@ use std::path::Path;
 use bevy::math::{IVec3, Vec3};
 use bevy::prelude::*;
 
-use crate::camera::position_split::PositionSplit;
 use crate::e2e::framebuffer::{Framebuffer, Rect};
-use crate::voxel::{VoxelTypeId, CELL_DIM};
+use crate::voxel::VoxelTypeId;
 use crate::world::data::WorldData;
 
 // ---------------------------------------------------------------------------
@@ -111,7 +110,7 @@ pub const SMALL_EDIT_CLICK_VOXEL: IVec3 = IVec3::new(32, 29, 32);
 /// demo origin offset.
 pub fn small_edit_click_voxel_world() -> IVec3 {
     use crate::e2e::gates::demo_origin_v;
-    let off = demo_origin_v();
+    let off = demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     SMALL_EDIT_CLICK_VOXEL + IVec3::new(off.x as i32, off.y as i32, off.z as i32)
 }
 
@@ -182,43 +181,8 @@ pub const SMALL_EDIT_CATASTROPHIC_FRACTION_CEILING: f32 = 0.15;
 // State resource
 // ---------------------------------------------------------------------------
 
-/// Stash for the two captured framebuffers + CPU snapshot counts +
-/// edit-applied flag.
-#[derive(Resource, Default)]
-pub struct SmallEditVisualState {
-    /// Pre-edit framebuffer.
-    pub before: Option<Framebuffer>,
-    /// Post-edit framebuffer.
-    pub after: Option<Framebuffer>,
-    /// Pre-edit count of non-empty voxels (resolved via the chunks/blocks/
-    /// voxels three-layer descent).
-    pub voxel_count_before: Option<u64>,
-    /// Post-edit count of non-empty voxels.
-    pub voxel_count_after: Option<u64>,
-    /// Cached size_in_voxels at the time the brush fired.
-    pub world_size_voxels: Option<[u32; 3]>,
-    /// Edit-fired flag — driver fires the brush exactly once.
-    pub edit_applied: bool,
-}
-
 // ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-/// Boot the e2e harness with `--small-edit-visual` mode active.
-pub fn run_small_edit_visual() -> AppExit {
-    let mut app_args = crate::AppArgs::default();
-    app_args.small_edit_visual_mode = true;
-    println!(
-        "e2e_render --small-edit-visual: target click voxel {:?}, brush radius {SMALL_EDIT_RADIUS}, \
-         paint type {:?}",
-        SMALL_EDIT_CLICK_VOXEL, SMALL_EDIT_PAINT_TYPE
-    );
-    crate::run_e2e_render_with_args(app_args)
-}
-
-// ---------------------------------------------------------------------------
-// Camera pose pin
+// Camera pose helper
 // ---------------------------------------------------------------------------
 
 /// Birdseye over the test grid centered on the click voxel.
@@ -249,29 +213,6 @@ pub fn birdseye_pose() -> Transform {
     Transform::from_xyz(cx, cam_y, cz).looking_at(Vec3::new(cx, cy, cz), Vec3::X)
 }
 
-/// Re-uses the `oasis_edit_visual::pin_oasis_camera` pattern: every tick,
-/// override the camera pose. Wired only when
-/// `AppArgs.small_edit_visual_mode == true`.
-pub fn pin_small_edit_camera(
-    args: Option<Res<crate::AppArgs>>,
-    world_data: Option<Res<WorldData>>,
-    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
-) {
-    let Some(args) = args else { return; };
-    if !args.small_edit_visual_mode {
-        return;
-    }
-    let Some(world_data) = world_data else { return; };
-    let size_v = world_data.size_in_chunks * (CELL_DIM as u32 * CELL_DIM as u32);
-    if size_v.x == 0 || size_v.y == 0 || size_v.z == 0 {
-        return;
-    }
-    let pose = birdseye_pose();
-    let (transform, position_split) = &mut *camera;
-    **transform = pose;
-    **position_split = PositionSplit::from_world(pose.translation);
-}
-
 // ---------------------------------------------------------------------------
 // CPU snapshot helper
 // ---------------------------------------------------------------------------
@@ -291,7 +232,7 @@ pub fn pin_small_edit_camera(
 pub fn count_non_empty_voxels(world_data: &WorldData) -> u64 {
     use crate::e2e::gates::demo_origin_v;
     use crate::voxel::grid::DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS;
-    let off = demo_origin_v();
+    let off = demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     let off_x = off.x as i32;
     let off_z = off.z as i32;
     let demo_sx = (DEFAULT_SMALL_WORLD_SIZE_IN_CHUNKS[0] * 16) as i32;
@@ -311,69 +252,6 @@ pub fn count_non_empty_voxels(world_data: &WorldData) -> u64 {
         }
     }
     count
-}
-
-// ---------------------------------------------------------------------------
-// Edit application
-// ---------------------------------------------------------------------------
-
-/// Apply the small cube brush at the configured click voxel via the
-/// production runtime path (`crate::editor::tools::cube_brush`). Captures
-/// pre/post non-empty voxel counts into the state resource.
-pub fn apply_small_cube_edit(
-    world_data: &mut WorldData,
-    state: &mut SmallEditVisualState,
-) {
-    let size_v = world_data.size_in_chunks * (CELL_DIM as u32 * CELL_DIM as u32);
-    state.world_size_voxels = Some([size_v.x, size_v.y, size_v.z]);
-
-    let count_before = count_non_empty_voxels(world_data);
-    state.voxel_count_before = Some(count_before);
-
-    // vox-gpu-rewrite Stage 2: click voxel is the demo-relative coord
-    // translated through `demo_origin_v` to its world-space location.
-    let click = small_edit_click_voxel_world();
-    let pre_type = world_data.get_voxel_type(click);
-    println!(
-        "e2e_render --small-edit-visual: pre-edit voxel at {:?} has type {:?}, \
-         non-empty voxel count = {}",
-        click, pre_type, count_before
-    );
-
-    // Voxel-centre world coords — `cube_brush` tests `(voxel + 0.5) - pos`.
-    let pos = click.as_vec3() + Vec3::splat(0.5);
-    let radius = SMALL_EDIT_RADIUS;
-    let ty = SMALL_EDIT_PAINT_TYPE;
-    let is_erase = false;
-
-    crate::editor::tools::cube_brush(world_data, pos, radius, ty, is_erase);
-
-    let count_after = count_non_empty_voxels(world_data);
-    state.voxel_count_after = Some(count_after);
-
-    let mut chunk_records = 0usize;
-    let mut block_records = 0usize;
-    let mut voxel_records = 0usize;
-    let batches = world_data.pending_edits.batches.len();
-    let groups = world_data.pending_edits.edited_groups.len();
-    for batch in &world_data.pending_edits.batches {
-        chunk_records += batch.changed_chunks.len();
-        block_records += batch.changed_blocks.len() / 65;
-        voxel_records += batch.changed_voxels.len() / 33;
-    }
-    let post_type = world_data.get_voxel_type(click);
-    println!(
-        "e2e_render --small-edit-visual: cube_brush returned — voxels {}→{} (Δ={}), \
-         click voxel {:?} now {:?}; pending_edits batches {batches}, edited_groups {groups}, \
-         changed_chunks {chunk_records}, changed_blocks {block_records}, changed_voxels {voxel_records}",
-        count_before,
-        count_after,
-        (count_after as i64 - count_before as i64),
-        click,
-        post_type,
-    );
-
-    state.edit_applied = true;
 }
 
 // ---------------------------------------------------------------------------

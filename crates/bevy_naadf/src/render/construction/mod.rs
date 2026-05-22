@@ -85,7 +85,9 @@ use crate::render::pipelines::NaadfPipelines;
 
 pub use chunk_calc::build_segment_voxel_buffer_from_dense;
 pub use config::ConstructionConfig;
-pub use extract::{extract_world_changes, MainWorldEntities, RenderWorldEntityState};
+pub use extract::{
+    extract_world_changes, MainWorldEntities, RenderWorldEntityState, SpawnTestEntity,
+};
 pub use producer::naadf_gpu_producer_node;
 pub use readback::{
     populate_cpu_mirror_from_gpu_producer, CpuMirrorReadback, ReadbackStage,
@@ -1784,8 +1786,8 @@ pub fn prepare_construction(
 /// `gpu_construction_enabled = true` (the default). The CPU `construct()`
 /// path still runs in `setup_test_grid` (it produces the CPU mirror used by
 /// the oracle + editing path) — E4 fallback is preserved.
-pub fn run_gpu_construction_startup(args: Res<crate::AppArgs>) {
-    if !args.construction_config.gpu_construction_enabled {
+pub fn run_gpu_construction_startup(cc: Res<ConstructionConfig>) {
+    if !cc.gpu_construction_enabled {
         info!(
             "phase-c — gpu construction DISABLED; CPU `construct()` path \
              produces every chunks/blocks/voxels buffer the renderer reads."
@@ -1818,23 +1820,19 @@ pub fn run_gpu_construction_startup(args: Res<crate::AppArgs>) {
 /// W3 / W4 each land their node. The empty seam stays out of the chain so
 /// W0's render-graph topology is byte-identical to pre-W0.
 ///
-/// The construction-config resource is mirrored from main-world `AppArgs`
-/// into the render sub-app the same way `TaaRingConfig` is mirrored
-/// (`render/mod.rs:73-86`).
+/// **Step 4 of the config-as-resource refactor** (`docs/orchestrate/
+/// config-as-resource-refactor/02-design.md` §4 Step 4): the
+/// `ConstructionConfig` lift from `AppArgs.construction_config` is gone. The
+/// main-world resource is inserted by `build_app_with_bootstrap_inputs`
+/// (defaultable to `ConstructionConfig::for_target_arch()`, overridable
+/// per-gate); the render-sub-app mirror is `init_resource`d to the canonical
+/// default and overwritten each frame by `extract_construction_config`. Same
+/// extract-driven pattern as `EffectiveWorldSize` / `TaaRingConfig`.
 pub struct ConstructionPlugin;
 
 
 impl Plugin for ConstructionPlugin {
     fn build(&self, app: &mut App) {
-        // Read the main-world `AppArgs.construction_config` once at
-        // plugin-build time and mirror it into the render sub-app, same
-        // pattern as `TaaRingConfig` (`render/mod.rs:73-86`).
-        let construction_config = app
-            .world()
-            .get_resource::<crate::AppArgs>()
-            .map(ConstructionConfig::from)
-            .unwrap_or_default();
-
         // Phase-C wave-3 — main-world resource for the W4 entity track. Empty
         // by default; e2e binaries / user code that wants to render an entity
         // populates `instances` + `voxel_data` (and flags `voxel_data_dirty`).
@@ -1842,15 +1840,18 @@ impl Plugin for ConstructionPlugin {
         app.init_resource::<MainWorldEntities>();
 
         // Phase-C wave-3 — `--entities` fixture spawner. Self-gates on
-        // `AppArgs::spawn_test_entity` so registration is unconditional; the
-        // scheduler skips the system body when the flag is `false`. Runs
-        // after `voxel::grid::setup_test_grid` so the world dimensions are
-        // known before the fixture computes its demo-relative position.
+        // `SpawnTestEntity` so registration is unconditional; the scheduler
+        // skips the system body when the flag is `false` (or the resource is
+        // absent). Runs after `voxel::grid::setup_test_grid` so the world
+        // dimensions are known before the fixture computes its demo-relative
+        // position. Step 8 of the config-as-resource refactor migrated the
+        // gate off `AppArgs::spawn_test_entity` onto the `SpawnTestEntity`
+        // resource.
         app.add_systems(
             Startup,
             test_fixture::spawn_phase_c_test_entity
                 .after(crate::voxel::grid::setup_test_grid)
-                .run_if(|args: Res<crate::AppArgs>| args.spawn_test_entity),
+                .run_if(|s: Option<Res<SpawnTestEntity>>| s.is_some_and(|s| s.0)),
         );
 
         // Main-world `Startup` driver (regime-1, `15-design-c.md` §1.2). W0
@@ -1862,8 +1863,14 @@ impl Plugin for ConstructionPlugin {
         };
 
         render_app
-            // Mirror the main-world construction config into the render sub-app.
-            .insert_resource(construction_config)
+            // Step 4 of the config-as-resource refactor — the render-world
+            // `ConstructionConfig` is `init_resource`d to the canonical
+            // `for_target_arch()` default and overwritten each frame by
+            // `extract_construction_config` (mirror of
+            // `extract_effective_world_size`). The plugin-build-time `From<&AppArgs>`
+            // snapshot is gone; same extract-driven pattern as `EffectiveWorldSize`
+            // / `TaaRingConfig`.
+            .init_resource::<ConstructionConfig>()
             // Construction pipelines now live on `NaadfPipelines` (Resolution D
             // — W0 seam retired). `NaadfRenderPlugin::build` registers
             // `NaadfPipelines` once via `init_gpu_resource`; no second-register

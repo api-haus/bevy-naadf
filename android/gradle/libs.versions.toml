@@ -1,0 +1,16 @@
+[versions]
+agp = "8.4.0"
+appcompat = "1.6.1"
+material = "1.10.0"
+# Must be compatible with the `android-activity` crate version Bevy 0.19 pulls
+# in via its `android-game-activity` feature. 4.4.0 is what Bevy's own
+# `examples/mobile/android_example` pins against.
+gamesActivity = "4.4.0"
+
+[libraries]
+appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+games-activity = { group = "androidx.games", name = "games-activity", version.ref = "gamesActivity" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }

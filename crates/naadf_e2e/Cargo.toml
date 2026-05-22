@@ -1,0 +1,42 @@
+[package]
+name = "naadf_e2e"
+version = "0.1.0"
+edition = "2021"
+description = "External BRP-driven e2e test runner library for bevy-naadf — Sut process harness + BrpClient + scenario helpers"
+license = "MIT"
+publish = false
+
+# Library-only — no `tests/` of its own. The 13 gate test files live in
+# `crates/bevy_naadf/tests/<gate>.rs` (same-package as the `bevy-naadf` binary
+# so Cargo sets `CARGO_BIN_EXE_bevy-naadf` for them) and depend on this crate
+# as a dev-dependency. See `docs/orchestrate/e2e-ipc-rpc-restructure/02-design.md`
+# §7 + the Phase 2 brief's hybrid-layout decision.
+[lib]
+name = "naadf_e2e"
+path = "src/lib.rs"
+
+[dependencies]
+# serde / serde_json — the BRP JSON-RPC 2.0 wire format. The runner serialises
+# its calls against `bevy_naadf::e2e_brp::schema` and parses replies.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# bevy-naadf (default features, no `e2e-brp`) — for the `e2e_brp::schema` verb
+# wire structs (compiled unconditionally — design D8 / A7) and the pure
+# `e2e::framebuffer` / `e2e::ssim` assertion code. The runner NEVER builds
+# bevy-naadf with `e2e-brp`; only the spawned SUT subprocess carries that
+# feature. `default-features = false` keeps the dependency surface minimal.
+# The package is `bevy-naadf` (hyphen); its library crate is `bevy_naadf`
+# (underscore — `use bevy_naadf::...`).
+bevy-naadf = { path = "../bevy_naadf", default-features = false }
+# base64 — decode the `naadf/await_capture` PNG payload. Same pin as bevy_naadf.
+base64 = "=0.22.1"
+# image — decode the captured PNG into raw RGBA for `Framebuffer::from_raw_rgba`.
+# Same version + feature set bevy_naadf pins.
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
+# NOTE: no HTTP-client dependency. The BRP transport is loopback HTTP/1.1
+# JSON-RPC; `BrpClient` speaks it directly over `std::net::TcpStream` (the
+# design §7.1 / A6 documented fallback) — this keeps the runner dependency
+# tree tiny and gives full control over the chunked `text/event-stream` SSE
+# bodies the watching verbs (`run_until_idle`, `await_capture`) return, which
+# a general HTTP client would buffer or fight.

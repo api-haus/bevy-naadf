@@ -4,28 +4,14 @@
 //! framebuffer readback is fast and every `pixel_count`-sized buffer is
 //! identical run-to-run (§4.2 determinism row).
 //!
-//! This module also owns the mode→window-config mapping used by
-//! [`crate::run_e2e_render_with_args`] (the lib-root entry point that boots
-//! the e2e binary). Each e2e mode constructor lives next to its peers here so
-//! adding a mode is a one-file edit.
-//!
 //! ## Imports from `crate::e2e` — legitimate consumer, not a dep-arrow bug
 //!
-//! Each `WindowConfig::e2e_*` constructor reads its dimensions from the e2e
-//! gate that boots through it (`crate::e2e::{E2E_WIDTH, E2E_HEIGHT,
-//! E2E_RESIZE_BOOT_WIDTH, E2E_RESIZE_BOOT_HEIGHT,
-//! vox_horizon_parity::HORIZON_WIDTH, vox_horizon_parity::HORIZON_HEIGHT,
-//! small_edit_repro::SMALL_EDIT_REPRO_WIDTH,
-//! small_edit_repro::SMALL_EDIT_REPRO_HEIGHT}`). These are legitimate consumer
-//! imports: each constant's value is pinned by the gate's own contract
-//! (Playwright viewport for the horizon gate, user-reported bug-report screen
-//! size for `small-edit-repro`, fast-readback 256×256 framebuffer choice for
-//! the standard e2e). Relocating them out of `e2e/` would orphan the constants
-//! from the gate logic that defines them. The standalone
-//! `WindowConfig::windowed()` constructor — the only one production calls —
-//! reads zero e2e constants.
-
-use crate::AppArgs;
+//! The `WindowConfig::e2e*` constructors read their dimensions from the e2e
+//! gate constants (`crate::e2e::{E2E_WIDTH, E2E_HEIGHT, …}`). These are
+//! legitimate consumer imports: each constant's value is pinned by a gate's
+//! own contract. `WindowConfig::e2e()` is the SUT window
+//! ([`crate::AppConfig::e2e_sut`]); the gate-specific window-size variants
+//! are reached by the BRP runner's `--e2e-window` spawn flag.
 
 /// Window sizing/title.
 #[derive(Clone, Copy, Debug)]
@@ -145,19 +131,3 @@ impl WindowConfig {
     }
 }
 
-/// Map the active e2e mode (as expressed by the boolean fields on
-/// [`AppArgs`]) to its [`WindowConfig`]. The mapping is mode-disjoint (at
-/// most one e2e flag is true at a time); the order below matches the
-/// historical precedence of the inline if-ladder in
-/// `run_e2e_render_with_args`.
-pub fn window_for_e2e_args(args: &AppArgs) -> WindowConfig {
-    if args.resize_test {
-        WindowConfig::e2e_resize_test()
-    } else if args.small_edit_repro_mode {
-        WindowConfig::e2e_small_edit_repro()
-    } else if args.vox_horizon_native_phase {
-        WindowConfig::e2e_horizon()
-    } else {
-        WindowConfig::e2e()
-    }
-}

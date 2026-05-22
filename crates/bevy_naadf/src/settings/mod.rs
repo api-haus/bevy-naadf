@@ -14,7 +14,12 @@
 //! (`crate::editor::hud`) so the settings overlay is purely "engine quality".
 //!
 //! Both keyboard navigation and mouse drag-sliders are live concurrently,
-//! mutating `AppArgs.gi`.
+//! mutating the per-domain [`GiSettings`] resource. **Step 3 of the
+//! config-as-resource refactor** swung this off `ResMut<AppArgs>` (mutating
+//! `args.gi`) onto `ResMut<GiSettings>`. **Step 9** deleted `AppArgs`
+//! entirely: the readonly rows split into `KnobKind::Readonly` (a pure
+//! function of compile-time constants), `ReadonlyFromTaa` (reads
+//! `TaaRingConfig`), and `ReadonlyFromGi` (reads `GiSettings`).
 
 pub mod canonical;
 
@@ -37,8 +42,8 @@ use crate::render::gi::{
     BUCKET_STORAGE_COUNT, INVALID_SAMPLE_STORAGE_COUNT, REFINED_BUCKET_STORAGE_COUNT,
     VALID_SAMPLE_STORAGE_COUNT,
 };
-use crate::render::taa::CAMERA_HISTORY_DEPTH;
-use crate::{AppArgs, DevFont};
+use crate::render::taa::{TaaRingConfig, CAMERA_HISTORY_DEPTH};
+use crate::DevFont;
 
 /// Drag-detection threshold in physical pixels.
 const DRAG_THRESHOLD_PX: f32 = 2.0;
@@ -135,11 +140,30 @@ enum KnobKind {
         setter: fn(&mut GiSettings, bool),
         default: bool,
     },
+    /// Read-only diagnostic row whose displayed value is a pure function of
+    /// compile-time constants — the closure takes no argument. Step 9 of the
+    /// config-as-resource refactor dropped the closure's old `&AppArgs`
+    /// parameter when `AppArgs` was deleted: the five rows using this variant
+    /// (`camera_history_depth`, the four `*_storage` counts) always read
+    /// `const`s and ignored the arg. Rows whose value comes from a per-domain
+    /// resource use the `ReadonlyFrom*` siblings below.
     Readonly {
-        value: fn(&AppArgs) -> String,
+        value: fn() -> String,
+    },
+    /// Step 2 of the config-as-resource refactor: readonly row whose source
+    /// is the per-domain [`crate::render::taa::TaaRingConfig`] resource.
+    ReadonlyFromTaa {
+        value: fn(&TaaRingConfig) -> String,
+    },
+    /// Step 3 of the config-as-resource refactor (Decision §7 partial split):
+    /// readonly row whose source is the per-domain [`GiSettings`] resource.
+    /// The `global_illum_max_accum` row moved here off the legacy
+    /// `KnobKind::Readonly { fn(&AppArgs) -> String }`.
+    ReadonlyFromGi {
+        value: fn(&GiSettings) -> String,
     },
     Action {
-        apply: fn(&mut AppArgs),
+        apply: fn(&mut GiSettings),
     },
 }
 
@@ -218,10 +242,28 @@ macro_rules! knob_bool {
 }
 
 /// Read-only diagnostic row — the closure formats the displayed value from
-/// `&AppArgs`.
+/// compile-time constants (it takes no argument).
 macro_rules! knob_readonly {
     ($label:literal, $expr:expr) => {
         Knob { label: $label, kind: KnobKind::Readonly { value: $expr } }
+    };
+}
+
+/// Read-only diagnostic row reading the per-domain
+/// [`crate::render::taa::TaaRingConfig`] main-world resource. Step 2 of the
+/// config-as-resource refactor (Decision §7 partial split).
+macro_rules! knob_readonly_taa {
+    ($label:literal, $expr:expr) => {
+        Knob { label: $label, kind: KnobKind::ReadonlyFromTaa { value: $expr } }
+    };
+}
+
+/// Read-only diagnostic row reading the per-domain [`GiSettings`] main-world
+/// resource. Step 3 of the config-as-resource refactor (Decision §7 partial
+/// split).
+macro_rules! knob_readonly_gi {
+    ($label:literal, $expr:expr) => {
+        Knob { label: $label, kind: KnobKind::ReadonlyFromGi { value: $expr } }
     };
 }
 
@@ -259,24 +301,28 @@ const KNOBS: &[Knob] = &[
     knob_bool!("  skip_samples",       skip_samples),
 
     knob_section!("DIAGNOSTICS (read-only)"),
-    knob_readonly!("  taa_ring_depth",         |a| format!("{} [restart-required]", a.taa_ring_depth)),
-    knob_readonly!("  camera_history_depth",   |_| format!("{} [const]", CAMERA_HISTORY_DEPTH)),
-    knob_readonly!("  valid_sample_storage",   |_| format!("{} [storage-tied]", VALID_SAMPLE_STORAGE_COUNT)),
-    knob_readonly!("  invalid_sample_storage", |_| format!("{} [storage-tied]", INVALID_SAMPLE_STORAGE_COUNT)),
-    knob_readonly!("  bucket_storage",         |_| format!("{} [storage-tied]", BUCKET_STORAGE_COUNT)),
-    knob_readonly!("  refined_bucket",         |_| format!("{} [storage-tied]", REFINED_BUCKET_STORAGE_COUNT)),
-    knob_readonly!("  global_illum_max_accum", |a| format!("{} [const]", a.gi.global_illum_max_accum)),
+    knob_readonly_taa!("  taa_ring_depth",     |t| format!("{} [restart-required]", t.depth)),
+    knob_readonly!("  camera_history_depth",   || format!("{} [const]", CAMERA_HISTORY_DEPTH)),
+    knob_readonly!("  valid_sample_storage",   || format!("{} [storage-tied]", VALID_SAMPLE_STORAGE_COUNT)),
+    knob_readonly!("  invalid_sample_storage", || format!("{} [storage-tied]", INVALID_SAMPLE_STORAGE_COUNT)),
+    knob_readonly!("  bucket_storage",         || format!("{} [storage-tied]", BUCKET_STORAGE_COUNT)),
+    knob_readonly!("  refined_bucket",         || format!("{} [storage-tied]", REFINED_BUCKET_STORAGE_COUNT)),
+    knob_readonly_gi!("  global_illum_max_accum", |g| format!("{} [const]", g.global_illum_max_accum)),
 
     knob_action!("> RESET ALL TO DEFAULTS <", reset_all_knobs),
 ];
 
-/// Apply every knob's `default` to `AppArgs.gi`.
-fn reset_all_knobs(args: &mut AppArgs) {
+/// Apply every knob's `default` to [`GiSettings`].
+///
+/// Step 3 of the config-as-resource refactor: signature changed from
+/// `&mut AppArgs` (mutating `args.gi`) to `&mut GiSettings` (mutating the
+/// per-domain resource directly). Action knobs now receive `&mut GiSettings`.
+fn reset_all_knobs(gi: &mut GiSettings) {
     for row in KNOBS {
         match row.kind {
-            KnobKind::U32 { setter, default, .. } => setter(&mut args.gi, default),
-            KnobKind::F32 { setter, default, .. } => setter(&mut args.gi, default),
-            KnobKind::Bool { setter, default, .. } => setter(&mut args.gi, default),
+            KnobKind::U32 { setter, default, .. } => setter(gi, default),
+            KnobKind::F32 { setter, default, .. } => setter(gi, default),
+            KnobKind::Bool { setter, default, .. } => setter(gi, default),
             _ => {}
         }
     }
@@ -451,11 +497,14 @@ pub fn hide_settings(
 
 /// `Update` system — keyboard navigation while the overlay is open + no drag.
 /// Gated by `.run_if(in_state(AppMode::Settings))` in `lib.rs`.
+///
+/// Step 3 of the config-as-resource refactor: `ResMut<AppArgs>` →
+/// `ResMut<GiSettings>` (the panel only ever mutated `args.gi`).
 pub fn adjust_settings(
     keys: Res<ButtonInput<KeyCode>>,
     drag: Res<SettingsDrag>,
     mut state: ResMut<SettingsState>,
-    mut args: ResMut<AppArgs>,
+    mut gi: ResMut<GiSettings>,
 ) {
     if !matches!(drag.state, DragState::Idle) {
         return;
@@ -478,41 +527,41 @@ pub fn adjust_settings(
     let reset_all = keys.just_pressed(KeyCode::KeyR) && shift;
 
     if reset_all {
-        reset_all_knobs(&mut args);
+        reset_all_knobs(&mut gi);
         return;
     }
 
     if let Some(row) = KNOBS.get(state.cursor) {
         match row.kind {
             KnobKind::U32 { getter, setter, nudge, big_step, min, max, default } => {
-                let mut v = getter(&args.gi);
+                let mut v = getter(&gi);
                 let n_step = if shift { (nudge / 4).max(1) } else { nudge };
                 if left { v = v.saturating_sub(n_step); }
                 if right { v = v.saturating_add(n_step); }
                 if big_left { v = v.saturating_sub(big_step); }
                 if big_right { v = v.saturating_add(big_step); }
                 if reset_one { v = default; }
-                setter(&mut args.gi, v.clamp(min, max));
+                setter(&mut gi, v.clamp(min, max));
             }
             KnobKind::F32 { getter, setter, nudge, big_step, min, max, default } => {
-                let mut v = getter(&args.gi);
+                let mut v = getter(&gi);
                 let n_step = if shift { nudge / 4.0 } else { nudge };
                 if left { v -= n_step; }
                 if right { v += n_step; }
                 if big_left { v -= big_step; }
                 if big_right { v += big_step; }
                 if reset_one { v = default; }
-                setter(&mut args.gi, v.clamp(min, max));
+                setter(&mut gi, v.clamp(min, max));
             }
             KnobKind::Bool { getter, setter, default } => {
-                let mut v = getter(&args.gi);
+                let mut v = getter(&gi);
                 if left || right { v = !v; }
                 if reset_one { v = default; }
-                setter(&mut args.gi, v);
+                setter(&mut gi, v);
             }
             KnobKind::Action { apply } => {
                 if reset_one {
-                    apply(&mut args);
+                    apply(&mut gi);
                 }
             }
             _ => {}
@@ -522,10 +571,13 @@ pub fn adjust_settings(
 
 /// `Update` system — mouse drag-sliders + click flips. Gated by
 /// `.run_if(in_state(AppMode::Settings))`.
+///
+/// Step 3 of the config-as-resource refactor: `ResMut<AppArgs>` →
+/// `ResMut<GiSettings>`.
 pub fn mouse_interact_settings(
     mut state: ResMut<SettingsState>,
     mut drag: ResMut<SettingsDrag>,
-    mut args: ResMut<AppArgs>,
+    mut gi: ResMut<GiSettings>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -563,9 +615,9 @@ pub fn mouse_interact_settings(
             total_motion += raw_dx.abs();
             if total_motion >= DRAG_THRESHOLD_PX {
                 drag.state = DragState::Dragging { knob_index, frac_accum: 0.0 };
-                apply_drag_delta(&mut args, &mut drag, knob_index, raw_dx, shift_factor, window_scale(&window));
+                apply_drag_delta(&mut gi, &mut drag, knob_index, raw_dx, shift_factor, window_scale(&window));
             } else if mouse_buttons.just_released(MouseButton::Left) {
-                handle_click_release(&mut args, knob_index);
+                handle_click_release(&mut gi, knob_index);
                 drag.state = DragState::Idle;
             } else {
                 drag.state = DragState::Pressed { knob_index, total_motion };
@@ -575,7 +627,7 @@ pub fn mouse_interact_settings(
             if mouse_buttons.just_released(MouseButton::Left) {
                 drag.state = DragState::Idle;
             } else {
-                apply_drag_delta(&mut args, &mut drag, knob_index, raw_dx, shift_factor, window_scale(&window));
+                apply_drag_delta(&mut gi, &mut drag, knob_index, raw_dx, shift_factor, window_scale(&window));
             }
         }
     }
@@ -586,7 +638,7 @@ fn window_scale(window: &Query<&Window, With<PrimaryWindow>>) -> f32 {
 }
 
 fn apply_drag_delta(
-    args: &mut AppArgs,
+    gi: &mut GiSettings,
     drag: &mut SettingsDrag,
     knob_index: usize,
     raw_dx: f32,
@@ -609,38 +661,45 @@ fn apply_drag_delta(
             frac_accum += delta_f;
             let whole = frac_accum.trunc();
             frac_accum -= whole;
-            let cur = getter(&args.gi) as i64;
+            let cur = getter(gi) as i64;
             let new = (cur + whole as i64).clamp(min as i64, max as i64) as u32;
-            setter(&mut args.gi, new);
+            setter(gi, new);
             drag.state = DragState::Dragging { knob_index, frac_accum };
         }
         KnobKind::F32 { getter, setter, min, max, .. } => {
             let range = (max - min).max(f32::EPSILON);
             let delta = dx * (range / full_range_px);
-            let cur = getter(&args.gi);
-            setter(&mut args.gi, (cur + delta).clamp(min, max));
+            let cur = getter(gi);
+            setter(gi, (cur + delta).clamp(min, max));
         }
         _ => {}
     }
 }
 
-fn handle_click_release(args: &mut AppArgs, knob_index: usize) {
+fn handle_click_release(gi: &mut GiSettings, knob_index: usize) {
     let Some(row) = KNOBS.get(knob_index) else { return };
     match row.kind {
         KnobKind::Bool { getter, setter, .. } => {
-            let v = getter(&args.gi);
-            setter(&mut args.gi, !v);
+            let v = getter(gi);
+            setter(gi, !v);
         }
-        KnobKind::Action { apply } => apply(args),
+        KnobKind::Action { apply } => apply(gi),
         _ => {}
     }
 }
 
 /// `Update` system — rewrite each row's Text content + row background color.
 /// Gated by `.run_if(in_state(AppMode::Settings))`.
+///
+/// Step 3 of the config-as-resource refactor: gained `gi: Res<GiSettings>` (the
+/// interactive U32/F32/Bool rows + the `ReadonlyFromGi` row read it directly).
+/// Step 9 dropped the old `Res<AppArgs>` parameter — `AppArgs` is deleted, and
+/// the `KnobKind::Readonly` rows it used to feed now read compile-time
+/// constants through an argument-free closure.
 pub fn update_settings_text(
     state: Res<SettingsState>,
-    args: Res<AppArgs>,
+    gi: Res<GiSettings>,
+    taa_ring: Res<TaaRingConfig>,
     mut row_texts: Query<(&SettingsRowText, &mut Text, &mut TextColor)>,
     mut row_bgs: Query<(&SettingsRow, &Interaction, &mut BackgroundColor)>,
     mut legend: Query<&mut Text, (With<SettingsLegendText>, Without<SettingsRowText>)>,
@@ -657,20 +716,28 @@ pub fn update_settings_text(
                 *text_color = TextColor(FG_SECTION);
             }
             KnobKind::U32 { getter, .. } => {
-                let _ = write!(s, "{}{:<24} {:>8}", marker, row.label, getter(&args.gi));
+                let _ = write!(s, "{}{:<24} {:>8}", marker, row.label, getter(&gi));
                 *text_color = TextColor(if i == state.cursor { FG_VALUE_SELECTED } else { FG_PRIMARY });
             }
             KnobKind::F32 { getter, .. } => {
-                let _ = write!(s, "{}{:<24} {:>8.2}", marker, row.label, getter(&args.gi));
+                let _ = write!(s, "{}{:<24} {:>8.2}", marker, row.label, getter(&gi));
                 *text_color = TextColor(if i == state.cursor { FG_VALUE_SELECTED } else { FG_PRIMARY });
             }
             KnobKind::Bool { getter, .. } => {
-                let mark = if getter(&args.gi) { " ON" } else { "OFF" };
+                let mark = if getter(&gi) { " ON" } else { "OFF" };
                 let _ = write!(s, "{}{:<24} {:>8}", marker, row.label, mark);
                 *text_color = TextColor(if i == state.cursor { FG_VALUE_SELECTED } else { FG_PRIMARY });
             }
             KnobKind::Readonly { value } => {
-                let _ = write!(s, "{}{:<24} {}", marker, row.label, value(&args));
+                let _ = write!(s, "{}{:<24} {}", marker, row.label, value());
+                *text_color = TextColor(FG_READONLY);
+            }
+            KnobKind::ReadonlyFromTaa { value } => {
+                let _ = write!(s, "{}{:<24} {}", marker, row.label, value(&taa_ring));
+                *text_color = TextColor(FG_READONLY);
+            }
+            KnobKind::ReadonlyFromGi { value } => {
+                let _ = write!(s, "{}{:<24} {}", marker, row.label, value(&gi));
                 *text_color = TextColor(FG_READONLY);
             }
             KnobKind::Action { .. } => {
@@ -826,18 +893,22 @@ mod tests {
         assert!(last.label.to_lowercase().contains("reset"));
     }
 
+    /// Step 3 of the config-as-resource refactor: `reset_all_knobs` signature
+    /// changed from `&mut AppArgs` to `&mut GiSettings`. The test mutates the
+    /// resource directly — the assertion shape is unchanged from the
+    /// pre-refactor `args.gi.*` reads.
     #[test]
     fn reset_all_knobs_restores_defaults() {
-        let mut args = AppArgs::default();
-        args.gi.max_ray_steps_primary = 7;
-        args.gi.spatial_iter_count = 1;
-        args.gi.is_denoise = false;
-        args.gi.spatial_resample_size = 1.0;
-        reset_all_knobs(&mut args);
-        assert_eq!(args.gi.max_ray_steps_primary, 120);
-        assert_eq!(args.gi.spatial_iter_count, 12);
-        assert!(args.gi.is_denoise);
-        assert!((args.gi.spatial_resample_size - 500.0).abs() < f32::EPSILON);
+        let mut gi = GiSettings::default();
+        gi.max_ray_steps_primary = 7;
+        gi.spatial_iter_count = 1;
+        gi.is_denoise = false;
+        gi.spatial_resample_size = 1.0;
+        reset_all_knobs(&mut gi);
+        assert_eq!(gi.max_ray_steps_primary, 120);
+        assert_eq!(gi.spatial_iter_count, 12);
+        assert!(gi.is_denoise);
+        assert!((gi.spatial_resample_size - 500.0).abs() < f32::EPSILON);
     }
 
     #[test]

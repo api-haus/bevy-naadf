@@ -11,13 +11,26 @@
 //! e2e-render-test.md`).
 
 pub mod aadf;
-pub mod app_args;
+#[cfg(target_os = "android")]
+pub mod android_main;
 pub mod app_config;
 pub mod app_mode;
+pub mod bootstrap;
 pub mod camera;
 pub mod dev_font;
 pub mod diagnostics;
 pub mod e2e;
+/// BRP (Bevy Remote Protocol) control surface for the external e2e runner.
+///
+/// The module is declared **unconditionally** so its `schema` sub-module — the
+/// plain-`serde` verb wire-format structs — compiles into every build, letting
+/// the external `naadf_e2e` runner crate import the param/return types without
+/// building `bevy_naadf` with the `e2e-brp` feature (design §7.1 D8 / A7). The
+/// BRP *handlers* (`verbs`) and the `install_brp_server` entry point stay
+/// behind `#[cfg(feature = "e2e-brp")]` inside `e2e_brp/mod.rs`, so the default
+/// production build still ships no `bevy_remote` dependency and no socket. See
+/// `docs/orchestrate/e2e-ipc-rpc-restructure/02-design.md` §2 / §7.
+pub mod e2e_brp;
 pub mod editor;
 pub mod hud;
 pub mod render;
@@ -27,7 +40,6 @@ pub mod window_config;
 pub mod world;
 pub mod world_size;
 
-pub use app_args::AppArgs;
 pub use app_config::AppConfig;
 pub use dev_font::{load_dev_font, DevFont};
 pub use settings::canonical::GiSettings;
@@ -53,8 +65,9 @@ use bevy::anti_alias::dlss::DlssProjectId;
 /// Track A (`docs/orchestrate/feature-completeness/02a-design-vox-loading.md`)
 /// added the [`GridPreset::Vox`] variant — a MagicaVoxel `.vox` file path read
 /// synchronously at `Startup` via [`voxel::vox_import::load_vox`]. `PathBuf` is
-/// not `Copy`, so this enum is now `Clone` only (the
-/// [`AppArgs`] / [`build_app_with_args`] surfaces propagate the move).
+/// not `Copy`, so this enum is `Clone` only; it is its own per-domain
+/// [`Resource`] inserted at bootstrap by the
+/// [`crate::bootstrap::BootstrapInputs`] fan-out.
 ///
 /// **vox-gpu-rewrite Stage 2 consolidation (2026-05-18):** both variants now
 /// always route through the C#-faithful fixed-world install path
@@ -64,7 +77,7 @@ use bevy::anti_alias::dlss::DlssProjectId;
 /// `voxelPos % modelSize` tiling on the device. The legacy sized-to-model
 /// install function is preserved only as a test-only oracle reachable from
 /// the `--vox-gpu-oracle` CPU-phase branch.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Resource, Clone, Default, PartialEq, Eq, Debug)]
 pub enum GridPreset {
     /// The default scene: ground slab + axis-aligned boxes + a sphere + one
     /// emissive box.
@@ -94,9 +107,13 @@ pub enum GridPreset {
     Empty,
     /// **Web `?skybox=1` URL-param surface** — same install behaviour as
     /// [`GridPreset::Empty`] (empty world, pure-sky render); kept as a
-    /// distinct arm so the wasm bootstrap can express the decision via
-    /// `AppArgs.grid_preset` mutation instead of a separate marker
-    /// resource + ordering constraint on `setup_test_grid`. The
+    /// distinct arm so the wasm bootstrap can express the decision via the
+    /// `GridPreset` resource value instead of a separate marker resource.
+    /// Step 5 of the config-as-resource refactor resolves `?skybox=1` into
+    /// `BootstrapInputs.grid_preset = GridPreset::WebSkybox` BEFORE the App
+    /// is built (see `crate::voxel::web_vox::resolve_skybox_only_param`),
+    /// so `setup_test_grid` reads the already-correct `Res<GridPreset>`
+    /// arm with no `Startup`-time mutation or ordering constraint. The
     /// `[palette-install]` smoke-detector log distinguishes the source
     /// (`"skybox-only"` vs `"cli-empty"`).
     WebSkybox,
@@ -128,16 +145,61 @@ pub const DEFAULT_TAA_RING_DEPTH: u32 = 32;
 /// window) in *both* configs; `AppConfig` only flips the four deliberate e2e
 /// deltas (`e2e-render-test.md` §2.2). Caller runs `.run()` on the result.
 pub fn build_app(cfg: AppConfig) -> App {
-    build_app_with_args(cfg, AppArgs::default())
+    build_app_core(cfg)
 }
 
-/// Build the bevy-naadf `App` with a caller-supplied [`AppArgs`].
+/// Build the bevy-naadf `App` with **GPU budget preselection** applied.
 ///
-/// Phase-C wave-3 — added to let the e2e binary toggle `--entities`-driven
-/// state (`entities_enabled = true` + `spawn_test_entity = true`) without
-/// having to mutate the global `AppArgs::default()`. Callers that don't need
-/// to override args use [`build_app`] (which forwards to this with the default).
-pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
+/// Runs the mobile GPU budget probe ([`crate::render::budget::probe_and_select`])
+/// BEFORE building the App, writes the chosen rung into a
+/// [`crate::bootstrap::BootstrapInputs`] (Step 2 of the config-as-resource
+/// refactor — the migrated field is `taa_ring_depth: TaaRingConfig`), then
+/// inserts the budget-selected [`render::budget::EffectiveWorldSize`] +
+/// [`render::budget::InvalidSampleStorageCount`] resources, overriding the
+/// defensive canonical seeds inside [`build_app_core`]. On desktop with a
+/// generous storage-buffer cap (≥ 1.35 GiB) the budget picks canonical
+/// defaults — output is byte-identical to [`build_app`]. On mobile
+/// targets (256 MiB cap — Android Mali / iOS Safari WebGPU) the routine picks
+/// the deepest world + TAA + invalid-samples rungs that fit `cap × 75%`.
+///
+/// Production callers:
+///   * Desktop + WebGPU/wasm32 — `src/main.rs::fn main()` → this →`.run()`.
+///   * Android JNI entry — `src/android_main.rs::android_main()` → this →
+///     [`bevy::winit::WinitSettings::mobile`] → `.run()`.
+///
+/// The e2e_render binary intentionally skips this — e2e gates need canonical
+/// world / TAA for deterministic SSIM comparisons across runs and machines.
+pub fn build_app_with_budget(cfg: AppConfig, grid_preset: GridPreset) -> App {
+    let caps = crate::render::budget::probe_and_select();
+    let inputs = crate::bootstrap::BootstrapInputs {
+        grid_preset,
+        taa_ring_depth: crate::render::taa::TaaRingConfig {
+            depth: caps.taa_ring_depth,
+        },
+        ..Default::default()
+    };
+    let mut app = crate::bootstrap::build_app_with_bootstrap_inputs(cfg, inputs);
+    app.insert_resource(crate::render::budget::EffectiveWorldSize::from_segments(
+        caps.world_size_in_segments,
+    ));
+    app.insert_resource(crate::render::budget::InvalidSampleStorageCount(
+        caps.invalid_sample_storage_count,
+    ));
+    app
+}
+
+/// Core App-wiring path — the shared plugin pyramid + the defensive
+/// per-domain resource seeds.
+///
+/// Step 9 of the config-as-resource refactor renamed this from
+/// `build_app_with_args` and dropped its `AppArgs` parameter — the
+/// `AppArgs` god-resource is fully decomposed into per-domain resources,
+/// so there is no `args` state left to thread through. The bootstrap
+/// fan-out ([`crate::bootstrap::build_app_with_bootstrap_inputs`]) calls
+/// this, then `insert_resource`-overwrites the defensive seeds with the
+/// caller's `BootstrapInputs` values; the direct [`build_app`] path
+/// (`run_e2e_render`) leaves the seeds at their canonical defaults.
+pub fn build_app_core(cfg: AppConfig) -> App {
 
     let mut app = App::new();
 
@@ -175,17 +237,108 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         primary_window.prevent_default_event_handling = true;
     }
 
-    // `AppArgs` lost `Copy` in Track A (carries `PathBuf` in
-    // `GridPreset::Vox`). The resource gets a clone — `args` is consumed
-    // afterwards for the `spawn_test_entity` / `resize_test` reads below.
-    // `AppConfig` is also inserted so plugins can `.run_if` on its fields
-    // (e.g. `DiagnosticsPlugin` self-skips under e2e).
+    // `AppConfig` is inserted so plugins can `.run_if` on its fields
+    // (e.g. `DiagnosticsPlugin` self-skips under e2e). The old `AppArgs`
+    // god-resource is gone — Step 9 of the config-as-resource refactor
+    // decomposed it fully into the per-domain resources seeded below.
     app.insert_resource(cfg)
-        .insert_resource(args.clone())
         // The 128-deep camera-history ring + the monotonic frame counter
         // (`06-design-a2.md` §2.3). Main-world resource, `Default`-seeded,
         // updated each frame by `update_camera_history`.
-        .init_resource::<render::taa::CameraHistory>()
+        .init_resource::<render::taa::CameraHistory>();
+
+    // Step 3 of the config-as-resource refactor — defensively seed the
+    // per-domain `TaaConfig` and `GiSettings` resources at the canonical
+    // defaults so the e2e_render binary's direct
+    // `build_app(AppConfig::e2e())` path (`run_e2e_render`, which
+    // bypasses `build_app_with_bootstrap_inputs`) still has the resources
+    // `update_camera_history` (`Res<TaaConfig>`) and the settings panel
+    // (`ResMut<GiSettings>`) need.  Callers routing through
+    // `build_app_with_bootstrap_inputs` overwrite both with their `inputs`
+    // values via Bevy's `insert_resource` overwrite-in-place semantic. Same
+    // shape as the `EffectiveWorldSize::canonical()` /
+    // `InvalidSampleStorageCount::canonical()` defensive seeds below. Step 9
+    // deletes these once every caller routes through the bootstrap fan-out.
+    if !app.world().contains_resource::<render::taa::TaaConfig>() {
+        app.insert_resource(render::taa::TaaConfig::default());
+    }
+    if !app.world().contains_resource::<crate::GiSettings>() {
+        app.insert_resource(crate::GiSettings::default());
+    }
+    // Same defensive seed for the Step-2 `TaaRingConfig` — the settings
+    // panel readonly knob reads it via `Res<TaaRingConfig>` (non-Option) when
+    // the panel is open. Today the e2e harness disables HUD/settings so the
+    // gap was invisible; defensively seeding keeps the future
+    // `cfg.add_hud + e2e` combination from regressing.
+    if !app.world().contains_resource::<render::taa::TaaRingConfig>() {
+        app.insert_resource(render::taa::TaaRingConfig::default());
+    }
+    // Step 4 of the config-as-resource refactor — defensive seed for the
+    // per-domain `ConstructionConfig`. `run_gpu_construction_startup` and the
+    // `extract_construction_config` system both need it; on the
+    // `build_app(AppConfig::e2e())` path we don't go through
+    // `build_app_with_bootstrap_inputs`, so the seed is the canonical
+    // `for_target_arch()` value (the wasm32 arm applies the documented
+    // clamp). Callers routing through the bootstrap fan-out overwrite it.
+    if !app
+        .world()
+        .contains_resource::<render::construction::ConstructionConfig>()
+    {
+        app.insert_resource(render::construction::ConstructionConfig::for_target_arch());
+    }
+    // Step 5 of the config-as-resource refactor — defensive seed for the
+    // per-domain `GridPreset`. `setup_test_grid` reads it as `Res<GridPreset>`
+    // (non-Option) at `Startup`; the `build_app(AppConfig::e2e())` path
+    // (`run_e2e_render`) bypasses
+    // `build_app_with_bootstrap_inputs`, so without the seed the system
+    // panics on the missing resource. Canonical default = `GridPreset::Default`
+    // (the embedded primitive test scene). Callers routing through the
+    // bootstrap fan-out overwrite it via `insert_resource` overwrite-in-place.
+    // Step 9 deletes this seed once every caller routes through the fan-out.
+    if !app.world().contains_resource::<crate::GridPreset>() {
+        app.insert_resource(crate::GridPreset::default());
+    }
+    // Step 8 of the config-as-resource refactor — defensive seed for the
+    // per-domain `SpawnTestEntity`. The `spawn_phase_c_test_entity` gate
+    // uses `Option<Res<SpawnTestEntity>>` so it is resource-absent tolerant,
+    // but the e2e driver and a clean diagnostics dump expect the resource to
+    // exist. Canonical default = `SpawnTestEntity(false)` (fixture off).
+    // Callers routing through the bootstrap fan-out overwrite it; the
+    // `--entities` e2e boot inserts `SpawnTestEntity(true)`. Step 9 deletes
+    // this seed once every caller routes through the fan-out.
+    if !app
+        .world()
+        .contains_resource::<render::construction::SpawnTestEntity>()
+    {
+        app.insert_resource(render::construction::SpawnTestEntity::default());
+    }
+    // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#
+    // canonical value if no caller (Android entry / future probe-mode CLI)
+    // inserted one before this point. Every existing caller (production
+    // `main.rs`, 17 e2e gates, every `--bin e2e_render -- <mode>` path) leaves
+    // this resource absent; the seed makes their behaviour byte-identical to
+    // pre-budget code (the canonical 256×32×256 chunk world).
+    // The Android probe routine (`android_main.rs`) overrides this with a
+    // smaller rung AFTER `build_app_with_args` returns; Bevy's
+    // `insert_resource` second-call semantic is overwrite-in-place.
+    //
+    // See `docs/orchestrate/mobile-budget/02-design.md` §3 "Insertion point".
+    if !app.world().contains_resource::<crate::render::budget::EffectiveWorldSize>() {
+        app.insert_resource(crate::render::budget::EffectiveWorldSize::canonical());
+    }
+    // Post-2026-05-21 — the unlit-sample ring is the third per-pixel-scaled
+    // mobile budget lever (`docs/orchestrate/mobile-budget/05-consolidated-fix.md`
+    // Design §1). Defensive seed of the canonical 8 keeps every existing
+    // caller byte-identical; the Android entry overrides post-build with the
+    // budget-selected value (typically 4 on mobile).
+    if !app
+        .world()
+        .contains_resource::<crate::render::budget::InvalidSampleStorageCount>()
+    {
+        app.insert_resource(crate::render::budget::InvalidSampleStorageCount::canonical());
+    }
+
+    app
         .add_plugins(
             // The NAADF WGSL render shaders live in `src/assets/shaders/`
             // (`03-design.md` §1 module layout) — point the asset server
@@ -194,16 +347,16 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
             // `e2e-render-test.md` §2.2 point 1); the `WindowPlugin` carries
             // the fixed-size e2e window.
             DefaultPlugins
-                // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 —
-                // when the e2e harness is active, install the
-                // `CountingLayer` via the `LogPlugin::custom_layer` hook so
-                // the `--vox-web-parity-loaded` gate can assert zero
-                // `tracing::error!` events fired during the run. The
-                // counter is a process-global static; resetting it in the
-                // harness boot via
+                // When the app is booted as the BRP-driven e2e SUT
+                // (`cfg.brp_port.is_some()`), install the `CountingLayer` via
+                // the `LogPlugin::custom_layer` hook so the `naadf/get_state`
+                // verb's `tracing_errors` field reports the count of
+                // `tracing::error!` events fired during the run. The counter
+                // is a process-global static; resetting it on boot via
                 // `tracing_error_counter::reset_tracing_error_count()` is
-                // safe and idempotent.
-                .set(if cfg.add_e2e_systems {
+                // safe and idempotent. The production binary
+                // (`brp_port = None`) gets the default `LogPlugin`.
+                .set(if cfg.brp_port.is_some() {
                     bevy::log::LogPlugin {
                         custom_layer: e2e::tracing_error_counter::vox_web_parity_log_layer,
                         ..default()
@@ -281,14 +434,11 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
     app.add_plugins(voxel::VoxelIoPlugin);
 
     // `spawn_phase_c_test_entity` (the W4 fixture spawner gated on
-    // `AppArgs::spawn_test_entity`) lives in
-    // `render::construction::test_fixture` and is registered inside
-    // `ConstructionPlugin::build` with the same
+    // `SpawnTestEntity`) lives in `render::construction::test_fixture` and is
+    // registered inside `ConstructionPlugin::build` with the same
     // `.after(voxel::grid::setup_test_grid)` ordering. See D7 cleanup
     // follow-up 2.
-    if cfg.add_e2e_systems {
-        e2e::add_e2e_systems(&mut app);
-    }
+    //
     // `setup_camera` + `update_camera_history` + `sync_position_split` are
     // all owned by `camera::CameraPlugin` above. `update_camera_history` is
     // registered with `.after(sync_position_split)` inside the plugin.
@@ -326,35 +476,20 @@ pub fn build_app_with_args(cfg: AppConfig, args: AppArgs) -> App {
         );
     }
 
+    // --- BRP server install (e2e-ipc-rpc-restructure, Phase 1) ---------------
+    // Install point per design §2.2: end of `build_app_core`, the single funnel
+    // both production and e2e route through, AFTER `DefaultPlugins` (incl.
+    // `RenderPlugin`) so the render sub-app exists. Behind the `e2e-brp` cargo
+    // feature; the opt-in is the `AppConfig::brp_port` field (set by
+    // `AppConfig::e2e_sut`, selected by `main.rs`'s `--e2e-brp <port>` flag).
+    // With the feature off, `cfg.brp_port` is an inert `None` and none of this
+    // compiles into the default-feature production binary.
+    #[cfg(feature = "e2e-brp")]
+    if let Some(port) = cfg.brp_port {
+        crate::e2e_brp::install_brp_server(&mut app, port);
+    }
+
     app
-}
-
-/// Boot the bounded windowed e2e render test and return its `AppExit`.
-///
-/// `cargo run --bin e2e_render` calls this. It builds the real app with
-/// [`AppConfig::e2e`], runs it (the winit runner drives the loop; the
-/// bounded-frame driver self-terminates after a fixed frame budget — see
-/// [`crate::e2e::driver`]), then runs the post-run `PipelineCache` error scan +
-/// node-dispatch check + degenerate-frame floor and folds any failure into the
-/// returned `AppExit` (`e2e-render-test.md` §3 / §7 / §8 / §11 step 7).
-pub fn run_e2e_render() -> AppExit {
-    e2e::run_e2e_render()
-}
-
-/// Phase-C wave-3 — boot the windowed e2e with caller-supplied [`AppArgs`].
-///
-/// Mirrors [`run_e2e_render`] but lets the `--entities` flag in `e2e_render`'s
-/// `main` toggle `entities_enabled = true` + `spawn_test_entity = true` for
-/// the fixture-entity render path.
-pub fn run_e2e_render_with_args(args: AppArgs) -> AppExit {
-    // The window config follows the active e2e mode; the mapping lives in
-    // [`window_config::window_for_e2e_args`] so adding a new mode is a
-    // one-file edit. All non-`--resize-test` / non-`--small-edit-repro` /
-    // non-`--vox-horizon-native` runs use the standard 256×256 e2e window.
-    let mut cfg = AppConfig::e2e();
-    cfg.window = window_config::window_for_e2e_args(&args);
-    let app = build_app_with_args(cfg, args);
-    e2e::run_with_app(app)
 }
 
 // `spawn_phase_c_test_entity` moved to `render::construction::test_fixture`

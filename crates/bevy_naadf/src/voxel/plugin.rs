@@ -6,12 +6,12 @@
 //! call. D3 architect F4 + D7 architect Step 7 designed this; the D7
 //! cleanup-follow-up landed the actual extraction.
 //!
-//! Self-gates on `Res<AppConfig>.add_e2e_systems` for the native drag-and-drop
-//! pair (`voxel/grid::log_native_dnd_registered` + `native_vox_drop_listener`):
-//! winit emits the drop events under e2e too, but the harness should never see
-//! foreign input. Wasm-side systems (`startup_fetch_default_vox`,
-//! `apply_pending_vox`, `pin_web_horizon_camera`) are unconditionally registered
-//! under the wasm32 cfg.
+//! The native drag-and-drop pair (`voxel/grid::log_native_dnd_registered` +
+//! `native_vox_drop_listener`) is registered unconditionally on native
+//! targets — the BRP-driven e2e SUT never receives a foreign file-drop event,
+//! so it is inert there. Wasm-side systems (`startup_fetch_default_vox`,
+//! `apply_pending_vox`, `pin_web_horizon_camera`) are unconditionally
+//! registered under the wasm32 cfg.
 
 use bevy::prelude::*;
 
@@ -20,17 +20,18 @@ use super::{async_vox, grid};
 #[cfg(target_arch = "wasm32")]
 use super::web_vox;
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::AppConfig;
-
 pub struct VoxelIoPlugin;
 
 impl Plugin for VoxelIoPlugin {
     fn build(&self, app: &mut App) {
-        // The test grid + camera spawn — shared. On web,
-        // `startup_fetch_default_vox` runs `.before(setup_test_grid)` so it can
-        // mutate `AppArgs.grid_preset` to `GridPreset::WebSkybox`
-        // (`?skybox=1` URL-param handling) before `setup_test_grid` reads it.
+        // The test grid + camera spawn — shared. `setup_test_grid` reads
+        // `Res<GridPreset>` to choose which world content to install.
+        // Step 5 of the config-as-resource refactor relocated the
+        // `?skybox=1` URL-param resolution out of `startup_fetch_default_vox`
+        // (which used to mutate `AppArgs.grid_preset` at `Startup` time)
+        // into the wasm32 bootstrap — the `GridPreset` resource carries the
+        // resolved value before any `Startup` system runs, so no
+        // `.before(setup_test_grid)` ordering is needed for it any more.
         app.add_systems(Startup, grid::setup_test_grid);
 
         // Async `.vox` parse pump (`web-vox-async-loading Step 4`, 2026-05-18).
@@ -53,10 +54,7 @@ impl Plugin for VoxelIoPlugin {
         // the polling system clears the slot post-install.
         #[cfg(target_arch = "wasm32")]
         {
-            app.add_systems(
-                Startup,
-                web_vox::startup_fetch_default_vox.before(grid::setup_test_grid),
-            )
+            app.add_systems(Startup, web_vox::startup_fetch_default_vox)
             .add_systems(
                 Update,
                 web_vox::apply_pending_vox.after(async_vox::poll_pending_vox_parse),
@@ -78,21 +76,13 @@ impl Plugin for VoxelIoPlugin {
         }
 
         // Native drag-and-drop: drop a `.vox` file onto the window to replace
-        // the active scene. Gated off the e2e harness — winit emits the event
-        // in both modes but the e2e harness should never see foreign input.
-        // Reads `Res<AppConfig>` (inserted by `build_app_with_args` before
-        // `add_plugins(VoxelIoPlugin)`).
+        // the active scene. Registered unconditionally on native targets —
+        // the BRP-driven e2e SUT never receives a foreign file-drop event, so
+        // the listener is inert there.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let add_e2e_systems = app
-                .world()
-                .get_resource::<AppConfig>()
-                .map(|c| c.add_e2e_systems)
-                .unwrap_or(false);
-            if !add_e2e_systems {
-                app.add_systems(Startup, grid::log_native_dnd_registered)
-                    .add_systems(Update, grid::native_vox_drop_listener);
-            }
+            app.add_systems(Startup, grid::log_native_dnd_registered)
+                .add_systems(Update, grid::native_vox_drop_listener);
         }
     }
 }

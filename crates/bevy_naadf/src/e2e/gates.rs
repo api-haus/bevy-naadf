@@ -55,7 +55,7 @@ pub use crate::voxel::grid::demo_origin_v;
 /// across the top. Gate rects below were re-derived from a fresh `save_to_disk`
 /// dump at this pose.
 pub fn e2e_camera_transform() -> Transform {
-    let off = demo_origin_v();
+    let off = demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     Transform::from_translation(off + Vec3::new(86.0, 42.0, 90.0))
         .looking_at(off + Vec3::new(32.0, 16.0, 32.0), Vec3::Y)
 }
@@ -69,7 +69,7 @@ pub const E2E_LOOK_TARGET: Vec3 = Vec3::new(32.0, 16.0, 32.0);
 /// [`demo_origin_v`]. Use this in place of [`E2E_LOOK_TARGET`] anywhere a
 /// transform-space coord is required.
 pub fn e2e_look_target_world() -> Vec3 {
-    demo_origin_v() + E2E_LOOK_TARGET
+    demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS) + E2E_LOOK_TARGET
 }
 
 /// A deterministic camera pose along the moving-camera e2e motion path
@@ -145,7 +145,7 @@ pub fn e2e_orbit_camera_transform(t: f32) -> Transform {
 /// geometry and (b) be far enough from the readback pose that the motion is a
 /// genuine reprojection workload.
 pub fn e2e_motion_start_transform() -> Transform {
-    let off = demo_origin_v();
+    let off = demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     Transform::from_translation(off + Vec3::new(-28.0, 70.0, 96.0))
         .looking_at(off + E2E_LOOK_TARGET, Vec3::Y)
 }
@@ -189,13 +189,13 @@ pub fn e2e_motion_start_transform() -> Transform {
 ///   centre — visible as a large dark band in the lower-left of the frame.
 /// - The atmospheric sky band still occupies the top of the frame.
 ///
-/// Used **only** by the resize-test phases (gated by `AppArgs.resize_test`);
+/// Used **only** by the resize-test phases (gated by `E2eGateMode::Resize`);
 /// the standard Batch-6 harness keeps using [`e2e_camera_transform`]. The
 /// pose is pinned for the entire resize-test sequence — no orbit motion, no
 /// per-phase changes — so any luma collapse between the three captures is
 /// attributable to the resize-induced ring drain, not to camera motion.
 pub fn e2e_resize_test_camera_transform() -> Transform {
-    let off = demo_origin_v();
+    let off = demo_origin_v(crate::WORLD_SIZE_IN_CHUNKS);
     Transform::from_translation(off + Vec3::new(20.0, 12.0, 50.0))
         .looking_at(off + Vec3::new(58.0, 18.0, 30.0), Vec3::Y)
 }
@@ -313,8 +313,8 @@ const ENTITY_PIXEL_MIN_LUM: f32 = 80.0;
 
 /// Phase-C followup #5 — entity-pixel luminance gate.
 ///
-/// Fires only in `--entities` mode (the driver gates the call on
-/// `AppArgs::spawn_test_entity`). Asserts the screen region the fixture
+/// Fires only in `--entities` mode (the driver gates the call on the
+/// `SpawnTestEntity` resource). Asserts the screen region the fixture
 /// entity projects into is brightly lit (mean luminance ≥
 /// [`ENTITY_PIXEL_MIN_LUM`]) — proves both (a) the rest of the renderer
 /// is producing usable framebuffer content at the entity's screen position

@@ -76,13 +76,9 @@
 //!   geometry IS visible), but the near-black-pixel count spikes —
 //!   the near-black-count check fails.
 
-use std::path::PathBuf;
-
 use bevy::prelude::*;
 
-use crate::camera::position_split::PositionSplit;
 use crate::e2e::framebuffer::{Framebuffer, Rect};
-use crate::e2e::oasis_edit_visual::{oasis_vox_fixture_path, OASIS_VOX_FIXTURE_PATH};
 
 // ---------------------------------------------------------------------------
 // Camera poses — C#-faithful literal voxel coordinates
@@ -175,149 +171,6 @@ pub const VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD: f32 = 10.0;
 /// pixels, while still tripping firmly on any meaningful re-emergence
 /// of the inversion symptom.
 pub const VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING: f32 = 0.01;
-
-// ---------------------------------------------------------------------------
-// Entry point — invoked from `bin/e2e_render.rs`
-// ---------------------------------------------------------------------------
-
-/// Boot the e2e harness with the production W5 GPU producer path enabled
-/// AND the `--oasis-edit-visual`-shape brush-edit driver flow.
-///
-/// Returns the harness's `AppExit`. The driver routes through the
-/// `OasisWarmup → ... → OasisAssert` phases (selected when EITHER
-/// `oasis_edit_visual_mode` OR `vox_gpu_construction_mode` is `true`); the
-/// camera is overridden by [`pin_vox_gpu_construction_camera`] (which
-/// runs `.after(pin_oasis_camera)` so it takes precedence over the
-/// birdseye); the brush is overridden by `apply_erase_brush`'s mode-aware
-/// branch to spawn at [`VOX_GPU_CONSTRUCTION_BRUSH_POS`].
-pub fn run_vox_gpu_construction() -> AppExit {
-    let path = oasis_vox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --vox-gpu-construction: FIXTURE MISSING at {} \
-             (cwd = {:?}). The fixture is Git LFS-tracked at \
-             {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull` to fetch the \
-             binary content, OR run the binary from the workspace root.",
-            path.display(),
-            std::env::current_dir().ok()
-        );
-        return AppExit::error();
-    }
-    println!(
-        "e2e_render --vox-gpu-construction: loading Oasis VOX fixture from \
-         {} ({} bytes) into the W5 GPU producer chain (production-path \
-         camera-sweep gate; camera A at {:?} look {:?} → camera B at {:?} \
-         look {:?}; expecting per-pixel RGB Δ ≥ {:.2} over central rect AND \
-         frame-A near-black (lum<{:.1}) count ≤ {:.1}% of frame pixels)",
-        path.display(),
-        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-        VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
-        VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A,
-        VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
-        VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B,
-        VOX_GPU_CONSTRUCTION_DIFF_FLOOR,
-        VOX_GPU_CONSTRUCTION_NEAR_BLACK_THRESHOLD,
-        100.0 * VOX_GPU_CONSTRUCTION_NEAR_BLACK_FRACTION_CEILING,
-    );
-
-    let mut app_args = crate::AppArgs::default();
-    // Production W5 path: the only install path. vox-gpu-rewrite Stage 2
-    // (2026-05-18) destroyed `fixed_world_size` — `setup_test_grid` always
-    // routes `GridPreset::Vox` through `install_vox_in_fixed_world`. The
-    // GPU construction default-on (`ConstructionConfig::default()` →
-    // `gpu_construction_enabled = true`) keeps the W5 producer chain
-    // active; the explicit assignment below is a belt-and-braces guard
-    // against a future default flip.
-    app_args.grid_preset = crate::GridPreset::Vox {
-        path: PathBuf::from(&app_path_for_args(&path)),
-    };
-    app_args.construction_config.gpu_construction_enabled = true;
-    // Route through the Oasis brush-edit driver flow. The driver's
-    // `OasisWarmup` fast-path triggers when EITHER `oasis_edit_visual_mode`
-    // OR `vox_gpu_construction_mode` is set; the brush + assertion mechanics
-    // are identical, the camera + brush position are mode-specific.
-    // NOTE: we deliberately do NOT also set `oasis_edit_visual_mode = true`
-    // — `pin_oasis_camera` would write a birdseye pose every tick that
-    // `pin_vox_gpu_construction_camera` would then override; cleaner to
-    // skip the birdseye write entirely.
-    app_args.vox_gpu_construction_mode = true;
-
-    crate::run_e2e_render_with_args(app_args)
-}
-
-/// Re-export the resolved path for the `AppArgs::grid_preset`. Mirrors the
-/// shape of `oasis_edit_visual.rs::run_oasis_edit_visual`.
-fn app_path_for_args(p: &std::path::Path) -> PathBuf {
-    p.to_path_buf()
-}
-
-// ---------------------------------------------------------------------------
-// Camera pin — overrides `pin_oasis_camera`'s birdseye
-// ---------------------------------------------------------------------------
-
-/// `Update` system: pin the camera at one of the two C#-faithful poses
-/// (A pre-promotion, B post-promotion). The "promotion" is the
-/// `OasisEditVisualState.edit_applied` flag, which the driver flips on
-/// `OasisApplyEdit` — this gate hijacks that flag as the "promote to
-/// camera B" trigger (instead of "apply brush"); the `OasisApplyEdit`
-/// branch in `driver.rs` is mode-aware and skips the brush call entirely
-/// for vox-gpu-construction mode.
-///
-/// Wired only when `AppArgs.vox_gpu_construction_mode == true`; runs
-/// `.after(pin_oasis_camera)` so it overrides the birdseye pose the
-/// Oasis pin would write (the Oasis driver fast-path doubles as our
-/// fast-path; we need the brush-edit phases but NOT the birdseye camera).
-pub fn pin_vox_gpu_construction_camera(
-    args: Option<Res<crate::AppArgs>>,
-    oasis: Option<Res<crate::e2e::oasis_edit_visual::OasisEditVisualState>>,
-    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
-) {
-    let Some(args) = args else { return; };
-    if !args.vox_gpu_construction_mode {
-        return;
-    }
-    let promoted = oasis.as_deref().is_some_and(|o| o.edit_applied);
-    let (pos, look_at) = if promoted {
-        (
-            VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
-            VOX_GPU_CONSTRUCTION_CAMERA_LOOK_B,
-        )
-    } else {
-        (
-            VOX_GPU_CONSTRUCTION_CAMERA_POS_A,
-            VOX_GPU_CONSTRUCTION_CAMERA_LOOK_A,
-        )
-    };
-    // Top-down birdseye: look DOWN at the target with `Vec3::X` as the up
-    // reference vector — same convention as `oasis_edit_visual::birdseye_pose`
-    // so the resulting camera Y-axis aligns toward `+Z` (the framebuffer's
-    // up direction).
-    let pose = Transform::from_translation(pos).looking_at(look_at, Vec3::X);
-    let (transform, position_split) = &mut *camera;
-    **transform = pose;
-    **position_split = PositionSplit::from_world(pose.translation);
-    let _ = promoted; // referenced by camera pos choice above
-}
-
-// ---------------------------------------------------------------------------
-// Camera-promotion stub — replaces the brush call in OasisApplyEdit
-// ---------------------------------------------------------------------------
-
-/// Driver-stub for the `OasisApplyEdit` phase in vox-gpu-construction mode.
-/// Does NOT touch `WorldData` (the W5 install path leaves the CPU mirror
-/// empty; `sphere_brush` would silently no-op on the empty mirror). The
-/// load-bearing side effect is `oasis.edit_applied = true` — which the
-/// driver sets after returning from this function — which
-/// `pin_vox_gpu_construction_camera` reads to promote the camera from
-/// pose A to pose B.
-pub fn promote_camera_to_pose_b() {
-    println!(
-        "e2e_render --vox-gpu-construction: promoting camera A→B \
-         (pose A {:?} → pose B {:?}) — no brush; W5 install path's empty \
-         CPU mirror would silently no-op a sphere_brush call",
-        VOX_GPU_CONSTRUCTION_CAMERA_POS_A, VOX_GPU_CONSTRUCTION_CAMERA_POS_B,
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Assertion — per-pixel mean RGB Δ over the central rect

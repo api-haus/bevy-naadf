@@ -7,7 +7,7 @@
 # config. The wasm32 build is driven out-of-band: Trunk for bevy_naadf
 # (`crates/bevy_naadf/Trunk.toml`).
 [workspace]
-members = ["crates/bevy_naadf"]
+members = ["crates/bevy_naadf", "crates/naadf_e2e"]
 resolver = "2"
 
 # Bevy's standard fast-iteration tweak: optimise dependencies even in dev

@@ -30,9 +30,9 @@
 //!
 //! ## Resource — [`TracingErrorCounter`]
 //!
-//! Inserted by [`crate::e2e::add_e2e_systems`] so any system can read the
-//! current count (the loaded-phase capture system uses it to short-circuit
-//! the screenshot if errors fired during warmup).
+//! Initialised on the BRP-driven e2e SUT (the `e2e_brp` install path) so any
+//! system — and the `naadf/get_state` verb — can read the current count of
+//! `tracing::error!` events fired during the run.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -97,10 +97,9 @@ pub fn vox_web_parity_log_layer(_app: &mut App) -> Option<BoxedLayer> {
     Some(Box::new(CountingLayer))
 }
 
-/// Bevy `Resource` mirror of the static counter, inserted by
-/// [`crate::e2e::add_e2e_systems`]. Reading this resource is equivalent to
-/// calling [`tracing_error_count`] — provided so Bevy systems can use the
-/// idiomatic `Res<TracingErrorCounter>` pattern.
+/// Bevy `Resource` mirror of the static counter. Reading this resource is
+/// equivalent to calling [`tracing_error_count`] — provided so Bevy systems
+/// can use the idiomatic `Res<TracingErrorCounter>` pattern.
 #[derive(Resource, Default, Clone, Copy)]
 pub struct TracingErrorCounter;
 

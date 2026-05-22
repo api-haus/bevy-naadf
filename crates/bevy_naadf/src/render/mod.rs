@@ -14,6 +14,13 @@
 //! (the HUD's UI pass then draws on top).
 
 pub mod atmosphere;
+// Mobile GPU budget preselection (`docs/orchestrate/mobile-budget/02-design.md`).
+// Owns the [`budget::EffectiveWorldSize`] resource (runtime override of the
+// C# canonical [`crate::WORLD_SIZE_IN_SEGMENTS`] const) + the probe-then-
+// select routine that Android pre-runs to size the three oversized storage-
+// buffer bindings (`voxels`, `blocks`, `taa_samples`) under the WebGPU 256 MiB
+// `max_storage_buffer_binding_size` ceiling.
+pub mod budget;
 pub mod color_compression;
 // Phase C (`15-design-c.md` §1.1) — the construction sub-module. W0 lands the
 // empty seam (`ConstructionGpu` / `ConstructionBindGroups` shells +
@@ -40,9 +47,12 @@ use bevy::render::{
 
 use atmosphere::prepare_atmosphere;
 use extract::{
-    extract_camera, extract_camera_history, extract_gi_config, extract_taa_config,
-    stage_model_data_buildonce, stage_world_gpu_buildonce, ExtractedCameraData,
-    ExtractedCameraHistory, ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
+    extract_camera, extract_camera_history, extract_construction_config,
+    extract_effective_world_size, extract_gi_config,
+    extract_invalid_sample_storage_count, extract_taa_config,
+    extract_taa_ring_depth, stage_model_data_buildonce,
+    stage_world_gpu_buildonce, ExtractedCameraData, ExtractedCameraHistory,
+    ExtractedGiConfig, ExtractedTaaConfig, WorldDataMeta,
 };
 // web-vox-color-divergence (2026-05-18) — `VoxelTypesRefresh` is consumed by
 // `prepare_world_gpu` via `crate::render::extract::VoxelTypesRefresh` path
@@ -81,7 +91,7 @@ use construction::naadf_gpu_producer_node;
 use construction::world_change::naadf_world_change_node;
 use pipelines::{prepare_blit_pipeline, NaadfPipelines};
 use prepare::{prepare_frame_gpu, prepare_world_gpu};
-use taa::{prepare_taa, TaaRingConfig};
+use taa::{prepare_taa, RenderTaaRingConfig};
 
 // W4 — the regime-3 entity-update node (gated on
 // `ConstructionConfig.entities_enabled`). The system body is a no-op when the
@@ -95,27 +105,33 @@ pub struct NaadfRenderPlugin;
 
 impl Plugin for NaadfRenderPlugin {
     fn build(&self, app: &mut App) {
-        // The configured TAA sample-ring depth (`18-taa-fidelity.md` fix #3):
-        // read once from the main-world `AppArgs` (inserted before this plugin
-        // in `build_app`) and mirrored into the render sub-app as
-        // `TaaRingConfig`. `NaadfPipelines::from_world` (built in
-        // `RenderStartup`, after this `build`) reads it for the WGSL
-        // `#{TAA_SAMPLE_RING_DEPTH}` shader-def; `prepare_taa` reads it for the
-        // buffer sizing — one source of truth, both sides agree.
-        let taa_ring_depth = app
-            .world()
-            .get_resource::<crate::AppArgs>()
-            .map(|args| args.taa_ring_depth)
-            .unwrap_or(crate::DEFAULT_TAA_RING_DEPTH);
-
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
 
         render_app
-            .insert_resource(TaaRingConfig {
-                depth: taa_ring_depth,
-            })
+            // `RenderTaaRingConfig` + `RenderEffectiveWorldSize` +
+            // `RenderInvalidSampleStorageCount` are all `init_resource`d to the
+            // C# canonical defaults (taa_ring_depth = 32, world = `(16, 2, 16)`,
+            // invalid_samples = 8). The real values are copied from the
+            // matching main-world resources each frame by
+            // `extract_taa_ring_depth` / `extract_effective_world_size` /
+            // `extract_invalid_sample_storage_count` (registered below in
+            // `ExtractSchedule`). This extract-driven path is what lets
+            // bootstrap-time overrides (e.g. the mobile budget routine's
+            // `TaaRingConfig { depth: 8 }`, `EffectiveWorldSize::from_segments
+            // ((6,2,6))`, `InvalidSampleStorageCount(4)`) reach the render-
+            // world consumers — a plugin-build-time snapshot would see only
+            // the defensive canonical seeds. See docstrings on the mirror
+            // structs in `budget.rs` + `taa.rs`. Step 2 of the
+            // config-as-resource refactor (`docs/orchestrate/config-as-resource-
+            // refactor/02-design.md` §3.4) brought `RenderTaaRingConfig` onto
+            // this pattern; Step 4 brought `ConstructionConfig` onto it too
+            // (`init_resource`d on the render sub-app inside
+            // `ConstructionPlugin::build` — see that plugin).
+            .init_resource::<RenderTaaRingConfig>()
+            .init_resource::<crate::render::budget::RenderEffectiveWorldSize>()
+            .init_resource::<crate::render::budget::RenderInvalidSampleStorageCount>()
             // `02f` rearch: no `ExtractedWorld` resource. The build-once
             // hand-off goes through `WorldGpuStaging` (transient, dropped
             // after `prepare_world_gpu` consumes it) + `WorldDataMeta`
@@ -158,6 +174,23 @@ impl Plugin for NaadfRenderPlugin {
                     extract_camera_history,
                     extract_taa_config,
                     extract_gi_config,
+                    // 2026-05-21 mobile-budget post-deploy fix — copy the
+                    // post-`build_app_with_args`-override main-world values
+                    // into the render-world mirrors (see docstrings on
+                    // `RenderEffectiveWorldSize` + `RenderInvalidSampleStorageCount`
+                    // in `budget.rs`).
+                    extract_effective_world_size,
+                    extract_invalid_sample_storage_count,
+                    // Step 2 of the config-as-resource refactor — the TAA
+                    // sample-ring depth is now extracted (was plugin-build
+                    // snapshot at this spot). Mirrors the budget-resource
+                    // pattern; see `extract_taa_ring_depth` docstring.
+                    extract_taa_ring_depth,
+                    // Step 4 of the config-as-resource refactor — the
+                    // construction config is now extracted (was
+                    // plugin-build snapshot via `From<&AppArgs>`). Same
+                    // pattern as `extract_taa_ring_depth`.
+                    extract_construction_config,
                 ),
             )
             // Prepare: create + upload GPU resources, build bind groups,

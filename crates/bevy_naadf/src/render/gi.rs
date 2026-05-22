@@ -229,6 +229,12 @@ pub fn prepare_gi(
     existing: Option<Res<GiGpu>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    // 2026-05-21 post-deploy consolidated fix: the unlit-sample ring is now
+    // a mobile budget lever (`crate::render::budget::InvalidSampleStorageCount`).
+    // Render-sub-app mirror inserted by `NaadfRenderPlugin::build`; defensive
+    // fallback to the C# canonical 8 if no caller seeded the resource
+    // (e.g. pre-2026-05-21 e2e fixtures).
+    invalid_sample_storage: Option<Res<crate::render::budget::RenderInvalidSampleStorageCount>>,
 ) {
     if !extracted_camera.valid || !extracted_history.valid {
         return;
@@ -237,6 +243,10 @@ pub fn prepare_gi(
     let pixel_count = viewport.x * viewport.y;
     let (bucket_size, bucket_count) = bucket_grid_of(viewport);
     let gi = extracted_gi.settings;
+    let invalid_storage_count: u32 = invalid_sample_storage
+        .as_ref()
+        .map(|r| r.0)
+        .unwrap_or(INVALID_SAMPLE_STORAGE_COUNT);
 
     // --- create / resize the buffers ---------------------------------------
     // The `pixel_count`- and `bucket_count`-sized buffers rebuild on a viewport
@@ -262,7 +272,13 @@ pub fn prepare_gi(
             gi_params: gpu.gi_params.clone(),
             fresh: false,
         },
-        _ => create_gi_buffers(&render_device, &render_queue, pixel_count, bucket_count),
+        _ => create_gi_buffers(
+            &render_device,
+            &render_queue,
+            pixel_count,
+            bucket_count,
+            invalid_storage_count,
+        ),
     };
 
     // --- per-frame reset of the ray-queue indirect counter -----------------
@@ -344,7 +360,13 @@ pub fn prepare_gi(
         bucket_count,
         sample_max_accum: gi.global_illum_max_accum,
         valid_sample_storage_count: VALID_SAMPLE_STORAGE_COUNT,
-        invalid_sample_storage_count: INVALID_SAMPLE_STORAGE_COUNT,
+        // Runtime override of the C# canonical 8 — see budget-routine
+        // explanation on the `prepare_gi` system param above. The WGSL
+        // shaders read THIS field (`naadf_global_illum.wgsl:528`,
+        // `sample_refine.wgsl:267,615,665`); the Rust buffer sizing in
+        // `create_gi_buffers` reads the SAME value via the
+        // `invalid_storage_count` argument — single source of truth.
+        invalid_sample_storage_count: invalid_storage_count,
         bucket_storage_count: BUCKET_STORAGE_COUNT,
         refined_bucket_storage_count: REFINED_BUCKET_STORAGE_COUNT,
         spatial_resample_size: gi.spatial_resample_size,
@@ -440,16 +462,23 @@ struct GiBuffers {
 /// - the three indirect buffers seeded: `ray_queue_indirect = [0,1,1,0,0]`,
 ///   `valid_dispatch = invalid_dispatch = [1,1,1,0,0]` (`WorldRenderBase.cs:136,
 ///   168,170`).
+/// Runtime override of [`INVALID_SAMPLE_STORAGE_COUNT`] supplied by the
+/// mobile budget routine (`crate::render::budget`). Desktop = canonical 8;
+/// mobile may drop to 4 or 2. **Caller must use the SAME value when
+/// uploading `GpuGiParams.invalid_sample_storage_count`** — `prepare_gi`
+/// does this via the same `invalid_storage_count` local.
 fn create_gi_buffers(
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
     pixel_count: u32,
     bucket_count: u32,
+    invalid_storage_count: u32,
 ) -> GiBuffers {
     // wgpu rejects zero-length buffers — `pixel_count` is `>= 1`, but
     // `bucket_count` for a 1×1 viewport is also `>= 1`; clamp defensively.
     let pixel_count = pixel_count.max(1) as u64;
     let bucket_count = bucket_count.max(1) as u64;
+    let invalid_storage_count = invalid_storage_count.max(1) as u64;
 
     let mk = |label: &str, size: u64, usages: BufferUsages| {
         render_device.create_buffer(&BufferDescriptor {
@@ -473,10 +502,14 @@ fn create_gi_buffers(
             * std::mem::size_of::<GpuSampleValid>() as u64,
         GI_BUFFER_USAGES,
     );
-    // `invalid_samples`: pixel_count * 8 × vec4<u32> (16 bytes).
+    // `invalid_samples`: pixel_count * invalid_storage_count × vec4<u32> (16 bytes).
+    // The multiplier was the const `INVALID_SAMPLE_STORAGE_COUNT = 8` pre-
+    // 2026-05-21; now runtime-overridable on mobile so the binding fits the
+    // 256 MiB WebGPU cap. See `crate::render::budget` + the consolidated-fix
+    // doc.
     let invalid_samples = mk(
         "naadf_gi_invalid_samples",
-        pixel_count * INVALID_SAMPLE_STORAGE_COUNT as u64 * 16,
+        pixel_count * invalid_storage_count * 16,
         GI_BUFFER_USAGES,
     );
     // `valid_samples_refined`: bucket_count * 32 × vec4<u32> (16 bytes).
