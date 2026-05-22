@@ -312,38 +312,6 @@ pub fn build_app_core(cfg: AppConfig) -> App {
     {
         app.insert_resource(render::construction::SpawnTestEntity::default());
     }
-    // Step 6 of the config-as-resource refactor — defensive seed for the
-    // per-domain `E2eGateMode`. `setup_test_grid` reads it as
-    // `Res<E2eGateMode>` (non-Option) at `Startup`, and the e2e driver
-    // reads it via `Res<E2eGateMode>`; the `build_app(AppConfig::e2e())`
-    // path (`run_e2e_render`) bypasses
-    // `build_app_with_bootstrap_inputs`, so without the seed `setup_test_grid`
-    // panics on the missing resource. Canonical default =
-    // `E2eGateMode::Standard` (the standard gate flow — `baseline`,
-    // `--vox-e2e`, `--entities`). Callers routing through the bootstrap
-    // fan-out overwrite it via `insert_resource` overwrite-in-place. Step 9
-    // deletes this seed once every caller routes through the fan-out.
-    if !app
-        .world()
-        .contains_resource::<crate::e2e::gate::E2eGateMode>()
-    {
-        app.insert_resource(crate::e2e::gate::E2eGateMode::default());
-    }
-    // Step 7 of the config-as-resource refactor — defensive seed for the
-    // per-domain `VoxE2eAssertion` (the last field drained off `AppArgs`).
-    // The e2e driver reads it via `Option<Res<VoxE2eAssertion>>` so it is
-    // already resource-absent tolerant, but seeding the canonical default
-    // (`VoxE2eAssertion(false)`) keeps the direct `build_app(AppConfig::e2e())`
-    // path (`run_e2e_render`) consistent with the bootstrap fan-out. Callers
-    // routing through `build_app_with_bootstrap_inputs` overwrite it; only
-    // the `--vox-e2e` gate inserts `VoxE2eAssertion(true)`.
-    if !app
-        .world()
-        .contains_resource::<crate::e2e::VoxE2eAssertion>()
-    {
-        app.insert_resource(crate::e2e::VoxE2eAssertion::default());
-    }
-
     // Mobile GPU budget — defensively seed [`EffectiveWorldSize`] to the C#
     // canonical value if no caller (Android entry / future probe-mode CLI)
     // inserted one before this point. Every existing caller (production
@@ -379,16 +347,16 @@ pub fn build_app_core(cfg: AppConfig) -> App {
             // `e2e-render-test.md` §2.2 point 1); the `WindowPlugin` carries
             // the fixed-size e2e window.
             DefaultPlugins
-                // web-vox-async-loading 2026-05-18 follow-up Step 8 / Q5 —
-                // when the e2e harness is active, install the
-                // `CountingLayer` via the `LogPlugin::custom_layer` hook so
-                // the `--vox-web-parity-loaded` gate can assert zero
-                // `tracing::error!` events fired during the run. The
-                // counter is a process-global static; resetting it in the
-                // harness boot via
+                // When the app is booted as the BRP-driven e2e SUT
+                // (`cfg.brp_port.is_some()`), install the `CountingLayer` via
+                // the `LogPlugin::custom_layer` hook so the `naadf/get_state`
+                // verb's `tracing_errors` field reports the count of
+                // `tracing::error!` events fired during the run. The counter
+                // is a process-global static; resetting it on boot via
                 // `tracing_error_counter::reset_tracing_error_count()` is
-                // safe and idempotent.
-                .set(if cfg.add_e2e_systems {
+                // safe and idempotent. The production binary
+                // (`brp_port = None`) gets the default `LogPlugin`.
+                .set(if cfg.brp_port.is_some() {
                     bevy::log::LogPlugin {
                         custom_layer: e2e::tracing_error_counter::vox_web_parity_log_layer,
                         ..default()
@@ -466,14 +434,11 @@ pub fn build_app_core(cfg: AppConfig) -> App {
     app.add_plugins(voxel::VoxelIoPlugin);
 
     // `spawn_phase_c_test_entity` (the W4 fixture spawner gated on
-    // `AppArgs::spawn_test_entity`) lives in
-    // `render::construction::test_fixture` and is registered inside
-    // `ConstructionPlugin::build` with the same
+    // `SpawnTestEntity`) lives in `render::construction::test_fixture` and is
+    // registered inside `ConstructionPlugin::build` with the same
     // `.after(voxel::grid::setup_test_grid)` ordering. See D7 cleanup
     // follow-up 2.
-    if cfg.add_e2e_systems {
-        e2e::add_e2e_systems(&mut app);
-    }
+    //
     // `setup_camera` + `update_camera_history` + `sync_position_split` are
     // all owned by `camera::CameraPlugin` above. `update_camera_history` is
     // registered with `.after(sync_position_split)` inside the plugin.
@@ -525,18 +490,6 @@ pub fn build_app_core(cfg: AppConfig) -> App {
     }
 
     app
-}
-
-/// Boot the bounded windowed e2e render test and return its `AppExit`.
-///
-/// `cargo run --bin e2e_render` calls this. It builds the real app with
-/// [`AppConfig::e2e`], runs it (the winit runner drives the loop; the
-/// bounded-frame driver self-terminates after a fixed frame budget — see
-/// [`crate::e2e::driver`]), then runs the post-run `PipelineCache` error scan +
-/// node-dispatch check + degenerate-frame floor and folds any failure into the
-/// returned `AppExit` (`e2e-render-test.md` §3 / §7 / §8 / §11 step 7).
-pub fn run_e2e_render() -> AppExit {
-    e2e::run_e2e_render()
 }
 
 // `spawn_phase_c_test_entity` moved to `render::construction::test_fixture`

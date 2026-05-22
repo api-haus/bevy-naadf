@@ -1,9 +1,9 @@
 //! Bootstrap-time configuration carrier.
 //!
 //! [`BootstrapInputs`] is the transient parser-output that the production
-//! binaries (`main.rs`, `android_main.rs`, `bin/e2e_render.rs`) build from
-//! CLI / argv / build-constants / device-probe values, and that the App
-//! bootstrap fans into per-domain Bevy resources before the App runs. It is
+//! binaries (`main.rs`, `android_main.rs`) build from CLI / argv /
+//! build-constants / device-probe values, and that the App bootstrap fans
+//! into per-domain Bevy resources before the App runs. It is
 //! the non-budget analogue of [`crate::render::budget::BudgetCaps`] —
 //! transient at boot, dropped after the resource fan-out, never stored as a
 //! `Resource` itself.
@@ -17,15 +17,11 @@
 //! as its own per-domain resource.
 //!
 //! [`build_app_with_bootstrap_inputs`] fans `BootstrapInputs` into the
-//! per-domain resources; [`run_e2e_render_with_bootstrap_inputs`] is the
-//! e2e-gate entry point — it builds the App via the fan-out, picks the
-//! window config from `inputs.gate_mode`, and drives the run to
-//! completion. As of Step 6 every e2e gate routes through these.
+//! per-domain resources. It is the boot funnel both the production binary
+//! (`main.rs`, native + wasm) and the e2e SUT path route through.
 
-use bevy::prelude::{App, AppExit};
+use bevy::prelude::App;
 
-use crate::e2e::gate::E2eGateMode;
-use crate::e2e::VoxE2eAssertion;
 use crate::render::construction::{ConstructionConfig, SpawnTestEntity};
 use crate::render::taa::{TaaConfig, TaaRingConfig};
 use crate::{AppConfig, GiSettings, GridPreset};
@@ -87,33 +83,10 @@ pub struct BootstrapInputs {
     /// emissive-voxel block at world centre) is spawned at `Startup`.
     /// Migrated out of `AppArgs.spawn_test_entity` in Step 8 of the
     /// config-as-resource refactor. `SpawnTestEntity::default()` =
-    /// `SpawnTestEntity(false)`; the `e2e_render --entities` boot flips it
-    /// on. The fan-out inserts it as a main-world `Res<SpawnTestEntity>`
-    /// that gates `spawn_phase_c_test_entity` and that the e2e driver reads
-    /// to pick the entity-aware ASSERT baseline.
+    /// `SpawnTestEntity(false)`; the `--e2e-entities` SUT spawn flag flips
+    /// it on. The fan-out inserts it as a main-world `Res<SpawnTestEntity>`
+    /// that gates `spawn_phase_c_test_entity`.
     pub spawn_test_entity: SpawnTestEntity,
-    /// Which e2e gate flow the run dispatches — Bucket B (Mode). Migrated
-    /// out of the 10 mutually-exclusive e2e-mode booleans on `AppArgs`
-    /// (`resize_test`, `oasis_edit_visual_mode`, …, `vox_horizon_native_phase`)
-    /// in Step 6 of the config-as-resource refactor. `E2eGateMode::default()`
-    /// = `E2eGateMode::Standard` (the standard Warmup→Motion→Settle→Shoot
-    /// flow); each per-gate `run_*` builder sets the matching variant. The
-    /// fan-out inserts it as a main-world `Res<E2eGateMode>` that the e2e
-    /// driver state machine and the per-gate `pin_*_camera` systems read,
-    /// and that [`crate::window_config::window_for_gate_mode`] reads to pick
-    /// the e2e window resolution. The `--vox-e2e` ASSERT-time tag is NOT
-    /// folded in here — it is Bucket A and travels on `vox_e2e_assertion`
-    /// below (`02-design.md` Decision §3).
-    pub gate_mode: E2eGateMode,
-    /// Whether the e2e driver's `ASSERT` step swaps the default-scene
-    /// region gates for the `--vox-e2e` non-skybox assertion — Bucket A
-    /// (`02-design.md` Decision §3). Migrated out of the last surviving
-    /// `AppArgs` field (`vox_e2e_mode`) in Step 7 of the
-    /// config-as-resource refactor. `VoxE2eAssertion::default()` =
-    /// `VoxE2eAssertion(false)`; only `run_vox_e2e` flips it on. The
-    /// fan-out inserts it as a main-world `Res<VoxE2eAssertion>` that the
-    /// driver reads once at ASSERT time.
-    pub vox_e2e_assertion: VoxE2eAssertion,
 }
 
 impl Default for BootstrapInputs {
@@ -132,8 +105,6 @@ impl Default for BootstrapInputs {
             construction_config: ConstructionConfig::for_target_arch(),
             grid_preset: GridPreset::default(),
             spawn_test_entity: SpawnTestEntity::default(),
-            gate_mode: E2eGateMode::default(),
-            vox_e2e_assertion: VoxE2eAssertion::default(),
         }
     }
 }
@@ -187,41 +158,7 @@ pub fn build_app_with_bootstrap_inputs(cfg: AppConfig, inputs: BootstrapInputs) 
     // has a defensive `SpawnTestEntity::default()` seed; this insert wins
     // for callers routing through the fan-out (the `--entities` e2e boot).
     app.insert_resource(inputs.spawn_test_entity);
-    // Migrated in Step 6 — main-world `E2eGateMode`. The 10 e2e-mode
-    // booleans on `AppArgs` collapsed into this one enum (Bucket B). The
-    // e2e driver state machine branches on it (`Res<E2eGateMode>`), the
-    // per-gate `pin_*_camera` systems read `Option<Res<E2eGateMode>>`, and
-    // `setup_test_grid` reads it for the test-only CPU-oracle install
-    // branch. `build_app_with_args` has a defensive `E2eGateMode::default()`
-    // seed for direct-`build_app` callers; this insert wins for callers
-    // routing through the fan-out (every e2e gate).
-    app.insert_resource(inputs.gate_mode);
-    // Migrated in Step 7 — main-world `VoxE2eAssertion`. The last field
-    // off the drained `AppArgs` god-resource (`vox_e2e_mode` — Bucket A,
-    // Decision §3). The e2e driver reads it once at ASSERT time via
-    // `Option<Res<VoxE2eAssertion>>`. `build_app_with_args` has a
-    // defensive `VoxE2eAssertion::default()` seed for the direct
-    // `build_app(AppConfig::e2e())` path; this insert wins for callers
-    // routing through the fan-out (the `--vox-e2e` gate flips it on).
-    app.insert_resource(inputs.vox_e2e_assertion);
     app
-}
-
-/// Boot the bounded windowed e2e render test from a [`BootstrapInputs`] and
-/// return its [`AppExit`].
-///
-/// The e2e-gate entry point: builds the App via the
-/// [`build_app_with_bootstrap_inputs`] resource fan-out, picks the e2e
-/// window config from `inputs.gate_mode`
-/// ([`crate::window_config::window_for_gate_mode`]), and drives the run to
-/// completion via [`crate::e2e::run_with_app`]. Every per-gate `run_*`
-/// builder under `crate::e2e` constructs a `BootstrapInputs` and calls
-/// this.
-pub fn run_e2e_render_with_bootstrap_inputs(inputs: BootstrapInputs) -> AppExit {
-    let mut cfg = AppConfig::e2e();
-    cfg.window = crate::window_config::window_for_gate_mode(inputs.gate_mode);
-    let app = build_app_with_bootstrap_inputs(cfg, inputs);
-    crate::e2e::run_with_app(app)
 }
 
 #[cfg(test)]
@@ -267,14 +204,7 @@ mod tests {
         assert_eq!(inputs.grid_preset, GridPreset::Default);
         // Step 8 — `spawn_test_entity` migrated off `AppArgs` onto the typed
         // `BootstrapInputs.spawn_test_entity` field. The fixture spawner is
-        // off by default; the `--entities` e2e boot flips it.
+        // off by default; the `--e2e-entities` SUT spawn flag flips it.
         assert!(!inputs.spawn_test_entity.0);
-        // Step 6 — the 10 e2e-mode booleans collapsed into the
-        // `E2eGateMode` enum; the default is the standard gate flow.
-        assert_eq!(inputs.gate_mode, crate::e2e::gate::E2eGateMode::Standard);
-        // Step 7 — `vox_e2e_mode` (Bucket A) migrated off `AppArgs` onto
-        // the typed `vox_e2e_assertion: VoxE2eAssertion` field; off by
-        // default (only `run_vox_e2e` flips it).
-        assert!(!inputs.vox_e2e_assertion.0);
     }
 }

@@ -287,19 +287,18 @@ impl Plugin for CameraPlugin {
             crate::render::taa::update_camera_history.after(sync_position_split),
         );
 
-        // Production-only camera spawn. The e2e harness uses its own
-        // `setup_e2e_camera` (fixed-pose) and ignores `InitialCameraPose`
-        // entirely (see `e2e/gates.rs::e2e_camera_transform`).
+        // The C#-faithful camera spawn. Runs for both the production binary
+        // and the BRP-driven e2e SUT — the SUT's external runner repositions
+        // the camera over BRP (`naadf/set_camera`); it still needs the camera
+        // entity spawned with its production component set first.
         //
         // `.after(setup_test_grid)` so the `GridPreset::Vox` arm has had a
         // chance to insert `InitialCameraPose` (the world-sized C#-faithful
         // camera pose); `setup_camera` then frames the loaded world.
-        if !cfg.add_e2e_systems {
-            app.add_systems(
-                Startup,
-                setup_camera.after(crate::voxel::grid::setup_test_grid),
-            );
-        }
+        app.add_systems(
+            Startup,
+            setup_camera.after(crate::voxel::grid::setup_test_grid),
+        );
 
         // The fly camera + runtime DLSS toggle + initial-pose re-apply —
         // production only. The e2e config omits `FreeCameraPlugin` so even

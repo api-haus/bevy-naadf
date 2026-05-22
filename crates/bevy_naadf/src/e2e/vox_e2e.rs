@@ -11,9 +11,8 @@
 //!   2. Writes the bytes to a deterministic temp file so the production
 //!      `--vox <path>` path (`crates/bevy_naadf/src/main.rs:21-33`) drives the
 //!      load — same code path the user invokes manually.
-//!   3. Boots the existing windowed e2e harness ([`crate::e2e::run_with_app`])
-//!      with [`crate::GridPreset::Vox`] selected, so the same fixed-pose
-//!      camera, frame budget, readback, and `PipelineCache` scan run.
+//!   3. The migrated BRP `vox_e2e` test body (`tests/vox_e2e.rs`) spawns the
+//!      SUT with `--vox <fixture>`, so the production `.vox` load path runs.
 //!   4. Replaces the default-scene gates (which sample rectangles tuned for
 //!      the hard-coded `voxel/grid.rs::build_default_volume` content layout)
 //!      with a "non-skybox" assertion: a region the synthesised geometry
@@ -95,8 +94,6 @@
 //! collapse to the sky luminance (~146) or below.
 
 use std::path::{Path, PathBuf};
-
-use bevy::prelude::AppExit;
 use std::collections::HashMap as StdHashMap;
 use std::io::Cursor;
 
@@ -331,69 +328,6 @@ pub fn write_vox_e2e_fixture_to_temp() -> std::io::Result<PathBuf> {
 /// so a stale file is safe.
 pub fn vox_e2e_fixture_path() -> PathBuf {
     PathBuf::from(crate::e2e::E2E_SCREENSHOT_DIR).join("vox_e2e_fixture.vox")
-}
-
-/// Boot the e2e harness with the synthesised `.vox` fixture loaded
-/// through the production `--vox <path>` ingestion path.
-///
-/// Returns the harness's `AppExit` — `AppExit::Success` if the regular
-/// pipeline-error scan + node-dispatch + degenerate-frame floor checks
-/// pass and the [`assert_vox_geometry_visible`] gate (substituted in for
-/// the default-scene `assert_batch_6` region gate) passes.
-///
-/// Caller (`bin/e2e_render.rs` `--vox-e2e` branch) is responsible for
-/// folding this into the binary exit code.
-pub fn run_vox_e2e() -> AppExit {
-    // 1) Serialise the fixture to a temp file so the production `--vox
-    //    <path>` ingestion path runs verbatim (load_vox → std::fs::read →
-    //    parse_vox_bytes → flatten_scene → build_world_from_vox).
-    let path = match write_vox_e2e_fixture_to_temp() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "e2e_render --vox-e2e: failed to write synthesised .vox \
-                 fixture: {e}"
-            );
-            return AppExit::error();
-        }
-    };
-    println!(
-        "e2e_render --vox-e2e: synthesised .vox fixture written to {} \
-         ({} models, 2 nTRN translations)",
-        path.display(),
-        2
-    );
-
-    // 2) Set up the bootstrap inputs so:
-    //     - `setup_test_grid` reads `Res<GridPreset>` = `GridPreset::Vox
-    //       { path }` and calls `vox_import::load_vox(&path)`.
-    //     - The driver's `ASSERT` step swaps the default-scene batch gate
-    //       for `assert_vox_geometry_visible` (driver branch on the
-    //       `VoxE2eAssertion` resource).
-    // `VoxE2eAssertion` is Bucket A (Decision §3) — it is NOT a flow
-    // selector (the `--vox-e2e` gate runs the STANDARD driver flow, hence
-    // `gate_mode` is left at the default `E2eGateMode::Standard`); Step 7
-    // of the config-as-resource refactor migrated it off the (then-last,
-    // now-deleted) `AppArgs.vox_e2e_mode` field onto its own resource.
-    //
-    // `grid_preset` migrated off `AppArgs` onto `BootstrapInputs.grid_preset`
-    // in Step 5. vox-gpu-rewrite Stage 2 (2026-05-18): the production
-    // install path is the only install path — the synthesised fixture flows
-    // through `install_vox_in_fixed_world` + the W5 GPU producer chain just
-    // like the production binary's `--vox` flag. The W5 chain runs
-    // `generator_model` + `chunk_calc` per segment to populate the fixed
-    // `(4096, 512, 4096)`-voxel world; `gpu_construction_enabled` is on by
-    // default (`ConstructionConfig::for_target_arch`), no override needed.
-
-    // 3) Run the harness the same way `--entities` does. The standard
-    //    `AppConfig::e2e()` window (256×256 non-resizable) is reused so
-    //    the gate rect fractions stay calibrated.
-    let inputs = crate::bootstrap::BootstrapInputs {
-        grid_preset: crate::GridPreset::Vox { path },
-        vox_e2e_assertion: crate::e2e::VoxE2eAssertion(true),
-        ..crate::bootstrap::BootstrapInputs::default()
-    };
-    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
 }
 
 /// The vox-e2e region gate: assert the central screen rectangle (where

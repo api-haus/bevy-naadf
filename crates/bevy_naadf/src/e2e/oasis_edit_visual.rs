@@ -63,12 +63,8 @@
 
 use std::path::{Path, PathBuf};
 
-use bevy::camera::Hdr;
-use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::prelude::*;
-use bevy::winit::WinitSettings;
 
-use crate::camera::position_split::PositionSplit;
 use crate::e2e::framebuffer::{Framebuffer, Rect};
 
 // ---------------------------------------------------------------------------
@@ -157,67 +153,6 @@ pub const OASIS_DIFF_RECT_FRACS: (f32, f32, f32, f32) = (0.35, 0.35, 0.65, 0.65)
 pub const OASIS_EDIT_DIFF_FLOOR: f32 = 8.0;
 
 // ---------------------------------------------------------------------------
-// State resource
-// ---------------------------------------------------------------------------
-
-/// Stash for the two captured framebuffers + the edit-applied flag.
-#[derive(Resource, Default)]
-pub struct OasisEditVisualState {
-    /// Pre-edit capture (frame A).
-    pub before: Option<Framebuffer>,
-    /// Post-edit capture (frame B).
-    pub after: Option<Framebuffer>,
-    /// Set to `true` once the brush has fired so the driver does not
-    /// re-fire it on subsequent ticks.
-    pub edit_applied: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Entry point — invoked from `bin/e2e_render.rs`
-// ---------------------------------------------------------------------------
-
-/// Boot the e2e harness with the Oasis VOX fixture + the
-/// `--oasis-edit-visual` driver branch enabled. Returns the harness's
-/// `AppExit`.
-pub fn run_oasis_edit_visual() -> AppExit {
-    let path = oasis_vox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --oasis-edit-visual: FIXTURE MISSING at {} \
-             (cwd = {:?}). The fixture is Git LFS-tracked at \
-             {OASIS_VOX_FIXTURE_PATH}. Run `git lfs pull` to fetch \
-             the binary content, OR run the binary from the workspace \
-             root.",
-            path.display(),
-            std::env::current_dir().ok()
-        );
-        return AppExit::error();
-    }
-    println!(
-        "e2e_render --oasis-edit-visual: loading Oasis VOX fixture from {} \
-         ({} bytes)",
-        path.display(),
-        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
-    );
-
-    // Step 6 of the config-as-resource refactor — the e2e-mode boolean
-    // collapsed into `E2eGateMode`; the gate sets `gate_mode = OasisEdit`.
-    // Step 5: `grid_preset` rides `BootstrapInputs.grid_preset`.
-    // vox-gpu-rewrite Stage 2 (2026-05-18): always the W5 GPU producer
-    // chain. The brush-edit assertion is on the framebuffer Δ from a
-    // birdseye-over-world-centre camera; the W5 path tiles Oasis to fill
-    // the fixed `(4096, 512, 4096)`-voxel world, so the birdseye sees the
-    // tiled architecture and the central edit at world centre still
-    // projects to the central screen rect — assertion semantics preserved.
-    let inputs = crate::bootstrap::BootstrapInputs {
-        gate_mode: crate::e2e::gate::E2eGateMode::OasisEdit,
-        grid_preset: crate::GridPreset::Vox { path },
-        ..crate::bootstrap::BootstrapInputs::default()
-    };
-    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
-}
-
-// ---------------------------------------------------------------------------
 // Camera pose helper
 // ---------------------------------------------------------------------------
 
@@ -242,92 +177,6 @@ pub fn world_centre_voxel(world_size_voxels: [u32; 3]) -> Vec3 {
         world_size_voxels[1] as f32 * 0.5,
         world_size_voxels[2] as f32 * 0.5,
     )
-}
-
-// ---------------------------------------------------------------------------
-// The brush call — the load-bearing step (must match runtime path)
-// ---------------------------------------------------------------------------
-
-/// Apply the erase-sphere brush at the world centre. Calls
-/// [`crate::editor::tools::sphere_brush`] with `is_erase = true` — the
-/// same function the editor's `apply_edit_tool` invokes when the user
-/// LMB-drags with Sphere brush + Erase active. **This is the
-/// load-bearing fidelity constraint** for the gate: the brush must hit
-/// the production runtime path (not the diagnostic oracle), so the gate
-/// catches regressions in that path.
-pub fn apply_erase_brush(world_data: &mut crate::world::data::WorldData) {
-    let size_v = world_data.size_in_chunks
-        * (crate::voxel::CELL_DIM as u32 * crate::voxel::CELL_DIM as u32);
-    let world_size_voxels = [size_v.x, size_v.y, size_v.z];
-    let centre = world_centre_voxel(world_size_voxels);
-    let radius = OASIS_ERASE_RADIUS;
-    let ty = crate::voxel::VoxelTypeId::EMPTY;
-    let is_erase = true;
-    println!(
-        "e2e_render --oasis-edit-visual: applying erase sphere — centre {:?}, \
-         radius {radius:.1} voxels, world size {:?} voxels",
-        centre, world_size_voxels,
-    );
-    let v_before = world_data.voxels_cpu.len();
-    let b_before = world_data.blocks_cpu.len();
-    crate::editor::tools::sphere_brush(world_data, centre, radius, ty, is_erase);
-    let v_after = world_data.voxels_cpu.len();
-    let b_after = world_data.blocks_cpu.len();
-    let batches = world_data.pending_edits.batches.len();
-    let groups = world_data.pending_edits.edited_groups.len();
-    let mut chunk_records = 0usize;
-    let mut block_records = 0usize;
-    let mut voxel_records = 0usize;
-    for batch in &world_data.pending_edits.batches {
-        chunk_records += batch.changed_chunks.len();
-        block_records += batch.changed_blocks.len() / 65;
-        voxel_records += batch.changed_voxels.len() / 33;
-    }
-    println!(
-        "e2e_render --oasis-edit-visual: sphere_brush returned — pending_edits \
-         batches {batches}, edited_groups {groups}, \
-         changed_chunks {chunk_records}, changed_blocks {block_records}, \
-         changed_voxels {voxel_records}; \
-         voxels_cpu {v_before}→{v_after} (+{}), blocks_cpu {b_before}→{b_after} (+{})",
-        v_after.saturating_sub(v_before),
-        b_after.saturating_sub(b_before),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Pose pin + the standard e2e camera silenced
-// ---------------------------------------------------------------------------
-
-/// `Update` system: pin the camera at the birdseye pose every tick. The
-/// e2e harness's standard `setup_e2e_camera` spawns the camera at
-/// `gates::e2e_motion_start_transform`; the standard `e2e_driver` writes
-/// the camera each tick during its WARMUP/MOTION/SETTLE phases. This
-/// system **overrides** that write — runs `.after(driver::e2e_driver)`
-/// so the pose pin lands AFTER the driver's pose write but BEFORE
-/// `sync_position_split` consumes the `Transform` (the driver's `.before`
-/// ordering also keeps `sync_position_split` post-pose-update).
-///
-/// Wired only when `E2eGateMode::OasisEdit` is active.
-pub fn pin_oasis_camera(
-    gate_mode: Option<Res<crate::e2e::gate::E2eGateMode>>,
-    world_data: Option<Res<crate::world::data::WorldData>>,
-    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
-) {
-    if gate_mode.as_deref().copied() != Some(crate::e2e::gate::E2eGateMode::OasisEdit) {
-        return;
-    }
-    let Some(world_data) = world_data else { return; };
-    let size_v = world_data.size_in_chunks
-        * (crate::voxel::CELL_DIM as u32 * crate::voxel::CELL_DIM as u32);
-    if size_v.x == 0 || size_v.y == 0 || size_v.z == 0 {
-        return;
-    }
-    let pose = birdseye_pose([size_v.x, size_v.y, size_v.z]);
-    let (transform, position_split) = &mut *camera;
-    **transform = pose;
-    **position_split = PositionSplit::from_world(pose.translation);
-    let _ = WinitSettings::game;
-    let _ = (Hdr, Tonemapping::default());
 }
 
 // ---------------------------------------------------------------------------

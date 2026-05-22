@@ -53,7 +53,20 @@ branch `feat/android-build`.
     - [x] Phase 3a — 6 gates migrated (dual-path green)
     - [x] Phase 3b — 4 special gates + `nodes_dispatched` verb — 13/13 gates dual-path green
   - [x] Phase 4 — repoint Playwright cross-target gate (`just test-wasm` green)
-  - [ ] Phase 5 — delete legacy harness
+  - [x] Phase 5 — delete legacy harness (~4,465 net lines removed, all gates green)
+
+## Status: COMPLETE (2026-05-22)
+
+All 6 phases done. The bevy-naadf e2e harness is now BRP-driven: the production
+`bin/bevy-naadf` is the system-under-test, spawned by the `naadf_e2e` runner crate
+and controlled over Bevy Remote Protocol via 13 `naadf/*` verbs. The 13 booted-window
+gates run as `cargo test -p bevy-naadf --features e2e-brp --test <gate>`. The legacy
+in-app-driver-mode machinery (`e2e_driver`, `E2eGateMode`, `add_e2e_systems`, the
+`e2e_render` 3-layer parser) is deleted; `bin/e2e_render` survives only as a 56-line
+`--ssim-compare` utility for the Playwright cross-target gate.
+
+Final verification — all green: `cargo build --workspace`, `cargo build --features e2e-brp`,
+`cargo test --workspace --lib` (192 passed), all 13 e2e gates, `just test-wasm`.
 
 ## Phase 5 carry-forward notes
 

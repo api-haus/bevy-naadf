@@ -57,11 +57,6 @@
 
 use std::path::{Path, PathBuf};
 
-use bevy::prelude::*;
-use bevy::winit::WinitSettings;
-
-use crate::camera::poses::{HORIZON_CAMERA_POS, HORIZON_CAMERA_ROT};
-use crate::camera::position_split::PositionSplit;
 use crate::e2e::framebuffer::Framebuffer;
 
 // ---------------------------------------------------------------------------
@@ -119,86 +114,6 @@ pub const HORIZON_DRAIN_FRAMES: u32 = super::vox_web_parity::PARITY_DRAIN_FRAMES
 /// headroom above the current measured SSIM and well above the 0.789
 /// pre-fix regression.
 pub const HORIZON_SSIM_SIMILARITY_MIN: f64 = 0.91;
-
-// ---------------------------------------------------------------------------
-// Sub-phase entry point
-// ---------------------------------------------------------------------------
-
-/// Boot the e2e harness configured for the native horizon-capture phase.
-/// Loads the Oasis `.cvox` fixture via the production W5 GPU producer chain
-/// (same install path as the live web build), pins the horizon camera, and
-/// saves `target/e2e-screenshots/vox_horizon_native.png`.
-pub fn run_vox_horizon_native_phase() -> AppExit {
-    let path = oasis_cvox_fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "e2e_render --vox-horizon-native: FIXTURE MISSING at {} \
-             (cwd = {:?}). The fixture is Git LFS-tracked at \
-             {OASIS_CVOX_FIXTURE_PATH}. Run `git lfs pull`, OR run from the \
-             workspace root.",
-            path.display(),
-            std::env::current_dir().ok()
-        );
-        return AppExit::error();
-    }
-    println!(
-        "e2e_render --vox-horizon-native: loading Oasis CVOX from {} via \
-         the W5 GPU producer chain. Camera pinned to translation={:?} \
-         rotation={:?}. Window {}×{}. Saving to {}.",
-        path.display(),
-        HORIZON_CAMERA_POS,
-        HORIZON_CAMERA_ROT,
-        HORIZON_WIDTH,
-        HORIZON_HEIGHT,
-        HORIZON_NATIVE_PNG,
-    );
-
-    // Step 6 of the config-as-resource refactor — the e2e-mode boolean
-    // collapsed into `E2eGateMode`; the gate sets
-    // `gate_mode = VoxHorizonNative` ([`window_for_gate_mode`] reads it to
-    // pick the 1280×720 window).
-    // Step 4: `construction_config` rides `BootstrapInputs.construction_config`.
-    let mut construction_config =
-        crate::render::construction::ConstructionConfig::for_target_arch();
-    construction_config.gpu_construction_enabled = true;
-    // Step 5: `grid_preset` rides `BootstrapInputs.grid_preset`.
-    let inputs = crate::bootstrap::BootstrapInputs {
-        gate_mode: crate::e2e::gate::E2eGateMode::VoxHorizonNative,
-        construction_config,
-        grid_preset: crate::GridPreset::Vox { path },
-        ..crate::bootstrap::BootstrapInputs::default()
-    };
-    crate::bootstrap::run_e2e_render_with_bootstrap_inputs(inputs)
-}
-
-// ---------------------------------------------------------------------------
-// Camera-pin system — overrides the e2e driver's pose write every tick
-// ---------------------------------------------------------------------------
-
-/// `Update` system: pin the camera at the horizon pose every tick when
-/// `E2eGateMode::VoxHorizonNative` is active. Registered with
-/// `.after(driver::e2e_driver)` so this pose write lands AFTER the driver's
-/// motion-phase write but BEFORE `sync_position_split` consumes the
-/// `Transform`.
-pub fn pin_vox_horizon_camera(
-    gate_mode: Option<Res<crate::e2e::gate::E2eGateMode>>,
-    mut camera: Single<(&mut Transform, &mut PositionSplit), With<Camera3d>>,
-) {
-    if gate_mode.as_deref().copied()
-        != Some(crate::e2e::gate::E2eGateMode::VoxHorizonNative)
-    {
-        return;
-    }
-    let pose = Transform {
-        translation: HORIZON_CAMERA_POS,
-        rotation: HORIZON_CAMERA_ROT,
-        scale: Vec3::ONE,
-    };
-    let (transform, position_split) = &mut *camera;
-    **transform = pose;
-    **position_split = PositionSplit::from_world(pose.translation);
-    let _ = WinitSettings::game;
-}
 
 // ---------------------------------------------------------------------------
 // Oasis CVOX fixture path

@@ -1646,3 +1646,379 @@ Build prerequisites for the gate (done in this phase, both green):
   subprocess from the legacy binary to the BRP test, which is strictly an
   improvement (the native side is now the same production-binary-as-SUT path
   the other 12 gates use).
+
+---
+
+## Phase 5 — delete legacy harness (2026-05-22)
+
+**Verdict: Phase 5 lands clean. The legacy in-app e2e driver machinery is
+deleted; the BRP-driven harness is now the SOLE e2e path. ~4 465 net lines
+removed (4 697 deleted, 232 added across 22 files). All 5 verification-gate
+items green — `cargo build --workspace`, `cargo build -p bevy-naadf --features
+e2e-brp`, `cargo test --workspace --lib` (192 passed), all 13 booted-window
+gates (11 `tests/*.rs` files) PASS, `just test-wasm-full` PASS (6/6 Playwright
+tests, the `vox-horizon-parity` cross-target gate confirms the shrunk
+`e2e_render --ssim-compare` contract holds). The default production build is
+0-warning and byte-identical in behaviour to today minus the deleted dead
+code. No assertion threshold was recalibrated.**
+
+The restructure (`e2e-ipc-rpc-restructure`, Phases 0–5) is **complete**.
+
+### Keep-set enumeration — what the BRP harness imports from `bevy_naadf`
+
+Built before deleting anything by grepping the import surface of the 13
+migrated `crates/bevy_naadf/tests/*.rs` files, the `naadf_e2e` runner crate,
+and the `e2e_brp` server. Every symbol below was confirmed preserved; the
+deletions were checked against this set step by step.
+
+**The 11 test files (`crates/bevy_naadf/tests/`) import:**
+- `e2e::framebuffer::{Framebuffer, Rect}`
+- `e2e::gates::{assert_entity_pixel, batch_gate, e2e_orbit_camera_transform,
+  region_luminance_report, GateState, CURRENT_BATCH, e2e_resize_test_camera_transform}`
+- `e2e::ssim::ssim_compare_framebuffers`
+- `e2e::small_edit_visual::{assert_small_edit_landed, birdseye_pose,
+  small_edit_click_voxel_world, SMALL_EDIT_CLICK_VOXEL, SMALL_EDIT_PAINT_TYPE,
+  SMALL_EDIT_RADIUS, SMALL_EDIT_WARMUP_FRAMES, SMALL_EDIT_POST_EDIT_WAIT_FRAMES}`
+- `e2e::small_edit_repro::{assert_no_pitch_black_pixels, SMALL_EDIT_REPRO_*}` (10 consts)
+- `e2e::vox_e2e::{assert_vox_geometry_visible, write_vox_e2e_fixture_to_temp}`
+- `e2e::vox_gpu_construction::{assert_vox_gpu_construction_landed,
+  VOX_GPU_CONSTRUCTION_CAMERA_{POS,LOOK}_{A,B}}`
+- `e2e::vox_gpu_oracle::{compare_oracle_frames, ORACLE_CAMERA_LOOK,
+  ORACLE_CAMERA_POS, ORACLE_SSIM_THRESHOLD, ORACLE_WARMUP_FRAMES}`
+- `e2e::vox_horizon_parity::{HORIZON_HEIGHT, HORIZON_NATIVE_PNG,
+  HORIZON_WARMUP_FRAMES, HORIZON_WIDTH}`
+- `e2e::vox_web_parity::{PARITY_CAMERA_{POS,LOOK}, PARITY_WARMUP_FRAMES,
+  VOX_WEB_PARITY_CHANNEL_MAX_FLOOR, VOX_WEB_PARITY_SSIM_DISSIMILARITY_MAX}`
+- `camera::poses::{HORIZON_CAMERA_POS, HORIZON_CAMERA_ROT}`
+- `naadf_e2e::{scenario, schema, Sut, SutOpts}`
+
+**`naadf_e2e` (the runner crate) imports:** `bevy_naadf::e2e::framebuffer::Framebuffer`,
+`bevy_naadf::e2e_brp::schema`. Untouched.
+
+**`e2e_brp` (the BRP server) imports from `e2e`:**
+- `e2e::checks::{PipelineScanResult, assert_nodes_dispatched,
+  pipeline_scan_result, scan_pipeline_errors_render_system}`
+- `e2e::framebuffer::{Framebuffer, Rect}`
+- `e2e::gates::{expected_spans, CURRENT_BATCH}`
+- `e2e::readback::{shoot_primary_window, E2eScreenshot}`
+- `e2e::small_edit_visual::count_non_empty_voxels`  ← load-bearing: a per-gate
+  module's pure helper read by the `naadf/count_demo_voxels` verb
+- `e2e::tracing_error_counter::tracing_error_count`
+
+Every one of these survives. `e2e/{readback,framebuffer,ssim,checks,gates}.rs`
+were untouched (verified they hold zero `driver::`/`gate::` references). The
+per-gate `e2e/<gate>.rs` files were reduced to **just their pure helpers** —
+no per-gate file was deleted wholesale.
+
+`WinitSettings::Continuous` — confirmed: it lives in
+`e2e_brp::install_brp_server` (Phase 1 already moved it there); deleting
+`add_e2e_systems` did not touch it. The `e2e/gates.rs` region-gate pure fns —
+untouched.
+
+### What was deleted — file by file
+
+**Deleted wholesale (2 files):**
+- `crates/bevy_naadf/src/e2e/driver.rs` — 1 994 lines. The whole
+  `match`-over-`E2ePhase` state machine: `e2e_driver`, `E2ePhase` (26
+  variants), `E2eState`, `E2eOutcome`, `ResizeTestState`, `E2eDriverConfig`,
+  `pin_resize_test_camera`, the `hyprctl` resize dispatch, `run_assertions`,
+  `run_resize_test_assertions`, `full_frame_luma`.
+- `crates/bevy_naadf/src/e2e/gate.rs` — 181 lines. `E2eGateMode` (the
+  11-variant enum), the dead `Gate` trait, `FrameBudget`, `set_camera_pose`.
+
+**Shrunk, NOT deleted:**
+- `crates/bevy_naadf/src/bin/e2e_render.rs` — **546 → 56 lines.** The 3-layer
+  argv parser (`TopLevelShortCircuit` / `BootCommand` / `PostAppValidations`,
+  `run_boot_command`, `run_resize_test`, the `hyprctl` windowrule helpers, all
+  Layer-1/2/3 dispatch) is gone. What remains is a single-purpose
+  `--ssim-compare` utility: a pure `bevy_naadf::e2e::ssim` wrapper, no Bevy, no
+  `App`, no GPU. See "The shrunk `e2e_render`" below.
+- `crates/bevy_naadf/src/e2e/mod.rs` — 409 → 141 lines. Deleted
+  `add_e2e_systems`, `setup_e2e_camera`, `run_e2e_render`, `run_with_app`, the
+  `VoxE2eAssertion` resource, the `driver`/`gate` `pub mod` declarations, and
+  all imports (the file is now `pub mod` decls + `pub const`s only). **All
+  `E2E_*` frame-budget / window / resize constants kept** — the migrated test
+  files + `crate::window_config` read them.
+- `crates/bevy_naadf/src/e2e/oasis_edit_visual.rs` — −151 lines. Deleted
+  `OasisEditVisualState`, `run_oasis_edit_visual`, `apply_erase_brush`,
+  `pin_oasis_camera`. Kept `birdseye_pose`, `world_centre_voxel`,
+  `assert_visual_edit_landed`, `region_mean_pixel_delta`, `save_oasis_screenshot`,
+  all `OASIS_*` consts.
+- `crates/bevy_naadf/src/e2e/small_edit_visual.rs` — −132 lines. Deleted
+  `SmallEditVisualState`, `run_small_edit_visual`, `pin_small_edit_camera`,
+  `apply_small_cube_edit`. Kept `birdseye_pose`, `count_non_empty_voxels`,
+  `small_edit_click_voxel_world`, `assert_small_edit_landed`, `click_voxel_rects`,
+  `save_small_edit_screenshot`, the `region_*_pixel_delta` helpers, all consts.
+- `crates/bevy_naadf/src/e2e/small_edit_repro.rs` — −173 lines. Deleted
+  `SmallEditReproState`, `run_small_edit_repro`, `pin_small_edit_repro_camera`,
+  `apply_small_edit_repro_edit`. Kept `assert_no_pitch_black_pixels`,
+  `save_small_edit_repro_screenshot`, all `SMALL_EDIT_REPRO_*` consts.
+- `crates/bevy_naadf/src/e2e/vox_e2e.rs` — −70 lines. Deleted `run_vox_e2e`.
+  Kept `build_vox_e2e_fixture`, `write_vox_e2e_fixture_to_temp`,
+  `vox_e2e_fixture_path`, `assert_vox_geometry_visible`, `save_vox_e2e_screenshot`.
+- `crates/bevy_naadf/src/e2e/vox_gpu_construction.rs` — −161 lines. Deleted
+  `run_vox_gpu_construction`, `app_path_for_args`, `pin_vox_gpu_construction_camera`,
+  `promote_camera_to_pose_b`. Kept `assert_vox_gpu_construction_landed`,
+  `region_mean_pixel_delta`, `save_vox_gpu_construction_screenshot`, all consts.
+- `crates/bevy_naadf/src/e2e/vox_gpu_oracle.rs` — −308 lines. Deleted
+  `run_vox_gpu_oracle_cpu_phase`, `run_vox_gpu_oracle_gpu_phase`,
+  `run_vox_gpu_oracle_compare`, `pin_vox_gpu_oracle_camera`, `VoxGpuOracleState`,
+  and the now-dead private `load_png_as_framebuffer` (a duplicate of the
+  canonical `e2e::ssim::load_png_as_framebuffer`). Kept `compare_oracle_frames`,
+  `count_pixels_with_luminance_above`, `framebuffer_to_rgb_image`,
+  `save_oracle_screenshot`, `oracle_cpu_png_path`, `oracle_gpu_png_path`, all consts.
+- `crates/bevy_naadf/src/e2e/vox_horizon_parity.rs` — −85 lines. Deleted
+  `run_vox_horizon_native_phase`, `pin_vox_horizon_camera`. Kept all `HORIZON_*`
+  consts, `OASIS_CVOX_FIXTURE_PATH`, `oasis_cvox_fixture_path`,
+  `horizon_native_png_path`, `horizon_web_png_path`, `save_horizon_screenshot`.
+- `crates/bevy_naadf/src/e2e/vox_web_parity.rs` — −300 lines. Deleted
+  `VoxWebParityState`, `run_vox_web_parity_skybox_phase`,
+  `run_vox_web_parity_loaded_phase`, `run_vox_web_parity_compare`,
+  `pin_vox_web_parity_camera`. Kept `PARITY_*` / `VOX_WEB_PARITY_*` consts,
+  `parity_skybox_png_path`, `parity_loaded_png_path`, `save_parity_screenshot`.
+
+**Other edits (field / call-site removal):**
+- `app_config.rs` — deleted the `AppConfig.add_e2e_systems` field and the
+  `AppConfig::e2e()` constructor. `AppConfig::windowed()` + `AppConfig::e2e_sut()`
+  remain.
+- `bootstrap.rs` — deleted the `BootstrapInputs.gate_mode` and
+  `.vox_e2e_assertion` fields, their fan-out inserts, their `Default` entries,
+  and `run_e2e_render_with_bootstrap_inputs` (it used `window_for_gate_mode` +
+  `AppConfig::e2e()` + `run_with_app`).
+- `window_config.rs` — deleted `window_for_gate_mode`. (The `WindowConfig::e2e_*`
+  size constructors are kept `pub` — see side-notes.)
+- `lib.rs` — deleted `run_e2e_render`, the `E2eGateMode` + `VoxE2eAssertion`
+  defensive seeds, and the `e2e::add_e2e_systems` call site. Re-gated the
+  `LogPlugin` `CountingLayer` install from `cfg.add_e2e_systems` to
+  `cfg.brp_port.is_some()` (design §6.3) so the BRP SUT's `naadf/get_state`
+  verb gets a live `tracing_errors` count.
+- `main.rs` — the `--e2e-brp` boot branch no longer constructs a `gate_mode`;
+  `--e2e-vox-oracle-cpu` now inserts the new marker resource (below).
+- `camera/mod.rs`, `diagnostics.rs`, `voxel/plugin.rs` — the three remaining
+  readers of `cfg.add_e2e_systems`. Each gated a *production-only* behaviour on
+  `!add_e2e_systems` (`setup_camera`, the press-P diagnostics dump, native
+  drag-and-drop). Since `AppConfig::windowed()` AND `AppConfig::e2e_sut()` both
+  had `add_e2e_systems: false`, all three already took the production branch
+  for every surviving config — so they were made **unconditional**. Zero
+  behavioural change for any surviving config; `AppConfig` was dropped from the
+  `DiagnosticsPlugin` / `VoxelIoPlugin` imports.
+
+### The `E2eGateMode::VoxGpuOracleCpu` replacement
+
+The Phase-3b finding (and design Assumption A3) was confirmed exactly:
+`setup_test_grid` (`voxel/grid.rs`) read `Res<E2eGateMode>` and branched
+`*gate_mode == E2eGateMode::VoxGpuOracleCpu` → `install_vox_sized_to_model`
+(the test-only natural-bound CPU oracle) for the `vox_gpu_oracle` gate's CPU
+phase. `E2eGateMode` could not be blindly deleted.
+
+**Replacement — a minimal, purpose-named marker resource.** Added
+`pub struct VoxOracleCpuConstruction` (a unit `#[derive(Resource)]`) in
+`voxel/grid.rs`, next to `setup_test_grid`. `setup_test_grid`'s signature
+changed `gate_mode: Res<E2eGateMode>` → `vox_oracle_cpu: Option<Res<VoxOracleCpuConstruction>>`,
+and the branch `*gate_mode == E2eGateMode::VoxGpuOracleCpu` →
+`vox_oracle_cpu.is_some()`. `Option<Res<…>>` makes it resource-absent
+tolerant, so the `lib.rs` defensive seed (formerly the `E2eGateMode` seed) was
+not needed and was deleted.
+
+**Wiring.** `main.rs`'s `--e2e-vox-oracle-cpu` spawn flag (the Phase-3b flag
+for the `vox_gpu_oracle` CPU-construction phase) previously set
+`BootstrapInputs.gate_mode = E2eGateMode::VoxGpuOracleCpu`. It now builds the
+app via the bootstrap fan-out and, when the flag is present,
+`app.insert_resource(VoxOracleCpuConstruction)` before `app.run()` — inserted
+post-build, exactly like the wasm budget overrides, so `setup_test_grid`'s
+`Startup` read sees it. The flag still rides the spawn contract (Forbidden
+Move #4), `naadf_e2e`'s `SutOpts::vox_oracle_cpu` builder is unchanged.
+
+Verified: every `E2eGateMode` reference across `src/` is gone (Grep confirmed
+zero hits). The `vox_gpu_oracle` gate PASSes on the new path (SSIM 0.8829 ≥
+0.85) — the marker replacement is behaviourally correct.
+
+### The shrunk `e2e_render`
+
+`bin/e2e_render.rs` is now **56 lines**: a module doc + a `fn main() -> ExitCode`
+that parses `--ssim-compare` via `bevy_naadf::e2e::ssim::parse_ssim_compare_args`
+and runs `bevy_naadf::e2e::ssim::ssim_compare_command`. Both fns are pure
+library code in `e2e/ssim.rs` (preserved untouched).
+
+The `--ssim-compare` contract is preserved **byte-for-byte** because the shrunk
+binary delegates to the same `ssim_compare_command` the legacy binary did:
+- **Exit codes** — `0` (SSIM within the asserted `[min, max)` band), `1` (out
+  of range), `2` (internal error / arg-parse failure). `ssim_compare_command`
+  returns these unchanged; arg-parse failure maps to `ExitCode::from(2)` as
+  before.
+- **`^SSIM=<f64>` stdout line** — `ssim_compare_command` still prints
+  `println!("SSIM={score:.6}")` (plus the `WIDTH=`/`HEIGHT=` lines). The
+  Playwright spec's `extractSsimScore()` regex `^SSIM=([0-9]+(?:\.[0-9]+)?)`
+  matches it.
+- The `--ssim-min` / `--ssim-max` flags parse identically (`parse_ssim_compare_args`
+  untouched).
+
+Confirmed by `just test-wasm-full`: the `vox-horizon-parity` Playwright spec —
+the sole external consumer of `e2e_render` — invokes
+`cargo run --bin e2e_render -- --ssim-compare <a> <b> --ssim-min <min>` via
+`runSsimCompare()` and PASSES.
+
+### The CLAUDE.md edit
+
+`CLAUDE.md` "Verification discipline" — the worktree-root file does not exist
+as a separate copy; the project `CLAUDE.md` (`/mnt/archive4/DEV/bevy-naadf/CLAUDE.md`,
+untracked) is the verification-discipline canon. Its stale e2e command line:
+
+> - `cargo run --bin e2e_render -- <mode>` — `baseline`, `--validate-gpu-construction`,
+>   `--edit-mode`, `--entities`, `--vox-e2e`, `--oasis-edit-visual`, `--runtime-edit-mode`
+
+was replaced with:
+
+> - The 13 booted-window e2e gates — `cargo test -p bevy-naadf --features e2e-brp
+>   --test <gate>`, one per gate file in `crates/bevy_naadf/tests/` (`standard`,
+>   `vox_e2e`, `oasis_edit_visual`, `small_edit_visual`, `small_edit_repro`,
+>   `vox_gpu_construction`, `vox_gpu_oracle`, `vox_web_parity`, `vox_horizon_native`,
+>   `resize_test`, `entities`). Each test spawns the production `bin/bevy-naadf`
+>   binary as the system-under-test and drives it externally over the Bevy Remote
+>   Protocol … `cargo test -p bevy-naadf --features e2e-brp` runs all of them.
+> - The cross-target parity gate — `just test-wasm` …
+
+The "add a gate to `e2e_render`" guidance was likewise updated to "add a
+BRP-driven gate in `crates/bevy_naadf/tests/`". The section's intent
+(deterministic gates; the user does the live visual check; no
+`cargo run --bin bevy-naadf` smokes) is unchanged — only the stale command.
+
+### Gate results — all 5 verification-gate items
+
+1. **`cargo build --workspace`** (default features) — **PASS.** `Finished in
+   28.91s`, 0 errors, 0 warnings.
+2. **`cargo build -p bevy-naadf --features e2e-brp`** — **PASS.** `Finished in
+   1m 15s`, 0 errors, 0 warnings.
+3. **`cargo test --workspace --lib`** — **PASS.** `192 passed; 0 failed; 1
+   ignored` (bevy-naadf lib) + `0 passed` (naadf_e2e lib, lib-only crate).
+4. **All 13 booted-window gates** (`cargo test -p bevy-naadf --features e2e-brp
+   --test <gate>`, each wrapped in `timeout`):
+
+   | Gate | Result |
+   |---|---|
+   | `standard` | PASS — 1 passed (1.99s) |
+   | `vox_e2e` | PASS — 1 passed (2.37s) |
+   | `oasis_edit_visual` | PASS — 1 passed (6.18s) |
+   | `small_edit_visual` | PASS — 1 passed (2.85s) |
+   | `small_edit_repro` | PASS — 1 passed (6.55s) |
+   | `vox_gpu_construction` | PASS — 1 passed (6.15s) |
+   | `vox_horizon_native` | PASS — 1 passed (2.61s) |
+   | `vox_gpu_oracle` | PASS — 1 passed (10.48s) |
+   | `vox_web_parity` | PASS — 1 passed (6.45s) |
+   | `resize_test` | PASS — 1 passed (7.08s) |
+   | `entities` | PASS — 1 passed (1.88s) |
+
+   11 `tests/*.rs` files = the 13 booted-window gates (`standard` covers the
+   `baseline` flow; `vox_gpu_oracle` + `vox_web_parity` are the two compare
+   gates). All PASS. The `vox_gpu_oracle` PASS specifically confirms the
+   `VoxOracleCpuConstruction` marker replacement is behaviourally correct.
+5. **`just test-wasm-full`** (the Playwright cross-target suite, headed, channel
+   `chrome`) — **PASS.** `6 passed (1.9m)`. Full log teed to
+   `/tmp/phase5-logs/test-wasm-full.log` (the `[wasm-diag]` browser-console
+   lines are forwarded into it). The `vox-horizon-parity` spec — which shells
+   `cargo run --bin e2e_render -- --ssim-compare …` — PASSED, confirming the
+   shrunk `e2e_render` contract holds.
+
+No assertion threshold was recalibrated anywhere in Phase 5.
+
+### Final state
+
+The BRP-driven harness is now the **sole e2e path**. There is no in-app
+driver mode, no `E2eGateMode`, no `add_e2e_systems`, no `bin/e2e_render` boot
+path. The production `bin/bevy-naadf` is the system-under-test; the 13 gates
+are BRP-driven `#[test]` bodies in `crates/bevy_naadf/tests/`; `bin/e2e_render`
+survives only as a 56-line `--ssim-compare` leaf utility for the Playwright
+cross-target bridge. The default production build is byte-identical in
+behaviour to before Phase 5 (it never ran the deleted dead code) and is
+0-warning.
+
+The `e2e-ipc-rpc-restructure` orchestration (Phases 0–5) is **complete**.
+
+**Left for a future `/refactor`** (flagged by this and prior phases — NOT
+Phase 5 scope):
+- `naadf/apply_brush.voxels_delta` is misleadingly named — it is the change in
+  the *packed `u32` array* `WorldData::voxels_cpu` length (32-`u32` granularity
+  per block), not a non-empty-voxel count. Honester: `voxels_cpu_len_delta`.
+  (Phase 3a side-note; Phase 3a worked around it with `naadf/count_demo_voxels`.)
+- `resize_test` keeps a `hyprctl resizewindowpixel` dependency under Hyprland —
+  a tiling Wayland compositor refuses a client-side `request_inner_size`, so
+  the `naadf/resize_window` verb is the platform-neutral fallback only. A truly
+  headless resize gate needs rendering to a fixed offscreen target decoupled
+  from the window swapchain. (Phase 3b D10 finding.)
+- `WindowConfig::e2e_resize_test` / `e2e_horizon` / `e2e_small_edit_repro` are
+  now dead `pub fn`s (their only caller, `window_for_gate_mode`, was deleted) —
+  see side-notes.
+
+## Side notes / observations / complaints
+
+- **`VoxE2eAssertion` was deleted even though the brief did not name it.** The
+  brief's deletion ledger explicitly lists `BootstrapInputs.gate_mode` but not
+  the parallel `vox_e2e_assertion` field. `VoxE2eAssertion` was a Bucket-A
+  driver-only resource: `add_e2e_systems` `init_resource`'d it, the deleted
+  `e2e_driver` read it once at ASSERT time, `bootstrap.rs` had a field +
+  fan-out for it, `lib.rs` had a defensive seed. With `add_e2e_systems` +
+  `e2e/driver.rs` gone it had **zero readers** — keeping it would have left a
+  `BootstrapInputs` field + a `lib.rs` seed for a resource nothing reads, i.e.
+  dead code the deletion *creates*. The migrated `vox_e2e` BRP gate calls
+  `assert_vox_geometry_visible` directly with no resource. Deleting it is the
+  same class of move as the `gate_mode` deletion the brief does list (both are
+  driver-only `BootstrapInputs` fields). Flagging it because it is one symbol
+  beyond the literal ledger — the call was made for internal consistency, not
+  scope creep.
+
+- **The three `WindowConfig::e2e_*` size constructors are now dead but kept
+  `pub`.** `window_for_gate_mode` was their only caller; the brief named
+  `window_for_gate_mode` for deletion but not the constructors. They are
+  `pub fn`s (no dead-code warning), they reference live `E2E_*` constants, and
+  the brief says "surgical deletion only — do not improve preserved code".
+  Deleting them would have been a judgement call beyond the ledger, so they
+  stay. A future `/refactor` should either delete them or note that the
+  `--e2e-window` spawn flag (the BRP runner's window-size mechanism) fully
+  subsumes them. `WindowConfig::e2e()` itself is still live —
+  `AppConfig::e2e_sut()` calls it.
+
+- **Three `add_e2e_systems` readers collapsed cleanly because the SUT was
+  already a production-shaped app.** `camera/mod.rs`, `diagnostics.rs`,
+  `voxel/plugin.rs` each gated a production-only behaviour on
+  `!cfg.add_e2e_systems`. Crucially `AppConfig::e2e_sut()` already set
+  `add_e2e_systems: false` — so the BRP SUT *already* ran production
+  `setup_camera` / diagnostics / drag-and-drop before Phase 5. The only config
+  that ever set the flag `true` was the now-deleted `AppConfig::e2e()`. So
+  making the three readers unconditional is a genuine zero-behaviour-change
+  edit for every config that still exists. This is the "the production app IS
+  the SUT" principle paying off — there was no e2e-specific app shape left to
+  preserve.
+
+- **One pre-existing wasm-only warning surfaced during `just test-wasm-full`,
+  unrelated to Phase 5.** `crates/bevy_naadf/src/voxel/async_vox.rs:27`
+  reports `unused import: parse_voxel_bytes` — but ONLY in the wasm release
+  build. `parse_voxel_bytes` is used at `async_vox.rs:179,205` on native; the
+  wasm build evidently `cfg`-gates those uses out. Phase 5 touched no
+  `async_vox.rs` and the native `cargo build --workspace` is 0-warning — this
+  is a pre-existing wasm-target wart, out of Phase 5 scope. Flagging it so a
+  future wasm-cleanup pass picks it up.
+
+- **~111 stale doc-comment mentions of deleted symbols remain in prose.**
+  Grep finds ~111 `//`/`///`/`//!` lines across the `e2e/` modules + `lib.rs`
+  + `main.rs` etc. that reference `add_e2e_systems`, `e2e_render --<flag>`,
+  `E2eGateMode`, the in-app driver, etc. — historical/journal prose. The 3
+  that were genuine *broken intra-doc links* (`[`crate::e2e::run_with_app`]`,
+  `[`crate::e2e::add_e2e_systems`]` ×2) were fixed (they would break
+  `cargo doc`). The rest are plain prose and were left — fixing all 111 is a
+  doc sweep well beyond "delete the legacy harness", and the brief is explicit
+  that surgical deletion, not doc polishing, is the task. A `/docs` or
+  `/refactor` pass should reconcile them. The module-level docs of `e2e/mod.rs`,
+  `bin/e2e_render.rs`, `app_config.rs`, `bootstrap.rs`, `tracing_error_counter.rs`,
+  `voxel/plugin.rs`, `diagnostics.rs` and the `voxel/grid.rs` setup_test_grid
+  docs WERE updated (those are the files whose *behaviour* changed).
+
+- **The deletion was genuinely clean — the keep-set held on first contact.**
+  Every per-gate file split cleanly into "delete the `run_*`/`pin_*`/`*State`
+  machinery, keep the pure helpers" exactly as the design promised. No
+  migrated test needed a new `pub` symbol; no keep-set symbol was at risk. The
+  one private duplicate that surfaced (`vox_gpu_oracle::load_png_as_framebuffer`,
+  a copy of the canonical `e2e::ssim` fn) was caught by the post-deletion
+  dead-code warning and removed. The rot was entirely in the orchestration
+  glue, exactly as the design's §-side-notes claimed — `e2e/driver.rs` (1 994
+  lines) + `bin/e2e_render.rs` (546 lines) + the per-gate boot scaffolding were
+  the whole of it. The restructure was not fighting the codebase.

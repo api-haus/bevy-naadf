@@ -4,28 +4,14 @@
 //! framebuffer readback is fast and every `pixel_count`-sized buffer is
 //! identical run-to-run (§4.2 determinism row).
 //!
-//! This module also owns the [`E2eGateMode`]→window-config mapping
-//! ([`window_for_gate_mode`]) used by the e2e bootstrap. Each e2e mode
-//! constructor lives next to its peers here so adding a mode is a one-file
-//! edit.
-//!
 //! ## Imports from `crate::e2e` — legitimate consumer, not a dep-arrow bug
 //!
-//! Each `WindowConfig::e2e_*` constructor reads its dimensions from the e2e
-//! gate that boots through it (`crate::e2e::{E2E_WIDTH, E2E_HEIGHT,
-//! E2E_RESIZE_BOOT_WIDTH, E2E_RESIZE_BOOT_HEIGHT,
-//! vox_horizon_parity::HORIZON_WIDTH, vox_horizon_parity::HORIZON_HEIGHT,
-//! small_edit_repro::SMALL_EDIT_REPRO_WIDTH,
-//! small_edit_repro::SMALL_EDIT_REPRO_HEIGHT}`). These are legitimate consumer
-//! imports: each constant's value is pinned by the gate's own contract
-//! (Playwright viewport for the horizon gate, user-reported bug-report screen
-//! size for `small-edit-repro`, fast-readback 256×256 framebuffer choice for
-//! the standard e2e). Relocating them out of `e2e/` would orphan the constants
-//! from the gate logic that defines them. The standalone
-//! `WindowConfig::windowed()` constructor — the only one production calls —
-//! reads zero e2e constants.
-
-use crate::e2e::gate::E2eGateMode;
+//! The `WindowConfig::e2e*` constructors read their dimensions from the e2e
+//! gate constants (`crate::e2e::{E2E_WIDTH, E2E_HEIGHT, …}`). These are
+//! legitimate consumer imports: each constant's value is pinned by a gate's
+//! own contract. `WindowConfig::e2e()` is the SUT window
+//! ([`crate::AppConfig::e2e_sut`]); the gate-specific window-size variants
+//! are reached by the BRP runner's `--e2e-window` spawn flag.
 
 /// Window sizing/title.
 #[derive(Clone, Copy, Debug)]
@@ -145,14 +131,3 @@ impl WindowConfig {
     }
 }
 
-/// Map the active [`E2eGateMode`] to its [`WindowConfig`]. Three gate
-/// modes need a non-standard window resolution; every other mode uses the
-/// standard 256×256 fast-readback e2e window.
-pub fn window_for_gate_mode(gate: E2eGateMode) -> WindowConfig {
-    match gate {
-        E2eGateMode::Resize => WindowConfig::e2e_resize_test(),
-        E2eGateMode::SmallEditRepro => WindowConfig::e2e_small_edit_repro(),
-        E2eGateMode::VoxHorizonNative => WindowConfig::e2e_horizon(),
-        _ => WindowConfig::e2e(),
-    }
-}

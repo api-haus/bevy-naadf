@@ -39,10 +39,10 @@
 //! - `--e2e-vox-oracle-cpu` — boot-time knob for the BRP-driven
 //!   `vox_gpu_oracle` compare gate's **CPU-oracle phase**: routes a `--vox`
 //!   load through the test-only `install_vox_sized_to_model` natural-bound CPU
-//!   loader (`E2eGateMode::VoxGpuOracleCpu`) instead of the production W5 GPU
-//!   producer chain. Boot-time because `setup_test_grid` reads it at
-//!   `Startup`; rides the spawn contract per Forbidden Move #4. Only
-//!   meaningful alongside `--e2e-brp` + `--vox`.
+//!   loader instead of the production W5 GPU producer chain. Inserts the
+//!   `voxel::grid::VoxOracleCpuConstruction` marker resource, which
+//!   `setup_test_grid` reads at `Startup`; rides the spawn contract per
+//!   Forbidden Move #4. Only meaningful alongside `--e2e-brp` + `--vox`.
 //! - `--e2e-entities` — boot-time knob for the BRP-driven `entities` gate:
 //!   spawns the Phase-C 4×4×4 emissive-voxel test fixture
 //!   (`SpawnTestEntity(true)`) and enables the W4 entity track
@@ -204,12 +204,6 @@ fn main() -> AppExit {
                 grid_preset = GridPreset::Empty;
             }
 
-            let gate_mode = if e2e_vox_oracle_cpu {
-                bevy_naadf::e2e::gate::E2eGateMode::VoxGpuOracleCpu
-            } else {
-                bevy_naadf::e2e::gate::E2eGateMode::default()
-            };
-
             let mut construction_config =
                 bevy_naadf::render::construction::ConstructionConfig::for_target_arch();
             if e2e_entities {
@@ -218,14 +212,25 @@ fn main() -> AppExit {
 
             let inputs = bevy_naadf::bootstrap::BootstrapInputs {
                 grid_preset,
-                gate_mode,
                 construction_config,
                 spawn_test_entity:
                     bevy_naadf::render::construction::SpawnTestEntity(e2e_entities),
                 ..Default::default()
             };
-            return bevy_naadf::bootstrap::build_app_with_bootstrap_inputs(cfg, inputs)
-                .run();
+            let mut app =
+                bevy_naadf::bootstrap::build_app_with_bootstrap_inputs(cfg, inputs);
+            // `--e2e-vox-oracle-cpu` — insert the test-only CPU-oracle marker
+            // resource so `setup_test_grid` routes a `--vox` load through the
+            // natural-bound CPU loader (`install_vox_sized_to_model`) instead
+            // of the production W5 GPU producer chain. The marker replaced the
+            // deleted `E2eGateMode::VoxGpuOracleCpu` enum variant
+            // (`e2e-ipc-rpc-restructure` Phase 5). Inserted post-build, before
+            // `app.run()` — `setup_test_grid` reads it (`Option<Res<…>>`) at
+            // `Startup`, so this lands before the first frame.
+            if e2e_vox_oracle_cpu {
+                app.insert_resource(bevy_naadf::voxel::grid::VoxOracleCpuConstruction);
+            }
+            return app.run();
         }
         bevy_naadf::build_app_with_budget(
             AppConfig::windowed(),

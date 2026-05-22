@@ -12,7 +12,6 @@ use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, Window};
 
-use crate::AppConfig;
 use crate::GiSettings;
 use crate::GridPreset;
 use crate::camera::position_split::PositionSplit;
@@ -166,19 +165,13 @@ pub fn dump_diagnostics_on_p(
     info!(target: "diagnostics", "{}", buf);
 }
 
-/// Wires `dump_diagnostics_on_p` into the `Update` schedule. Self-skips
-/// under the e2e harness (`AppConfig.add_e2e_systems` true) — the harness is
-/// non-interactive + resources the dump reads may be absent there.
+/// Wires `dump_diagnostics_on_p` into the `Update` schedule. The system only
+/// fires on `KeyCode::KeyP` just-pressed, so it is inert on the
+/// non-interactive BRP-driven e2e SUT (the runner never injects key input).
 pub struct DiagnosticsPlugin;
 
 impl Plugin for DiagnosticsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            dump_diagnostics_on_p
-                .run_if(|cfg: Option<Res<AppConfig>>| {
-                    cfg.map(|c| !c.add_e2e_systems).unwrap_or(true)
-                }),
-        );
+        app.add_systems(Update, dump_diagnostics_on_p);
     }
 }

@@ -38,8 +38,24 @@ use crate::render::budget::EffectiveWorldSize;
 // `EffectiveWorldSize` resource instead of the consts.
 #[cfg(test)]
 use crate::WORLD_SIZE_IN_CHUNKS;
-use crate::e2e::gate::E2eGateMode;
 use crate::GridPreset;
+
+/// Marker resource — when present, [`setup_test_grid`]'s `GridPreset::Vox`
+/// arm routes the load through the test-only [`install_vox_sized_to_model`]
+/// natural-bound CPU oracle instead of the production W5 GPU producer chain.
+///
+/// This is the SOLE test-only escape hatch in `setup_test_grid`. It is the
+/// CPU phase of the BRP-driven `vox_gpu_oracle` SSIM compare gate: the gate
+/// spawns one SUT with `--e2e-vox-oracle-cpu` (this resource inserted, CPU
+/// render) and one without (production W5 GPU render), then SSIM-compares.
+///
+/// Set by the native `--e2e-vox-oracle-cpu` spawn flag in `main.rs`
+/// (`e2e-ipc-rpc-restructure` Phase 5 — replaced the deleted
+/// `E2eGateMode::VoxGpuOracleCpu` enum variant; per Forbidden Move #4 it
+/// rides the spawn contract, not a BRP verb). Absent on every production
+/// boot and every other e2e gate.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct VoxOracleCpuConstruction;
 
 // Palette indices into `VoxelTypes::types`. Index 0 is the reserved empty
 // placeholder (C# convention) — see `VoxelTypes::default`.
@@ -115,28 +131,28 @@ pub fn demo_origin_v(world_size_in_chunks: UVec3) -> Vec3 {
 ///   `?skybox=1` URL-param surface (mutated into place by
 ///   `web_vox::startup_fetch_default_vox` before this system reads it).
 ///
-/// The [`E2eGateMode::VoxGpuOracleCpu`] escape hatch is the SOLE test-only
+/// The [`VoxOracleCpuConstruction`] marker resource is the SOLE test-only
 /// branch that routes `Vox` loads to [`install_vox_sized_to_model`] (the
 /// legacy natural-bound CPU oracle) — used as the CPU phase of the
-/// SSIM-based `--vox-gpu-oracle` gate. Production callers never reach this
-/// gate mode.
+/// SSIM-based `vox_gpu_oracle` gate. Production callers never insert it.
 pub fn setup_test_grid(
     mut commands: Commands,
     grid_preset: Res<GridPreset>,
-    gate_mode: Res<E2eGateMode>,
+    vox_oracle_cpu: Option<Res<VoxOracleCpuConstruction>>,
     effective_world: Res<EffectiveWorldSize>,
 ) {
     let effective = *effective_world;
-    // Step 6 of the config-as-resource refactor — the test-only CPU-oracle
-    // install branch is selected by `E2eGateMode::VoxGpuOracleCpu`, the
-    // per-domain mode resource that collapsed the e2e-mode booleans (the
-    // read was the former `AppArgs.vox_gpu_oracle_cpu_phase`).
+    // The test-only CPU-oracle install branch is selected by the presence of
+    // the `VoxOracleCpuConstruction` marker resource — set by the native
+    // `--e2e-vox-oracle-cpu` spawn flag (`e2e-ipc-rpc-restructure` Phase 5
+    // replaced the deleted `E2eGateMode::VoxGpuOracleCpu` enum variant with
+    // this dedicated purpose-named marker).
     match &*grid_preset {
         GridPreset::Default => {
             install_default_embedded_in_fixed_world(&mut commands, &effective);
         }
         GridPreset::Vox { path } => {
-            if *gate_mode == E2eGateMode::VoxGpuOracleCpu {
+            if vox_oracle_cpu.is_some() {
                 // Test-only CPU oracle phase for `--vox-gpu-oracle`. The
                 // gate's compare phase pairs this CPU render against the
                 // GPU render of the same fixture through the production W5
@@ -406,9 +422,9 @@ fn install_default_embedded_in_fixed_world(
 
 /// Legacy `.vox` loader — sizes the world to the model's natural bounds.
 ///
-/// Reachable ONLY via the test-only `E2eGateMode::VoxGpuOracleCpu` branch
-/// in [`setup_test_grid`] — the CPU oracle phase of the SSIM-based
-/// `--vox-gpu-oracle` gate. The production binary always routes through
+/// Reachable ONLY via the test-only [`VoxOracleCpuConstruction`] marker
+/// branch in [`setup_test_grid`] — the CPU oracle phase of the SSIM-based
+/// `vox_gpu_oracle` gate. The production binary always routes through
 /// [`install_vox_in_fixed_world`]. Kept as a separate path so the CPU-vs-GPU
 /// SSIM compare measures two distinct install paths' renders rather than two
 /// captures of the same render.
